@@ -43,12 +43,12 @@ inputs, and constants introduced after promotion. Definitions feeding phis are
 common values have no retained original VIR consumer, so this census does not
 assign them a consumer slot.
 
-[constant-consumer-census.csv](constant-consumer-census.csv) records every
+[constant-consumer-census.csv](../MEASUREMENTS.md#cs2-pressure) records every
 observed consumer opcode, encoding, physical GPR-source-list index, logical
 machine operand role, uniform-file admission and maximum uniform index, both
 before and after. Multiple slots can refer to one definition; their definition
 counts must not be summed. `FMA_LOW_SOURCE` remains bounded at u63 where that
-short encoding requires it. [constant-census-results.json](constant-census-results.json)
+short encoding requires it. [constant-census-results.json](../MEASUREMENTS.md#cs2-pressure)
 retains the aggregate counts.
 
 After the new families, prominent GPR-only consumers are vertex `LOGIC_EXPORT`

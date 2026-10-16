@@ -183,7 +183,7 @@ The intermediate six-family build (`6a1f13364ae`) alone removes 76,319 main
 instructions and 1,567 swaps, but adds 1,237 SAVEs / 1,211 FILLs. The retained
 loop-weighted promotion and immutable-import changes improve that result to
 the final totals above. Full intermediate, final and baseline metrics are in
-[uniform-source-results.json](uniform-source-results.json). The source records
+[uniform-source-results.json](../MEASUREMENTS.md#cs2-pressure). The source records
 and logs remain under `tmp/uniform-source-probes/` and
 `tmp/cs2-pressure-20261005/uniform-census/{families,final}-whole*`.
 
@@ -193,7 +193,7 @@ Each validated family is committed separately: select `e096cec38df`, predicate
 cross-control-flow immutable imports are `ff53faea9e7`. All work remains local.
 
 The complete 79-dispatch bit-exact evidence is retained in
-[uniform-source-probes.json](uniform-source-probes.json): injected instruction
+[uniform-source-probes.json](../MEASUREMENTS.md#cs2-pressure): injected instruction
 bytes, initialized uniform words, run-length encoded expected and actual lane
 outputs, mismatches and SHA256 over little-endian output words. The initial
 harness compilation assertion is listed separately from GPU dispatches.
@@ -203,6 +203,6 @@ A final replay of the frozen **uninstrumented** driver also completed all
 metric and every actual uniform destination matches the diagnostic result
 exactly. The independent phi-edge census likewise matches all main metrics.
 Source hashes and verification flags are retained in
-[uniform-replay-verification.json](uniform-replay-verification.json). All 79
+[uniform-replay-verification.json](../MEASUREMENTS.md#cs2-pressure). All 79
 compact probe fixtures were checked back against their original stdout and
 little-endian word hashes.

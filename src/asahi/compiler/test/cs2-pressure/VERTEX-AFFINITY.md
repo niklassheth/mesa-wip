@@ -9,7 +9,7 @@ passed; its separately labelled results supersede the pending status below.
 
 ## Distribution from the saved mini replay
 
-[All 127 regressing vertex outputs](vertex-regressors.csv) are listed by
+[All 127 regressing vertex outputs](../MEASUREMENTS.md#cs2-pressure) are listed by
 zero-based whole-replay row, vertex ordinal and Fossilize pipeline hash, with
 metrics for the original combined baseline and each of the three stages.
 Pipeline hashes identify work; a pipeline can emit multiple outputs or be
