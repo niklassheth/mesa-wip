@@ -78,7 +78,7 @@ Both scheduling choices were measured for all 320 at-cap programs. Hoisting samp
 - 204 focused compiler, allocator, spilling and coalescing tests pass. Tests execute reconstructed values across uniform mutation and compare three loop iterations before/after spill placement, including loop-carried values.
 - Full host replay passes. The diagnostic driver checks the post-spill register-demand bound even in release builds. Its main metrics match the uninstrumented driver exactly; the baseline also exactly reproduces the frozen uniform-family results.
 - No mini access, resets, installation or GPU tests were performed for this work. Hardware correctness and game performance await an available slot.
-- [Aggregate results](spill-latency-results.json), [the fixed 320-program cohort](spill-latency-at-cap.csv), and [the retained diagnostic kit](spill-census/README.md). Raw host runs are under `tmp/cs2-pressure-20261006/spill-analysis/` in the workspace.
+- [Aggregate results](../MEASUREMENTS.md#cs2-pressure), [the fixed 320-program cohort](../MEASUREMENTS.md#cs2-pressure), and [the retained diagnostic kit](spill-census/README.md). Raw host runs are under `tmp/cs2-pressure-20261006/spill-analysis/` in the workspace.
 
 ## Frozen driver for the next uniform-family A/B
 

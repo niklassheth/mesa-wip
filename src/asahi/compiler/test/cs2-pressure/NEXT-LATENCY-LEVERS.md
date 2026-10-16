@@ -65,7 +65,7 @@ The 20 highest-weight records account for 808,820 events (43.8%); 50 account for
 capture records, not 20 independent algorithms or 43.8% of measured frame time.
 The highest group has 42,499 events per record; use the CSV pipeline identities
 when selecting repros. The complete sorted
-[320-program list](next-levers-at-cap.csv) and [producer/kind totals](next-levers-census.json)
+[320-program list](../MEASUREMENTS.md#cs2-pressure) and [producer/kind totals](../MEASUREMENTS.md#cs2-pressure)
 provide the reproducible shortlist.
 
 ## Direct frame-destination probe proposal

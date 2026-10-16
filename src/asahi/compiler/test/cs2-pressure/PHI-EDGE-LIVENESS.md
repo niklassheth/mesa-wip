@@ -62,9 +62,9 @@ counts, without claiming equal execution frequency across edges or shaders.
 | Compute, placement | 17,277 | 7,784 | 9,493 | 9,082 |
 
 The complete partitions, constant/computed splits, edge kinds and register
-pressure cohorts are in [phi-edge-liveness-summary.json](phi-edge-liveness-summary.json).
-Per-program pipeline hashes and counts are in [phi-edge-liveness.csv](phi-edge-liveness.csv)
-and [phi-edge-liveness-after-placement.csv](phi-edge-liveness-after-placement.csv).
+pressure cohorts are in [phi-edge-liveness-summary.json](../MEASUREMENTS.md#cs2-pressure).
+Per-program pipeline hashes and counts are in [phi-edge-liveness.csv](../MEASUREMENTS.md#cs2-pressure)
+and [phi-edge-liveness-after-placement.csv](../MEASUREMENTS.md#cs2-pressure).
 
 ## Method and verification
 
@@ -134,6 +134,6 @@ to 69,383 here, while its candidate bound falls from 38,143 to 32,558. Keep the
 complete instruction/copy/spill cost comparison in
 [UNIFORM-SOURCES.md](UNIFORM-SOURCES.md), since coalescing and uniform promotion
 can also move costs outside phi edges. Full stage, edge and pressure partitions
-are in [phi-edge-liveness-after-uniforms.json](phi-edge-liveness-after-uniforms.json).
+are in [phi-edge-liveness-after-uniforms.json](../MEASUREMENTS.md#cs2-pressure).
 Per-program records and pipeline hashes remain in
 `tmp/cs2-pressure-20261005/phi-edge-analysis/final-whole-summary/programs.csv`.

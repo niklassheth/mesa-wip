@@ -15,7 +15,7 @@ instructions; 232 regressors add 1–3, 78 add 4–9, and seven add ten or more.
 The largest ten account for only 16.4% of gross growth. Of 155 kernels gaining
 swaps, 103 gain one, 36 gain two, and 16 gain three; another 16 lose swaps.
 
-[All changed compute outputs](compute-deltas.csv) include stable Fossilize
+[All changed compute outputs](../MEASUREMENTS.md#cs2-pressure) include stable Fossilize
 pipeline hashes, indices, before/after metrics and the inspected mechanisms.
 The capture provides no useful symbolic kernel names in these outputs.
 
@@ -117,8 +117,8 @@ compute copies occur below it.
 | Other selected identity/materialization | 36 | 0 | 55 |
 | **Total** | **153,751** | **20,225** | **63,263** |
 
-[Category counts by pressure cohort](copy-attribution.csv) and the
-[machine-readable summary](copy-summary.json) retain all subdivisions.
+[Category counts by pressure cohort](../MEASUREMENTS.md#cs2-pressure) and the
+[machine-readable summary](../MEASUREMENTS.md#cs2-pressure) retain all subdivisions.
 There are no unclassified copies. No direct generic eviction-copy category
 survives; allocator reconciliation and constrained-operand moves are counted
 at their actual insertion sites.
