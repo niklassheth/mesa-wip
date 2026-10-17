@@ -3007,6 +3007,7 @@ init_driver_workarounds(struct zink_screen *screen)
    case VK_DRIVER_ID_MESA_PANVK:
    case VK_DRIVER_ID_MESA_NVK:
    case VK_DRIVER_ID_MESA_KOSMICKRISP:
+   case VK_DRIVER_ID_MESA_HONEYKRISP:
    case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
       screen->driver_workarounds.implicit_sync = false;
       break;
