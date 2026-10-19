@@ -12,7 +12,7 @@ def generate(root):
     spec=importlib.util.spec_from_file_location('attributes',Path(__file__).resolve().parents[1]/'native-attributes/arms.py')
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     p=module.positions('CONTROL',False);rows=[]
-    for name in ['CONTROL','USER','PARTIAL_T3','PID','USER_PID','MIXED','CULL_FALSE','CULL_TRUE']:
+    for name in ['CONTROL','USER','PARTIAL_T3','PID','USER_PID','MIXED','CULL_FALSE','CULL_TRUE','CULL_UNTAKEN']:
         user=name in ['USER','PARTIAL_T3','USER_PID','MIXED'];pid=name in ['PID','USER_PID']
         cull=name.startswith('CULL_');culled=name=='CULL_TRUE';threads=3 if name=='PARTIAL_T3' else 1
         linear=[dict(name='linearValue',slot=3,component=0,mode='noperspective',values=[[0],[1],[0]],type='float',n=1)] if name=='MIXED' else []
@@ -44,7 +44,9 @@ def generate(root):
                     s+=f'if(gl_LocalInvocationIndex=={threads-1}u) dataValue[0]=uvec2(0x7fc01234u,0x7fc00000u);\n'
                     if threads==3:s+='barrier();\nif(gl_LocalInvocationIndex==0u) dataValue[0].y=0x7fc01234u^0x1234u;\n'
                 if pid:s+='gl_MeshPrimitivesEXT[0].gl_PrimitiveID=37;\n'
-                if cull:s+='gl_MeshPrimitivesEXT[0].gl_CullPrimitiveEXT='+('true' if culled else 'false')+';\n'
+                if cull:
+                    if name=='CULL_UNTAKEN':s+='if(gl_WorkGroupID.x!=0u) '
+                    s+='gl_MeshPrimitivesEXT[0].gl_CullPrimitiveEXT='+('true' if culled or name=='CULL_UNTAKEN' else 'false')+';\n'
             else:
                 s+='gl_Position=positions['+('0' if culled else 'gl_VertexIndex')+'];\n'
                 if user:s+='dataValue=uvec2(0x7fc01234u,0x7fc00000u)+uint(gl_VertexIndex);\n'

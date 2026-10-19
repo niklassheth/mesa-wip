@@ -37,7 +37,7 @@ for arch in ['host','arm']:
         expected=[shade for mode,shade in [('flat',0),('noperspective',3)]
                   for attr in arm['attributes'] if attr['mode']==mode for _ in range(attr['n'])]
         assert shades==expected,(arch,arm['name'],shades,expected)
-        if arm['name'] in ['CONTROL','PID','CULL_FALSE','CULL_TRUE']:
+        if arm['name'] in ['CONTROL','PID','CULL_FALSE','CULL_TRUE','CULL_UNTAKEN']:
             assert fvs==fmesh and v==m
         rows.append(dict(arch=arch,arm=arm['name'],fragment_programs_byte_identical=fvs==fmesh,
             native_coefficient_words=words,expected_shades=expected,

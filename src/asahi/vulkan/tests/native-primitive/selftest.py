@@ -19,7 +19,9 @@ for arm in arms:
     except ValueError:pass
     else:raise AssertionError('dry run counted as GPU evidence')
     checks+=2
-assert (root/'expected/CULL_FALSE.rgba').read_bytes()==(root/'expected/CONTROL.rgba').read_bytes()
+for name in ['CULL_FALSE','CULL_UNTAKEN']:
+    for ext in ['rgba','depth']:
+        assert (root/('expected/'+name+'.'+ext)).read_bytes()==(root/('expected/CONTROL.'+ext)).read_bytes()
 arm=arms[0]
 with tempfile.TemporaryDirectory(prefix='primitive-oracle-synthetic-') as t:
     dirs=[]
