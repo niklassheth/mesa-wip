@@ -158,7 +158,7 @@ def stream(memory, address, compiled, user_components=0):
             memory.read(CONTEXT_BASE + pointer, 4)
         assert words[31] == ppp + 0xf0
         assert words[32] == 0x70000600
-        assert words[33:39] == (1, 1, 1, 1, 1, 1)
+        assert words[33:39] == (16, 1, 1, 16, 1, 1)
         mesh = launch(memory, words[8], False, compiled, components, local_bytes)
         obj = launch(memory, words[6], True, compiled)
         assert mesh['arguments'] == obj['arguments']

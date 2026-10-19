@@ -4,7 +4,6 @@
 """Require exact whole-image RGBA8 and D32 source oracles AND VS/native equality."""
 import argparse, hashlib, json
 from pathlib import Path
-from arms import oracle
 
 def require(condition,message):
     if not condition:raise ValueError(message)

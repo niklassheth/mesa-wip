@@ -13,10 +13,11 @@ def manifest(root):
         digest,name=line.split('  ',1);path=(root/name).resolve()
         if root.resolve() not in path.parents:raise ValueError('manifest path escaped kit')
         if hashlib.sha256(path.read_bytes()).hexdigest()!=digest:raise ValueError('kit input hash mismatch: '+name)
-def environment(icd, attributes=False):
+def environment(icd, attributes=False, primitive_lowering=False):
     env={k:v for k,v in os.environ.items() if not k.upper().startswith(('AGX_','ASAHI_','HK_','VK_','MESA_','LD_'))}
     env.update(VK_DRIVER_FILES=str(icd),HK_EXPERIMENTAL_APPLE9='1',HK_APPLE9_NATIVE_MESH='1',MESA_SHADER_CACHE_DISABLE='true')
     if attributes:env['HK_APPLE9_NATIVE_MESH_ATTRIBUTES']='1'
+    if primitive_lowering:env['HK_APPLE9_NATIVE_MESH_PRIMITIVE_LOWERING']='1'
     return env
 
 def main():
@@ -42,10 +43,10 @@ def main():
     icd.write_text(json.dumps({'file_format_version':'1.0.0','ICD':{
         'library_path':str(root/'lib-arm/libvulkan_asahi.so'),'api_version':'1.4.305'}})+'\n')
     cmd=[str(root/'lib-arm/probe'),str(root/'shaders'/(arm['name']+'.'+a.stage+'.spv')),
-         str(root/'shaders'/(arm['fragment']+'.frag.spv')),str(int(arm['halfz'])),
+         str(root/'shaders'/(arm.get('fragments',{}).get(a.stage,arm['fragment'])+'.frag.spv')),str(int(arm['halfz'])),
          str(out/'color.bin'),str(out/'depth.bin'),'0']
     with (out/'log.txt').open('w') as log:
-        process=subprocess.Popen(cmd,env=environment(icd,suite.get('native_attributes',False)),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+        process=subprocess.Popen(cmd,env=environment(icd,suite.get('native_attributes',False),suite.get('primitive_lowering',False)),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         meta=dict(arm=arm['name'],stage=a.stage,pid=process.pid,no_gpu_execution=False,
             boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),cmdline=cmdline,
             uname=list(uname),kernel=kernel,command=cmd,started=time.time(),
