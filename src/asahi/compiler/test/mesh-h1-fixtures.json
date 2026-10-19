@@ -1,0 +1,187 @@
+{
+  "qualification": "Successful H1 combined-input BASE and SHIFT_X draws, recorded 2026-10-19. All ordinary DATA, pixels, retirement and ownership gates passed. Only the bounded geometry/list/root/scene record spans and the submitted PPP DATA are read. No native executable content.",
+  "rows": [
+    {
+      "case": "H1_BASE",
+      "analysis": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/analysis/H1_ADD_S01_INPUTS.json",
+      "analysis_sha256": "3e6cb69b102523cc18b1af7a69770b04dc94975e94b071b360c6a47099f78009",
+      "source": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/SOURCE-INPUTS.json",
+      "source_sha256": "ebded1ca857e1b564e141cdcec06320378811d01b4ee4d2eec5668fc14f87bc9",
+      "source_name": "BASE",
+      "ppp_data_sha256": "0b12a956a7f991a7e3af4f02996ebdfdd53e5c7674269078c2fe934ab5a3b674",
+      "records": [
+        {
+          "role": "OUTPUT_SLOT_00",
+          "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/analysis/blobs/c44ecba55bea7b179c1f2caa0f1976bd2ca2b174681b68f13b459eda1aff0e6d.bin.z",
+          "sha256": "c44ecba55bea7b179c1f2caa0f1976bd2ca2b174681b68f13b459eda1aff0e6d",
+          "offset": 0,
+          "length": 68
+        },
+        {
+          "role": "OUTPUT_SLOT_01",
+          "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/analysis/blobs/f75cec1a72cd96d2557f0d773e8419fa338e90e5e986f558d0851ad07382a809.bin.z",
+          "sha256": "f75cec1a72cd96d2557f0d773e8419fa338e90e5e986f558d0851ad07382a809",
+          "offset": 0,
+          "length": 12
+        },
+        {
+          "role": "OUTPUT_SLOT_02",
+          "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/analysis/blobs/da726ecde6021b9817ff344d90cc5f9f8a3bf2c9bba9aeee52f762d1da94b309.bin.z",
+          "sha256": "da726ecde6021b9817ff344d90cc5f9f8a3bf2c9bba9aeee52f762d1da94b309",
+          "offset": 0,
+          "length": 32
+        },
+        {
+          "role": "SCENE_PAGE",
+          "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/analysis/blobs/0ffa1b1f668afc10f9bd6588ce68056de0a4dd5821c71b23c618d9c762db1f89.bin.z",
+          "sha256": "0ffa1b1f668afc10f9bd6588ce68056de0a4dd5821c71b23c618d9c762db1f89",
+          "offset": 0,
+          "length": 48
+        }
+      ],
+      "units": {
+        "U0": {
+          "A_primitive_count": 1,
+          "B_provisional_vertex_count": 3,
+          "lanes": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15
+          ],
+          "A_after": 0
+        },
+        "channels": [
+          [
+            0,
+            32
+          ],
+          [
+            1,
+            48
+          ],
+          [
+            2,
+            64
+          ],
+          [
+            3,
+            80
+          ]
+        ],
+        "channel_lanes": [
+          0,
+          1,
+          2
+        ],
+        "scalar_count": 3,
+        "scalar_lanes": [
+          0
+        ]
+      }
+    },
+    {
+      "case": "H1_SHIFT_X",
+      "analysis": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/analysis/H1_ADD_S01_SHIFT_INPUTS.json",
+      "analysis_sha256": "69dd2d5a163e8e8181a0b7460ca800dfde8fd804c97386b74e96d6615fda0003",
+      "source": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/SOURCE-INPUTS.json",
+      "source_sha256": "ebded1ca857e1b564e141cdcec06320378811d01b4ee4d2eec5668fc14f87bc9",
+      "source_name": "SHIFT_X",
+      "ppp_data_sha256": "0b12a956a7f991a7e3af4f02996ebdfdd53e5c7674269078c2fe934ab5a3b674",
+      "records": [
+        {
+          "role": "OUTPUT_SLOT_00",
+          "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/analysis/blobs/9da4aa3139084c64ded0628104609960acc87e9cf6659a08dcaaee7087f0835d.bin.z",
+          "sha256": "9da4aa3139084c64ded0628104609960acc87e9cf6659a08dcaaee7087f0835d",
+          "offset": 0,
+          "length": 68
+        },
+        {
+          "role": "OUTPUT_SLOT_01",
+          "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/analysis/blobs/f75cec1a72cd96d2557f0d773e8419fa338e90e5e986f558d0851ad07382a809.bin.z",
+          "sha256": "f75cec1a72cd96d2557f0d773e8419fa338e90e5e986f558d0851ad07382a809",
+          "offset": 0,
+          "length": 12
+        },
+        {
+          "role": "OUTPUT_SLOT_02",
+          "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/analysis/blobs/da726ecde6021b9817ff344d90cc5f9f8a3bf2c9bba9aeee52f762d1da94b309.bin.z",
+          "sha256": "da726ecde6021b9817ff344d90cc5f9f8a3bf2c9bba9aeee52f762d1da94b309",
+          "offset": 0,
+          "length": 32
+        },
+        {
+          "role": "SCENE_PAGE",
+          "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/analysis/blobs/0ffa1b1f668afc10f9bd6588ce68056de0a4dd5821c71b23c618d9c762db1f89.bin.z",
+          "sha256": "0ffa1b1f668afc10f9bd6588ce68056de0a4dd5821c71b23c618d9c762db1f89",
+          "offset": 0,
+          "length": 48
+        }
+      ],
+      "units": {
+        "U0": {
+          "A_primitive_count": 1,
+          "B_provisional_vertex_count": 3,
+          "lanes": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15
+          ],
+          "A_after": 0
+        },
+        "channels": [
+          [
+            0,
+            32
+          ],
+          [
+            1,
+            48
+          ],
+          [
+            2,
+            64
+          ],
+          [
+            3,
+            80
+          ]
+        ],
+        "channel_lanes": [
+          0,
+          1,
+          2
+        ],
+        "scalar_count": 3,
+        "scalar_lanes": [
+          0
+        ]
+      }
+    }
+  ]
+}
