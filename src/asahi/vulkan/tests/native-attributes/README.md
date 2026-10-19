@@ -62,7 +62,11 @@ for previously qualified position-only code.
 
 ## Reproduce host preparation from the source checkout
 
-Build the assertion-enabled host driver and ARM driver, then run:
+Build the assertion-enabled host driver and ARM driver. The ARM cross build must
+use `mesa_clc`, `vtn_bindgen2`, and `asahi_clc` built from this same checkout;
+serialized NIR from older external tools is incompatible. Put those tools first
+on PATH and clear Meson's program lookup cache when reconfiguring an existing
+cross build. Then run:
 
 ```sh
 python3 src/asahi/vulkan/tests/native-attributes/prepare-kit.py \
