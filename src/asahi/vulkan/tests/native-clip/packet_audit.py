@@ -71,7 +71,7 @@ def literal(b, register):
     return ((b[1] & 127) | ((b[4] & 30) << 6) | ((b[5] & 12) << 9) |
             (b[6] << 13) | ((b[7] & 15) << 21) | ((b[3] & 254) << 24))
 
-def launch(memory, handle, object_stage, compiled):
+def launch(memory, handle, object_stage, compiled, channels=4, local_bytes=128):
     address = USC_BASE + 64 * handle
     assert address % 128 == 0
     b = memory.read(address, 256)
@@ -86,7 +86,7 @@ def launch(memory, handle, object_stage, compiled):
     assert b[target_at + 8:target_at + 10] == bytes([2 if object_stage else 6, 0])
     entry = (int.from_bytes(b[target_at + 2:target_at + 8], 'little') - 0x2a) // 2
     assert b[target_at - 8:target_at - 4] == bytes.fromhex('77002a41')
-    assert b[target_at - 4:target_at] == bytes.fromhex('80020000')  # local 128 bytes
+    assert b[target_at - 4:target_at] == struct.pack('<I', (local_bytes << 2) | 0x80)
     frame = b[target_at + 10:target_at + 20]
     assert frame[:3] == bytes.fromhex('f7002a')
     a, bb = struct.unpack_from('<HH', frame, 5)
@@ -122,14 +122,16 @@ def launch(memory, handle, object_stage, compiled):
                 'local index lacks its zero-extension companion'
     else:
         mesh_ops = [op for op in ops if op.startswith('MESH_')]
-        assert mesh_ops == ['MESH_CONTROL', *['MESH_SUBMIT_CHANNEL'] * 4, 'MESH_SUBMIT_SCALAR']
+        assert mesh_ops == ['MESH_CONTROL', *['MESH_SUBMIT_CHANNEL'] * channels, 'MESH_SUBMIT_SCALAR']
     return dict(address=hex(address), entry=hex(entry), argument_table=hex(table),
                 arguments=[hex(x) for x in args], grid=list(grid), frames=[a, bb],
-                publications=publications, code_bytes=len(program['code']), code_sha256=digest,
+                publications=publications, local_bytes=local_bytes, code_bytes=len(program['code']), code_sha256=digest,
                 launch_sha256=sha(memory.read(address, 256)),
                 callee_local_index_reads=local_reads if object_stage else [])
 
-def stream(memory, address, compiled):
+def stream(memory, address, compiled, user_components=0):
+    components=4+user_components
+    local_bytes=1 << (max(128,32+16*components)-1).bit_length()
     visited, draws = set(), []
     for _ in range(1024):
         assert address not in visited, 'VDM cycle'
@@ -143,9 +145,9 @@ def stream(memory, address, compiled):
             continue
         assert header == 0x40000d2c, ('unexpected VDM packet', hex(header), hex(address))
         words = struct.unpack('<39I', memory.read(address, 156))
-        assert words[:6] == (0x40000d2c, 0x504, 0x10, 0, 0, 0x1000000)
+        assert words[:6] == (0x40000d2c, ((components+1)<<8)|components, 0x10, 0, 0, 0x1000000)
         assert words[7] == 0x1000000
-        assert words[9:14] == (1, 0, 0x400810, 0, 5)
+        assert words[9:14] == (1, 0, 0x400810, 0, components+1)
         assert words[14] == 0x500
         ppp = words[15]
         offsets = [0, 0x40, 0x5c, 0x70, 0x8c, 0xc0, 0xa0, 0xac]
@@ -157,9 +159,11 @@ def stream(memory, address, compiled):
         assert words[31] == ppp + 0xf0
         assert words[32] == 0x70000600
         assert words[33:39] == (1, 1, 1, 1, 1, 1)
-        mesh = launch(memory, words[8], False, compiled)
+        mesh = launch(memory, words[8], False, compiled, components, local_bytes)
         obj = launch(memory, words[6], True, compiled)
         assert mesh['arguments'] == obj['arguments']
-        draws.append(dict(stream=hex(address), state=list(words[:14]), mesh=mesh, object=obj))
+        ppp_header=struct.unpack('<2I',memory.read(CONTEXT_BASE+ppp,8))
+        draws.append(dict(stream=hex(address), state=list(words[:14]), mesh=mesh, object=obj,
+                          ppp_address=hex(CONTEXT_BASE+ppp), ppp_header=list(ppp_header)))
         address += 156
     raise AssertionError('VDM packet budget exceeded')

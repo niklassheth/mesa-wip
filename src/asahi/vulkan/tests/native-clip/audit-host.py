@@ -36,7 +36,7 @@ def audit(root, dry):
                     kind,size,vdm,cdm=struct.unpack_from('<4H',b,at);assert at+size+8<=len(b)
                     if kind==0:
                         flags,_,address=struct.unpack_from('<IIQ',b,at+8)
-                        draws+=stream(memory,address,compiled)
+                        draws+=stream(memory,address,compiled,arm.get('user_components',0))
                     at+=8+size
                 assert at==len(b)
             assert len(draws)==1
@@ -45,10 +45,14 @@ def audit(root, dry):
             for x in mesh['instructions']:
                 r=dict(x);r.update(op=OPCODES[int(r['op'])],imm=int(r['imm'],0),offset=int(r['offset']),
                     code=bytes.fromhex(r['bytes']),src=r['src'].split(',') if r['src'] else []);rows.append(r)
-            u.check_program(rows)
-            # The native packet is the same position-only class in both modes.
+            u.check_program(rows,arm.get('channel_planes'))
+            # Counts and allocation follow the declared scalar output map.
             state=list(draw['state']);state[6]=state[8]=0
-            assert state==[0x40000d2c,0x504,0x10,0,0,0x1000000,0,0x1000000,0,1,0,0x400810,0,5]
+            components=4+arm.get('user_components',0)
+            assert state==[0x40000d2c,((components+1)<<8)|components,0x10,0,0,0x1000000,0,0x1000000,0,1,0,0x400810,0,components+1]
+            counts=[sum(a['n'] for a in arm.get('attributes',[]) if a['mode']==m)
+                    for m in ['smooth','flat','noperspective']]
+            assert draw['ppp_header']==[0x10040000,counts[0]|counts[1]<<8|counts[2]<<16]
             row=dict(arm=arm['name'],arch=arch,normalized_state=state,**draw)
             (d/'AUDIT.json').write_text(json.dumps(row,indent=2)+'\n');results.append(row)
             if arch=='host':
@@ -65,6 +69,6 @@ def audit(root, dry):
                     assert draw[stage]['launch_sha256']==twin[stage]['launch_sha256']
                 (d/'AUDIT.json').write_text(json.dumps(row,indent=2)+'\n')
     (dry.parent/'SUBMISSION-AUDIT.json').write_text(json.dumps(results,indent=2)+'\n')
-    print(len(results),'native submissions: full uploaded code, launches, roots, U0/four channels/scalar and state verified; host/ARM launch identical; code differences limited to independent immediate-move scheduling')
+    print(len(results),'native submissions: full uploaded code, launches, roots, U0/channel planes/scalar and state verified; host/ARM launch identical; code differences limited to independent immediate-move scheduling')
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--root',type=Path,required=True);p.add_argument('--dry',type=Path,required=True);a=p.parse_args();audit(a.root,a.dry)

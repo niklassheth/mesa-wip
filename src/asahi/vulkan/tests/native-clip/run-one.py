@@ -13,9 +13,10 @@ def manifest(root):
         digest,name=line.split('  ',1);path=(root/name).resolve()
         if root.resolve() not in path.parents:raise ValueError('manifest path escaped kit')
         if hashlib.sha256(path.read_bytes()).hexdigest()!=digest:raise ValueError('kit input hash mismatch: '+name)
-def environment(icd):
+def environment(icd, attributes=False):
     env={k:v for k,v in os.environ.items() if not k.upper().startswith(('AGX_','ASAHI_','HK_','VK_','MESA_','LD_'))}
     env.update(VK_DRIVER_FILES=str(icd),HK_EXPERIMENTAL_APPLE9='1',HK_APPLE9_NATIVE_MESH='1',MESA_SHADER_CACHE_DISABLE='true')
+    if attributes:env['HK_APPLE9_NATIVE_MESH_ATTRIBUTES']='1'
     return env
 
 def main():
@@ -31,7 +32,10 @@ def main():
     if not kernel.get('production_h1_qualified') or not kernel.get('source_commit') or not kernel.get('image_sha256') or not kernel.get('h1_report_sha256'):
         raise ValueError('production kernel H1 qualification and source/image/report hashes required')
     manifest(root)
-    arm=next(x for x in json.loads((root/'ARMS.json').read_text())['arms'] if x['name']==a.arm)
+    suite=json.loads((root/'ARMS.json').read_text())
+    if suite.get('native_attributes') and not kernel.get('native_mesh_attributes_supported'):
+        raise ValueError('matching kernel support for native attribute state/launch sizes required')
+    arm=next(x for x in suite['arms'] if x['name']==a.arm)
     if arm['pending_attributes'] and a.stage=='mesh':
         raise ValueError('pending native attributes: this position-only compiler intentionally rejects the smooth mesh arm')
     out.mkdir(parents=True,exist_ok=False);icd=out/'icd.json'
@@ -41,7 +45,7 @@ def main():
          str(root/'shaders'/(arm['fragment']+'.frag.spv')),str(int(arm['halfz'])),
          str(out/'color.bin'),str(out/'depth.bin'),'0']
     with (out/'log.txt').open('w') as log:
-        process=subprocess.Popen(cmd,env=environment(icd),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+        process=subprocess.Popen(cmd,env=environment(icd,suite.get('native_attributes',False)),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         meta=dict(arm=arm['name'],stage=a.stage,pid=process.pid,no_gpu_execution=False,
             boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),cmdline=cmdline,
             uname=list(uname),kernel=kernel,command=cmd,started=time.time(),

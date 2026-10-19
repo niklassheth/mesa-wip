@@ -11,7 +11,7 @@ def clean_environment():
         ('AGX_','ASAHI_','HK_','VK_','MESA_','LD_'))}
 def run(root, out, workspace, arch):
     sysroot=workspace/'tmp/mini-sysroot'
-    rows=json.loads((root/'ARMS.json').read_text())['arms'];results=[]
+    suite=json.loads((root/'ARMS.json').read_text());rows=suite['arms'];results=[]
     lib=root/('lib-'+arch);icd=lib/'icd.json'
     icd.write_text(json.dumps({'file_format_version':'1.0.0','ICD':{
         'library_path':str(lib/'libvulkan_asahi.so'),'api_version':'1.4.305'}})+'\n')
@@ -23,6 +23,7 @@ def run(root, out, workspace, arch):
                 VK_DRIVER_FILES=str(icd),HK_EXPERIMENTAL_APPLE9='1',HK_APPLE9_NATIVE_MESH='1',
                 MESA_SHADER_CACHE_DISABLE='true',ASAHI_HOST_TRACE_DIR=str(d),AGX_APPLE9_ASM='1',
                 HK_APPLE9_TRACE_NIR='1')
+            if suite.get('native_attributes'):settings['HK_APPLE9_NATIVE_MESH_ATTRIBUTES']='1'
             cmd=[]
             if arch=='arm':
                 settings['LD_LIBRARY_PATH']=str(sysroot/'usr/lib64')
@@ -37,7 +38,7 @@ def run(root, out, workspace, arch):
             log=(d/'log.txt').read_text(errors='replace');commands=list(d.glob('*.commands.bin'))
             rejected=arm['pending_attributes'] and stage=='mesh'
             if rejected:
-                ok=rc==2 and not commands and 'Position only and no primitive attributes' in log
+                ok=rc==2 and not commands and 'native mesh attributes development path is disabled' in log
             else:
                 ok=rc==0 and commands and 'PIPELINE_OK' in log and 'submission=0 dry_run=1' in log
                 # A no-op shim cannot produce a successful image result.
