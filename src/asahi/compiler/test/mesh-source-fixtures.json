@@ -1,0 +1,221 @@
+{
+  "qualification": "Only authored Position/index inputs and submitted state are retained in the fixture headers. Expected DATA is decoded semantically; no native compression-choice oracle.",
+  "source_commit": "151c366e0b3",
+  "research_archive": "../review-evidence/v0-data-oracle",
+  "groups": [
+    "mesh-formation-fixtures.h",
+    "mesh-h1-fixtures.h"
+  ],
+  "rows": [
+    {
+      "case": "B1_BASE",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/BASE.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "B1_BIAS",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/BIAS.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "B1_CW",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/CW.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "B1_EMPTY",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/EMPTY.mesh",
+        "sha256": "98c98a20144808716d3d0d2d988cd1df18d711d239d5a48c70953bd0fab6c6f3"
+      }
+    },
+    {
+      "case": "B1_PROC0_OTHER",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/PROC0_OTHER.mesh",
+        "sha256": "3149d44377ad83eaea2f170dcea5098c3d4f542d23cedf230133325b09739880"
+      }
+    },
+    {
+      "case": "B1_REVERSE",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/REVERSE.mesh",
+        "sha256": "5e8ad94887758759982fcc9fad8a78a83f9661ebdcba77b300d81f5e442b858f"
+      }
+    },
+    {
+      "case": "B1_STENCIL_REF",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/STENCIL_REF.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "B1_VIEWPORT_00",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/VIEWPORT_00.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "B1_VIEWPORT_02",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/VIEWPORT_02.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "B1_VIEWPORT_04",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/VIEWPORT_04.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "B1_VIEWPORT_06",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/VIEWPORT_06.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "B1_VIEWPORT_08",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/VIEWPORT_08.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "B1_VIEWPORT_10",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/VIEWPORT_10.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "B1_W_ONE_5",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/W_ONE_5.mesh",
+        "sha256": "fa37845f29c3c0301ee28c0f3d0c721dde7456f600d61125703ba1c06b2ccd37"
+      }
+    },
+    {
+      "case": "B1_X_RANGE_03",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/X_RANGE_03.mesh",
+        "sha256": "3512d9d46414c1dc0e7f8f776945cea03cbb14e940b62c1d627cf75ca8675fa0"
+      }
+    },
+    {
+      "case": "B1_X_RANGE_04",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/X_RANGE_04.mesh",
+        "sha256": "305296b0d53267f67e5b46a5d8e02cea369977b0a196f8fbd15f4d57abc6d31b"
+      }
+    },
+    {
+      "case": "B1_Z_ONE_01",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/Z_ONE_01.mesh",
+        "sha256": "cbfff8e0408d782a65872c1d2e5bd18c0c4e4d124ef58ce1a4523907e433644a"
+      }
+    },
+    {
+      "case": "B1_Z_ONE_07",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B1/results/shaders/Z_ONE_07.mesh",
+        "sha256": "e3e21a650949a8644093eb2810ec319d6c2f4054347c5254119cf6189e70ffea"
+      }
+    },
+    {
+      "case": "B3_CONTEXTS_SAME_THREAD_0",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B3/results/shaders/BASE.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "B3_CONTEXTS_SAME_THREAD_1",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B3/results/shaders/BASE.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "B4_CONTEXTS_THREADS_0",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B4/results/shaders/BASE.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "B4_CONTEXTS_THREADS_1",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-data-contract/bridge/B4/results/shaders/BASE.mesh",
+        "sha256": "ffc936ff3b618304e36af81dd40219638496d7aea9e808b852e0184e9c390272"
+      }
+    },
+    {
+      "case": "D4_CURRENT_EMPTY",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-exact-helper/kit/shaders/EMPTY.mesh",
+        "sha256": "98c98a20144808716d3d0d2d988cd1df18d711d239d5a48c70953bd0fab6c6f3"
+      }
+    },
+    {
+      "case": "D4_TRIANGLE",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-exact-helper/kit/shaders/TRIANGLE.mesh",
+        "sha256": "37983fd25758c35a9b6931c60aa3d5c42a0c320188951755fd41cb54f276beba"
+      }
+    },
+    {
+      "case": "E1_CURRENT_EMPTY",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-exact-helper/kit/shaders/EMPTY.mesh",
+        "sha256": "98c98a20144808716d3d0d2d988cd1df18d711d239d5a48c70953bd0fab6c6f3"
+      }
+    },
+    {
+      "case": "E1_REG_EMPTY",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-exact-helper/kit/shaders/EMPTY.mesh",
+        "sha256": "98c98a20144808716d3d0d2d988cd1df18d711d239d5a48c70953bd0fab6c6f3"
+      }
+    },
+    {
+      "case": "E1_REG_TRIANGLE",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-exact-helper/kit/shaders/TRIANGLE.mesh",
+        "sha256": "37983fd25758c35a9b6931c60aa3d5c42a0c320188951755fd41cb54f276beba"
+      }
+    },
+    {
+      "case": "E1_TRIANGLE",
+      "source": {
+        "file": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-exact-helper/kit/shaders/TRIANGLE.mesh",
+        "sha256": "37983fd25758c35a9b6931c60aa3d5c42a0c320188951755fd41cb54f276beba"
+      }
+    },
+    {
+      "case": "H1_BASE",
+      "source": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/SOURCE-INPUTS.json",
+      "source_sha256": "ebded1ca857e1b564e141cdcec06320378811d01b4ee4d2eec5668fc14f87bc9",
+      "source_name": "BASE",
+      "ppp_data_sha256": "0b12a956a7f991a7e3af4f02996ebdfdd53e5c7674269078c2fe934ab5a3b674"
+    },
+    {
+      "case": "H1_SHIFT_X",
+      "source": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/SOURCE-INPUTS.json",
+      "source_sha256": "ebded1ca857e1b564e141cdcec06320378811d01b4ee4d2eec5668fc14f87bc9",
+      "source_name": "SHIFT_X",
+      "ppp_data_sha256": "0b12a956a7f991a7e3af4f02996ebdfdd53e5c7674269078c2fe934ab5a3b674"
+    }
+  ]
+}
