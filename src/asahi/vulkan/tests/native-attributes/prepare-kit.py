@@ -32,7 +32,7 @@ def main():
         kernel_prerequisite='production H1 qualified, matching attribute state/launch admission, asahi_m4.native_mesh=1'),indent=2)+'\n')
     (root/'kernel-identity.example.json').write_text(json.dumps(dict(release='FILL_FROM_QUALIFIED_KERNEL',version='FILL_FROM_QUALIFIED_KERNEL',
         source_commit='',image_sha256='',production_h1_qualified=False,h1_report_sha256='',native_mesh_attributes_supported=False),indent=2)+'\n')
-    paths=sorted(x for x in root.rglob('*') if x.is_file() and x.name not in ['SHA256SUMS','icd.json'])
+    paths=sorted(x for x in root.rglob('*') if x.is_file() and x.name not in ['SHA256SUMS','icd.json'] and '__pycache__' not in x.parts)
     (root/'SHA256SUMS').write_text(''.join(hashlib.sha256(x.read_bytes()).hexdigest()+'  '+str(x.relative_to(root))+'\n' for x in paths))
     print('prepared',len(paths),'hashed inputs from',commit)
 if __name__=='__main__':main()
