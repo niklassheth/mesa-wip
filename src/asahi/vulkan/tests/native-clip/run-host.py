@@ -24,6 +24,7 @@ def run(root, out, workspace, arch):
                 MESA_SHADER_CACHE_DISABLE='true',ASAHI_HOST_TRACE_DIR=str(d),AGX_APPLE9_ASM='1',
                 HK_APPLE9_TRACE_NIR='1')
             if suite.get('native_attributes'):settings['HK_APPLE9_NATIVE_MESH_ATTRIBUTES']='1'
+            if suite.get('primitive_lowering'):settings['HK_APPLE9_NATIVE_MESH_PRIMITIVE_LOWERING']='1'
             cmd=[]
             if arch=='arm':
                 settings['LD_LIBRARY_PATH']=str(sysroot/'usr/lib64')
@@ -31,7 +32,7 @@ def run(root, out, workspace, arch):
                 for k,v in settings.items():cmd.extend(['-E',k+'='+v])
             else:env.update(settings)
             cmd += [str(lib/'probe'),str(root/'shaders'/(arm['name']+'.'+stage+'.spv')),
-                str(root/'shaders'/(arm['fragment']+'.frag.spv')),
+                str(root/'shaders'/(arm.get('fragments',{}).get(stage,arm['fragment'])+'.frag.spv')),
                 str(int(arm['halfz'])),str(d/'color.bin'),str(d/'depth.bin'),'1']
             with (d/'log.txt').open('w') as log:
                 rc=subprocess.run(cmd,env=env,cwd=d,stdout=log,stderr=subprocess.STDOUT,timeout=45).returncode
