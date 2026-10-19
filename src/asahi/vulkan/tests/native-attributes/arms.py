@@ -21,7 +21,7 @@ def attributes(kind):
     return [a('affine',0,2,'noperspective',[[0,F(1,2)],[1,0],[F(1,2),1]]),
             a('tag',1,1,'flat',[[3],[7],[11]],'uint'),
             a('color',3,0,'smooth',[[0,1,F(1,2),F(1,4)],[1,0,F(1,4),F(3,4)],[F(1,2),F(1,4),1,0]]),
-            a('extra',5,1,'smooth',[[0],[1],[F(1,2)]])]
+            a('extra',5,1,'smooth',[[F(1,8)],[F(3,4)],[F(7,8)]])]
 
 def positions(kind, halfz):
     w=[F(1),F(2),F(1,2)]

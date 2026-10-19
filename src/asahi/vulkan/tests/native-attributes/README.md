@@ -78,10 +78,12 @@ python3 /path/to/device-kit/run-host.py --root /path/to/device-kit \
   --out /path/to/dry --workspace /home/nsheth/Projects/asahi --arch host
 python3 /path/to/device-kit/run-host.py --root /path/to/device-kit \
   --out /path/to/dry --workspace /home/nsheth/Projects/asahi --arch arm
-python3 src/asahi/vulkan/tests/native-clip/audit-host.py \
+python3 src/asahi/vulkan/tests/native-attributes/audit-host.py \
   --root /path/to/device-kit --dry /path/to/dry
 ```
 
 Host/QEMU uses a recording, non-executing DRM shim; readbacks must stay poisoned.
-Its submissions establish compiler/driver preparation only. `SHA256SUMS` covers
+Its submissions establish compiler/driver preparation only. The audit follows the
+actual PPP and coefficient tables for both stages, requiring equal interpolation
+state and the expected smooth/flat/linear modes. `SHA256SUMS` covers
 the immutable device inputs; per-run ICD files are generated at runtime.
