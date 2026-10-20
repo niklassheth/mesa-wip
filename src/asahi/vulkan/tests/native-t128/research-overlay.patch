@@ -22,7 +22,7 @@ index 87be72cc004..56a7c778bb1 100644
     if (stage == HK_APPLE9_NATIVE_OBJECT)
        return body->logical_size[0] == 1 && body->logical_size[1] == 1 &&
 diff --git a/src/asahi/vulkan/hk_cmd_apple9.c b/src/asahi/vulkan/hk_cmd_apple9.c
-index fed148e10e9..d0bc419b475 100644
+index 4eb4b71cbe3..055e9f34bee 100644
 --- a/src/asahi/vulkan/hk_cmd_apple9.c
 +++ b/src/asahi/vulkan/hk_cmd_apple9.c
 @@ -506,7 +506,7 @@ hk_apple9_prepare_native_mesh(struct hk_cmd_buffer *cmd,
