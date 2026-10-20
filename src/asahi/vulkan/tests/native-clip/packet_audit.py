@@ -129,7 +129,7 @@ def launch(memory, handle, object_stage, compiled, channels=4, local_bytes=128):
                 launch_sha256=sha(memory.read(address, 256)),
                 callee_local_index_reads=local_reads if object_stage else [])
 
-def stream(memory, address, compiled, user_components=0):
+def stream(memory, address, compiled, user_components=0, physical_threads=16):
     components=4+user_components
     local_bytes=1 << (max(128,32+16*components)-1).bit_length()
     visited, draws = set(), []
@@ -147,7 +147,7 @@ def stream(memory, address, compiled, user_components=0):
         words = struct.unpack('<39I', memory.read(address, 156))
         assert words[:6] == (0x40000d2c, ((components+1)<<8)|components, 0x10, 0, 0, 0x1000000)
         assert words[7] == 0x1000000
-        assert words[9:14] == (1, 0, 0x400810, 0, components+1)
+        assert words[9:14] == (1, 0, 0x400800 | physical_threads, 0, components+1)
         assert words[14] == 0x500
         ppp = words[15]
         offsets = [0, 0x40, 0x5c, 0x70, 0x8c, 0xc0, 0xa0, 0xac]
