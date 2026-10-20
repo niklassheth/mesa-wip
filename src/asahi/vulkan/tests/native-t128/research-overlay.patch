@@ -1,0 +1,81 @@
+diff --git a/src/asahi/vulkan/hk_apple9_mesh.c b/src/asahi/vulkan/hk_apple9_mesh.c
+index 87be72cc004..56a7c778bb1 100644
+--- a/src/asahi/vulkan/hk_apple9_mesh.c
++++ b/src/asahi/vulkan/hk_apple9_mesh.c
+@@ -37,7 +37,8 @@ hk_apple9_native_shader_valid(const struct agx_shader_info *code,
+    if (!code || !body || stage == HK_APPLE9_NATIVE_NONE ||
+        stage > HK_APPLE9_NATIVE_MESH || !code->apple9_body_only ||
+        !code->binary_size || code->scratch_size ||
+-       code->apple9_atomic_frame_size || code->workgroup_size[0] != 16 ||
++       code->apple9_atomic_frame_size ||
++       code->workgroup_size[0] != (stage == HK_APPLE9_NATIVE_MESH ? 32 : 16) ||
+        code->workgroup_size[1] != 1 || code->workgroup_size[2] != 1 ||
+        body->requires_mesh_completion || body->requires_object_completion ||
+        body->argument_uniform_words != AGX_APPLE9_MESH_ARGUMENT_WORDS)
+@@ -49,7 +50,7 @@ hk_apple9_native_shader_valid(const struct agx_shader_info *code,
+        k->primitive_count_bits != expected.primitive_count_bits ||
+        k->payload_uniform != expected.payload_uniform ||
+        k->grid_root != expected.grid_root || k->grid_offset_B ||
+-       k->physical_threads != AGX_APPLE9_NATIVE_THREADS)
++       k->physical_threads != (stage == HK_APPLE9_NATIVE_MESH ? 32 : 16))
+       return false;
+    if (stage == HK_APPLE9_NATIVE_OBJECT)
+       return body->logical_size[0] == 1 && body->logical_size[1] == 1 &&
+diff --git a/src/asahi/vulkan/hk_cmd_apple9.c b/src/asahi/vulkan/hk_cmd_apple9.c
+index fed148e10e9..d0bc419b475 100644
+--- a/src/asahi/vulkan/hk_cmd_apple9.c
++++ b/src/asahi/vulkan/hk_cmd_apple9.c
+@@ -506,7 +506,7 @@ hk_apple9_prepare_native_mesh(struct hk_cmd_buffer *cmd,
+       .mesh_launch = agx_usc_addr(&dev->dev, launch.gpu) / 64,
+       .object_launch = agx_usc_addr(
+          &dev->dev, launch.gpu + AGX_APPLE9_GRAPHICS_LAUNCH_SIZE) / 64,
+-      .threads = AGX_APPLE9_NATIVE_THREADS,
++      .threads = mesh->info.apple9_native.key.physical_threads,
+       .has_object_stage = true,
+    };
+    return agx_apple9_mesh_state_build(state, &params);
+diff --git a/src/asahi/vulkan/hk_physical_device.c b/src/asahi/vulkan/hk_physical_device.c
+index 98f31b2b2ea..a538e362fb7 100644
+--- a/src/asahi/vulkan/hk_physical_device.c
++++ b/src/asahi/vulkan/hk_physical_device.c
+@@ -1843,14 +1843,17 @@ hk_apple9_restrict_caps(struct vk_device_extension_table *ext,
+    props->prefersLocalInvocationPrimitiveOutput = false;
+    props->prefersCompactVertexOutput = true;
+ 
++   if (hk_apple9_native_mesh_enabled())
++      props->subgroupSupportedStages |= VK_SHADER_STAGE_MESH_BIT_EXT;
++
+    /* This opt-in development class is deliberately below extension minima.
+     * These limits describe what native pipeline/draw validation accepts. */
+    if (hk_apple9_native_mesh_enabled()) {
+       props->maxMeshWorkGroupTotalCount = 1;
+-      props->maxMeshWorkGroupInvocations = AGX_APPLE9_NATIVE_THREADS;
++      props->maxMeshWorkGroupInvocations = 128;
+       for (unsigned i = 0; i < 3; ++i) {
+          props->maxMeshWorkGroupCount[i] = 1;
+-         props->maxMeshWorkGroupSize[i] = AGX_APPLE9_NATIVE_THREADS;
++         props->maxMeshWorkGroupSize[i] = 128;
+       }
+       props->maxTaskPayloadSize = 0;
+       props->maxMeshSharedMemorySize = 0;
+@@ -1866,7 +1869,7 @@ hk_apple9_restrict_caps(struct vk_device_extension_table *ext,
+       props->maxMeshOutputPrimitives = 1;
+       props->maxMeshOutputLayers = 1;
+       props->maxMeshMultiviewViewCount = 1;
+-      props->maxPreferredMeshWorkGroupInvocations = AGX_APPLE9_NATIVE_THREADS;
++      props->maxPreferredMeshWorkGroupInvocations = 32;
+    }
+ 
+ 
+diff --git a/src/asahi/vulkan/hk_shader.c b/src/asahi/vulkan/hk_shader.c
+index ae5c8333727..a4dd6664c2a 100644
+--- a/src/asahi/vulkan/hk_shader.c
++++ b/src/asahi/vulkan/hk_shader.c
+@@ -5881,6 +5881,7 @@ hk_apple9_compile_native_mesh_program(
+    const char **reason)
+ {
+    const struct agx_apple9_native_mesh_options options = {
++      .physical_threads = 32,
+       .clip_halfz = key->clip_negative_one_to_one,
+       .attributes = hk_apple9_native_mesh_attributes_enabled(),
+       .primitive_broadcast = hk_apple9_native_mesh_primitive_lowering_enabled(),
