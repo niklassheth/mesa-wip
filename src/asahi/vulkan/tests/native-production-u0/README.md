@@ -7,7 +7,9 @@ by codex-hw at `b54cc5d2271` in `tmp/codex-hw/mesh-u0-producer-r4/RESULTS.md`.
 All 352 draws qualified and the references reproduced. For both masks 0x01
 and 0x02, BEFORE_U0 failed 10/10 and AFTER_U0 passed 10/10; M00 and M04 failed
 at both sites. This supports work issued by U0, without separating slot
-ownership. The production rule therefore retires the conservative mask 0x03.
+ownership. H4 (one completion class spanning slots 1 and 2) and H5 (multiple
+producers or domains) remain unresolved. The production rule therefore
+retires the deliberately conservative mask 0x03, without claiming an owner.
 
 ### Compiler model
 
@@ -32,7 +34,28 @@ the conservative resultless 0x03 obligation uses scheduler-placed WAIT. No
 placement, register assignment, padding, or instruction sequence was taken
 from Metal. There is no research override in the production compiler.
 
-### Host validation
+### Clean merge candidate
+
+`apple9/native-mesh-production-u0-merge` starts at integration-next
+`95d4caa95b0` and takes only the compiler changes from `b58c3ee907c` and
+`e00e17fe7c0`, including the unit tests and this design/byte-comparison record.
+The research history is retained separately on
+`research/native-mesh-wait-localization` at `44e8a4aaf87`. No campaign runners,
+r2-r4 kit sources or probe scaffolding are added by this candidate.
+
+The merge candidate adds three allocation regressions: pending U0 excludes
+slots 1/2 from free allocation; exhaustion of slots 3-6 retires the whole
+0x03 effect before reusing 1/2; and a slot-1 load reaching a join alongside
+U0's effect gets a standalone WAIT 0x03, with no folded slot-1 input field.
+A fourth static packing test exhausts all encodings, including PSEUDO, for
+each of the 13 former opcode-list barriers; every accepted encoding must
+carry `requires_prior_completion`.
+
+`HK_APPLE9_NATIVE_MESH` remains default-off. Passing the production device
+run is required before merging. The ordinary hk N32 CTS subset and the gate
+lift are separate later steps, and this candidate is not in the release.
+
+### Initial production-rule host validation
 
 All ten compiler Meson tests pass, including 513 unit tests and the native
 shared, workgroup, object, primitive, mesh and limit fixtures. The focused new
