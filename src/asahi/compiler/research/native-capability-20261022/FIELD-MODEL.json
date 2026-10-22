@@ -1,0 +1,1549 @@
+{
+  "scope": "Compiler metadata correlations only; no GPU execution or live launch capture",
+  "compiled": 66,
+  "rejected": 5,
+  "checks": [
+    {
+      "name": "base",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertices_4",
+      "mesh_fields": {
+        "1": 4,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertices_16",
+      "mesh_fields": {
+        "1": 16,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 272,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 288,
+      "application_output_bytes": 256,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertices_64",
+      "mesh_fields": {
+        "1": 64,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 1040,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 1056,
+      "application_output_bytes": 1024,
+      "control_flags": [
+        "110"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertices_128",
+      "mesh_fields": {
+        "1": 128,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 2064,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 2080,
+      "application_output_bytes": 2048,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertices_256",
+      "mesh_fields": {
+        "1": 256,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 4112,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 4128,
+      "application_output_bytes": 4096,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitives_2",
+      "mesh_fields": {
+        "1": 3,
+        "2": 2,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitives_16",
+      "mesh_fields": {
+        "1": 3,
+        "2": 16,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 48
+      },
+      "inferred_local_bytes": 128,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitives_128",
+      "mesh_fields": {
+        "1": 3,
+        "2": 128,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 384
+      },
+      "inferred_local_bytes": 464,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitives_256",
+      "mesh_fields": {
+        "1": 3,
+        "2": 256,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 768
+      },
+      "inferred_local_bytes": 848,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitives_512",
+      "mesh_fields": {
+        "1": 3,
+        "2": 512,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 1536
+      },
+      "inferred_local_bytes": 1616,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "shape_4_2",
+      "mesh_fields": {
+        "1": 4,
+        "2": 2,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "shape_16_16",
+      "mesh_fields": {
+        "1": 16,
+        "2": 16,
+        "3": 2,
+        "4": 4,
+        "6": 272,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 48
+      },
+      "inferred_local_bytes": 320,
+      "application_output_bytes": 256,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "shape_64_128",
+      "mesh_fields": {
+        "1": 64,
+        "2": 128,
+        "3": 2,
+        "4": 4,
+        "6": 1040,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 384
+      },
+      "inferred_local_bytes": 1424,
+      "application_output_bytes": 1024,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "shape_128_256",
+      "mesh_fields": {
+        "1": 128,
+        "2": 256,
+        "3": 2,
+        "4": 4,
+        "6": 2064,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 768
+      },
+      "inferred_local_bytes": 2832,
+      "application_output_bytes": 2048,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "shape_256_512",
+      "mesh_fields": {
+        "1": 256,
+        "2": 512,
+        "3": 2,
+        "4": 4,
+        "6": 4112,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 1536
+      },
+      "inferred_local_bytes": 5648,
+      "application_output_bytes": 4096,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "point_3_1",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 0,
+        "4": 5,
+        "6": 96,
+        "8": 0,
+        "14": 1,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 80,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "point_16_16",
+      "mesh_fields": {
+        "1": 16,
+        "2": 16,
+        "3": 0,
+        "4": 5,
+        "6": 336,
+        "8": 0,
+        "14": 1,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 352,
+      "application_output_bytes": 320,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "point_256_512",
+      "mesh_fields": {
+        "1": 256,
+        "2": 512,
+        "3": 0,
+        "4": 5,
+        "6": 5136,
+        "8": 0,
+        "14": 1,
+        "22": 16,
+        "28": 512
+      },
+      "inferred_local_bytes": 5648,
+      "application_output_bytes": 5120,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "line_3_1",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 1,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "line_16_16",
+      "mesh_fields": {
+        "1": 16,
+        "2": 16,
+        "3": 1,
+        "4": 4,
+        "6": 272,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 32
+      },
+      "inferred_local_bytes": 304,
+      "application_output_bytes": 256,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "line_256_512",
+      "mesh_fields": {
+        "1": 256,
+        "2": 512,
+        "3": 1,
+        "4": 4,
+        "6": 4112,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 1024
+      },
+      "inferred_local_bytes": 5136,
+      "application_output_bytes": 4096,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "point_no_size",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 0,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertex_varyings_1",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 8,
+        "6": 144,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 160,
+      "application_output_bytes": 128,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertex_varyings_2",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 12,
+        "6": 208,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 224,
+      "application_output_bytes": 192,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertex_varyings_4",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 20,
+        "6": 336,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 352,
+      "application_output_bytes": 320,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertex_varyings_8",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 36,
+        "6": 592,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 608,
+      "application_output_bytes": 576,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertex_varyings_16",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 68,
+        "6": 1104,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 1120,
+      "application_output_bytes": 1088,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertex_varyings_24",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 100,
+        "6": 1616,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 1632,
+      "application_output_bytes": 1600,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertex_varyings_28",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 116,
+        "6": 1872,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 1888,
+      "application_output_bytes": 1856,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertex_varyings_29",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 120,
+        "6": 1936,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 1952,
+      "application_output_bytes": 1920,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "vertex_varyings_30",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 124,
+        "6": 2000,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 2016,
+      "application_output_bytes": 1984,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_varyings_1",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 16,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 80,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_varyings_2",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 32,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 96,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_varyings_4",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 64,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 128,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_varyings_8",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 128,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 192,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_varyings_16",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 256,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 320,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_varyings_24",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 384,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 448,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_varyings_28",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 448,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 512,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_varyings_29",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 464,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 528,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_varyings_30",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 480,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 544,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_scalars_1",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 4,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 68,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_scalars_2",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 8,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 72,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_scalars_3",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 12,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 76,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_scalars_5",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 20,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 84,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_scalars_7",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 28,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 92,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "primitive_scalars_15",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 5,
+        "6": 96,
+        "8": 60,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 112,
+      "application_output_bytes": 124,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "output_16_16_4_4",
+      "mesh_fields": {
+        "1": 16,
+        "2": 16,
+        "3": 2,
+        "4": 21,
+        "6": 1360,
+        "8": 64,
+        "14": 0,
+        "22": 16,
+        "28": 48
+      },
+      "inferred_local_bytes": 1408,
+      "application_output_bytes": 2304,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "output_64_64_4_4",
+      "mesh_fields": {
+        "1": 64,
+        "2": 64,
+        "3": 2,
+        "4": 21,
+        "6": 5392,
+        "8": 64,
+        "14": 0,
+        "22": 16,
+        "28": 192
+      },
+      "inferred_local_bytes": 5584,
+      "application_output_bytes": 9216,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "output_128_128_4_4",
+      "mesh_fields": {
+        "1": 128,
+        "2": 128,
+        "3": 2,
+        "4": 21,
+        "6": 10768,
+        "8": 64,
+        "14": 0,
+        "22": 16,
+        "28": 384
+      },
+      "inferred_local_bytes": 11152,
+      "application_output_bytes": 18432,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "output_256_128_4_4",
+      "mesh_fields": {
+        "1": 256,
+        "2": 128,
+        "3": 2,
+        "4": 21,
+        "6": 21520,
+        "8": 64,
+        "14": 0,
+        "22": 16,
+        "28": 384
+      },
+      "inferred_local_bytes": 21904,
+      "application_output_bytes": 28672,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "output_256_256_1_1",
+      "mesh_fields": {
+        "1": 256,
+        "2": 256,
+        "3": 2,
+        "4": 9,
+        "6": 9232,
+        "8": 16,
+        "14": 0,
+        "22": 16,
+        "28": 768
+      },
+      "inferred_local_bytes": 10000,
+      "application_output_bytes": 12288,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "output_256_512_1_1",
+      "mesh_fields": {
+        "1": 256,
+        "2": 512,
+        "3": 2,
+        "4": 9,
+        "6": 9232,
+        "8": 16,
+        "14": 0,
+        "22": 16,
+        "28": 1536
+      },
+      "inferred_local_bytes": 10768,
+      "application_output_bytes": 16384,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "output_256_1_6_0",
+      "mesh_fields": {
+        "1": 256,
+        "2": 1,
+        "3": 2,
+        "4": 28,
+        "6": 28688,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 28704,
+      "application_output_bytes": 28672,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "output_256_1_7_0",
+      "mesh_fields": {
+        "1": 256,
+        "2": 1,
+        "3": 2,
+        "4": 32,
+        "6": 32784,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 32800,
+      "application_output_bytes": 32768,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "payload_16",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "payload_32",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "payload_256",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "payload_1024",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "payload_4096",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "payload_8192",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "payload_16384",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "runtime_3_1",
+      "mesh_fields": {
+        "1": 3,
+        "2": 1,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "runtime_4_2",
+      "mesh_fields": {
+        "1": 4,
+        "2": 2,
+        "3": 2,
+        "4": 4,
+        "6": 80,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 16
+      },
+      "inferred_local_bytes": 96,
+      "application_output_bytes": 64,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "runtime_64_128",
+      "mesh_fields": {
+        "1": 64,
+        "2": 128,
+        "3": 2,
+        "4": 4,
+        "6": 1040,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 384
+      },
+      "inferred_local_bytes": 1424,
+      "application_output_bytes": 1024,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    },
+    {
+      "name": "runtime_256_512",
+      "mesh_fields": {
+        "1": 256,
+        "2": 512,
+        "3": 2,
+        "4": 4,
+        "6": 4112,
+        "8": 0,
+        "14": 0,
+        "22": 16,
+        "28": 1536
+      },
+      "inferred_local_bytes": 5648,
+      "application_output_bytes": 4096,
+      "control_flags": [
+        "111"
+      ],
+      "submit_modes": [
+        0,
+        2
+      ]
+    }
+  ],
+  "rejections": [
+    {
+      "name": "vertex_varyings_31",
+      "diagnostic": "applegpu-nt: note: Mesh unique scalar count of 128 exceeds limit of 124\napplegpu-nt: error: plugin '/opt/metal-toolchain/usr/metal/32023/lib/wrapper-nt.dylib' cannot emit pipeline\nmetal-tt: applegpu-nt command failed\n"
+    },
+    {
+      "name": "primitive_varyings_31",
+      "diagnostic": "applegpu-nt: note: Mesh unique scalar count of 128 exceeds limit of 124\napplegpu-nt: error: plugin '/opt/metal-toolchain/usr/metal/32023/lib/wrapper-nt.dylib' cannot emit pipeline\nmetal-tt: applegpu-nt command failed\n"
+    },
+    {
+      "name": "output_256_1_8_0",
+      "diagnostic": "applegpu-nt: note: Total mesh size (36864) exceeds the maximum mesh size allowed (32768)\napplegpu-nt: error: plugin '/opt/metal-toolchain/usr/metal/32023/lib/wrapper-nt.dylib' cannot emit pipeline\nmetal-tt: applegpu-nt command failed\n"
+    },
+    {
+      "name": "output_256_1_15_0",
+      "diagnostic": "applegpu-nt: note: Total mesh size (65536) exceeds the maximum mesh size allowed (32768)\napplegpu-nt: error: plugin '/opt/metal-toolchain/usr/metal/32023/lib/wrapper-nt.dylib' cannot emit pipeline\nmetal-tt: applegpu-nt command failed\n"
+    },
+    {
+      "name": "output_3_512_0_4",
+      "diagnostic": "applegpu-nt: note: Total mesh size (32832) exceeds the maximum mesh size allowed (32768)\napplegpu-nt: error: plugin '/opt/metal-toolchain/usr/metal/32023/lib/wrapper-nt.dylib' cannot emit pipeline\nmetal-tt: applegpu-nt command failed\n"
+    }
+  ],
+  "mismatches": [],
+  "hardware_capability_measured": false
+}
