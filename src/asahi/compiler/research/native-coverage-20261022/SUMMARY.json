@@ -1,0 +1,137 @@
+{
+  "api_by_first_rejection": {
+    "builtin_layer": {
+      "createGraphicsPipelines": 3,
+      "pipeline construction": 1
+    },
+    "builtin_primitive_id": {
+      "pipeline construction": 2
+    },
+    "builtin_viewport": {
+      "pipeline construction": 1
+    },
+    "draw_conditional_direct": {
+      "endCommandBuffer": 60
+    },
+    "draw_indirect": {
+      "endCommandBuffer": 61
+    },
+    "draw_indirect_count": {
+      "endCommandBuffer": 60
+    },
+    "lines": {
+      "createGraphicsPipelines": 6
+    },
+    "mesh_payload": {
+      "createGraphicsPipelines": 1
+    },
+    "output_components_limit": {
+      "property assertion": 80
+    },
+    "points": {
+      "createGraphicsPipelines": 20,
+      "endCommandBuffer": 8,
+      "pipeline construction": 1
+    },
+    "primitive_attributes": {
+      "createGraphicsPipelines": 27
+    },
+    "triangle_output_shape": {
+      "createGraphicsPipelines": 238,
+      "endCommandBuffer": 37,
+      "pipeline construction": 18
+    },
+    "vertex_attributes_gate": {
+      "createGraphicsPipelines": 1
+    }
+  },
+  "deferred_compiler_failures": 45,
+  "disjoint_first_rejections": {
+    "builtin_layer": 4,
+    "builtin_primitive_id": 2,
+    "builtin_viewport": 1,
+    "draw_conditional_direct": 60,
+    "draw_indirect": 61,
+    "draw_indirect_count": 60,
+    "lines": 6,
+    "mesh_payload": 1,
+    "output_components_limit": 80,
+    "points": 29,
+    "primitive_attributes": 27,
+    "triangle_output_shape": 293,
+    "vertex_attributes_gate": 1
+  },
+  "gpu_execution": false,
+  "host_only": true,
+  "inputs": [
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-cts-full-native/CASE-RESULTS.json",
+      "sha256": "747b6a519edb8c9c891047806345e5d591c233f047354e191fb40c30186a5a2b"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/all-rejections/stdout.log",
+      "sha256": "795dee76822b6f4f0a9e2c64b24ff1face12b156c1ce7268df1e5620e8ea15c4"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/all-rejections/results.qpa",
+      "sha256": "f3fbf4022eab48b15865712933387a12f964bdb4de6cb2af98ab82f91cb63848"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-cts-full-native/device/results/native/main/worker-0/shadercache.bin",
+      "sha256": "d15427c044ab839c2ff5034966c91f132b936cb22a9159cdeb63b2799b431f34"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-cts-full-native/device/results/native/main/worker-1/shadercache.bin",
+      "sha256": "152a6143f829dd9f735bcedc6942ad8e1a77bea81aed0d93f4523281cb1d0eb7"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-cts-full-native/device/results/native/main/worker-2/shadercache.bin",
+      "sha256": "f0096082b945950b2b0110da87029cb5c954bf35e6bea9ebf6de884f606062a6"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-cts-full-native/device/results/native/main/worker-3/shadercache.bin",
+      "sha256": "011c881fe05a6c1337d6801869fbb9876ce09039a946375b623914dfb71b8568"
+    }
+  ],
+  "mesa_source": "bcb0837f948a",
+  "original_cts_source": "f6a29701220f34dd1407513bfe80d74ca7b392ce",
+  "original_failure_api": {
+    "createGraphicsPipelines": 296,
+    "endCommandBuffer": 226,
+    "pipeline construction": 23,
+    "property assertion": 80
+  },
+  "original_inventory_categories": {
+    "Aborted": 2,
+    "Fail": 625,
+    "NotRun": 12744,
+    "Pass": 15,
+    "Skip": 14626
+  },
+  "original_skip_reasons": {
+    "Implementation does not support the given amount of items at vktMeshShaderPropertyTestsEXT.cpp:1092": 8,
+    "Multiview not supported for mesh shaders at vktMeshShaderBuiltinTestsEXT.cpp:2243": 1,
+    "Multiview not supported for mesh shaders at vktMeshShaderMiscTestsEXT.cpp:2806": 4,
+    "Multiview not supported for mesh shaders at vktMeshShaderPropertyTestsEXT.cpp:1909": 3,
+    "Multiview not supported for mesh shaders at vktMeshShaderPropertyTestsEXT.cpp:570": 1,
+    "Primitive fragment shading rate not supported in mesh shaders at vktMeshShaderSmokeTestsEXT.cpp:662": 6,
+    "Requested core feature is not supported: shaderFloat64 at vktTestCase.cpp:1497": 120,
+    "Required local size not supported at vktMeshShaderMiscTestsEXT.cpp:3681": 1,
+    "Required number of output vertices not supported at vktMeshShaderMiscTestsEXT.cpp:3684": 5,
+    "Task shader not supported at vktMeshShaderUtil.cpp:135": 7054,
+    "VK_KHR_device_address_commands is not supported at vktTestCase.cpp:1394": 24,
+    "VK_KHR_fragment_shading_rate is not supported at vktTestCase.cpp:1394": 9,
+    "VK_NV_mesh_shader is not supported at vktTestCase.cpp:1394": 1123,
+    "meshShaderQueries not supported at vktMeshShaderQueryTestsEXT.cpp:546": 6168,
+    "multiviewMeshShader not supported at vktMeshShaderConditionalRenderingTestsEXT.cpp:362": 18,
+    "multiviewMeshShader not supported at vktMeshShaderQueryTestsEXT.cpp:558": 1,
+    "storageInputOutput16 feature not supported at vktMeshShaderInOutTestsEXT.cpp:617": 80
+  },
+  "replay_diagnostics": 590,
+  "source_identity": {
+    "caveat": "Host CTS binary differs. Compiler inputs match original cache keys; no claim of bit-identical generated SPIR-V or GPU results.",
+    "distinct_matching_assembly_inputs": 2,
+    "distinct_matching_glsl": 109,
+    "original_cache_records": 272
+  }
+}
