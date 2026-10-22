@@ -1,0 +1,174 @@
+{
+  "result": "pass",
+  "gpu_execution": false,
+  "sequence": "NENVNMNN",
+  "captures": [
+    {
+      "directory": "../native-hybrid-20261022/transitions-1-final/trace",
+      "native": true,
+      "commands": [
+        {
+          "submission": "000",
+          "kind": 0,
+          "size": 240,
+          "vdm_barrier": 0,
+          "cdm_barrier": 0,
+          "prefix": "0x40000d2c",
+          "native": true,
+          "bg": "0x8b8100",
+          "eot": "0x8b8700",
+          "partial_bg": "0x8b8300",
+          "partial_eot": "0x8b8700",
+          "native_stream_bytes": 160,
+          "native_draws": 1
+        },
+        {
+          "submission": "001",
+          "kind": 1,
+          "size": 64,
+          "vdm_barrier": 0,
+          "cdm_barrier": 0
+        },
+        {
+          "submission": "002",
+          "kind": 0,
+          "size": 240,
+          "vdm_barrier": 0,
+          "cdm_barrier": 0,
+          "prefix": "0x4000002e",
+          "native": false,
+          "bg": "0x8b8300",
+          "eot": "0x8b8700",
+          "partial_bg": "0x8b8300",
+          "partial_eot": "0x8b8700"
+        },
+        {
+          "submission": "003",
+          "kind": 0,
+          "size": 240,
+          "vdm_barrier": 0,
+          "cdm_barrier": 0,
+          "prefix": "0x40000d2c",
+          "native": true,
+          "bg": "0x8b8300",
+          "eot": "0x8b8700",
+          "partial_bg": "0x8b8300",
+          "partial_eot": "0x8b8700",
+          "native_stream_bytes": 160,
+          "native_draws": 1
+        },
+        {
+          "submission": "004",
+          "kind": 0,
+          "size": 240,
+          "vdm_barrier": 0,
+          "cdm_barrier": 0,
+          "prefix": "0x4000002e",
+          "native": false,
+          "bg": "0x8b8300",
+          "eot": "0x8b8700",
+          "partial_bg": "0x8b8300",
+          "partial_eot": "0x8b8700"
+        },
+        {
+          "submission": "005",
+          "kind": 0,
+          "size": 240,
+          "vdm_barrier": 0,
+          "cdm_barrier": 0,
+          "prefix": "0x40000d2c",
+          "native": true,
+          "bg": "0x8b8300",
+          "eot": "0x8b8700",
+          "partial_bg": "0x8b8300",
+          "partial_eot": "0x8b8700",
+          "native_stream_bytes": 160,
+          "native_draws": 1
+        },
+        {
+          "submission": "006",
+          "kind": 0,
+          "size": 240,
+          "vdm_barrier": 0,
+          "cdm_barrier": 0,
+          "prefix": "0x4000002e",
+          "native": false,
+          "bg": "0x8b8300",
+          "eot": "0x8b8700",
+          "partial_bg": "0x8b8300",
+          "partial_eot": "0x8b8700"
+        },
+        {
+          "submission": "007",
+          "kind": 0,
+          "size": 240,
+          "vdm_barrier": 0,
+          "cdm_barrier": 0,
+          "prefix": "0x40000d2c",
+          "native": true,
+          "bg": "0x8b8300",
+          "eot": "0x8b8700",
+          "partial_bg": "0x8b8300",
+          "partial_eot": "0x8b8700",
+          "native_stream_bytes": 160,
+          "native_draws": 1
+        },
+        {
+          "submission": "008",
+          "kind": 0,
+          "size": 240,
+          "vdm_barrier": 0,
+          "cdm_barrier": 0,
+          "prefix": "0x40000d2c",
+          "native": true,
+          "bg": "0x8b8300",
+          "eot": "0x8b8500",
+          "partial_bg": "0x8b8300",
+          "partial_eot": "0x8b8700",
+          "native_stream_bytes": 160,
+          "native_draws": 1
+        },
+        {
+          "submission": "009",
+          "kind": 1,
+          "size": 64,
+          "vdm_barrier": 0,
+          "cdm_barrier": 0
+        }
+      ]
+    },
+    {
+      "directory": "../native-hybrid-20261022/transitions-0-final/trace",
+      "native": false,
+      "commands": [
+        {
+          "submission": "000",
+          "kind": 1,
+          "size": 64,
+          "vdm_barrier": 0,
+          "cdm_barrier": 0
+        },
+        {
+          "submission": "001",
+          "kind": 0,
+          "size": 240,
+          "vdm_barrier": 0,
+          "cdm_barrier": 0,
+          "prefix": "0x4000002e",
+          "native": false,
+          "bg": "0x8a0100",
+          "eot": "0x8a0500",
+          "partial_bg": "0x8a0300",
+          "partial_eot": "0x8a0700"
+        },
+        {
+          "submission": "002",
+          "kind": 1,
+          "size": 64,
+          "vdm_barrier": 0,
+          "cdm_barrier": 0
+        }
+      ]
+    }
+  ]
+}
