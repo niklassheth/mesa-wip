@@ -19,6 +19,9 @@ def main():
         p.add_argument('--' + key, type=Path, required=True)
     p.add_argument('--native', choices=('0', '1'), required=True)
     p.add_argument('--sequence', default='NENVNMNN')
+    p.add_argument('--mode', choices=('plain', 'timestamp', 'merged', 'deferred'), default='plain')
+    p.add_argument('--constant-table', action='store_true',
+                   help='Use the V3/P1 mesh with a dynamically indexed immutable table')
     a = p.parse_args()
     assert 1 <= len(a.sequence) <= 8 and set(a.sequence) <= set('NEVM')
     a.output.mkdir(parents=True, exist_ok=False)
@@ -33,16 +36,18 @@ def main():
                   HK_EXPERIMENTAL_APPLE9='1', HK_APPLE9_NATIVE_MESH=a.native,
                   VK_DRIVER_FILES=str(icd.resolve()), MESA_SHADER_CACHE_DISABLE='true')
     files = [a.probes.resolve() / name for name in (
-        'transitions', 'native.mesh.spv', 'emulated.mesh.spv', 'vertex.spv',
+        'transitions', 'constant.mesh.spv' if a.constant_table else 'native.mesh.spv',
+        'emulated.mesh.spv', 'vertex.spv',
         'mesh.frag.spv', 'vertex.frag.spv')]
     cmd = ['qemu-aarch64-static', '-L', str(a.sysroot.resolve()),
            *[x for k, v in values.items() for x in ('-E', k + '=' + v)],
-           *map(str, files), str(a.output.resolve()), a.sequence]
+           *map(str, files), str(a.output.resolve()), a.sequence, a.mode]
     inputs = {str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
               for path in [a.driver, a.shim, *files]}
     (a.output / 'RUN.json').write_text(json.dumps(dict(
         gpu_execution=False, queue_submission=True, native=a.native,
-        sequence=a.sequence, argv=cmd, input_sha256=inputs), indent=2) + '\n')
+        sequence=a.sequence, mode=a.mode, constant_table=a.constant_table,
+        argv=cmd, input_sha256=inputs), indent=2) + '\n')
     env = {k: v for k, v in os.environ.items()
            if not k.upper().startswith(('LD_', 'HK_', 'VK_', 'MESA_', 'AGX_', 'ASAHI_'))}
     with (a.output / 'stdout.log').open('w') as out:

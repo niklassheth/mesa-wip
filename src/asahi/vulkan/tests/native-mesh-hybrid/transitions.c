@@ -116,14 +116,22 @@ save(const char *dir, const char *name, const void *data, size_t size)
 int
 main(int argc, char **argv)
 {
-   if (argc != 8 || !*argv[7] || strlen(argv[7]) > 8 ||
+   if ((argc != 8 && argc != 9) || !*argv[7] || strlen(argv[7]) > 8 ||
        strspn(argv[7], "NEVM") != strlen(argv[7])) {
       fprintf(
          stderr,
-         "usage: transitions native.mesh.spv emulated.mesh.spv vertex.spv mesh.frag.spv vertex.frag.spv output-directory NEVM-sequence\n");
+         "usage: transitions native.mesh.spv emulated.mesh.spv vertex.spv mesh.frag.spv vertex.frag.spv output-directory NEVM-sequence [plain|timestamp|merged|deferred]\n");
       return 3;
    }
    const char *sequence = argv[7];
+   const char *mode = argc == 9 ? argv[8] : "plain";
+   bool timestamp = !strcmp(mode, "timestamp");
+   bool merged = !strcmp(mode, "merged");
+   bool deferred = !strcmp(mode, "deferred");
+   if ((!timestamp && !merged && !deferred && strcmp(mode, "plain")) ||
+       (timestamp && strcmp(sequence, "N")) ||
+       (merged && strcmp(sequence, "NN")))
+      return 3;
    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
                             .pApplicationName = "hybrid-mesh-transitions",
                             .apiVersion = VK_API_VERSION_1_3};
@@ -179,8 +187,12 @@ main(int argc, char **argv)
    free(devices);
    if (!phys)
       return 3;
+   VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic3 = {
+      .sType =
+         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
    VkPhysicalDeviceMeshShaderFeaturesEXT mf = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,
+      .pNext = deferred ? &dynamic3 : NULL};
    VkPhysicalDeviceVulkan12Features v12 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
       .pNext = &mf};
@@ -195,15 +207,23 @@ main(int argc, char **argv)
       "features dynamicRendering=%u meshShader=%u vertexPipelineStoresAndAtomics=%u drawIndirectCount=%u\n",
       v13.dynamicRendering, mf.meshShader,
       features.features.vertexPipelineStoresAndAtomics, v12.drawIndirectCount);
-   if (!v13.dynamicRendering || !mf.meshShader)
+   if (!v13.dynamicRendering || !mf.meshShader ||
+       (timestamp && !v13.synchronization2) ||
+       (deferred && !dynamic3.extendedDynamicState3ColorBlendEnable))
       return 3;
-   mf = (VkPhysicalDeviceMeshShaderFeaturesEXT){.sType = mf.sType,
-                                                .meshShader = VK_TRUE};
+   dynamic3 = (VkPhysicalDeviceExtendedDynamicState3FeaturesEXT){
+      .sType = dynamic3.sType,
+      .extendedDynamicState3ColorBlendEnable = deferred};
+   mf = (VkPhysicalDeviceMeshShaderFeaturesEXT){
+      .sType = mf.sType,
+      .pNext = deferred ? &dynamic3 : NULL,
+      .meshShader = VK_TRUE};
    v12 = (VkPhysicalDeviceVulkan12Features){.sType = v12.sType,
                                             .pNext = &mf,
                                             .drawIndirectCount = VK_FALSE};
    v13 = (VkPhysicalDeviceVulkan13Features){.sType = v13.sType,
                                             .pNext = &v12,
+                                            .synchronization2 = timestamp,
                                             .dynamicRendering = VK_TRUE};
    features = (VkPhysicalDeviceFeatures2){.sType = features.sType,
                                           .pNext = &v13,
@@ -213,7 +233,8 @@ main(int argc, char **argv)
    VkQueueFamilyProperties *families = calloc(n, sizeof(*families));
    vkGetPhysicalDeviceQueueFamilyProperties(phys, &n, families);
    uint32_t qfam = 0;
-   while (qfam < n && !(families[qfam].queueFlags & VK_QUEUE_GRAPHICS_BIT))
+   while (qfam < n && (!(families[qfam].queueFlags & VK_QUEUE_GRAPHICS_BIT) ||
+                       (timestamp && !families[qfam].timestampValidBits)))
       ++qfam;
    free(families);
    if (qfam == n)
@@ -224,13 +245,14 @@ main(int argc, char **argv)
       .queueFamilyIndex = qfam,
       .queueCount = 1,
       .pQueuePriorities = &priority};
-   const char *mesh_ext = VK_EXT_MESH_SHADER_EXTENSION_NAME;
+   const char *extensions[] = {VK_EXT_MESH_SHADER_EXTENSION_NAME,
+                               VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME};
    VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                              .pNext = &features,
                              .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qci,
-                             .enabledExtensionCount = 1,
-                             .ppEnabledExtensionNames = &mesh_ext};
+                             .enabledExtensionCount = deferred ? 2 : 1,
+                             .ppEnabledExtensionNames = extensions};
    CHECK(vkCreateDevice(phys, &dci, NULL, &dev));
    VkQueue queue;
    vkGetDeviceQueue(dev, qfam, 0, &queue);
@@ -287,10 +309,11 @@ main(int argc, char **argv)
       .pMultisampleState = &ms,
       .pColorBlendState = &cb,
       .layout = layout};
-   VkDynamicState dynamic[] = {VK_DYNAMIC_STATE_SCISSOR};
+   VkDynamicState dynamic[] = {VK_DYNAMIC_STATE_SCISSOR,
+                               VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT};
    VkPipelineDynamicStateCreateInfo ds = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-      .dynamicStateCount = 1,
+      .dynamicStateCount = deferred ? 2 : 1,
       .pDynamicStates = dynamic};
    pci.pDynamicState = &ds;
    VkPipelineVertexInputStateCreateInfo vi = {
@@ -357,9 +380,27 @@ main(int argc, char **argv)
       .commandBufferCount = 1};
    VkCommandBuffer cmd;
    CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+   VkQueryPool query = VK_NULL_HANDLE;
+   if (timestamp) {
+      VkQueryPoolCreateInfo q = {
+         .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+         .queryType = VK_QUERY_TYPE_TIMESTAMP,
+         .queryCount = 1};
+      CHECK(vkCreateQueryPool(dev, &q, NULL, &query));
+   }
    VkCommandBufferBeginInfo begin = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
    CHECK(vkBeginCommandBuffer(cmd, &begin));
+   if (timestamp)
+      vkCmdResetQueryPool(cmd, query, 0, 1);
+   if (deferred) {
+      PFN_vkCmdSetColorBlendEnableEXT set_blend =
+         (void *)vkGetDeviceProcAddr(dev, "vkCmdSetColorBlendEnableEXT");
+      if (!set_blend)
+         return 3;
+      const VkBool32 enabled = VK_FALSE;
+      set_blend(cmd, 0, 1, &enabled);
+   }
    VkImageMemoryBarrier barrier = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
       .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -389,6 +430,22 @@ main(int argc, char **argv)
    if (!draw_mesh)
       return 3;
    for (unsigned i = 0; sequence[i]; ++i) {
+      if (merged && i == 1) {
+         vkCmdEndRendering(cmd);
+         /* A valid attachment-only dependency can stay within a merged
+          * hardware render. The continuation loads the first stripe. */
+         VkMemoryBarrier continuation = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+         vkCmdPipelineBarrier(
+            cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_DEPENDENCY_BY_REGION_BIT, 1, &continuation, 0, NULL, 0, NULL);
+         att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+         vkCmdBeginRendering(cmd, &render);
+      }
       VkRect2D stripe = {{i * 8, 0}, {8, HEIGHT}};
       vkCmdSetScissor(cmd, 0, 1, &stripe);
       if (sequence[i] == 'M') {
@@ -408,6 +465,9 @@ main(int argc, char **argv)
          else
             draw_mesh(cmd, 1, 1, 1);
       }
+      if (timestamp)
+         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT, query,
+                              0);
    }
    vkCmdEndRendering(cmd);
    barrier.srcAccessMask = barrier.dstAccessMask;
@@ -443,6 +503,19 @@ main(int argc, char **argv)
    CHECK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 10000000000ull));
    puts("SUBMIT_OK");
    fflush(stdout);
+   bool timestamp_ready = true;
+   if (timestamp) {
+      uint64_t data[2] = {0};
+      VkResult result = vkGetQueryPoolResults(
+         dev, query, 0, 1, sizeof(data), data, sizeof(data),
+         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+      if (result != VK_SUCCESS && result != VK_NOT_READY)
+         return 2;
+      timestamp_ready = result == VK_SUCCESS && data[1] != 0;
+      printf("timestamp result=%d value=%" PRIu64 " available=%" PRIu64 "\n",
+             result, data[0], data[1]);
+      save(argv[6], "timestamp.bin", data, sizeof(data));
+   }
    save(argv[6], "pixels.bin", pixels.map, WIDTH * HEIGHT * 4);
    uint8_t expected_pixels[WIDTH * HEIGHT * 4] = {0};
    unsigned mismatches = 0;
@@ -463,10 +536,13 @@ main(int argc, char **argv)
    }
    save(argv[6], "expected-pixels.bin", expected_pixels,
         sizeof(expected_pixels));
-   printf("sequence=%s pixels_mismatched=%u/4096\n", sequence, mismatches);
+   printf("mode=%s sequence=%s pixels_mismatched=%u/4096\n", mode, sequence,
+          mismatches);
    CHECK(vkDeviceWaitIdle(dev));
    vkDestroyFence(dev, fence, NULL);
    vkDestroyCommandPool(dev, commands, NULL);
+   if (query)
+      vkDestroyQueryPool(dev, query, NULL);
    for (unsigned i = 0; i < 3; ++i)
       vkDestroyPipeline(dev, pipelines[i], NULL);
    for (unsigned i = 0; i < 5; ++i)
@@ -484,6 +560,7 @@ main(int argc, char **argv)
    vkDestroyDevice(dev, NULL);
    destroy_debug(instance, messenger, NULL);
    vkDestroyInstance(instance, NULL);
-   puts(mismatches ? "FAIL" : "PASS");
-   return mismatches ? 1 : 0;
+   bool passed = !mismatches && timestamp_ready;
+   puts(passed ? "PASS" : "FAIL");
+   return passed ? 0 : 1;
 }
