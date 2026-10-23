@@ -1,0 +1,22 @@
+{
+  "cts_commit": "659bbe6987197b4ff7ac20011261b92009286100",
+  "sliced_cases": 156,
+  "storage_cases": 300,
+  "storage_groups": {
+    "image/load-store.txt": 154,
+    "image/load-store-lod.txt": 78,
+    "image/atomic-operations.txt": 8,
+    "image/image-size.txt": 24,
+    "robustness.txt": 32,
+    "image/texel-view-compatible.txt": 4
+  },
+  "source_sha256": {
+    "pipeline/monolithic/sliced-view-of-3d-image.txt": "e80ccf8299b82351a1720dc69f0e862e1cd37a627188fbe0fd6d6dae92baba99",
+    "image/load-store.txt": "0f04bac2cf5be407abe783adefb8f56f5f63441f5d314aee7438813ba373592b",
+    "image/load-store-lod.txt": "fcf315f0e3b52c150693a8969cda6a5c9021aab76a74e4373a52890d43536203",
+    "image/atomic-operations.txt": "866fbd2408dd53a9364ad30b8e6eb0e7a1c7adca7922d7f57341e114212783d2",
+    "image/image-size.txt": "20a63efd8145a30c8a4896060c9c5693e4c085f2e846e81f7f8e2015f1f3c0cf",
+    "robustness.txt": "ce915152f8a00dcb8e84857bc6bdcd74e3cd2dc8906a36cc795226a1bd7e269e",
+    "image/texel-view-compatible.txt": "e3aa027e1023287cccc64a69ed8456f335918f201657939bee716c56bcc5d8e1"
+  }
+}
