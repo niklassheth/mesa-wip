@@ -155,3 +155,20 @@ python3 check_admission.py --kernel WORKSPACE/linux-m4-integration --out SCRATCH
 
 The new work accesses only the controller for offline compilation. It has not
 accessed, reset, installed on, or submitted work to the M4 target.
+
+## C2: independently compiled count/topology pilot
+
+`compile_native.c` now constructs whole native programs from our own NIR using
+normal selection and register allocation. The device-kit source is
+`../../../vulkan/tests/native-capability-v2/`. It contains separate count and
+thread-width experiments, all three topologies, runtime/zero counts, a flag-42
+comparison, exact full-buffer guards and an additive R32_SFLOAT raster oracle
+qualified by ordinary draws. It intentionally starts with Position/PointSize;
+varying/primitive/payload device tiers remain pending.
+
+The first 54-arm host run verified all uploaded program, launch, state,
+argument and PPP identities through the host DRM shim; it performed **zero GPU
+trials**. The expanded pilot contains 32 programs and 160 runtime arms. Its
+kernel pin remains deliberately non-runnable until the kernel owner extends
+admission and freezes image/DTB identities. Neither compiler acceptance nor a
+host shim completion changes the reported native hardware capability.
