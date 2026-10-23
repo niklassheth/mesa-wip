@@ -59,11 +59,16 @@ exposed it: each was an older bug that had stayed hidden until a codegen change 
     tooling.
   - With a change, it builds aarch64 libraries for the base and candidate (`gate-a64-lib.sh`) and runs
     `gate-sentinel.sh`.
-- **Air access:**
-  - `gate-sentinel.sh` drops `tmp/manager-queue/air/NEXT-codegen-sentinel-<rev>` and waits FIFO for the Air lease.
-    The running Air campaign pauses at its next batch boundary.
-  - With no Air within two hours, the step fails ("device step not run") instead of skipping.
-- **How:** head against candidate, Air to Air, with `runner/run-list.sh` and `compare-results.py`.
+- **Air access (kit mode, the default):**
+  - `gate-sentinel.sh` writes an immutable kit holding both libraries, the list and the scripts. It then drops
+    `tmp/manager-queue/air/NEXT-codegen-sentinel-<rev>`, naming the kit's `host-run.sh`.
+  - The Air lease holder runs that command at its next batch boundary. The gate itself never contacts the Air.
+  - The gate waits for the kit's results, computes the verdict and removes the queue file.
+  - With no result within two hours, the step fails ("device step not run") instead of skipping.
+  - Fallback: `SENTINEL_MODE=direct` takes the Air lease FIFO and runs the Air runner itself, for when no lease
+    holder is running kits.
+- **How:** head against candidate in the same Air boot, through the Air runner's deqp-runner, skips and flakes;
+  `verdict.py` compares the two runs.
 - **Blocking:**
   - any case that passes on head but not on the candidate;
   - any new G16 line in dmesg.
