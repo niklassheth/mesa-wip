@@ -23,6 +23,7 @@ aarch64-linux-gnu-gcc --sysroot="$sysroot" -Iinclude -O2 -Wall -Wextra -Werror \
   -shared -fPIC "$src/recording-icd.c" -L"$sysroot/usr/lib64" \
   -Wl,-rpath-link,"$sysroot/usr/lib64" -ldl -o "$out/recording-icd.so"
 glslangValidator -V --target-env vulkan1.3 "$src/triangle.mesh" -o "$out/native.mesh.spv"
+glslangValidator -V --target-env vulkan1.3 "$src/constant.mesh" -o "$out/constant.mesh.spv"
 glslangValidator -V --target-env vulkan1.3 -DVERTICES=4 -DPRIMITIVES=2 \
   '-DCOLOR=vec4(0,1,0,1)' "$src/triangle.mesh" -o "$out/emulated.mesh.spv"
 glslangValidator -V --target-env vulkan1.3 "$src/triangle.vert" -o "$out/vertex.spv"
@@ -60,12 +61,52 @@ attachment load/store programs and final store. It intentionally accepts only
 this bounded fixture and the current UAPI layout. It does not cover depth/stencil
 pixels, query results, secondary replay or the full native state space.
 
+M4 adds three bounded modes and an immutable-table shader. Run each row with
+native off and on, then pass the same mode/table arguments to
+`check-transitions.py`:
+
+| Recorder arguments | Capture checks |
+|---|---|
+| `--sequence NENVNMNN --constant-table` | Original transitions plus the complete mesh constant table reached through each native draw's launch, argument table, resource table and descriptor root. |
+| `--mode deferred --sequence NN --constant-table` | Dynamic blend-enable state forces deferred compilation. Both native leaves bind the correct table; repeat draws preserve the ordinary partial-store/load transition. |
+| `--mode timestamp --sequence N` | Query reset precedes the render; only its fragment-end timestamp is set; post-graphics work follows it. Native stream remains exactly one draw and stop. |
+| `--mode merged --sequence NN` | Two CLEAR/STORE then LOAD/STORE API renders. Native actually enters the merge path, then splits before the second draw; the new stream uses its partial-load program. Emulation's compute producer prevents merging. |
+
+The checker takes trace directories, for example:
+
+```sh
+python "$src/check-transitions.py" --mode deferred --constant-table \
+  --native "$on/trace" --emulated "$off/trace"
+```
+
+The merged host recorder alone enables `ASAHI_MESA_DEBUG=perf` to establish
+merge-path entry from the existing driver diagnostic. This does not disable
+compression. Other modes leave it unset. Both render passes request STORE,
+so the first stream retains the final-store program installed by EndRendering.
+The capture checker checks dependency edges for each fixture; it does not
+require waits on subqueues that have no earlier work.
+
+`constant.mesh` dynamically selects entry 37 of a 64-entry table. Its blue
+pixel oracle is independent of the table address; the host checker compares
+all 1024 table bytes through the submitted pointer chain. This probe exposed
+the old six-slot constant root being indexed by task/mesh slots 6/7. Root
+layout version 5 contains all eight slots; `hk-constant-data` now also checks
+real binds/uploads, cached reuse, a native leaf rebind and adjacent descriptor
+buffer canaries. The bounded capture reader's mesh-root offset is 1856 bytes,
+verified against this layout with `offsetof`.
+
 On the manager's scheduled device, run `transitions` directly with its five
 SPIR-V paths, an existing output directory, and the sequence `NENVNMNN`.
 It must return zero and report `pixels_mismatched=0/4096` in both modes. The host
 runner instead requires the untouched `0xa5` readback sentinel. Device runs must
 use the fixed runner's knob revision 2 and debugfs mode protocol. Leave
 `ASAHI_MESA_DEBUG` unset and verify the actual renderer, library and kernel.
+For the new modes, append the mode after its sequence. Substitute
+`constant.mesh.spv` for the first shader when requested above. Timestamp mode
+also requires an available timestamp after the fence. The host shim can report
+availability without GPU execution, so neither that result nor a recorded
+timestamp destination qualifies hardware behavior. M4's eight host captures
+are not device runs; the manager schedules their hardware qualification.
 
 Recorded 2026-10-22 evidence and limitations are in
 `src/asahi/compiler/README.apple9-native-mesh.md`, section `native-hybrid`.

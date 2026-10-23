@@ -1,0 +1,911 @@
+{
+  "schema_version": 1,
+  "milestone": "native hybrid M4",
+  "driver_source_commit": "08f0715c6dfa14d10c75e44f99c7e99bf14e0eb8",
+  "driver": {
+    "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/libvulkan_asahi-08f0715c6df.so",
+    "sha256": "879cbb143e79795b93c975df933a4d2f317f9099ac51d4cb0febc7d30e98ca9e"
+  },
+  "gpu_execution": false,
+  "device_access": false,
+  "leases": false,
+  "compiler_driver_commits": [
+    "ab4f31a9abbb1f23735635a349f3094446ef8c95",
+    "cf3fb9a207cea9f40000399ee578b562900a442a",
+    "08f0715c6dfa14d10c75e44f99c7e99bf14e0eb8"
+  ],
+  "source_sha256": {
+    "src/asahi/compiler/agx_apple9_mesh.h": "3a5a6d3e185f2dd7e9ee94c7d990c3e5ec045e257e74dccc1129ef18c18dfa22",
+    "src/asahi/compiler/agx_nir_apple9_mesh_native.c": "f30bfb8126bb32066adffdda90f054e55b97a926dc36a39e4e04284c4548df9c",
+    "src/asahi/vulkan/hk_cmd_apple9.c": "2feefeb2e6c7fd099f264278dc69c81d5bfe05690b0060886621ac3fc62b861c",
+    "src/asahi/vulkan/hk_cmd_buffer.h": "c344b171095b7d32f1906295c425b6650b741154ab20d5a68f8e7538c5c66b0f",
+    "src/asahi/vulkan/hk_cmd_draw.c": "0c71128bf3ea48487acb4f26de4b770230f1f3edc97bdeae017b4268c8a5b084",
+    "src/asahi/vulkan/hk_shader.c": "1d5fef12f72b84289da455757b647b173db20a7ed3f81ddac01dff45ef19258f",
+    "src/asahi/vulkan/hk_shader.h": "ccf5198ae55e7a500a766bc90e6f316b6d9d12bdf52def97ac1f020c1a79ffa1",
+    "src/asahi/vulkan/meson.build": "bf8302c9b163039a54ba97425531ec57c8120484324600de994204f005361a16",
+    "src/asahi/vulkan/tests/hk-constant-data.c": "7df675a3ceb17a788e9db0847235ca9328bb101597a7e0afc88931471a40fbba",
+    "src/asahi/vulkan/tests/hk-native-mesh-hybrid.c": "ada61b050e01efcbfac9715d64600fc277e82498fc3056dc570c3a20f011f0b5",
+    "src/asahi/vulkan/tests/hk-native-mesh-routing.c": "d524ec1661ff6c8b55c1e515d1b2c7f314c965cecbe8974620ceac9c273a8480",
+    "src/asahi/vulkan/tests/hk-variant-retry.c": "23fd4b97914c00475b473cf09b4291f7cefaafd8d8fb32f63222f8016945e17b"
+  },
+  "tooling_sha256": {
+    "README.md": "f332a6f1e1caef6b5e6f62efc74da5aee8d11c7b4f3c00f7cc1b816b2556b57d",
+    "check-transitions.py": "537024d89224d9b8962c9fa0c2beeea2f242240a2bde405c066edf6487620fcc",
+    "record-transitions.py": "5739d25fe4dec9ac1bff95adff181b30332b38906fdab42a13414979bd3468ea",
+    "transitions.c": "7788b787e4ca219acaef9c94e592d911cbc5bfbe178ca8247eeda5d3dc3f4336",
+    "constant.mesh": "c8811313979c4a215184e2fdb1cd7ece7f7783388a9ca8a28a48460fef331a69"
+  },
+  "validation": {
+    "builds": {
+      "x86_64": {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/final2-host-build.log",
+        "sha256": "7367add98c10a799f5d74c4165b3e352655aa76ae5e655170c9b46c2bc383abe"
+      },
+      "aarch64": {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/final2-arm-build.log",
+        "sha256": "4ab8ca1a1e9440a308572466b51d0d622c0e75a5d823735318c4d4ed33e875ca"
+      }
+    },
+    "tests": {
+      "passed": 9,
+      "failed": 0,
+      "log": {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/final2-focused-tests.log",
+        "sha256": "fcf31699c037556caa5eda88de95ba624e1fd71d7f2e4acae50a6a7b41a16d97"
+      }
+    },
+    "offsets": {
+      "mesh_constant_slot": 1856,
+      "root_size": 1864,
+      "ts_vtx": 208,
+      "ts_frag": 224,
+      "root_layout_version": 5,
+      "evidence": {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/OFFSETS.txt",
+        "sha256": "4607aed18ad75134f020fc104c7d0de336ce220e93fc621561164a602b3e3198"
+      }
+    },
+    "recording_runs": [
+      {
+        "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-deferred-constant-0",
+        "metadata": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-deferred-constant-0/RUN.json",
+          "sha256": "b6da963afc0a9eac38ece39cb46bf6b0529a3d6872140ef67344dbe79732dc4a"
+        },
+        "log": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-deferred-constant-0/stdout.log",
+          "sha256": "a4dc752a0a494d7dc0b54db842effec44d7f428cb21f78271aff3a5f5a4a7412"
+        },
+        "inputs": {
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/libvulkan_asahi-08f0715c6df.so": "879cbb143e79795b93c975df933a4d2f317f9099ac51d4cb0febc7d30e98ca9e",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/u0-r8-v2-20261022/r2/kit/lib/libasahi_host_trace_drm_shim.so": "25ebb1ad4c38bbc3a1720e735f3193de5cd6a472cab1d06ed970317133bc03f3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/transitions": "b57ec14d98d9af66a4eccc7713043c4b2e1baa74fd0fed0f9ce580110668839c",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/constant.mesh.spv": "5d2eb4b38b35ede2ef5422940aeda48f14327b126b86cc86f0b9f2a37b64eccf",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/emulated.mesh.spv": "051c85f21be81395a94c258e9b2971db5050ecbbf4e6f3f602a1faf5ba66d607",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.spv": "62842a3ae033905b9e0b44d3f22732d721836cd9e7759be54f8246b33e29aaa3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/mesh.frag.spv": "c73975daee1291efd38d4bdec3a1eccd4244de3f0182f2d131627edf4760860d",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.frag.spv": "2e09a8564b49e005adb16f5a860ef31721b8abfa023d834d2df4745f670f6f88"
+        }
+      },
+      {
+        "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-deferred-constant-1",
+        "metadata": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-deferred-constant-1/RUN.json",
+          "sha256": "382cdaa9d218bcdb2da3fe2608d7d59a4550ad926b22b7f9a686105ea2d5ae09"
+        },
+        "log": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-deferred-constant-1/stdout.log",
+          "sha256": "4077541b3200c27d877af8ab95faaec13b2f407b1a477c126e9b1b570403d17c"
+        },
+        "inputs": {
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/libvulkan_asahi-08f0715c6df.so": "879cbb143e79795b93c975df933a4d2f317f9099ac51d4cb0febc7d30e98ca9e",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/u0-r8-v2-20261022/r2/kit/lib/libasahi_host_trace_drm_shim.so": "25ebb1ad4c38bbc3a1720e735f3193de5cd6a472cab1d06ed970317133bc03f3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/transitions": "b57ec14d98d9af66a4eccc7713043c4b2e1baa74fd0fed0f9ce580110668839c",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/constant.mesh.spv": "5d2eb4b38b35ede2ef5422940aeda48f14327b126b86cc86f0b9f2a37b64eccf",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/emulated.mesh.spv": "051c85f21be81395a94c258e9b2971db5050ecbbf4e6f3f602a1faf5ba66d607",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.spv": "62842a3ae033905b9e0b44d3f22732d721836cd9e7759be54f8246b33e29aaa3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/mesh.frag.spv": "c73975daee1291efd38d4bdec3a1eccd4244de3f0182f2d131627edf4760860d",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.frag.spv": "2e09a8564b49e005adb16f5a860ef31721b8abfa023d834d2df4745f670f6f88"
+        }
+      },
+      {
+        "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-merged-0",
+        "metadata": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-merged-0/RUN.json",
+          "sha256": "8607d37cc2f08dd46b472e3d2770d6c5f3bcbb97439ed8caa418af5f1ba2722f"
+        },
+        "log": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-merged-0/stdout.log",
+          "sha256": "b6335e60afb50cf159562aa793b069e1a0937ca9b05793195c4bfc46345c5bbe"
+        },
+        "inputs": {
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/libvulkan_asahi-08f0715c6df.so": "879cbb143e79795b93c975df933a4d2f317f9099ac51d4cb0febc7d30e98ca9e",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/u0-r8-v2-20261022/r2/kit/lib/libasahi_host_trace_drm_shim.so": "25ebb1ad4c38bbc3a1720e735f3193de5cd6a472cab1d06ed970317133bc03f3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/transitions": "b57ec14d98d9af66a4eccc7713043c4b2e1baa74fd0fed0f9ce580110668839c",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/native.mesh.spv": "d307c51580af2f41bbe5f01236910eb3274f4af68c4db950513a9bcce5d77a6a",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/emulated.mesh.spv": "051c85f21be81395a94c258e9b2971db5050ecbbf4e6f3f602a1faf5ba66d607",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.spv": "62842a3ae033905b9e0b44d3f22732d721836cd9e7759be54f8246b33e29aaa3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/mesh.frag.spv": "c73975daee1291efd38d4bdec3a1eccd4244de3f0182f2d131627edf4760860d",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.frag.spv": "2e09a8564b49e005adb16f5a860ef31721b8abfa023d834d2df4745f670f6f88"
+        }
+      },
+      {
+        "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-merged-1",
+        "metadata": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-merged-1/RUN.json",
+          "sha256": "6e11e5740dc2703df368cade6a1676153ce64220291498b42986389836de3302"
+        },
+        "log": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-merged-1/stdout.log",
+          "sha256": "0b07dc26962d35645f3f6c11e391943cb2970d5c7b26c346117877f1b476ea5e"
+        },
+        "inputs": {
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/libvulkan_asahi-08f0715c6df.so": "879cbb143e79795b93c975df933a4d2f317f9099ac51d4cb0febc7d30e98ca9e",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/u0-r8-v2-20261022/r2/kit/lib/libasahi_host_trace_drm_shim.so": "25ebb1ad4c38bbc3a1720e735f3193de5cd6a472cab1d06ed970317133bc03f3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/transitions": "b57ec14d98d9af66a4eccc7713043c4b2e1baa74fd0fed0f9ce580110668839c",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/native.mesh.spv": "d307c51580af2f41bbe5f01236910eb3274f4af68c4db950513a9bcce5d77a6a",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/emulated.mesh.spv": "051c85f21be81395a94c258e9b2971db5050ecbbf4e6f3f602a1faf5ba66d607",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.spv": "62842a3ae033905b9e0b44d3f22732d721836cd9e7759be54f8246b33e29aaa3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/mesh.frag.spv": "c73975daee1291efd38d4bdec3a1eccd4244de3f0182f2d131627edf4760860d",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.frag.spv": "2e09a8564b49e005adb16f5a860ef31721b8abfa023d834d2df4745f670f6f88"
+        }
+      },
+      {
+        "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-plain-constant-0",
+        "metadata": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-plain-constant-0/RUN.json",
+          "sha256": "c2b7b310b895b5af5622be3e291dd5f92b7b1163d4e275521056b0a8db278ab6"
+        },
+        "log": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-plain-constant-0/stdout.log",
+          "sha256": "f2c6552c4ed0d299f8b7c4aead8b6e24f5a26368098d7cc9aaa1875810f2ff3b"
+        },
+        "inputs": {
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/libvulkan_asahi-08f0715c6df.so": "879cbb143e79795b93c975df933a4d2f317f9099ac51d4cb0febc7d30e98ca9e",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/u0-r8-v2-20261022/r2/kit/lib/libasahi_host_trace_drm_shim.so": "25ebb1ad4c38bbc3a1720e735f3193de5cd6a472cab1d06ed970317133bc03f3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/transitions": "b57ec14d98d9af66a4eccc7713043c4b2e1baa74fd0fed0f9ce580110668839c",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/constant.mesh.spv": "5d2eb4b38b35ede2ef5422940aeda48f14327b126b86cc86f0b9f2a37b64eccf",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/emulated.mesh.spv": "051c85f21be81395a94c258e9b2971db5050ecbbf4e6f3f602a1faf5ba66d607",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.spv": "62842a3ae033905b9e0b44d3f22732d721836cd9e7759be54f8246b33e29aaa3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/mesh.frag.spv": "c73975daee1291efd38d4bdec3a1eccd4244de3f0182f2d131627edf4760860d",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.frag.spv": "2e09a8564b49e005adb16f5a860ef31721b8abfa023d834d2df4745f670f6f88"
+        }
+      },
+      {
+        "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-plain-constant-1",
+        "metadata": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-plain-constant-1/RUN.json",
+          "sha256": "8507012626c65211cfc7b019257dbd051e946205b898d651e1c08f01d1badd93"
+        },
+        "log": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-plain-constant-1/stdout.log",
+          "sha256": "040f1beee9ef0926b1a545f04e542d0b7bca62f3d20dcada729fc0ce8b762fef"
+        },
+        "inputs": {
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/libvulkan_asahi-08f0715c6df.so": "879cbb143e79795b93c975df933a4d2f317f9099ac51d4cb0febc7d30e98ca9e",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/u0-r8-v2-20261022/r2/kit/lib/libasahi_host_trace_drm_shim.so": "25ebb1ad4c38bbc3a1720e735f3193de5cd6a472cab1d06ed970317133bc03f3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/transitions": "b57ec14d98d9af66a4eccc7713043c4b2e1baa74fd0fed0f9ce580110668839c",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/constant.mesh.spv": "5d2eb4b38b35ede2ef5422940aeda48f14327b126b86cc86f0b9f2a37b64eccf",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/emulated.mesh.spv": "051c85f21be81395a94c258e9b2971db5050ecbbf4e6f3f602a1faf5ba66d607",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.spv": "62842a3ae033905b9e0b44d3f22732d721836cd9e7759be54f8246b33e29aaa3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/mesh.frag.spv": "c73975daee1291efd38d4bdec3a1eccd4244de3f0182f2d131627edf4760860d",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.frag.spv": "2e09a8564b49e005adb16f5a860ef31721b8abfa023d834d2df4745f670f6f88"
+        }
+      },
+      {
+        "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-timestamp-0",
+        "metadata": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-timestamp-0/RUN.json",
+          "sha256": "a9dd8c94ac7a0fb70a4013c6c55ad7713bb3c5411f0496fb743dc1179a045ae9"
+        },
+        "log": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-timestamp-0/stdout.log",
+          "sha256": "22b29af263b106e2f8721a75695070f21dfa24e28946e0ecd2e9f146c681755c"
+        },
+        "inputs": {
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/libvulkan_asahi-08f0715c6df.so": "879cbb143e79795b93c975df933a4d2f317f9099ac51d4cb0febc7d30e98ca9e",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/u0-r8-v2-20261022/r2/kit/lib/libasahi_host_trace_drm_shim.so": "25ebb1ad4c38bbc3a1720e735f3193de5cd6a472cab1d06ed970317133bc03f3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/transitions": "b57ec14d98d9af66a4eccc7713043c4b2e1baa74fd0fed0f9ce580110668839c",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/native.mesh.spv": "d307c51580af2f41bbe5f01236910eb3274f4af68c4db950513a9bcce5d77a6a",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/emulated.mesh.spv": "051c85f21be81395a94c258e9b2971db5050ecbbf4e6f3f602a1faf5ba66d607",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.spv": "62842a3ae033905b9e0b44d3f22732d721836cd9e7759be54f8246b33e29aaa3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/mesh.frag.spv": "c73975daee1291efd38d4bdec3a1eccd4244de3f0182f2d131627edf4760860d",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.frag.spv": "2e09a8564b49e005adb16f5a860ef31721b8abfa023d834d2df4745f670f6f88"
+        }
+      },
+      {
+        "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-timestamp-1",
+        "metadata": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-timestamp-1/RUN.json",
+          "sha256": "854010faa72be43c21a9aa807f918a22e54de14ab5f5df8fa42d3c26f0e2861a"
+        },
+        "log": {
+          "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-timestamp-1/stdout.log",
+          "sha256": "85e37a20b561a47181e82127e563a3fd634da90cae347dfd9a0405cef860db7d"
+        },
+        "inputs": {
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/libvulkan_asahi-08f0715c6df.so": "879cbb143e79795b93c975df933a4d2f317f9099ac51d4cb0febc7d30e98ca9e",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/u0-r8-v2-20261022/r2/kit/lib/libasahi_host_trace_drm_shim.so": "25ebb1ad4c38bbc3a1720e735f3193de5cd6a472cab1d06ed970317133bc03f3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/transitions": "b57ec14d98d9af66a4eccc7713043c4b2e1baa74fd0fed0f9ce580110668839c",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/native.mesh.spv": "d307c51580af2f41bbe5f01236910eb3274f4af68c4db950513a9bcce5d77a6a",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/emulated.mesh.spv": "051c85f21be81395a94c258e9b2971db5050ecbbf4e6f3f602a1faf5ba66d607",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.spv": "62842a3ae033905b9e0b44d3f22732d721836cd9e7759be54f8246b33e29aaa3",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/mesh.frag.spv": "c73975daee1291efd38d4bdec3a1eccd4244de3f0182f2d131627edf4760860d",
+          "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/probes/vertex.frag.spv": "2e09a8564b49e005adb16f5a860ef31721b8abfa023d834d2df4745f670f6f88"
+        }
+      }
+    ],
+    "capture_checks": [
+      {
+        "result": "pass",
+        "gpu_execution": false,
+        "mode": "timestamp",
+        "sequence": "N",
+        "captures": [
+          {
+            "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-timestamp-1/trace",
+            "native": true,
+            "mode": "timestamp",
+            "constant_table": false,
+            "commands": [
+              {
+                "submission": "000",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 65535,
+                "cdm_barrier": 65535
+              },
+              {
+                "submission": "001",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 65535,
+                "cdm_barrier": 0,
+                "prefix": "0x40000d2c",
+                "native": true,
+                "bg": "0x8b8600",
+                "eot": "0x8b8a00",
+                "partial_bg": "0x8b8800",
+                "partial_eot": "0x8b8c00",
+                "fragment_end_timestamp": {
+                  "handle": 25,
+                  "offset": 0
+                },
+                "native_stream_bytes": 160,
+                "native_draws": 1
+              },
+              {
+                "submission": "002",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0
+              }
+            ]
+          },
+          {
+            "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-timestamp-0/trace",
+            "native": false,
+            "mode": "timestamp",
+            "constant_table": false,
+            "commands": [
+              {
+                "submission": "000",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0
+              },
+              {
+                "submission": "001",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0,
+                "prefix": "0x4000002e",
+                "native": false,
+                "bg": "0x8a0600",
+                "eot": "0x8a0a00",
+                "partial_bg": "0x8a0800",
+                "partial_eot": "0x8a0c00",
+                "fragment_end_timestamp": {
+                  "handle": 22,
+                  "offset": 0
+                }
+              },
+              {
+                "submission": "002",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "result": "pass",
+        "gpu_execution": false,
+        "mode": "merged",
+        "sequence": "NN",
+        "captures": [
+          {
+            "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-merged-1/trace",
+            "native": true,
+            "mode": "merged",
+            "constant_table": false,
+            "commands": [
+              {
+                "submission": "000",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 65535,
+                "cdm_barrier": 65535,
+                "prefix": "0x40000d2c",
+                "native": true,
+                "bg": "0x8b8100",
+                "eot": "0x8b8500",
+                "partial_bg": "0x8b8300",
+                "partial_eot": "0x8b8700",
+                "native_stream_bytes": 160,
+                "native_draws": 1
+              },
+              {
+                "submission": "001",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 65535,
+                "prefix": "0x40000d2c",
+                "native": true,
+                "bg": "0x8b9200",
+                "eot": "0x8b9400",
+                "partial_bg": "0x8b9200",
+                "partial_eot": "0x8b9600",
+                "native_stream_bytes": 160,
+                "native_draws": 1
+              },
+              {
+                "submission": "002",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 65535
+              }
+            ]
+          },
+          {
+            "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-merged-0/trace",
+            "native": false,
+            "mode": "merged",
+            "constant_table": false,
+            "commands": [
+              {
+                "submission": "000",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0
+              },
+              {
+                "submission": "001",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0,
+                "prefix": "0x4000002e",
+                "native": false,
+                "bg": "0x8a0100",
+                "eot": "0x8a0500",
+                "partial_bg": "0x8a0300",
+                "partial_eot": "0x8a0700"
+              },
+              {
+                "submission": "002",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0
+              },
+              {
+                "submission": "003",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0,
+                "prefix": "0x4000002e",
+                "native": false,
+                "bg": "0x8a14c0",
+                "eot": "0x8a18c0",
+                "partial_bg": "0x8a16c0",
+                "partial_eot": "0x8a1ac0"
+              },
+              {
+                "submission": "004",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "result": "pass",
+        "gpu_execution": false,
+        "mode": "plain",
+        "sequence": "NENVNMNN",
+        "captures": [
+          {
+            "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-plain-constant-1/trace",
+            "native": true,
+            "mode": "plain",
+            "constant_table": true,
+            "commands": [
+              {
+                "submission": "000",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0,
+                "prefix": "0x40000d2c",
+                "native": true,
+                "bg": "0x8b8100",
+                "eot": "0x8b8700",
+                "partial_bg": "0x8b8300",
+                "partial_eot": "0x8b8700",
+                "native_stream_bytes": 160,
+                "native_draws": 1,
+                "constant_data": {
+                  "launch": "0x100008b8d00",
+                  "arguments": "0x2ffff92f80",
+                  "resources": "0x2ffff92f00",
+                  "root": "0x2ffff91710",
+                  "address": "0x100008607c0",
+                  "bytes": 1024,
+                  "selected_index": 37,
+                  "sha256": "dd13a1eefa34578f6791bd824920c1685a80848483517daa685347a75bea718d"
+                }
+              },
+              {
+                "submission": "001",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0
+              },
+              {
+                "submission": "002",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0,
+                "prefix": "0x4000002e",
+                "native": false,
+                "bg": "0x8b8300",
+                "eot": "0x8b8700",
+                "partial_bg": "0x8b8300",
+                "partial_eot": "0x8b8700"
+              },
+              {
+                "submission": "003",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0,
+                "prefix": "0x40000d2c",
+                "native": true,
+                "bg": "0x8b8300",
+                "eot": "0x8b8700",
+                "partial_bg": "0x8b8300",
+                "partial_eot": "0x8b8700",
+                "native_stream_bytes": 160,
+                "native_draws": 1,
+                "constant_data": {
+                  "launch": "0x100008b9d00",
+                  "arguments": "0x2ffff96dc0",
+                  "resources": "0x2ffff96d40",
+                  "root": "0x2ffff95750",
+                  "address": "0x100008607c0",
+                  "bytes": 1024,
+                  "selected_index": 37,
+                  "sha256": "dd13a1eefa34578f6791bd824920c1685a80848483517daa685347a75bea718d"
+                }
+              },
+              {
+                "submission": "004",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0,
+                "prefix": "0x4000002e",
+                "native": false,
+                "bg": "0x8b8300",
+                "eot": "0x8b8700",
+                "partial_bg": "0x8b8300",
+                "partial_eot": "0x8b8700"
+              },
+              {
+                "submission": "005",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0,
+                "prefix": "0x40000d2c",
+                "native": true,
+                "bg": "0x8b8300",
+                "eot": "0x8b8700",
+                "partial_bg": "0x8b8300",
+                "partial_eot": "0x8b8700",
+                "native_stream_bytes": 160,
+                "native_draws": 1,
+                "constant_data": {
+                  "launch": "0x100008ba800",
+                  "arguments": "0x2ffff99740",
+                  "resources": "0x2ffff996c0",
+                  "root": "0x2ffff980d0",
+                  "address": "0x100008607c0",
+                  "bytes": 1024,
+                  "selected_index": 37,
+                  "sha256": "dd13a1eefa34578f6791bd824920c1685a80848483517daa685347a75bea718d"
+                }
+              },
+              {
+                "submission": "006",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0,
+                "prefix": "0x4000002e",
+                "native": false,
+                "bg": "0x8b8300",
+                "eot": "0x8b8700",
+                "partial_bg": "0x8b8300",
+                "partial_eot": "0x8b8700"
+              },
+              {
+                "submission": "007",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0,
+                "prefix": "0x40000d2c",
+                "native": true,
+                "bg": "0x8b8300",
+                "eot": "0x8b8700",
+                "partial_bg": "0x8b8300",
+                "partial_eot": "0x8b8700",
+                "native_stream_bytes": 160,
+                "native_draws": 1,
+                "constant_data": {
+                  "launch": "0x100008bb000",
+                  "arguments": "0x2ffff9c540",
+                  "resources": "0x2ffff9c4c0",
+                  "root": "0x2ffff9acd0",
+                  "address": "0x100008607c0",
+                  "bytes": 1024,
+                  "selected_index": 37,
+                  "sha256": "dd13a1eefa34578f6791bd824920c1685a80848483517daa685347a75bea718d"
+                }
+              },
+              {
+                "submission": "008",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0,
+                "prefix": "0x40000d2c",
+                "native": true,
+                "bg": "0x8b8300",
+                "eot": "0x8b8500",
+                "partial_bg": "0x8b8300",
+                "partial_eot": "0x8b8700",
+                "native_stream_bytes": 160,
+                "native_draws": 1,
+                "constant_data": {
+                  "launch": "0x100008bb400",
+                  "arguments": "0x2ffff9d500",
+                  "resources": "0x2ffff9c4c0",
+                  "root": "0x2ffff9acd0",
+                  "address": "0x100008607c0",
+                  "bytes": 1024,
+                  "selected_index": 37,
+                  "sha256": "dd13a1eefa34578f6791bd824920c1685a80848483517daa685347a75bea718d"
+                }
+              },
+              {
+                "submission": "009",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0
+              }
+            ]
+          },
+          {
+            "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-plain-constant-0/trace",
+            "native": false,
+            "mode": "plain",
+            "constant_table": true,
+            "commands": [
+              {
+                "submission": "000",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0
+              },
+              {
+                "submission": "001",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0,
+                "prefix": "0x4000002e",
+                "native": false,
+                "bg": "0x8a0100",
+                "eot": "0x8a0500",
+                "partial_bg": "0x8a0300",
+                "partial_eot": "0x8a0700"
+              },
+              {
+                "submission": "002",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "result": "pass",
+        "gpu_execution": false,
+        "mode": "deferred",
+        "sequence": "NN",
+        "captures": [
+          {
+            "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-deferred-constant-1/trace",
+            "native": true,
+            "mode": "deferred",
+            "constant_table": true,
+            "commands": [
+              {
+                "submission": "000",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 65535,
+                "cdm_barrier": 65535,
+                "prefix": "0x40000d2c",
+                "native": true,
+                "bg": "0x868100",
+                "eot": "0x868700",
+                "partial_bg": "0x868300",
+                "partial_eot": "0x868700",
+                "native_stream_bytes": 160,
+                "native_draws": 1,
+                "constant_data": {
+                  "launch": "0x10000868d00",
+                  "arguments": "0x2ffff92f80",
+                  "resources": "0x2ffff92f00",
+                  "root": "0x2ffff91710",
+                  "address": "0x100008a4500",
+                  "bytes": 1024,
+                  "selected_index": 37,
+                  "sha256": "dd13a1eefa34578f6791bd824920c1685a80848483517daa685347a75bea718d"
+                }
+              },
+              {
+                "submission": "001",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 65535,
+                "prefix": "0x40000d2c",
+                "native": true,
+                "bg": "0x868300",
+                "eot": "0x868500",
+                "partial_bg": "0x868300",
+                "partial_eot": "0x868700",
+                "native_stream_bytes": 160,
+                "native_draws": 1,
+                "constant_data": {
+                  "launch": "0x10000869100",
+                  "arguments": "0x2ffff93f40",
+                  "resources": "0x2ffff92f00",
+                  "root": "0x2ffff91710",
+                  "address": "0x100008a4500",
+                  "bytes": 1024,
+                  "selected_index": 37,
+                  "sha256": "dd13a1eefa34578f6791bd824920c1685a80848483517daa685347a75bea718d"
+                }
+              },
+              {
+                "submission": "002",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 65535
+              }
+            ]
+          },
+          {
+            "directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/review-deferred-constant-0/trace",
+            "native": false,
+            "mode": "deferred",
+            "constant_table": true,
+            "commands": [
+              {
+                "submission": "000",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0
+              },
+              {
+                "submission": "001",
+                "kind": 0,
+                "size": 240,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0,
+                "prefix": "0x4000002e",
+                "native": false,
+                "bg": "0x868100",
+                "eot": "0x868500",
+                "partial_bg": "0x868300",
+                "partial_eot": "0x868700"
+              },
+              {
+                "submission": "002",
+                "kind": 1,
+                "size": 64,
+                "vdm_barrier": 0,
+                "cdm_barrier": 0
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "checker_negative_controls": [
+      {
+        "control": "missing render continuation dependency",
+        "rejected": true,
+        "reason": "unexpected render/compute dependency edges"
+      },
+      {
+        "control": "missing timestamp destination",
+        "rejected": true,
+        "reason": "expected only a fragment-end timestamp"
+      },
+      {
+        "control": "missing merge-path evidence",
+        "rejected": true,
+        "reason": "no evidence of the merged BeginRendering path"
+      },
+      {
+        "control": "wrong immutable table byte",
+        "rejected": true,
+        "reason": "mesh constant-data root does not reach the complete immutable table"
+      }
+    ],
+    "checker_negative_control_source": {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/validate-capture-checker.py",
+      "sha256": "615fab6af98e27132c37e81c685f9f1b1515f48d8dd7497688ccefd28f286373"
+    },
+    "older_inventory": {
+      "source_commit": "ab4f31a9abb",
+      "note": "625 cases per native setting; no GPU execution or queue submission. Retained at its original identity, not rerun or relabelled as the final ICD.",
+      "evidence": {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-m4-20261022/INVENTORY-COMPARISON.json",
+        "sha256": "0d1b0b2d6e069a6d18fa104ad544db3de24e41b858595436910c9cb4fcda9676"
+      }
+    }
+  },
+  "attribute_p1_default_decision": {
+    "action": "retain both enabled within explicit native opt-in",
+    "native_default_enabled": false,
+    "condition": "Disable the corresponding opt-in default on any native-fail/emulated-pass attribute or P1 case.",
+    "observed_native_fail_emulated_pass": 0,
+    "comparison_candidate": "64598c0abb5",
+    "compared_cases": 27999,
+    "excluded_cases": 13,
+    "phase_counts": {
+      "native": {
+        "Pass": 26349,
+        "Fail": 1,
+        "Skip": 1649,
+        "XFail": 0,
+        "Flake": 0,
+        "Crash": 0,
+        "Timeout": 0,
+        "Warn": 0,
+        "Missing": 0,
+        "Aborted": 0,
+        "NotRun": 0,
+        "Excluded": 13
+      },
+      "emulated": {
+        "Pass": 26349,
+        "Fail": 1,
+        "Skip": 1649,
+        "XFail": 0,
+        "Flake": 0,
+        "Crash": 0,
+        "Timeout": 0,
+        "Warn": 0,
+        "Missing": 0,
+        "Aborted": 0,
+        "NotRun": 0,
+        "Excluded": 13
+      }
+    },
+    "native_route_case_count": 54,
+    "native_route_note": "Case-level path entry, not proof every draw executed natively.",
+    "shared_failure_cases": [
+      "dEQP-VK.mesh_shader.ext.misc.max_lines"
+    ],
+    "state_coverage_gaps": [
+      {
+        "group": "rasterizer_discard",
+        "gaps": [
+          "No explicit fragment-present rasterizer-discard toggle or image oracle proving discarded pixels were suppressed.",
+          "A native entry elsewhere in a multi-draw case does not prove the discarded draw itself used native; the trace records case-level route presence."
+        ]
+      },
+      {
+        "group": "last_vertex_flat_P1",
+        "gaps": [
+          "All these cases use emulation in the hybrid run; no native last-provoking proof.",
+          "The per-primitive output is gl_Layer, not a custom per-primitive color varying."
+        ]
+      },
+      {
+        "group": "last_vertex_flat_and_per_primitive",
+        "gaps": [
+          "These tests declare max_vertices=4 and max_primitives=2, beyond the V3/P1 native class; all route through emulation.",
+          "The eligible V3/P1 combination of last-vertex mode with custom per-primitive varyings remains untested by this group."
+        ]
+      },
+      {
+        "group": "depth_bias",
+        "gaps": [
+          "Constant/slope/clamped depth bias on native mesh has no positive coverage here; depth_only tests do not exercise bias."
+        ]
+      },
+      {
+        "group": "sample_mask_alpha_to_coverage_1x",
+        "gaps": [
+          "Mask bit 0 disabled/enabled and alpha-to-coverage with discriminating alpha values at 1x need separate coverage."
+        ]
+      }
+    ],
+    "evidence": [
+      {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-cts-full-native/DEFAULT-ON-BLOCKERS-hybrid.json",
+        "sha256": "aaff04ed6aed7522c0249406341f17fb61c3a7122d00c96fe52a4dc4495687cc"
+      },
+      {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-cts-full-native/hybrid-retry/FINAL-VERIFICATION.json",
+        "sha256": "971d531319f8f061a39150c56bc6c813da2288b1568b1cc9212a3871c4b3cfb1"
+      },
+      {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-cts-full-native/hybrid-retry/NATIVE-ROUTES.json",
+        "sha256": "77f99ec8600209a5cbaa996d7456523cb4f35a521629c0a374fb53554060107b"
+      },
+      {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-cts-full-native/hybrid-retry/STATE-COVERAGE.json",
+        "sha256": "eeb432ab37081c9375ed3203b30f27006c7d603f41abf84fe7977984432e508f"
+      }
+    ]
+  },
+  "limitations": [
+    "M2 device results qualify only its exact 64598c0abb5 artifact; M4 still needs compiler/driver review and bounded device validation.",
+    "Host recording and timestamp availability under a shim are not rendered-pixel, timestamp-execution, or GPU-ordering evidence.",
+    "Capability C1/C2 evidence has not broadened advertised limits or the production native eligibility class.",
+    "No changes to kernel or UAPI; frozen C2 kit remains unchanged."
+  ]
+}

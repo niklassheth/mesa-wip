@@ -35,6 +35,10 @@ def main():
                   ASAHI_HOST_TRACE_DIR=str(trace.resolve()),
                   HK_EXPERIMENTAL_APPLE9='1', HK_APPLE9_NATIVE_MESH=a.native,
                   VK_DRIVER_FILES=str(icd.resolve()), MESA_SHADER_CACHE_DISABLE='true')
+    if a.mode == 'merged':
+        # Host diagnostic only: prove BeginRendering actually resumed the
+        # open render before the next native draw forced a stream split.
+        values['ASAHI_MESA_DEBUG'] = 'perf'
     files = [a.probes.resolve() / name for name in (
         'transitions', 'constant.mesh.spv' if a.constant_table else 'native.mesh.spv',
         'emulated.mesh.spv', 'vertex.spv',
@@ -56,6 +60,8 @@ def main():
     log = (a.output / 'stdout.log').read_text()
     assert result.returncode == 1 and 'SUBMIT_OK' in log and 'Vulkan:' not in log, log
     assert (a.output / 'pixels.bin').read_bytes() == bytes([0xa5]) * 64 * 64 * 4
+    if a.mode == 'merged' and a.native == '1':
+        assert log.count('Merging render pass into the previous render') == 1, log
     print('Recorded without GPU execution; untouched readback verified.')
 
 
