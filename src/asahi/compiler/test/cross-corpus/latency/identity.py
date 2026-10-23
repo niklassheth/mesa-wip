@@ -52,6 +52,13 @@ def checked_digest(process, key, output, packed=False):
         # Linked pipelines may replay their library dependencies too.
         if sum(map(int, replayed)) < 1:
             raise RuntimeError(f'{key}: missing replayed pipeline\n{text[-4000:]}')
+        # State-only graphics pipeline libraries legitimately have no shader
+        # modules. Keep these outcomes distinct from emitted-program hashes.
+        modules = re.findall(r'Playing back (\d+) shader modules took', text)
+        if (process.returncode == 0 and modules and sum(map(int, modules)) == 0
+                and 'APPLE9_ASM_BEGIN' not in text
+                and 'APPLE9_PREAMBLE_ASM_BEGIN' not in text):
+            return key, (hashlib.sha256(b'FOSSILIZE_STATE_ONLY').hexdigest(), 0)
     begins = len(re.findall(r'^APPLE9(?:_PREAMBLE)?_ASM_BEGIN', text, re.M))
     ends = len(re.findall(r'^APPLE9_ASM_END', text, re.M))
     result = digest(text)
@@ -99,6 +106,7 @@ for name in args.corpora:
         failures[name] = {k: v for k, v in rows.items() if isinstance(v, dict)}
         res[name] = {k: v for k, v in rows.items() if not isinstance(v, dict)}
     print(name, len(res[name]), 'passed', len(failures[name]), 'failed',
+          'state-only', sum(v[1] == 0 for v in res[name].values()),
           'programs-lines', sum(v[1] for v in res[name].values()), flush=True)
     Path(out).write_text(json.dumps(res) + '\n')
     Path(out + '.failures.json').write_text(json.dumps(failures, indent=2) + '\n')
