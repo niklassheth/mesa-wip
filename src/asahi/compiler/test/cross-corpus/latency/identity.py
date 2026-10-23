@@ -49,8 +49,9 @@ def checked_digest(process, key, output, packed=False):
             raise RuntimeError(f'{key}: missing replay device receipt\n{text[-4000:]}')
         text = text.split(marker, 1)[1]
         replayed = re.findall(r'Playing back (\d+) (?:graphics|compute) pipelines took', text)
-        if sum(map(int, replayed)) != 1:
-            raise RuntimeError(f'{key}: expected one replayed pipeline\n{text[-4000:]}')
+        # Linked pipelines may replay their library dependencies too.
+        if sum(map(int, replayed)) < 1:
+            raise RuntimeError(f'{key}: missing replayed pipeline\n{text[-4000:]}')
     begins = len(re.findall(r'^APPLE9(?:_PREAMBLE)?_ASM_BEGIN', text, re.M))
     ends = len(re.findall(r'^APPLE9_ASM_END', text, re.M))
     result = digest(text)
