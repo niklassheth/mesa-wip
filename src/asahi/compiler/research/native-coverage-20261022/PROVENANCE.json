@@ -1,0 +1,71 @@
+{
+  "scope": "host-only; no driver modifications or GPU execution",
+  "mesa_full_commit": "bcb0837f948a958255210e31cf90e0867efc6a14",
+  "analysis_base_commit": "97804dde415081d036dfb6c0a7930bc92f7ec796",
+  "inputs": [
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/debug_icd.c",
+      "sha256": "be189f0b2064b71b2b0bc95af864bc13b89a14fb2b723118528c6ee87d770257"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/debug_icd.so",
+      "sha256": "f932b8ce514a51bbe1154bcecccd0532aa1d5c0ad9b18c3bffc11283dc4b70f0"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/replay.py",
+      "sha256": "c68ea5bdb1dbba96fa039efa7e7b195751a9c022dff67c76134c57a29a31ff2d"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/all-rejections/RUN.json",
+      "sha256": "a65f2355712c12762dff819c3276cde38d7fc3c4045e72dce5e1078a91162f1f"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/integration-next-builds/sysmesa-bcb0837f948/aarch64-gl/src/asahi/vulkan/libvulkan_asahi.so",
+      "sha256": "907ced990a15920b38074b289c6fccafdc1cc2957529753e737564306c1aa5d5"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-num-workgroups/package/cts/tools/deqp-vk",
+      "sha256": "83acc28c211c515668ddaf108cbd5a38fdaaa1c46a3dd141ee1ed0e6683310aa"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/u0-r8-v2-20261022/r2/kit/lib/libasahi_host_trace_drm_shim.so",
+      "sha256": "25ebb1ad4c38bbc3a1720e735f3193de5cd6a472cab1d06ed970317133bc03f3"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/pinned/agx_apple9_mesh.h",
+      "sha256": "340ec38fb4fb07ef00bc4b819936eb1e92887a6d3b949358d1c4e38e7d67dccd"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/pinned/agx_nir_apple9_mesh_native.c",
+      "sha256": "e0c69f831062c371e439f513f5ecca40db25a9e7ac1f9fc5dee44b8b77dfc630"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/pinned/agx_nir_lower_apple9_mesh.c",
+      "sha256": "dd95719c15c3835b2a919c22800298533f0a5fba168e2647b2321c2427bfe6c0"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/pinned/hk_cmd_apple9.c",
+      "sha256": "753100cc108965e944803c5bc88d4bc9b14bc84234c186a3f4fbbb50c3f549ea"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/pinned/hk_cmd_buffer.h",
+      "sha256": "080943fff341d9c86ddfde01d0c4f1a5f02f6ab98d0e6b38b93030bbea65c10e"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/pinned/hk_cmd_draw.c",
+      "sha256": "982f91f4c5ee1fe404b01d4e30b6bd36ac1fe73a3ef298538dd36e50bfb730fa"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/pinned/hk_physical_device.c",
+      "sha256": "c64a0cb9fedfc36a3edca1dbf9de915459c37773c2f936895110be89f63b3c47"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/pinned/hk_shader.c",
+      "sha256": "30af1069fd1409bd9be4b511d681b56fc893f3f7efbaefe6471609b93081f0b8"
+    },
+    {
+      "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-coverage-plan-20261022/pinned/hk_shader.h",
+      "sha256": "ffde04f0438b8c07777b69e761b92c057b1c567e66b2d03263289dac6524572a"
+    }
+  ]
+}

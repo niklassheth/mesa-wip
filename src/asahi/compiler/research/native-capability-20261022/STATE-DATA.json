@@ -1,0 +1,7810 @@
+{
+  "scope": "Re-extract classified T8132 Metal VDM DATA, then check its field model.\n\nThe existing reader never follows shader targets. These retained captures are\nseparate from the new offline MSL sweep; matching models do not join their runs.\n",
+  "observed_chip_id": "0x8132",
+  "captures": 138,
+  "cases": 69,
+  "reader_sha256": "20ad3d408d1f2103643c93b7a0d76bb33c96ee86cfc72ae03ee04a2b4d1d1310",
+  "source_files": {
+    "artifacts/mesh-shaders-20261008/metal/xmat-spec.txt": {
+      "sha256": "3274f547c51311ea3b70227e5f0cef7a7760c2d0ad61c2c089b0298bfd2729d5",
+      "bytes": 5087
+    },
+    "artifacts/mesh-shaders-20261008/metal/trace7.jsonl": {
+      "sha256": "fc092284cfd3d3cade7d0a95e5212ba4db0e74536b946f8b3c5a6468d797b3dd",
+      "bytes": 25970527
+    },
+    "artifacts/mesh-shaders-20261008/metal/xmat-spec8.txt": {
+      "sha256": "d672e718108dcd65bb9fe2254d5437a37a492495a8623d67e4d33f0f745e0bf8",
+      "bytes": 1215
+    },
+    "artifacts/mesh-shaders-20261008/metal/trace8.jsonl": {
+      "sha256": "5e95b851f07fe33ca7175328a0cd20f18e0da2e4037eb43b75936d508ebb5d40",
+      "bytes": 4001385
+    }
+  },
+  "checks": [
+    {
+      "name": "E0",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 8,
+      "definition": {
+        "name": "E0",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "E0"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x0",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "E0",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 11,
+      "definition": {
+        "name": "E0",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "E0"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x0",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "E30",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 14,
+      "definition": {
+        "name": "E30",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "E30"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "E30",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 17,
+      "definition": {
+        "name": "E30",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "E30"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "EG4",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 20,
+      "definition": {
+        "name": "EG4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 4,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "EG"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "EG4",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 23,
+      "definition": {
+        "name": "EG4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 4,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "EG"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "L64",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 26,
+      "definition": {
+        "name": "L64",
+        "mt": 32,
+        "mv": 66,
+        "mp": 64,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "L"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3003f",
+        "0x400820",
+        "0x40",
+        "0x67"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "L64",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 29,
+      "definition": {
+        "name": "L64",
+        "mt": 32,
+        "mv": 66,
+        "mp": 64,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "L"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3003f",
+        "0x400820",
+        "0x40",
+        "0x67"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P63",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 32,
+      "definition": {
+        "name": "P63",
+        "mt": 128,
+        "mv": 65,
+        "mp": 63,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3003e",
+        "0x400880",
+        "0x3f",
+        "0x67"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P63",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 35,
+      "definition": {
+        "name": "P63",
+        "mt": 128,
+        "mv": 65,
+        "mp": 63,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3003e",
+        "0x400880",
+        "0x3f",
+        "0x67"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P64",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 38,
+      "definition": {
+        "name": "P64",
+        "mt": 128,
+        "mv": 66,
+        "mp": 64,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3003f",
+        "0x400880",
+        "0x40",
+        "0x67"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P64",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 41,
+      "definition": {
+        "name": "P64",
+        "mt": 128,
+        "mv": 66,
+        "mp": 64,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3003f",
+        "0x400880",
+        "0x40",
+        "0x67"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P65",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 44,
+      "definition": {
+        "name": "P65",
+        "mt": 128,
+        "mv": 67,
+        "mp": 65,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x40040",
+        "0x400880",
+        "0x41",
+        "0x67"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P65",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 47,
+      "definition": {
+        "name": "P65",
+        "mt": 128,
+        "mv": 67,
+        "mp": 65,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x40040",
+        "0x400880",
+        "0x41",
+        "0x67"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Q31",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 50,
+      "definition": {
+        "name": "Q31",
+        "mt": 128,
+        "mv": 33,
+        "mp": 31,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 2,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x1001e",
+        "0x400880",
+        "0x3e",
+        "0x37"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Q31",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 53,
+      "definition": {
+        "name": "Q31",
+        "mt": 128,
+        "mv": 33,
+        "mp": 31,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 2,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x1001e",
+        "0x400880",
+        "0x3e",
+        "0x37"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Q32",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 56,
+      "definition": {
+        "name": "Q32",
+        "mt": 128,
+        "mv": 34,
+        "mp": 32,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 2,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x1001f",
+        "0x400880",
+        "0x40",
+        "0x37"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Q32",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 59,
+      "definition": {
+        "name": "Q32",
+        "mt": 128,
+        "mv": 34,
+        "mp": 32,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 2,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x1001f",
+        "0x400880",
+        "0x40",
+        "0x37"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Q33",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 62,
+      "definition": {
+        "name": "Q33",
+        "mt": 128,
+        "mv": 35,
+        "mp": 33,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 2,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x20020",
+        "0x400880",
+        "0x42",
+        "0x37"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Q33",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 65,
+      "definition": {
+        "name": "Q33",
+        "mt": 128,
+        "mv": 35,
+        "mp": 33,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 2,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x20020",
+        "0x400880",
+        "0x42",
+        "0x37"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "W0",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 68,
+      "definition": {
+        "name": "W0",
+        "mt": 32,
+        "mv": 10,
+        "mp": 8,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "W0"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7",
+        "0x400820",
+        "0x8",
+        "0x13"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "W0",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 71,
+      "definition": {
+        "name": "W0",
+        "mt": 32,
+        "mv": 10,
+        "mp": 8,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "W0"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7",
+        "0x400820",
+        "0x8",
+        "0x13"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P8N",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 74,
+      "definition": {
+        "name": "P8N",
+        "mt": 32,
+        "mv": 24,
+        "mp": 8,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "N"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7",
+        "0x400820",
+        "0x8",
+        "0x25"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P8N",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 77,
+      "definition": {
+        "name": "P8N",
+        "mt": 32,
+        "mv": 24,
+        "mp": 8,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "N"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7",
+        "0x400820",
+        "0x8",
+        "0x25"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "CU4",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 80,
+      "definition": {
+        "name": "CU4",
+        "mt": 32,
+        "mv": 6,
+        "mp": 4,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "CU"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x40000003",
+        "0x400820",
+        "0x4",
+        "0xe"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "CU4",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 83,
+      "definition": {
+        "name": "CU4",
+        "mt": 32,
+        "mv": 6,
+        "mp": 4,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "CU"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x40000003",
+        "0x400820",
+        "0x4",
+        "0xe"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "D2",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 86,
+      "definition": {
+        "name": "D2",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "D2"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "D2",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 89,
+      "definition": {
+        "name": "D2",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "D2"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 92,
+      "definition": {
+        "name": "B0",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 95,
+      "definition": {
+        "name": "B0",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0t128",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 98,
+      "definition": {
+        "name": "B0t128",
+        "mt": 128,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400880",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0t128",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 101,
+      "definition": {
+        "name": "B0t128",
+        "mt": 128,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400880",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0t256",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 106,
+      "definition": {
+        "name": "B0t256",
+        "mt": 256,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400900",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0t256",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 109,
+      "definition": {
+        "name": "B0t256",
+        "mt": 256,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400900",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P2",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 116,
+      "definition": {
+        "name": "P2",
+        "mt": 128,
+        "mv": 4,
+        "mp": 2,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x1",
+        "0x400880",
+        "0x2",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P2",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 119,
+      "definition": {
+        "name": "P2",
+        "mt": 128,
+        "mv": 4,
+        "mp": 2,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x1",
+        "0x400880",
+        "0x2",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P4",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 122,
+      "definition": {
+        "name": "P4",
+        "mt": 128,
+        "mv": 6,
+        "mp": 4,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3",
+        "0x400880",
+        "0x4",
+        "0xd"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P4",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 125,
+      "definition": {
+        "name": "P4",
+        "mt": 128,
+        "mv": 6,
+        "mp": 4,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3",
+        "0x400880",
+        "0x4",
+        "0xd"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P8",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 128,
+      "definition": {
+        "name": "P8",
+        "mt": 128,
+        "mv": 10,
+        "mp": 8,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7",
+        "0x400880",
+        "0x8",
+        "0x13"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P8",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 131,
+      "definition": {
+        "name": "P8",
+        "mt": 128,
+        "mv": 10,
+        "mp": 8,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7",
+        "0x400880",
+        "0x8",
+        "0x13"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P16",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 135,
+      "definition": {
+        "name": "P16",
+        "mt": 128,
+        "mv": 18,
+        "mp": 16,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0xf",
+        "0x400880",
+        "0x10",
+        "0x1f"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P16",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 138,
+      "definition": {
+        "name": "P16",
+        "mt": 128,
+        "mv": 18,
+        "mp": 16,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0xf",
+        "0x400880",
+        "0x10",
+        "0x1f"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P32",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 141,
+      "definition": {
+        "name": "P32",
+        "mt": 128,
+        "mv": 34,
+        "mp": 32,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x1001f",
+        "0x400880",
+        "0x20",
+        "0x37"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P32",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 144,
+      "definition": {
+        "name": "P32",
+        "mt": 128,
+        "mv": 34,
+        "mp": 32,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x1001f",
+        "0x400880",
+        "0x20",
+        "0x37"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P128",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 149,
+      "definition": {
+        "name": "P128",
+        "mt": 128,
+        "mv": 130,
+        "mp": 128,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7007f",
+        "0x400880",
+        "0x80",
+        "0xc7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P128",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 152,
+      "definition": {
+        "name": "P128",
+        "mt": 128,
+        "mv": 130,
+        "mp": 128,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7007f",
+        "0x400880",
+        "0x80",
+        "0xc7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P256",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 155,
+      "definition": {
+        "name": "P256",
+        "mt": 128,
+        "mv": 256,
+        "mp": 256,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0xf00ff",
+        "0x400880",
+        "0x100",
+        "0x181"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P256",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 160,
+      "definition": {
+        "name": "P256",
+        "mt": 128,
+        "mv": 256,
+        "mp": 256,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0xf00ff",
+        "0x400880",
+        "0x100",
+        "0x181"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "V8",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 163,
+      "definition": {
+        "name": "V8",
+        "mt": 256,
+        "mv": 8,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400900",
+        "0x1",
+        "0xd"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "V8",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 166,
+      "definition": {
+        "name": "V8",
+        "mt": 256,
+        "mv": 8,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400900",
+        "0x1",
+        "0xd"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "V32",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 169,
+      "definition": {
+        "name": "V32",
+        "mt": 256,
+        "mv": 32,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400900",
+        "0x1",
+        "0x31"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "V32",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 172,
+      "definition": {
+        "name": "V32",
+        "mt": 256,
+        "mv": 32,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400900",
+        "0x1",
+        "0x31"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "V128",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 175,
+      "definition": {
+        "name": "V128",
+        "mt": 256,
+        "mv": 128,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400900",
+        "0x1",
+        "0xc1"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "V128",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 178,
+      "definition": {
+        "name": "V128",
+        "mt": 256,
+        "mv": 128,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400900",
+        "0x1",
+        "0xc1"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0c12",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 181,
+      "definition": {
+        "name": "B0c12",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0c12",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 184,
+      "definition": {
+        "name": "B0c12",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "V256",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 187,
+      "definition": {
+        "name": "V256",
+        "mt": 256,
+        "mv": 256,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400900",
+        "0x1",
+        "0x181"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "V256",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 190,
+      "definition": {
+        "name": "V256",
+        "mt": 256,
+        "mv": 256,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400900",
+        "0x1",
+        "0x181"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "A0",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 193,
+      "definition": {
+        "name": "A0",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 0,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x605",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x6"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "A0",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 196,
+      "definition": {
+        "name": "A0",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 0,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x605",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x6"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "A2",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 199,
+      "definition": {
+        "name": "A2",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 2,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x807",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x8"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "A2",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 202,
+      "definition": {
+        "name": "A2",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 2,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x807",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x8"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "A4",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 205,
+      "definition": {
+        "name": "A4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 4,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0xa09",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0xa"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "A4",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 208,
+      "definition": {
+        "name": "A4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 4,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0xa09",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0xa"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "A8",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 211,
+      "definition": {
+        "name": "A8",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 8,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0xe0d",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0xe"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "A8",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 214,
+      "definition": {
+        "name": "A8",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 8,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0xe0d",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0xe"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "A15",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 250,
+      "definition": {
+        "name": "A15",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 15,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x1514",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x15"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "A15",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 253,
+      "definition": {
+        "name": "A15",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 15,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x1514",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x15"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "C0",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 256,
+      "definition": {
+        "name": "C0",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 0,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x605",
+        "0x10",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x0",
+        "0x6"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "C0",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 259,
+      "definition": {
+        "name": "C0",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 0,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x605",
+        "0x10",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x0",
+        "0x6"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "C2",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 262,
+      "definition": {
+        "name": "C2",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 2,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x2",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "C2",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 265,
+      "definition": {
+        "name": "C2",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 2,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x2",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "C4",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 268,
+      "definition": {
+        "name": "C4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 4,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x4",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "C4",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 271,
+      "definition": {
+        "name": "C4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 4,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x4",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "C4P8",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 274,
+      "definition": {
+        "name": "C4P8",
+        "mt": 32,
+        "mv": 10,
+        "mp": 8,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 4,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7",
+        "0x400820",
+        "0x20",
+        "0x13"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "C4P8",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 277,
+      "definition": {
+        "name": "C4P8",
+        "mt": 32,
+        "mv": 10,
+        "mp": 8,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 4,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7",
+        "0x400820",
+        "0x20",
+        "0x13"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "TL",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 280,
+      "definition": {
+        "name": "TL",
+        "mt": 32,
+        "mv": 5,
+        "mp": 4,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "l",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3",
+        "0x400820",
+        "0x4",
+        "0xd"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000100",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "TL",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 283,
+      "definition": {
+        "name": "TL",
+        "mt": 32,
+        "mv": 5,
+        "mp": 4,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "l",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3",
+        "0x400820",
+        "0x4",
+        "0xd"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000100",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "TP",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 286,
+      "definition": {
+        "name": "TP",
+        "mt": 32,
+        "mv": 4,
+        "mp": 4,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "p",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x807",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3",
+        "0x400820",
+        "0x4",
+        "0x8"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000000",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "TP",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 289,
+      "definition": {
+        "name": "TP",
+        "mt": 32,
+        "mv": 4,
+        "mp": 4,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "p",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x807",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3",
+        "0x400820",
+        "0x4",
+        "0x8"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000000",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0c24",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 292,
+      "definition": {
+        "name": "B0c24",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0c24",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 295,
+      "definition": {
+        "name": "B0c24",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "T1",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 298,
+      "definition": {
+        "name": "T1",
+        "mt": 1,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400801",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "T1",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 301,
+      "definition": {
+        "name": "T1",
+        "mt": 1,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400801",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "T256",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 304,
+      "definition": {
+        "name": "T256",
+        "mt": 256,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400900",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "T256",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 307,
+      "definition": {
+        "name": "T256",
+        "mt": 256,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400900",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "G4",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 310,
+      "definition": {
+        "name": "G4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 4,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "G4",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 313,
+      "definition": {
+        "name": "G4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 4,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "G234",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 316,
+      "definition": {
+        "name": "G234",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 2,
+        "gy": 3,
+        "gz": 4,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "G234",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 319,
+      "definition": {
+        "name": "G234",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 2,
+        "gy": 3,
+        "gz": 4,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "G64",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 322,
+      "definition": {
+        "name": "G64",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 64,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "G64",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 325,
+      "definition": {
+        "name": "G64",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 64,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "G4P8",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 328,
+      "definition": {
+        "name": "G4P8",
+        "mt": 32,
+        "mv": 10,
+        "mp": 8,
+        "gx": 4,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 4,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7",
+        "0x400820",
+        "0x20",
+        "0x13"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "G4P8",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 331,
+      "definition": {
+        "name": "G4P8",
+        "mt": 32,
+        "mv": 10,
+        "mp": 8,
+        "gx": 4,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 4,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7",
+        "0x400820",
+        "0x20",
+        "0x13"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "O1",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 334,
+      "definition": {
+        "name": "O1",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 1,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x1",
+            "0x1",
+            "0x1",
+            "0x1",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "O1",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 337,
+      "definition": {
+        "name": "O1",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 1,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x1",
+            "0x1",
+            "0x1",
+            "0x1",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "O32",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 340,
+      "definition": {
+        "name": "O32",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x20",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "O32",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 343,
+      "definition": {
+        "name": "O32",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x20",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "OW16",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 346,
+      "definition": {
+        "name": "OW16",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 16,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x20",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "OW16",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 349,
+      "definition": {
+        "name": "OW16",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 16,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x20",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "OW256",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 352,
+      "definition": {
+        "name": "OW256",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 256,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x20",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "OW256",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 355,
+      "definition": {
+        "name": "OW256",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 256,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x20",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "OM321",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 358,
+      "definition": {
+        "name": "OM321",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 16,
+        "mgx": 3,
+        "mgy": 2,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x20",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "OM321",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 361,
+      "definition": {
+        "name": "OM321",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 16,
+        "mgx": 3,
+        "mgy": 2,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x20",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "OG4",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 364,
+      "definition": {
+        "name": "OG4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 4,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 16,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x80",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "OG4",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 410,
+      "definition": {
+        "name": "OG4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 4,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 16,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x80",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "END",
+      "session": 7,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 413,
+      "definition": {
+        "name": "END",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "END",
+      "session": 7,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace7.jsonl",
+      "line": 416,
+      "definition": {
+        "name": "END",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 7,
+      "definition": {
+        "name": "B0",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 10,
+      "definition": {
+        "name": "B0",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "E0",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 13,
+      "definition": {
+        "name": "E0",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "E0"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x0",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "E0",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 16,
+      "definition": {
+        "name": "E0",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "E0"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x0",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0b",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 19,
+      "definition": {
+        "name": "B0b",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0b",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 22,
+      "definition": {
+        "name": "B0b",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "E30",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 25,
+      "definition": {
+        "name": "E30",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "E30"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "E30",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 28,
+      "definition": {
+        "name": "E30",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "E30"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0c",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 31,
+      "definition": {
+        "name": "B0c",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0c",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 34,
+      "definition": {
+        "name": "B0c",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "L64",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 37,
+      "definition": {
+        "name": "L64",
+        "mt": 32,
+        "mv": 66,
+        "mp": 64,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "L"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3003f",
+        "0x400820",
+        "0x40",
+        "0x67"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "L64",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 40,
+      "definition": {
+        "name": "L64",
+        "mt": 32,
+        "mv": 66,
+        "mp": 64,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "L"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3003f",
+        "0x400820",
+        "0x40",
+        "0x67"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P64",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 43,
+      "definition": {
+        "name": "P64",
+        "mt": 32,
+        "mv": 66,
+        "mp": 64,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3003f",
+        "0x400820",
+        "0x40",
+        "0x67"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P64",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 46,
+      "definition": {
+        "name": "P64",
+        "mt": 32,
+        "mv": 66,
+        "mp": 64,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x3003f",
+        "0x400820",
+        "0x40",
+        "0x67"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0d",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 95,
+      "definition": {
+        "name": "B0d",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "B0d",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 99,
+      "definition": {
+        "name": "B0d",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "EG4",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 102,
+      "definition": {
+        "name": "EG4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 4,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "EG"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "EG4",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 105,
+      "definition": {
+        "name": "EG4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 4,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "EG"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "G4",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 108,
+      "definition": {
+        "name": "G4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 4,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "G4",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 111,
+      "definition": {
+        "name": "G4",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 4,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "C4P8",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 114,
+      "definition": {
+        "name": "C4P8",
+        "mt": 32,
+        "mv": 10,
+        "mp": 8,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 4,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7",
+        "0x400820",
+        "0x20",
+        "0x13"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "C4P8",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 117,
+      "definition": {
+        "name": "C4P8",
+        "mt": 32,
+        "mv": 10,
+        "mp": 8,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 4,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x7",
+        "0x400820",
+        "0x20",
+        "0x13"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "O32",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 120,
+      "definition": {
+        "name": "O32",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x20",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "O32",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 123,
+      "definition": {
+        "name": "O32",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x20",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "OW16",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 126,
+      "definition": {
+        "name": "OW16",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 16,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x20",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "OW16",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 129,
+      "definition": {
+        "name": "OW16",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 32,
+        "pw": 16,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5204",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x20",
+            "0x1",
+            "0x1",
+            "0x20",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "E0b",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 132,
+      "definition": {
+        "name": "E0b",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "E0"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x0",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "E0b",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 135,
+      "definition": {
+        "name": "E0b",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": [
+          "E0"
+        ]
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x0",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "END",
+      "session": 8,
+      "repeat": 1,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 138,
+      "definition": {
+        "name": "END",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "END",
+      "session": 8,
+      "repeat": 2,
+      "trace": "artifacts/mesh-shaders-20261008/metal/trace8.jsonl",
+      "line": 141,
+      "definition": {
+        "name": "END",
+        "mt": 32,
+        "mv": 3,
+        "mp": 1,
+        "gx": 1,
+        "gy": 1,
+        "gz": 1,
+        "ot": 0,
+        "pw": 1,
+        "mgx": 1,
+        "mgy": 1,
+        "mgz": 1,
+        "topo": "t",
+        "nva": 1,
+        "vtype": "f",
+        "npa": 1,
+        "flags": []
+      },
+      "words": [
+        "0x40000d2c",
+        "0x706",
+        "0xd0",
+        "0x0",
+        "0x0",
+        "0x1000000",
+        "0x5200",
+        "0x1000000",
+        "0x5203",
+        "0x1",
+        "0x0",
+        "0x400820",
+        "0x1",
+        "0x7"
+      ],
+      "draws": [
+        {
+          "word_offset": 32,
+          "words": [
+            "0x70000600",
+            "0x3",
+            "0x1",
+            "0x1",
+            "0x3",
+            "0x1",
+            "0x1"
+          ]
+        }
+      ]
+    }
+  ],
+  "mismatches": [],
+  "shader_targets_followed": false,
+  "new_device_access": false
+}

@@ -1,0 +1,65 @@
+{
+  "gpu_execution": false,
+  "queue_submission": false,
+  "comparison": "same hybrid candidate, native disabled versus enabled",
+  "outcome_note": "Harness statuses include expected missing-GPU image failures; they are not CTS device pass/fail results.",
+  "inventory_sha256": "9e88123a5a16ee143fd9ca79a5ffd0da214b64e85dbbd73c6b078f0684c9d4b3",
+  "native_off": {
+    "cases": 625,
+    "api_errors": 0,
+    "debug_errors": 0,
+    "suppressed_submissions": 626,
+    "inputs": {
+      "driver": {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-20261022/libvulkan_asahi-64598c0abb5.so",
+        "sha256": "331b16359c26a10504a0111f58d83d6099cb13539c3154f02be20e3df9fceee2"
+      },
+      "proxy": {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-20261022/recording-icd.so",
+        "sha256": "6b2fe4b74b4abc377815149f4782320c4f41806d7361d8cf89cbbdebb9dd8c0f"
+      },
+      "shim": {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/u0-r8-v2-20261022/r2/kit/lib/libasahi_host_trace_drm_shim.so",
+        "sha256": "25ebb1ad4c38bbc3a1720e735f3193de5cd6a472cab1d06ed970317133bc03f3"
+      },
+      "cts": {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-num-workgroups/package/cts/tools/deqp-vk",
+        "sha256": "83acc28c211c515668ddaf108cbd5a38fdaaa1c46a3dd141ee1ed0e6683310aa"
+      }
+    },
+    "harness_outcomes": {
+      "Fail": 622,
+      "Pass": 3
+    }
+  },
+  "native_on": {
+    "cases": 625,
+    "api_errors": 0,
+    "debug_errors": 0,
+    "suppressed_submissions": 626,
+    "inputs": {
+      "driver": {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-20261022/libvulkan_asahi-64598c0abb5.so",
+        "sha256": "331b16359c26a10504a0111f58d83d6099cb13539c3154f02be20e3df9fceee2"
+      },
+      "proxy": {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-hybrid-20261022/recording-icd.so",
+        "sha256": "6b2fe4b74b4abc377815149f4782320c4f41806d7361d8cf89cbbdebb9dd8c0f"
+      },
+      "shim": {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/u0-r8-v2-20261022/r2/kit/lib/libasahi_host_trace_drm_shim.so",
+        "sha256": "25ebb1ad4c38bbc3a1720e735f3193de5cd6a472cab1d06ed970317133bc03f3"
+      },
+      "cts": {
+        "path": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-num-workgroups/package/cts/tools/deqp-vk",
+        "sha256": "83acc28c211c515668ddaf108cbd5a38fdaaa1c46a3dd141ee1ed0e6683310aa"
+      }
+    },
+    "harness_outcomes": {
+      "Fail": 622,
+      "Pass": 3
+    }
+  },
+  "former_deferred_shape_cases_recorded": 45,
+  "changed_outcomes": []
+}
