@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: MIT
 """Hash every compiled program's instruction bytes per corpus entry, so two
 compilers can be checked for byte-identical output (host-only).
-Usage: identity.py ICD.json OUT.json corpus..."""
+Usage: identity.py ICD.json OUT.json corpus...
+
+OUT.state.json holds a separate digest of each entry's APPLE9_INFO lines (the
+hardware state a driver derives outside the program bytes), or null when the
+driver predates them. Compare two runs with identity-compare.py."""
 import sys, os, re, json, hashlib, subprocess, argparse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -19,6 +23,10 @@ def digest(text):
             h.update(m.group(1).encode() if m else b'?'); n += 1
     return h.hexdigest(), n
 
+def state_digest(text):
+    lines = [l for l in text.splitlines() if l.startswith('APPLE9_INFO ')]
+    return [hashlib.sha256('\n'.join(lines).encode()).hexdigest(), len(lines)] if lines else None
+
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('icd')
 parser.add_argument('out')
@@ -33,6 +41,7 @@ env = L.env_for(icd)
 if args.host_shim:
     env['LD_PRELOAD'] = os.path.abspath(args.host_shim)
 res = {}
+states = {}
 failures = {}
 def checked_digest(process, key, output, packed=False):
     text = output.decode(errors='replace')
@@ -61,7 +70,7 @@ def checked_digest(process, key, output, packed=False):
             return key, (hashlib.sha256(b'FOSSILIZE_STATE_ONLY').hexdigest(), 0)
     begins = len(re.findall(r'^APPLE9(?:_PREAMBLE)?_ASM_BEGIN', text, re.M))
     ends = len(re.findall(r'^APPLE9_ASM_END', text, re.M))
-    result = digest(text)
+    result = digest(text) + (state_digest(text),)
     if process.returncode or not begins or begins != ends or not result[1]:
         raise RuntimeError(f'{key}: exit={process.returncode}, programs={begins}/{ends}\n{text[-4000:]}')
     return key, result
@@ -104,11 +113,13 @@ for name in args.corpora:
             items = ex.map(one_pack, [(k, pack.frame(p, k)[0]) for p, k in entries])
         rows = dict(items)
         failures[name] = {k: v for k, v in rows.items() if isinstance(v, dict)}
-        res[name] = {k: v for k, v in rows.items() if not isinstance(v, dict)}
+        res[name] = {k: tuple(v[:2]) for k, v in rows.items() if not isinstance(v, dict)}
+        states[name] = {k: (v[2] if len(v) > 2 else None) for k, v in rows.items() if not isinstance(v, dict)}
     print(name, len(res[name]), 'passed', len(failures[name]), 'failed',
           'state-only', sum(v[1] == 0 for v in res[name].values()),
           'programs-lines', sum(v[1] for v in res[name].values()), flush=True)
     Path(out).write_text(json.dumps(res) + '\n')
+    Path(out).with_suffix('.state.json').write_text(json.dumps(states) + '\n')
     Path(out + '.failures.json').write_text(json.dumps(failures, indent=2) + '\n')
 if any(failures.values()):
     sys.exit(1)

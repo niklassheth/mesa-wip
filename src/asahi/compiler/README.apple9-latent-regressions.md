@@ -41,16 +41,28 @@ exposed it: each was an older bug that had stayed hidden until a codegen change 
 ### Host: for every change under `src/asahi/compiler` or the hk shader lowering
 - **Unchanged:** `tmp/claude-ct/merge-gate.sh` and strict corpus identity, using `--keep-going` and the pre-raster
   adapter for GS/tess changes.
-- **Proposed:**
-  - Print an `APPLE9_INFO` line next to each program dump, carrying the `agx_shader_info` fields that program
-    hardware state: `disable_tri_merging`, tag writes, sample shading and the like.
-  - Include that line in the identity digest.
-  - A merge message must explain a state change the same way it explains a program change. d6e3b580280 would
-    then have shown fragment variants in the corpus switching triangle merging on.
+- **Shader state:**
+  - With `AGX_APPLE9_ASM`, hk prints one `APPLE9_INFO` line per uploaded shader (`agx_apple9_dump_info`). The
+    line carries the final `agx_shader_info` fields that program hardware state: `disable_tri_merging`, tag
+    writes, ZS and sample-mask behaviour, varying layout, resources and the like.
+  - `identity.py` writes their digest to `OUT.state.json`.
+  - `identity-compare.py BASE.json CAND.json --json SUMMARY` reports program changes, state changes and
+    state-only changes (same program bytes, different state) separately.
+  - A merge message must explain a state change the same way it explains a program change.
+  - **Check:** removing hk's triangle-merging override changes no program bytes in lethal, willems, vkmark or
+    CTS, but shows 14 state-only changes.
 
 ### Device: codegen sentinel on the Air
-- **When:** required whenever the identity diff is non-empty, meaning any program or state change. It runs before
-  the merge, not batched.
+- **When:** required whenever `identity-compare.py` reports a program or state change, or can't compare state.
+  It runs before the merge, not batched.
+  - `merge-gate.py` takes either `--identity-summary SUMMARY` or `--no-codegen-change`, an attestation for docs and
+    tooling.
+  - With a change, it builds aarch64 libraries for the base and candidate (`gate-a64-lib.sh`) and runs
+    `gate-sentinel.sh`.
+- **Air access:**
+  - `gate-sentinel.sh` drops `tmp/manager-queue/air/NEXT-codegen-sentinel-<rev>` and waits FIFO for the Air lease.
+    The running Air campaign pauses at its next batch boundary.
+  - With no Air within two hours, the step fails ("device step not run") instead of skipping.
 - **How:** head against candidate, Air to Air, with `runner/run-list.sh` and `compare-results.py`.
 - **Blocking:**
   - any case that passes on head but not on the candidate;
