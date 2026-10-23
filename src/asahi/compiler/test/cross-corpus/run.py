@@ -14,10 +14,10 @@ for prior in a.exclude_results:
 paths=[x for x in paths if x not in excluded]
 paths=paths[:a.limit] if a.limit else paths
 icd=a.icd.resolve();lib=Path(json.loads(icd.read_text())['ICD']['library_path']);lib=lib if lib.is_absolute() else icd.parent/lib
-keys=['AGX_MESA_DEBUG','ASAHI_MESA_DEBUG','NIR_DEBUG','AGX_APPLE9_TRACE','AGX_APPLE9_ASM','AGX_APPLE9_TRACE_NIR','AGX_APPLE9_TRACE_FINAL_NIR','AGX_SPILL_NO_LOOP_HANDLING','AGX_APPLE9_RA_WEBS','AGX_APPLE9_RA_AUDIT']
+keys=['AGX_MESA_DEBUG','ASAHI_MESA_DEBUG','NIR_DEBUG','AGX_APPLE9_TRACE','AGX_APPLE9_ASM','AGX_APPLE9_TRACE_NIR','AGX_APPLE9_TRACE_FINAL_NIR','AGX_SPILL_NO_LOOP_HANDLING','AGX_SPILL_COALESCE','AGX_APPLE9_RA_WEBS','AGX_APPLE9_RA_AUDIT']
 env=dict(os.environ)
 for k in keys:env.pop(k,None)
-env.update(LD_PRELOAD=str(a.host_shim.resolve()),VK_DRIVER_FILES=str(icd),HK_EXPERIMENTAL_APPLE9='1',HK_APPLE9_EAGER_VARIANTS='1',AGX_APPLE9_STATS='1',MESA_SHADER_CACHE_DISABLE='true',AGX_SPILL_COALESCE='1',CORPUS_DIRECT_PRERAST='1')
+env.update(LD_PRELOAD=str(a.host_shim.resolve()),VK_DRIVER_FILES=str(icd),HK_EXPERIMENTAL_APPLE9='1',HK_APPLE9_EAGER_VARIANTS='1',AGX_APPLE9_STATS='1',MESA_SHADER_CACHE_DISABLE='true',CORPUS_DIRECT_PRERAST='1')
 (out/('resume-provenance.json' if a.resume else 'provenance.json')).write_text(json.dumps(dict(icd=str(icd),library=str(lib),library_sha256=hashlib.sha256(lib.read_bytes()).hexdigest(),runner_sha256=hashlib.sha256(a.runner.read_bytes()).hexdigest(),shim_sha256=hashlib.sha256(a.host_shim.read_bytes()).hexdigest(),inputs=len(paths),pack=str(a.pack.resolve()),population=a.population,env={k:env[k] for k in env if k.startswith(('AGX_','HK_','MESA_','NIR_','CORPUS_'))},excluded_results=[str(x.resolve()) for x in a.exclude_results],batch_size=a.batch_size,load_before=os.getloadavg()),indent=2)+'\n')
 index={v:i for i,v in enumerate(paths)};counts=prior_counts;start=time.perf_counter();begin=resource.getrusage(resource.RUSAGE_CHILDREN);offset=0;current=None;process=None
 stat=re.compile(r'^(APPLE9(?:_PREAMBLE)?)_CODEGEN (.*)')
