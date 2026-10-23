@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_shader_image_load_formatted : require
+layout(local_size_x=1) in;
+#if MODE == 0
+layout(set=0, binding=0, r32ui) readonly uniform uimage3D volume;
+#elif MODE == 1
+layout(set=0, binding=0) readonly uniform uimage3D volume;
+#elif MODE == 3
+layout(set=0, binding=0) writeonly uniform uimage3D volume;
+#else
+layout(set=0, binding=0, r32ui) uniform uimage3D volume;
+#endif
+layout(set=0, binding=1, std430) buffer Output { uint result[]; };
+layout(set=0, binding=2) uniform usampler3D sampled;
+layout(push_constant) uniform Params { uint count; uint offset; } pc;
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    ivec3 coord = ivec3(0, 0, int(i) - 1);
+#if MODE < 2
+    result[i] = imageLoad(volume, coord).x;
+#elif MODE < 4
+    imageStore(volume, coord, uvec4(0x80000000u | i));
+    result[i] = 0x12345678u;
+#else
+    result[i] = imageAtomicAdd(volume, coord, 0x10000u);
+#endif
+    if (i == 0) {
+        ivec3 size = imageSize(volume);
+        result[16] = uint(size.x);
+        result[17] = uint(size.y);
+        result[18] = uint(size.z);
+#if MODE < 2
+        result[19] = uint(textureSize(sampled, 0).z);
+        result[20] = texelFetch(sampled, ivec3(0, 0, 0), 0).x;
+        result[21] = texelFetch(sampled, ivec3(0, 0, int(pc.offset)), 0).x;
+#endif
+    }
+}
