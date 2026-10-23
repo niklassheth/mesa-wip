@@ -4,6 +4,7 @@
 compilers can be checked for byte-identical output (host-only).
 Usage: identity.py ICD.json OUT.json corpus..."""
 import sys, os, re, json, hashlib, subprocess, argparse
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import latmetrics as L
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from packed import Pack
@@ -24,12 +25,15 @@ parser.add_argument('out')
 parser.add_argument('corpora', nargs='+')
 parser.add_argument('--host-shim', help='Host-only DRM shim to preload')
 parser.add_argument('--jobs', type=int, default=12)
+parser.add_argument('--keep-going', action='store_true',
+                    help='Collect all failures; still exit unsuccessfully if any fail')
 args = parser.parse_args()
 icd, out = args.icd, args.out
 env = L.env_for(icd)
 if args.host_shim:
     env['LD_PRELOAD'] = os.path.abspath(args.host_shim)
 res = {}
+failures = {}
 def checked_digest(process, key, output, packed=False):
     text = output.decode(errors='replace')
     if packed:
@@ -45,6 +49,14 @@ def checked_digest(process, key, output, packed=False):
     if process.returncode or not begins or begins != ends or not result[1]:
         raise RuntimeError(f'{key}: exit={process.returncode}, programs={begins}/{ends}\n{text[-4000:]}')
     return key, result
+def collect_digest(process, key, output, packed=False):
+    try:
+        return checked_digest(process, key, output, packed)
+    except RuntimeError as err:
+        if not args.keep_going:
+            raise
+        return key, {'failure': str(err), 'exit': process.returncode}
+
 def pack_entries(name):
     if name in ('cts', 'robust', 'timing-large-gs'):
         pack = Pack(L.R + '/artifacts/compiler-cross-corpus-20261006/corpus.sqlite3')
@@ -58,13 +70,13 @@ def one_pack(args):
     key, frame = args
     p = subprocess.run(['/tmp/asahi-cross-corpus/compile-shader-packed'], input=frame,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env, timeout=900)
-    return checked_digest(p, key, p.stderr, packed=True)
+    return collect_digest(p, key, p.stderr, packed=True)
 def one_foz(args):
     foz, h = args
     p = subprocess.run(['/tmp/asahi-cross-corpus/lethal-tools/fossilize-replay-audit', '--num-threads', '1',
                         '--disable-signal-handler', '--pipeline-hash', h, foz], env=env,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
-    return checked_digest(p, h, p.stdout)
+    return collect_digest(p, h, p.stdout)
 for name in args.corpora:
     with ThreadPoolExecutor(args.jobs) as ex:
         if name in ('cs2', 'lethal'):
@@ -74,6 +86,12 @@ for name in args.corpora:
         else:
             pack, entries = pack_entries(name)
             items = ex.map(one_pack, [(k, pack.frame(p, k)[0]) for p, k in entries])
-        res[name] = {k: v for k, v in items}
-    print(name, len(res[name]), 'programs-lines', sum(v[1] for v in res[name].values()), flush=True)
-json.dump(res, open(out, 'w'))
+        rows = dict(items)
+        failures[name] = {k: v for k, v in rows.items() if isinstance(v, dict)}
+        res[name] = {k: v for k, v in rows.items() if not isinstance(v, dict)}
+    print(name, len(res[name]), 'passed', len(failures[name]), 'failed',
+          'programs-lines', sum(v[1] for v in res[name].values()), flush=True)
+    Path(out).write_text(json.dumps(res) + '\n')
+    Path(out + '.failures.json').write_text(json.dumps(failures, indent=2) + '\n')
+if any(failures.values()):
+    sys.exit(1)
