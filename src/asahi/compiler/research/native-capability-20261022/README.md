@@ -166,9 +166,30 @@ comparison, exact full-buffer guards and an additive R32_SFLOAT raster oracle
 qualified by ordinary draws. It intentionally starts with Position/PointSize;
 varying/primitive/payload device tiers remain pending.
 
-The first 54-arm host run verified all uploaded program, launch, state,
-argument and PPP identities through the host DRM shim; it performed **zero GPU
-trials**. The expanded pilot contains 32 programs and 160 runtime arms. Its
-kernel pin remains deliberately non-runnable until the kernel owner extends
-admission and freezes image/DTB identities. Neither compiler acceptance nor a
-host shim completion changes the reported native hardware capability.
+The frozen C2 pilot contains **47 programs and 175 runtime arms**: 32 normal
+shapes with five runtime-count patterns, and 15 separate high-index controls.
+The latter make only the last vertex visible, through index 255, and require
+exactly one covered primitive. Their earlier point/line geometry lies outside
+the viewport, so zero-length line behavior cannot imitate a passing control.
+
+All 175 arms passed the host DRM-shim code/launch/state/argument/PPP identity
+audit, and all C-materialized expected buffers matched the Python source
+oracle. An independent geometric calculation checked every pixel count. Every
+oracle has a full-byte mask over the entire 512-KiB owned buffer. The ordinary
+render-control executable traversed all 21 calibration draws on the host shim.
+These checks performed **zero GPU trials**. `C2-HOST.json` records program
+hashes/resources and the exact scope of the evidence.
+
+The kit freezes 47 actual carrier streams for the kernel owner. A negative
+control with the old parser accepts only three narrow states and rejects 44,
+including the wider threadgroups. The new research mode (expected value 3)
+must admit every frozen fixture through the kit's `check_parser.py` before a
+device run. Its actual mode and exact image/DTB/release/version pins are passed
+in a separate requirements JSON; this keeps the program/oracle kit immutable
+while the kernel artifact is finished. The manager schedules codex-hw.
+
+Kit: `../native-capability-20261022/c2-r8/kit/` relative to the Mesa checkout.
+Its README contains the parser and device commands, safe-boot contract, lease
+budget and stop/collection procedure. Production eligibility, advertised
+limits, varying/primitive/payload device tiers and hardware qualification
+remain pending. The M4 target has not been accessed during this preparation.

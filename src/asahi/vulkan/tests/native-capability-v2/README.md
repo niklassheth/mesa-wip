@@ -83,12 +83,20 @@ python3 prepare.py --base PATH/TO/SEALED/R8-V2/kit \
   --compiler PATH/TO/BUILD/src/asahi/compiler/apple9-native-capability-probe \
   --out PATH/TO/NEW/kit
 python3 dry_run.py --root PATH/TO/NEW/kit --out PATH/TO/NEW/dry
+python3 host_checks.py --root PATH/TO/NEW/kit --dry PATH/TO/NEW/dry
 ```
 
 `prepare.py` verifies the base manifest and compiles all program bodies and both
 AArch64 owners. `dry_run.py` submits only to the host DRM shim; every result must
 remain a Q failure because no GPU work executes. Host success proves upload and
 identity plumbing only. See the frozen kit's host-check JSON and hashes.
+
+The frozen host checks are in `HOST-CHECKS.json`, `HOST-CALIBRATION.json` and
+`HOST-OLD-PARSER-CONTROL.json`. All 175 native arms passed the identity audit;
+C oracle materialization matches Python, and an independent geometry check
+confirms the expected pixel multiplicities. All masks cover every owned byte.
+The host shim executes no GPU work: zero device trials are qualified. The
+ordinary control's host pixel differences are expected poison, not GPU failures.
 
 The old revision-2 parser pinned by C1 admits only the narrow class. The kernel
 owner is preparing a separate research admission value (expected `native_mesh=3`)
@@ -115,6 +123,11 @@ transplant old image hashes or interpret parser admission as GPU success.
 The manager schedules codex-hw only after kernel and packet review, on the same
 revision-2 safe-boot contract used by harness v2 (read-only root, swap/zswap off,
 16 KiB pages, no other native clients). No UAPI change is needed.
+
+Before transfer, verify the frozen kit with `sha256sum -c SHA256SUMS` from its
+root. Preserve all files and keep results outside that directory. The kernel
+requirements and verified boot identity are separate manager-supplied files.
+No edit or reseal of the kit is required when those arrive.
 
 Once the kernel owner supplies the separate pinned requirements file, the scheduled command is:
 

@@ -1,0 +1,2248 @@
+{
+  "arms": 175,
+  "program_shapes": 47,
+  "gpu_execution": false,
+  "qualified_trials": 0,
+  "exact_c_oracle_vs_python": true,
+  "independent_geometry_count_check": true,
+  "all_uploaded_bodies_exact": true,
+  "all_state_allocation_and_ppp_fields_exact": true,
+  "fixtures_catalog_sha256": "fdc8ab58cc1da35b27da1a407a187f36a1029beb1dbe33e4ea93012832da13f6",
+  "renderer": {
+    "renderer": "Apple M4 (G16G B1)",
+    "driver": "Honeykrisp",
+    "info": "Mesa 26.3.0-devel (git-e08fa6cf73)",
+    "version": 109060195,
+    "source": "synchronized READY; checked Vulkan properties"
+  },
+  "all_175_oracles_full_byte_masks": true,
+  "old_parser_expected_rejection_control": {
+    "commit": "7b61c4f84c08e08c09ecfd97febc120a2597bd03",
+    "accepted": [
+      "T6_V3_P1_W16_C1_H0",
+      "T6_V4_P1_W16_C1_H0",
+      "T6_V3_P1_W32_C1_H0"
+    ],
+    "rejected": 44,
+    "new_kernel_not_yet_tested": true
+  },
+  "ordinary_raster_calibration": {
+    "host_only": true,
+    "draws": 21,
+    "gpu_trials": 0,
+    "actual_device_must_qualify": true
+  },
+  "programs": {
+    "T6_V3_P1_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 3,
+        "primitives": 1,
+        "threads": 16,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 96,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T6_V3_P1_W16_C1_H0.mesh.bin",
+        "sha256": "356893b9e3121d08c77727fec63bd69051a6027c65aee73cc38ec6850bc7ab1f",
+        "bytes": 1592
+      },
+      "object": {
+        "file": "T6_V3_P1_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1592,
+          "gprs": 16,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V4_P2_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 4,
+        "primitives": 2,
+        "threads": 16,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 96,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T6_V4_P2_W16_C1_H0.mesh.bin",
+        "sha256": "758282caa066410f01f415197286eac47e8fa40dd8d1b5bd756b6a6fdb1e142c",
+        "bytes": 1630
+      },
+      "object": {
+        "file": "T6_V4_P2_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1630,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V16_P16_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 16,
+        "primitives": 16,
+        "threads": 16,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 320,
+        "allocation_B": 512,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 48,
+        "position_B": 64,
+        "pitch_B": 64
+      },
+      "mesh": {
+        "file": "T6_V16_P16_W16_C1_H0.mesh.bin",
+        "sha256": "5f09ed0bc3bddba1a84741388bca1d4a7776b7282f06adadb0e1920eca712885",
+        "bytes": 1636
+      },
+      "object": {
+        "file": "T6_V16_P16_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1636,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V64_P128_W64_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 64,
+        "primitives": 128,
+        "threads": 64,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 1424,
+        "allocation_B": 2048,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 384,
+        "position_B": 400,
+        "pitch_B": 256
+      },
+      "mesh": {
+        "file": "T6_V64_P128_W64_C1_H0.mesh.bin",
+        "sha256": "9d42b8320ea37a740326125a15af4caf84b8d0192f7d47278ecb079e34736a03",
+        "bytes": 1682
+      },
+      "object": {
+        "file": "T6_V64_P128_W64_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1682,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V128_P256_W128_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 128,
+        "primitives": 256,
+        "threads": 128,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 2832,
+        "allocation_B": 4096,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 768,
+        "position_B": 784,
+        "pitch_B": 512
+      },
+      "mesh": {
+        "file": "T6_V128_P256_W128_C1_H0.mesh.bin",
+        "sha256": "60006c390b2f50aaaa85116c0503ab4c5395c0d1f5fb6dbb068d4658cea25321",
+        "bytes": 1694
+      },
+      "object": {
+        "file": "T6_V128_P256_W128_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1694,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V256_P512_W256_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 256,
+        "primitives": 512,
+        "threads": 256,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 5648,
+        "allocation_B": 8192,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 1536,
+        "position_B": 1552,
+        "pitch_B": 1024
+      },
+      "mesh": {
+        "file": "T6_V256_P512_W256_C1_H0.mesh.bin",
+        "sha256": "f24473d5f0a29748a71416f63561953d60c2fa8d604a59a85a40ad4681b356cd",
+        "bytes": 1706
+      },
+      "object": {
+        "file": "T6_V256_P512_W256_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1706,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T1_V3_P1_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 3,
+        "primitives": 1,
+        "threads": 16,
+        "topology": 1,
+        "planes": 4,
+        "local_B": 96,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 2,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T1_V3_P1_W16_C1_H0.mesh.bin",
+        "sha256": "6ea10aec5dedb510e7fde42993246b0bc5a206ad56fc44eeb2a47f06acfacdd8",
+        "bytes": 1520
+      },
+      "object": {
+        "file": "T1_V3_P1_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1520,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T1_V4_P2_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 4,
+        "primitives": 2,
+        "threads": 16,
+        "topology": 1,
+        "planes": 4,
+        "local_B": 96,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 2,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T1_V4_P2_W16_C1_H0.mesh.bin",
+        "sha256": "5d220d24a79f03ac155346176ddb49cbea329052b18305a89d6de5f8c826d0c9",
+        "bytes": 1510
+      },
+      "object": {
+        "file": "T1_V4_P2_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1510,
+          "gprs": 16,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T1_V16_P16_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 16,
+        "primitives": 16,
+        "threads": 16,
+        "topology": 1,
+        "planes": 4,
+        "local_B": 304,
+        "allocation_B": 512,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 2,
+        "count_B": 32,
+        "position_B": 48,
+        "pitch_B": 64
+      },
+      "mesh": {
+        "file": "T1_V16_P16_W16_C1_H0.mesh.bin",
+        "sha256": "a4a9c395cfb9a961dbebdd6177bb9b6cf19b2b024b2cfa70ddb32809404b3387",
+        "bytes": 1526
+      },
+      "object": {
+        "file": "T1_V16_P16_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1526,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T1_V64_P128_W64_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 64,
+        "primitives": 128,
+        "threads": 64,
+        "topology": 1,
+        "planes": 4,
+        "local_B": 1296,
+        "allocation_B": 2048,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 2,
+        "count_B": 256,
+        "position_B": 272,
+        "pitch_B": 256
+      },
+      "mesh": {
+        "file": "T1_V64_P128_W64_C1_H0.mesh.bin",
+        "sha256": "9d26f42191faf6d19a9361aca702d575d4469069cd7956535d97b59cf754f92a",
+        "bytes": 1586
+      },
+      "object": {
+        "file": "T1_V64_P128_W64_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1586,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T1_V128_P256_W128_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 128,
+        "primitives": 256,
+        "threads": 128,
+        "topology": 1,
+        "planes": 4,
+        "local_B": 2576,
+        "allocation_B": 4096,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 2,
+        "count_B": 512,
+        "position_B": 528,
+        "pitch_B": 512
+      },
+      "mesh": {
+        "file": "T1_V128_P256_W128_C1_H0.mesh.bin",
+        "sha256": "f5c0e402bd520f7550b0a72a3fcad381412f196b353cc22d67c2f53a00bcd153",
+        "bytes": 1598
+      },
+      "object": {
+        "file": "T1_V128_P256_W128_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1598,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T1_V256_P512_W256_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 256,
+        "primitives": 512,
+        "threads": 256,
+        "topology": 1,
+        "planes": 4,
+        "local_B": 5136,
+        "allocation_B": 8192,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 2,
+        "count_B": 1024,
+        "position_B": 1040,
+        "pitch_B": 1024
+      },
+      "mesh": {
+        "file": "T1_V256_P512_W256_C1_H0.mesh.bin",
+        "sha256": "0ef37269c80ae74eb5dc9385166fc9daad0d8496c09ef80f5c6cc8922d59b216",
+        "bytes": 1610
+      },
+      "object": {
+        "file": "T1_V256_P512_W256_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1610,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T0_V3_P1_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 3,
+        "primitives": 1,
+        "threads": 16,
+        "topology": 0,
+        "planes": 5,
+        "local_B": 112,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 1,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T0_V3_P1_W16_C1_H0.mesh.bin",
+        "sha256": "2e396b7ef653d8c2aed00d4d463750eda52318c20fa3f014bf6411e6fe937c1e",
+        "bytes": 1500
+      },
+      "object": {
+        "file": "T0_V3_P1_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1500,
+          "gprs": 24,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T0_V4_P2_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 4,
+        "primitives": 2,
+        "threads": 16,
+        "topology": 0,
+        "planes": 5,
+        "local_B": 112,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 1,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T0_V4_P2_W16_C1_H0.mesh.bin",
+        "sha256": "ee0b63319c63d6ba47fdfb9183b3014f5c6233f5c36da762f40ec219c3b8f510",
+        "bytes": 1482
+      },
+      "object": {
+        "file": "T0_V4_P2_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1482,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T0_V16_P16_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 16,
+        "primitives": 16,
+        "threads": 16,
+        "topology": 0,
+        "planes": 5,
+        "local_B": 352,
+        "allocation_B": 512,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 1,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 64
+      },
+      "mesh": {
+        "file": "T0_V16_P16_W16_C1_H0.mesh.bin",
+        "sha256": "f35f18850558daa1a933e45408dc219e42e88a73d873d909f98a0730e8b7ff74",
+        "bytes": 1484
+      },
+      "object": {
+        "file": "T0_V16_P16_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1484,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T0_V64_P128_W64_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 64,
+        "primitives": 128,
+        "threads": 64,
+        "topology": 0,
+        "planes": 5,
+        "local_B": 1424,
+        "allocation_B": 2048,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 1,
+        "count_B": 128,
+        "position_B": 144,
+        "pitch_B": 256
+      },
+      "mesh": {
+        "file": "T0_V64_P128_W64_C1_H0.mesh.bin",
+        "sha256": "9bc18212a5fe407a094e29cc80ff925c36b57b567f689ef5dcd5372d5439527c",
+        "bytes": 1536
+      },
+      "object": {
+        "file": "T0_V64_P128_W64_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1536,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T0_V128_P256_W128_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 128,
+        "primitives": 256,
+        "threads": 128,
+        "topology": 0,
+        "planes": 5,
+        "local_B": 2832,
+        "allocation_B": 4096,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 1,
+        "count_B": 256,
+        "position_B": 272,
+        "pitch_B": 512
+      },
+      "mesh": {
+        "file": "T0_V128_P256_W128_C1_H0.mesh.bin",
+        "sha256": "3e92d53ca304135836f7f01e42f0b83e6a56803978933668ccb76761684343c9",
+        "bytes": 1556
+      },
+      "object": {
+        "file": "T0_V128_P256_W128_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1556,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T0_V256_P512_W256_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 256,
+        "primitives": 512,
+        "threads": 256,
+        "topology": 0,
+        "planes": 5,
+        "local_B": 5648,
+        "allocation_B": 8192,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 1,
+        "count_B": 512,
+        "position_B": 528,
+        "pitch_B": 1024
+      },
+      "mesh": {
+        "file": "T0_V256_P512_W256_C1_H0.mesh.bin",
+        "sha256": "fa5454e059db919e44d5717127ce8c668f7fbfdeb25aac1c48d9821448d1e623",
+        "bytes": 1562
+      },
+      "object": {
+        "file": "T0_V256_P512_W256_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1562,
+          "gprs": 24,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V4_P1_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 4,
+        "primitives": 1,
+        "threads": 16,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 96,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T6_V4_P1_W16_C1_H0.mesh.bin",
+        "sha256": "821e04dd1991b224ef24c24538aa191f08aed5222031e4ade4eaba2db8a91a18",
+        "bytes": 1628
+      },
+      "object": {
+        "file": "T6_V4_P1_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1628,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V16_P1_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 16,
+        "primitives": 1,
+        "threads": 16,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 288,
+        "allocation_B": 512,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 64
+      },
+      "mesh": {
+        "file": "T6_V16_P1_W16_C1_H0.mesh.bin",
+        "sha256": "8163894ceab1aa188ea87b7418efe7c6d7fc6eceb993f281dbc4e04626752238",
+        "bytes": 1620
+      },
+      "object": {
+        "file": "T6_V16_P1_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1620,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V64_P1_W64_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 64,
+        "primitives": 1,
+        "threads": 64,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 1056,
+        "allocation_B": 2048,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 256
+      },
+      "mesh": {
+        "file": "T6_V64_P1_W64_C1_H0.mesh.bin",
+        "sha256": "1b7e8b14e4cfa727b632f9f11bb5430512405c73b13f180e56ad848f66552ec0",
+        "bytes": 1658
+      },
+      "object": {
+        "file": "T6_V64_P1_W64_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1658,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V128_P1_W128_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 128,
+        "primitives": 1,
+        "threads": 128,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 2080,
+        "allocation_B": 4096,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 512
+      },
+      "mesh": {
+        "file": "T6_V128_P1_W128_C1_H0.mesh.bin",
+        "sha256": "293bb8378f25e65a9671f763f84a5925bf820632803fb0782edad1f683ffe933",
+        "bytes": 1670
+      },
+      "object": {
+        "file": "T6_V128_P1_W128_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1670,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V256_P1_W256_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 256,
+        "primitives": 1,
+        "threads": 256,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 4128,
+        "allocation_B": 8192,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 1024
+      },
+      "mesh": {
+        "file": "T6_V256_P1_W256_C1_H0.mesh.bin",
+        "sha256": "084fd6a1fe67890f2fa8c2ba7912e3fd8624cccf78817a5058e765e132e5900c",
+        "bytes": 1682
+      },
+      "object": {
+        "file": "T6_V256_P1_W256_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1682,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V3_P2_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 3,
+        "primitives": 2,
+        "threads": 16,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 96,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T6_V3_P2_W16_C1_H0.mesh.bin",
+        "sha256": "569197db28685c31286ad6d29df66d94b8ef8a7e7216ac4b9838ad5cb3f711b1",
+        "bytes": 1594
+      },
+      "object": {
+        "file": "T6_V3_P2_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1594,
+          "gprs": 16,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V3_P128_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 3,
+        "primitives": 128,
+        "threads": 16,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 464,
+        "allocation_B": 512,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 384,
+        "position_B": 400,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T6_V3_P128_W16_C1_H0.mesh.bin",
+        "sha256": "963b5557f2c281a6d92e2756f9738874201138fc59952511723623abb280397a",
+        "bytes": 1664
+      },
+      "object": {
+        "file": "T6_V3_P128_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1664,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V3_P256_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 3,
+        "primitives": 256,
+        "threads": 16,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 848,
+        "allocation_B": 1024,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 768,
+        "position_B": 784,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T6_V3_P256_W16_C1_H0.mesh.bin",
+        "sha256": "f4b1a220314810b2b0fd3f87e5552e602f55291df8daa85bb3c95737836288bf",
+        "bytes": 1664
+      },
+      "object": {
+        "file": "T6_V3_P256_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1664,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V3_P512_W16_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 3,
+        "primitives": 512,
+        "threads": 16,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 1616,
+        "allocation_B": 2048,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 1536,
+        "position_B": 1552,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T6_V3_P512_W16_C1_H0.mesh.bin",
+        "sha256": "6b7ee53bfc0102a725e12b4f8d34347a8a4005df1111fdde6b6ba3209b70554a",
+        "bytes": 1672
+      },
+      "object": {
+        "file": "T6_V3_P512_W16_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1672,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V3_P1_W32_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 3,
+        "primitives": 1,
+        "threads": 32,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 96,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T6_V3_P1_W32_C1_H0.mesh.bin",
+        "sha256": "61df42d9a603933e55bcc17835d71069ddc517b93a12556dce2bf15e30bec9c0",
+        "bytes": 1590
+      },
+      "object": {
+        "file": "T6_V3_P1_W32_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1590,
+          "gprs": 16,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V3_P1_W64_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 3,
+        "primitives": 1,
+        "threads": 64,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 96,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T6_V3_P1_W64_C1_H0.mesh.bin",
+        "sha256": "a7fd43d379e592b044c46fee42db0ebe5be00a91c925025d2bf502f6f3803f6d",
+        "bytes": 1610
+      },
+      "object": {
+        "file": "T6_V3_P1_W64_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1610,
+          "gprs": 16,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V3_P1_W128_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 3,
+        "primitives": 1,
+        "threads": 128,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 96,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T6_V3_P1_W128_C1_H0.mesh.bin",
+        "sha256": "444bad386becad82cb8d054c1b956cf5b4cfb69864e761f61d4bc109e6837f00",
+        "bytes": 1604
+      },
+      "object": {
+        "file": "T6_V3_P1_W128_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1604,
+          "gprs": 16,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V3_P1_W256_C1_H0.mesh.bin": {
+      "shape": {
+        "vertices": 3,
+        "primitives": 1,
+        "threads": 256,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 96,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T6_V3_P1_W256_C1_H0.mesh.bin",
+        "sha256": "40bdbeba7cda3d2185341c18b87ec67eeb705c3e2033c841f8d0b4f0b86037f4",
+        "bytes": 1632
+      },
+      "object": {
+        "file": "T6_V3_P1_W256_C1_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1632,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V64_P1_W64_C0_H0.mesh.bin": {
+      "shape": {
+        "vertices": 64,
+        "primitives": 1,
+        "threads": 64,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 1056,
+        "allocation_B": 2048,
+        "control42": 0,
+        "high_index": 0,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 256
+      },
+      "mesh": {
+        "file": "T6_V64_P1_W64_C0_H0.mesh.bin",
+        "sha256": "20dd649c9edf03551ff655621cd08d23ecbd46a22e8d479b4c0801c834aec168",
+        "bytes": 1658
+      },
+      "object": {
+        "file": "T6_V64_P1_W64_C0_H0.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1658,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V4_P2_W16_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 4,
+        "primitives": 2,
+        "threads": 16,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 96,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 3,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T6_V4_P2_W16_C1_H1.mesh.bin",
+        "sha256": "0449cca58704ceaab173d7acf5bde52d342296c255d416a9e1871bd84cf8cbba",
+        "bytes": 1394
+      },
+      "object": {
+        "file": "T6_V4_P2_W16_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1394,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V16_P16_W16_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 16,
+        "primitives": 16,
+        "threads": 16,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 320,
+        "allocation_B": 512,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 3,
+        "count_B": 48,
+        "position_B": 64,
+        "pitch_B": 64
+      },
+      "mesh": {
+        "file": "T6_V16_P16_W16_C1_H1.mesh.bin",
+        "sha256": "bc1f15a794919c4b9d33eedc8bd6d9aa5cd47c17b4117ff4a9c4a58ae8151f83",
+        "bytes": 1400
+      },
+      "object": {
+        "file": "T6_V16_P16_W16_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1400,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V64_P128_W64_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 64,
+        "primitives": 128,
+        "threads": 64,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 1424,
+        "allocation_B": 2048,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 3,
+        "count_B": 384,
+        "position_B": 400,
+        "pitch_B": 256
+      },
+      "mesh": {
+        "file": "T6_V64_P128_W64_C1_H1.mesh.bin",
+        "sha256": "c47bd452d8bd9219c024d78ace4696e19dc64d8a5a33f7c4db3a2d20f09090cb",
+        "bytes": 1446
+      },
+      "object": {
+        "file": "T6_V64_P128_W64_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1446,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V128_P256_W128_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 128,
+        "primitives": 256,
+        "threads": 128,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 2832,
+        "allocation_B": 4096,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 3,
+        "count_B": 768,
+        "position_B": 784,
+        "pitch_B": 512
+      },
+      "mesh": {
+        "file": "T6_V128_P256_W128_C1_H1.mesh.bin",
+        "sha256": "aa74c24bae53531e0d975268aaf4431d088e281e4c168aa49e8539488cf70095",
+        "bytes": 1458
+      },
+      "object": {
+        "file": "T6_V128_P256_W128_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1458,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T6_V256_P512_W256_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 256,
+        "primitives": 512,
+        "threads": 256,
+        "topology": 6,
+        "planes": 4,
+        "local_B": 5648,
+        "allocation_B": 8192,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 3,
+        "count_B": 1536,
+        "position_B": 1552,
+        "pitch_B": 1024
+      },
+      "mesh": {
+        "file": "T6_V256_P512_W256_C1_H1.mesh.bin",
+        "sha256": "4426ef42d0ec08922a69d055067e51c4fb5d43d0e135f4550aa2042a58282875",
+        "bytes": 1470
+      },
+      "object": {
+        "file": "T6_V256_P512_W256_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1470,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T1_V4_P2_W16_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 4,
+        "primitives": 2,
+        "threads": 16,
+        "topology": 1,
+        "planes": 4,
+        "local_B": 96,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 2,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T1_V4_P2_W16_C1_H1.mesh.bin",
+        "sha256": "bfc2c26173456158c98b5d149c2844b11fd3ee81ff6f7d682a22995a72f0580b",
+        "bytes": 1264
+      },
+      "object": {
+        "file": "T1_V4_P2_W16_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1264,
+          "gprs": 16,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T1_V16_P16_W16_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 16,
+        "primitives": 16,
+        "threads": 16,
+        "topology": 1,
+        "planes": 4,
+        "local_B": 304,
+        "allocation_B": 512,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 2,
+        "count_B": 32,
+        "position_B": 48,
+        "pitch_B": 64
+      },
+      "mesh": {
+        "file": "T1_V16_P16_W16_C1_H1.mesh.bin",
+        "sha256": "241251bb010662e5f0d9ea7a1fe876382753681951146469527d861aae26ece1",
+        "bytes": 1280
+      },
+      "object": {
+        "file": "T1_V16_P16_W16_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1280,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T1_V64_P128_W64_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 64,
+        "primitives": 128,
+        "threads": 64,
+        "topology": 1,
+        "planes": 4,
+        "local_B": 1296,
+        "allocation_B": 2048,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 2,
+        "count_B": 256,
+        "position_B": 272,
+        "pitch_B": 256
+      },
+      "mesh": {
+        "file": "T1_V64_P128_W64_C1_H1.mesh.bin",
+        "sha256": "bd093d63a0cc140506b32d6ba391ac01c20c4dfd51c6e22204447b8656fbba09",
+        "bytes": 1340
+      },
+      "object": {
+        "file": "T1_V64_P128_W64_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1340,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T1_V128_P256_W128_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 128,
+        "primitives": 256,
+        "threads": 128,
+        "topology": 1,
+        "planes": 4,
+        "local_B": 2576,
+        "allocation_B": 4096,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 2,
+        "count_B": 512,
+        "position_B": 528,
+        "pitch_B": 512
+      },
+      "mesh": {
+        "file": "T1_V128_P256_W128_C1_H1.mesh.bin",
+        "sha256": "cbca5ffd0192b59ba68bf9a24cb1d0b3f650deeec5591cf0a5d270a63e3d879b",
+        "bytes": 1352
+      },
+      "object": {
+        "file": "T1_V128_P256_W128_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1352,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T1_V256_P512_W256_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 256,
+        "primitives": 512,
+        "threads": 256,
+        "topology": 1,
+        "planes": 4,
+        "local_B": 5136,
+        "allocation_B": 8192,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 2,
+        "count_B": 1024,
+        "position_B": 1040,
+        "pitch_B": 1024
+      },
+      "mesh": {
+        "file": "T1_V256_P512_W256_C1_H1.mesh.bin",
+        "sha256": "73af2b721718b78d88a066f65ca0e5d03bc353df4179c644c20329968557cc29",
+        "bytes": 1364
+      },
+      "object": {
+        "file": "T1_V256_P512_W256_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1364,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T0_V4_P2_W16_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 4,
+        "primitives": 2,
+        "threads": 16,
+        "topology": 0,
+        "planes": 5,
+        "local_B": 112,
+        "allocation_B": 128,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 1,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 16
+      },
+      "mesh": {
+        "file": "T0_V4_P2_W16_C1_H1.mesh.bin",
+        "sha256": "fa5af1fe3c50f66858182b07b9e2884497bc6130e9a1c0dfff22f3482d5c8360",
+        "bytes": 1332
+      },
+      "object": {
+        "file": "T0_V4_P2_W16_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1332,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T0_V16_P16_W16_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 16,
+        "primitives": 16,
+        "threads": 16,
+        "topology": 0,
+        "planes": 5,
+        "local_B": 352,
+        "allocation_B": 512,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 1,
+        "count_B": 16,
+        "position_B": 32,
+        "pitch_B": 64
+      },
+      "mesh": {
+        "file": "T0_V16_P16_W16_C1_H1.mesh.bin",
+        "sha256": "a0d7e3a2903c2977e52ed2f43bc530534313afca01a3021c4553ac68ada51aae",
+        "bytes": 1334
+      },
+      "object": {
+        "file": "T0_V16_P16_W16_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1334,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T0_V64_P128_W64_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 64,
+        "primitives": 128,
+        "threads": 64,
+        "topology": 0,
+        "planes": 5,
+        "local_B": 1424,
+        "allocation_B": 2048,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 1,
+        "count_B": 128,
+        "position_B": 144,
+        "pitch_B": 256
+      },
+      "mesh": {
+        "file": "T0_V64_P128_W64_C1_H1.mesh.bin",
+        "sha256": "4cf6cffb1f7060a73285fd08a998519358a828efae4799c0eaaf51031270b7a4",
+        "bytes": 1386
+      },
+      "object": {
+        "file": "T0_V64_P128_W64_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1386,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T0_V128_P256_W128_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 128,
+        "primitives": 256,
+        "threads": 128,
+        "topology": 0,
+        "planes": 5,
+        "local_B": 2832,
+        "allocation_B": 4096,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 1,
+        "count_B": 256,
+        "position_B": 272,
+        "pitch_B": 512
+      },
+      "mesh": {
+        "file": "T0_V128_P256_W128_C1_H1.mesh.bin",
+        "sha256": "589a2fc5b762140863b69a4d401dfaaf3648af382421eaa7b33f47afd3b3a0c3",
+        "bytes": 1406
+      },
+      "object": {
+        "file": "T0_V128_P256_W128_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1406,
+          "gprs": 20,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    },
+    "T0_V256_P512_W256_C1_H1.mesh.bin": {
+      "shape": {
+        "vertices": 256,
+        "primitives": 512,
+        "threads": 256,
+        "topology": 0,
+        "planes": 5,
+        "local_B": 5648,
+        "allocation_B": 8192,
+        "control42": 1,
+        "high_index": 1,
+        "indices": 1,
+        "count_B": 512,
+        "position_B": 528,
+        "pitch_B": 1024
+      },
+      "mesh": {
+        "file": "T0_V256_P512_W256_C1_H1.mesh.bin",
+        "sha256": "0ad82601380ac870579dd9ecc8361d93df3e9492eefb278677633e06f7d6581c",
+        "bytes": 1412
+      },
+      "object": {
+        "file": "T0_V256_P512_W256_C1_H1.object.bin",
+        "sha256": "b6909af21f79ef947acd034eef8414dc9c671c5df41ed0965429af50872ce4a1",
+        "bytes": 256
+      },
+      "metadata": {
+        "mesh": {
+          "bytes": 1412,
+          "gprs": 24,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 0,
+          "compiler_abi": 8
+        },
+        "object": {
+          "bytes": 256,
+          "gprs": 8,
+          "scratch": 0,
+          "frame": 0,
+          "preamble": 0,
+          "publications": 1,
+          "compiler_abi": 8
+        }
+      }
+    }
+  },
+  "frozen_kit_directory": "/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/native-capability-20261022/c2-r8/kit",
+  "no_target_access": true
+}
