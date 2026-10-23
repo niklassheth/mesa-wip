@@ -259,6 +259,22 @@ main(int argc, char **argv)
    VkPhysicalDeviceRobustness2FeaturesEXT robust = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, .pNext = &host};
    VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &robust};
    vkGetPhysicalDeviceFeatures2(physical, &features);
+   uint32_t extension_count = 0;
+   VK(vkEnumerateDeviceExtensionProperties(physical, NULL, &extension_count, NULL));
+   VkExtensionProperties *available = calloc(extension_count, sizeof(*available));
+   REQUIRE(available);
+   VK(vkEnumerateDeviceExtensionProperties(physical, NULL, &extension_count, available));
+   unsigned has_sliced = 0;
+   for (unsigned i = 0; i < extension_count; ++i)
+      has_sliced |= !strcmp(available[i].extensionName, VK_EXT_IMAGE_SLICED_VIEW_OF_3D_EXTENSION_NAME);
+   free(available);
+   printf("imageSlicedViewOf3D=%u extension=%u variableMultisampleRate=%u\n",
+          sliced.imageSlicedViewOf3D, has_sliced, features.features.variableMultisampleRate);
+   REQUIRE(has_sliced == sliced.imageSlicedViewOf3D);
+   if (!strcmp(argv[1], "--caps-only")) {
+      vkDestroyInstance(instance, NULL);
+      return 0;
+   }
    if (!sliced.imageSlicedViewOf3D) { puts("SKIP imageSlicedViewOf3D is false"); return 77; }
    REQUIRE(host.hostImageCopy && robust.robustImageAccess2);
    REQUIRE(features.features.shaderStorageImageReadWithoutFormat && features.features.shaderStorageImageWriteWithoutFormat);
