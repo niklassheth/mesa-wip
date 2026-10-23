@@ -5,7 +5,7 @@ compiler snapshot. Usage: ctime.py ICD.json corpus... (host-only, serial)."""
 import sys, os, re, json, subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import latmetrics as L
 sys.path.insert(0, L.R + '/mesa-isa-probe/src/asahi/compiler/test/cross-corpus'); from packed import Pack
-icd = sys.argv[1]; env = L.env_for(icd, asm=False); env['AGX_SPILL_COALESCE'] = '1'
+icd = sys.argv[1]; env = L.env_for(icd, asm=False)
 def frames(name):
     if name in ('cts', 'timing-large-gs', 'robust'):
         pack = Pack(L.R + '/artifacts/compiler-cross-corpus-20261006/corpus.sqlite3')

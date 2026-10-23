@@ -3,10 +3,10 @@
 """Hash every compiled program's instruction bytes per corpus entry, so two
 compilers can be checked for byte-identical output (host-only).
 Usage: identity.py ICD.json OUT.json corpus..."""
-import sys, os, re, json, hashlib, subprocess
+import sys, os, re, json, hashlib, subprocess, argparse
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import latmetrics as L
-sys.path.insert(0, L.R + '/mesa-isa-probe/src/asahi/compiler/test/cross-corpus'); from packed import Pack
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from packed import Pack
 
 def digest(text):
     h = hashlib.sha256(); n = 0
@@ -18,9 +18,33 @@ def digest(text):
             h.update(m.group(1).encode() if m else b'?'); n += 1
     return h.hexdigest(), n
 
-icd, out = sys.argv[1], sys.argv[2]
-env = L.env_for(icd); env['AGX_SPILL_COALESCE'] = '1'
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('icd')
+parser.add_argument('out')
+parser.add_argument('corpora', nargs='+')
+parser.add_argument('--host-shim', help='Host-only DRM shim to preload')
+parser.add_argument('--jobs', type=int, default=12)
+args = parser.parse_args()
+icd, out = args.icd, args.out
+env = L.env_for(icd)
+if args.host_shim:
+    env['LD_PRELOAD'] = os.path.abspath(args.host_shim)
 res = {}
+def checked_digest(process, key, output, packed=False):
+    text = output.decode(errors='replace')
+    if packed:
+        # Device initialization also dumps programs. They cannot stand in for
+        # a deferred shader or a failed corpus entry.
+        marker = 'CORPUS_BEGIN ' + key + '\n'
+        if marker not in text or 'CORPUS_END 0\n' not in text.split(marker, 1)[-1]:
+            raise RuntimeError(f'{key}: missing successful corpus receipt\n{text[-4000:]}')
+        text = text.split(marker, 1)[1].split('CORPUS_END ', 1)[0]
+    begins = len(re.findall(r'^APPLE9(?:_PREAMBLE)?_ASM_BEGIN', text, re.M))
+    ends = len(re.findall(r'^APPLE9_ASM_END', text, re.M))
+    result = digest(text)
+    if process.returncode or not begins or begins != ends or not result[1]:
+        raise RuntimeError(f'{key}: exit={process.returncode}, programs={begins}/{ends}\n{text[-4000:]}')
+    return key, result
 def pack_entries(name):
     if name in ('cts', 'robust', 'timing-large-gs'):
         pack = Pack(L.R + '/artifacts/compiler-cross-corpus-20261006/corpus.sqlite3')
@@ -34,15 +58,15 @@ def one_pack(args):
     key, frame = args
     p = subprocess.run(['/tmp/asahi-cross-corpus/compile-shader-packed'], input=frame,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env, timeout=900)
-    return key, digest(p.stderr.decode(errors='replace'))
+    return checked_digest(p, key, p.stderr, packed=True)
 def one_foz(args):
     foz, h = args
     p = subprocess.run(['/tmp/asahi-cross-corpus/lethal-tools/fossilize-replay-audit', '--num-threads', '1',
                         '--disable-signal-handler', '--pipeline-hash', h, foz], env=env,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
-    return h, digest(p.stdout.decode(errors='replace'))
-for name in sys.argv[3:]:
-    with ThreadPoolExecutor(12) as ex:
+    return checked_digest(p, h, p.stdout)
+for name in args.corpora:
+    with ThreadPoolExecutor(args.jobs) as ex:
         if name in ('cs2', 'lethal'):
             foz = L.R + ('/tmp/cs2-fossilize-20261004/cs2-capture.foz' if name == 'cs2' else
                          '/artifacts/compiler-cross-corpus-20261006/lethal-company/lethal-capture.foz')

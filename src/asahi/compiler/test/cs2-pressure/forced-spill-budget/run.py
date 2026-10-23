@@ -9,8 +9,8 @@ assert a.icd.is_file() and a.host_intercept.is_file()
 a.output.mkdir(parents=True,exist_ok=False);out=a.output.resolve();here=Path(__file__).resolve().parent
 subprocess.run(['cc','-O2',str(here/'repro.c'),'-lvulkan','-o',str(out/'repro')],check=True)
 subprocess.run(['glslangValidator','-V',str(here/'test.vert'),'-o',str(out/'test.vert.spv')],check=True)
-env=dict(os.environ,LD_PRELOAD=str(a.host_intercept.resolve()),VK_DRIVER_FILES=str(a.icd.resolve()),HK_EXPERIMENTAL_APPLE9='1',HK_APPLE9_EAGER_VARIANTS='1',AGX_MESA_DEBUG='spill',AGX_SPILL_COALESCE='1',MESA_SHADER_CACHE_DISABLE='true',AGX_APPLE9_STATS='1')
-for key in ['ASAHI_MESA_DEBUG','AGX_SPILL_NO_LOOP_HANDLING','AGX_APPLE9_RA_WEBS']:env.pop(key,None)
+env=dict(os.environ,LD_PRELOAD=str(a.host_intercept.resolve()),VK_DRIVER_FILES=str(a.icd.resolve()),HK_EXPERIMENTAL_APPLE9='1',HK_APPLE9_EAGER_VARIANTS='1',AGX_MESA_DEBUG='spill',MESA_SHADER_CACHE_DISABLE='true',AGX_APPLE9_STATS='1')
+for key in ['ASAHI_MESA_DEBUG','AGX_SPILL_COALESCE','AGX_SPILL_NO_LOOP_HANDLING','AGX_APPLE9_RA_WEBS']:env.pop(key,None)
 results={}
 for precision in ['highp','mediump']:
  for loop in ['for','while','do_while']:
