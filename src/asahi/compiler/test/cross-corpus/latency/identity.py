@@ -43,6 +43,14 @@ def checked_digest(process, key, output, packed=False):
         if marker not in text or 'CORPUS_END 0\n' not in text.split(marker, 1)[-1]:
             raise RuntimeError(f'{key}: missing successful corpus receipt\n{text[-4000:]}')
         text = text.split(marker, 1)[1].split('CORPUS_END ', 1)[0]
+    else:
+        marker = 'Fossilize INFO: Creating Vulkan device took:'
+        if marker not in text:
+            raise RuntimeError(f'{key}: missing replay device receipt\n{text[-4000:]}')
+        text = text.split(marker, 1)[1]
+        replayed = re.findall(r'Playing back (\d+) (?:graphics|compute) pipelines took', text)
+        if sum(map(int, replayed)) != 1:
+            raise RuntimeError(f'{key}: expected one replayed pipeline\n{text[-4000:]}')
     begins = len(re.findall(r'^APPLE9(?:_PREAMBLE)?_ASM_BEGIN', text, re.M))
     ends = len(re.findall(r'^APPLE9_ASM_END', text, re.M))
     result = digest(text)
