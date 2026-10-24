@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Exact independent raster/G-buffer oracle for the original Niagara pair."""
 import hashlib
+import math
 import struct
 
 W,H,Q_BYTES=128,64,512*1024
@@ -42,9 +43,11 @@ def inputs():
         index=(13*v+7)%64
         struct.pack_into('<H',q,16384+28+v*2,index)
         x,y=position(v)
-        # Exact half positions, normal -Z, tangent +X, positive bitangent sign.
+        # Normal +Z stays away from the octahedral -Z seam. Packed
+        # (511,511,0) is unsuitable: fused unpack makes X/Y slightly negative
+        # where separate multiply/subtract gives zero, choosing another corner.
         struct.pack_into('<3eHI2e',q,20480+(5+index)*16,
-                         x/64-1,y/32-1,.25,254|(127<<8),511|(511<<10),v/64,1-v/64)
+                         x/64-1,y/32-1,.25,254|(127<<8),511|(511<<10)|(1022<<20),v/64,1-v/64)
     for i,tri in enumerate(triangles()):q[16384+156+3*i:16384+159+3*i]=bytes(tri)
     # No textures; original FS: endpoint sRGB values, zero emission and full gloss.
     struct.pack_into('<4I4f4f3f',q,28672+3*64,0,0,0,0,1,0,1,1,0,0,0,1,0,0,0)
@@ -66,15 +69,27 @@ def coverage(tri):
     assert covered
     return covered
 
+def noise(x,y):
+    f=lambda v:struct.unpack('<f',struct.pack('<f',v))[0]
+    dot=f(f(x*f(.06711056))+f(y*f(.00583715)))
+    value=f(f(52.9829189)*f(dot-math.floor(dot)))
+    return f(value-math.floor(value))
+
+def normal_component(index):
+    # +Z is the continuous centre of the octahedron. The original noise
+    # chooses between the two nearest 10-bit values; quantization.py proves
+    # that fused/separate arithmetic makes the same choice for this grid.
+    return 512 if noise(index%W+.5,index//W+.5)>=.5 else 511
+
 _expected=None
 def expected(primitives=96):
     p=bytearray(W*H*8)
     for tri in triangles()[:primitives]:
         for index in coverage(tri):
             p[index*4:index*4+4]=bytes((255,0,255,0))
-            # Original A2B10G10R10 target: -Z -> oct(1,1), gloss 1, alpha 0.
-            # Dither is strictly less than half a quantization step; clamps to 1.
-            struct.pack_into('<I',p,W*H*4+index*4,0x3fffffff)
+            component=normal_component(index)
+            struct.pack_into('<I',p,W*H*4+index*4,
+                             0x3ff00000|component|(component<<10))
     return bytes(p)
 
 def verify_bytes(pixels,q,case=None):

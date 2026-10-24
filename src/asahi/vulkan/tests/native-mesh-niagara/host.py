@@ -4,6 +4,7 @@
 import argparse,hashlib,json,os,struct,subprocess,sys
 from pathlib import Path
 from check import cases,inputs,mutations,verify,MESH_SHA
+from quantization import verify_margin
 HERE=Path(__file__).resolve().parent
 p=argparse.ArgumentParser(description=__doc__)
 for name in ('out','corpus','coverage','host-probe','lavapipe','driver','shim','probe','sysroot'):
@@ -28,6 +29,7 @@ write('INPUTS.json',dict(original_sources=pins,mesh_entry=entry,fragment_build=c
     specialization='upstream defaults: TASK=false, POST=0; original modules unmodified',
     staged={f.name:sha(f) for f in shaders.iterdir()}))
 write('MUTATIONS.json',mutations())
+write('QUANTIZATION-MARGIN.json',verify_margin())
 (out/'icd.json').write_text(json.dumps(dict(file_format_version='1.0.0',ICD=dict(library_path=str(a.lavapipe.resolve()),api_version='1.4.0'))))
 env={k:v for k,v in os.environ.items() if not k.startswith(('HK_','VK_','LD_','MESA_','AGX_','ASAHI_','M1_','M2_'))}
 env.update(VK_DRIVER_FILES=str(out/'icd.json'),VK_LOADER_LAYERS_DISABLE='~implicit~',LP_NUM_THREADS='2',LIBGL_ALWAYS_SOFTWARE='1',M2_SOFTWARE_REFERENCE='1')
@@ -40,7 +42,7 @@ for name in ('upper-vertex','last-primitive','normal','draw-material'):
     md=out/('control-'+name);md.mkdir();data=bytearray(inputs());index=(13*63+7)%64
     if name=='upper-vertex':struct.pack_into('<e',data,20480+(5+index)*16,0)
     if name=='last-primitive':data[16384+156+95*3:16384+156+96*3]=bytes(3)
-    if name=='normal':struct.pack_into('<I',data,20480+(5+index)*16+8,511|(511<<10)|(1022<<20))
+    if name=='normal':struct.pack_into('<I',data,20480+(5+index)*16+8,1022<<20)
     if name=='draw-material':struct.pack_into('<I',data,4096+3*20,6)
     (md/'inputs.bin').write_bytes(data);run(md,md/'inputs.bin')
     assert (md/'Q.bin').read_bytes()==data

@@ -19,14 +19,24 @@ payload injection occurs.
 
 The oracle uses integer edge functions at pixel centres; no centre lies on
 an edge. Endpoint material colors avoid uncertain transcendental rounding.
-Normal -Z yields octahedral coordinates (1,1); the original fragment's noise
-has less than half a packed-normal quantization step and leaves endpoint
-values unchanged. The checker compares all 65,536 target bytes and all
+Normal +Z yields target coordinates (1/2,1/2), away from the octahedral seam.
+The original noise chooses packed values 511 or 512. `quantization.py` checks
+fused/separate unpack, dot and addition forms for every covered pixel. The
+checker compares all 65,536 target bytes and all
 524,288 input/witness bytes exactly, with zero tolerance. Software input
 controls separately change an upper vertex, last primitive, normal and
 flat draw/material selection. Twenty-two corrupt-output/guard mutations
 must be rejected. Texture branches and complete engine rendering are outside
 this one-input test's coverage; their descriptors are valid.
+
+The first Air input used packed normal (511,511,0), intending exact -Z. That
+oracle failed: fused unpack produces X/Y=-2^-27 while separate operations
+produce zero, selecting another corner of the octahedral seam. Its entire
+device image matches the fused prediction. The corrected input avoids that
+discontinuity without changing either original shader or relaxing comparison.
+The first result remains a failure and provides no native coverage credit.
+Future inputs on seams should compare decoded normal directions within a
+quantization tolerance, rather than requiring the same octahedral corner.
 
 Real ARM ICD recording must select native physical T32, logical 64, V64/P96,
 17 vertex component planes, no task payload and no primitive record. The

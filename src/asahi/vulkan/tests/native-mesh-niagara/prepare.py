@@ -48,7 +48,7 @@ for filename,expected in json.loads((a.host/'INPUTS.json').read_text())['origina
     if original.suffix!='.spv':shutil.copy2(original,out/'source/corpus'/original.name)
 shutil.copy2(HERE.parent/'native-stage-batching/vm-audit.c',out/'source/vm-audit.c')
 shutil.copy2(HERE.parent/'native-mesh-m2/kernel-replay.py',out/'source/kernel-replay.py')
-for name in ('RESULT.json','INPUTS.json','MUTATIONS.json','SOFTWARE.json','SOFTWARE-CONTROLS.json'):
+for name in ('RESULT.json','INPUTS.json','MUTATIONS.json','SOFTWARE.json','SOFTWARE-CONTROLS.json','QUANTIZATION-MARGIN.json'):
     shutil.copy2(a.host/name,out/'evidence'/name)
 shutil.copy2(a.host/'native-records/RESULT.json',out/'evidence/NATIVE-RECORDS.json')
 shutil.copy2(a.parser/'RESULT.json',out/'evidence/KERNEL-PARSER.json')
