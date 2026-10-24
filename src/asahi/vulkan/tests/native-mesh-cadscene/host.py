@@ -4,6 +4,7 @@
 import argparse,hashlib,json,os,struct,subprocess,sys
 from pathlib import Path
 from check import cases,inputs,mutations,verify,MESH_SHA,FRAGMENT_SHA
+from quantization import verify_margin
 HERE=Path(__file__).resolve().parent
 p=argparse.ArgumentParser(description=__doc__)
 for name in ('out','modules','host-probe','lavapipe','driver','shim','probe','sysroot'):
@@ -26,15 +27,7 @@ write('INPUTS.json',dict(original_sources=pins,
         'fixed 128x64 viewport/scissor and deterministic buffers'],
     staged={f.name:sha(f) for f in shaders.iterdir()}))
 write('MUTATIONS.json',mutations())
-# Fixture values sit >=1/8 UNORM step from a rounding boundary. The
-# light vector's transverse component is <2^-29 of Z; +Z normals and
-# constant extras avoid interpolation seams. A 2^-12 intensity error
-# budget is conservative relative to the resulting 1/(8*255) margin.
-write('QUANTIZATION-MARGIN.json',dict(verdict='PASS',min_unorm_steps=.125,
-    intensity_error_budget=2**-12,margin=.125/255,far_light_z=2**30,
-    constant_normal=[0,0,1],constant_extra=[.125,.25,.375,.125],
-    color_base='-.25 * .8 + .2 = 0; fused and unfused agree',
-    exact_depth=[.25,1],edge_centers=0))
+write('QUANTIZATION-MARGIN.json',verify_margin())
 (out/'icd.json').write_text(json.dumps(dict(file_format_version='1.0.0',ICD=dict(library_path=str(a.lavapipe.resolve()),api_version='1.4.0'))))
 env={k:v for k,v in os.environ.items() if not k.startswith(('HK_','VK_','LD_','MESA_','AGX_','ASAHI_','M1_','M2_'))}
 env.update(VK_DRIVER_FILES=str(out/'icd.json'),VK_LOADER_LAYERS_DISABLE='~implicit~',LP_NUM_THREADS='2',LIBGL_ALWAYS_SOFTWARE='1',M2_SOFTWARE_REFERENCE='1')
