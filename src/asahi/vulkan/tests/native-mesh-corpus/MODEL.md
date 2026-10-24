@@ -37,3 +37,5 @@ and receive no rehearsal credit; actual device execution requires them.
 
 Budget: three draws, 100 seconds, zero retries, stop on first failure. The
 canonical operator owns device state, staging, collection and recovery.
+
+Host packet recording uses the historical no-op DRM shim and an explicitly enabled synchronous fence model. It does not execute a GPU and cannot model the kernel qualification advertisement, so that recording uses the research override. The Air harness does not use either host helper or that override: every draw requires INDEX=1, a qualified own-FD VM, a native route, retired submission and exact readback.

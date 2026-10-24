@@ -4,3 +4,5 @@ vk = cc.find_library('vulkan')
 headers = include_directories('../../../../../include')
 executable('mesh-corpus', '../native-mesh-m2/probe.c',
   c_args : ['-DM2_RGBA'], include_directories : headers, dependencies : vk)
+shared_library('host-record-sync', 'record-sync.c',
+  dependencies : [cc.find_library('dl'), dependency('threads')])

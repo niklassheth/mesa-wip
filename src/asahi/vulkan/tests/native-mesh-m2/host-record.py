@@ -14,6 +14,7 @@ for name in ('driver','shim','probe','shaders','sysroot','out'):p.add_argument('
 p.add_argument('--cases',type=Path,help='Additional authored host-only subset')
 p.add_argument('--corpus',type=Path)
 p.add_argument('--coverage',type=Path)
+p.add_argument('--completion-shim',type=Path,help='Host-only compatibility for historical no-op recorder')
 a=p.parse_args();out=a.out.resolve();out.mkdir();rows=[]
 selected=json.loads(a.cases.read_text()) if a.cases else cases()
 if a.corpus or a.coverage:
@@ -34,6 +35,12 @@ for case in selected:
  d=out/case['name'];d.mkdir();(d/'trace').mkdir();(d/'icd.json').write_text(json.dumps(dict(file_format_version='1.0.0',ICD=dict(library_path=str(a.driver.resolve()),api_version='1.4.0'))))
  env={k:v for k,v in os.environ.items() if not k.startswith(('LD_','HK_','VK_','MESA_','AGX_','ASAHI_','M1_','M2_'))}
  settings=dict(LD_LIBRARY_PATH=str(a.sysroot.resolve()/'usr/lib64'),LD_PRELOAD=str(a.shim.resolve()),ASAHI_HOST_TRACE_DIR=str(d/'trace'),VK_DRIVER_FILES=str(d/'icd.json'),HK_EXPERIMENTAL_APPLE9='1',HK_APPLE9_NATIVE_MESH='1',HK_APPLE9_NATIVE_MESH_PACKED_SHAPES='T16V3P1,T32V3P1',HK_APPLE9_MESH_ROUTE_LOG='1',HK_APPLE9_RESEARCH_NATIVE_BATCH='1',MESA_SHADER_CACHE_DISABLE='true',MESA_VK_ENABLE_SUBMIT_THREAD='false',VK_LOADER_LAYERS_DISABLE='~implicit~',AGX_APPLE9_ASM='1',AGX_APPLE9_NIR='1',AGX_APPLE9_STATS='1')
+ # Historical recorder lacks the per-file kernel qualification capability.
+ # This is a research packet recording, never evidence of qualified routing.
+ settings.update(case.get('env',{}))
+ if a.completion_shim:
+  settings['LD_PRELOAD']=str(a.completion_shim.resolve())+':'+settings['LD_PRELOAD']
+  settings['ASAHI_HOST_RECORD_SYNCHRONOUS']='1'
  argv=['qemu-aarch64-static','-L',str(a.sysroot.resolve())]
  for k,v in settings.items():
   if ',' in v:env[k]=v
