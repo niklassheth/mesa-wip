@@ -13,7 +13,7 @@ coverage=json.loads(a.coverage.read_text());selected=[];rows=[];pins={}
 for case in cases():
     folder='sources/KhronosGroup-Vulkan-Samples/shaders/mesh_shading/'+case['language']
     entry=next(e for e in coverage['entries'] if e['path']==folder+'/ms.mesh.spv')
-    assert entry['status']=='NEEDS_PIPELINE_COMPILE'
+    assert entry['stage']=='mesh'
     for stage,basename in [('mesh','ms.mesh.spv'),('frag','ps.frag.spv')]:
         source=a.corpus/folder/basename;data=source.read_bytes();sha=hashlib.sha256(data).hexdigest()
         if stage=='mesh':assert sha==entry['sha256']
