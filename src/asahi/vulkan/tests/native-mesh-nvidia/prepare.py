@@ -14,6 +14,7 @@ p=argparse.ArgumentParser(description=__doc__)
 for name in ('out','prior-kit','driver','probe','host','parser','coverage'):
     p.add_argument('--'+name,type=Path,required=True)
 p.add_argument('--driver-revision',required=True)
+p.add_argument('--mini-kernel-kit',type=Path,help='Pinned research-mini-native-blocks kernel kit')
 a=p.parse_args();out=a.out.resolve();out.mkdir()
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def write(name,value):(out/name).write_text(json.dumps(value,indent=2)+'\n')
@@ -24,7 +25,9 @@ assert host['native_pipeline_recordings']==len(parser['cases'])==1
 assert host['driver_sha256']==sha(a.driver) and host['mesh_sha256']==MESH_SHA
 assert parser['qualified_expected']=='reject'
 prior=a.prior_kit.resolve()
-kernel=json.loads((prior/'KERNEL.json').read_text())
+kernel_source=a.mini_kernel_kit.resolve() if a.mini_kernel_kit else prior
+kernel=json.loads((kernel_source/'KERNEL.json').read_text())
+if a.mini_kernel_kit:assert kernel['name']=='research-mini-native-blocks'
 assert parser['kernel_revision']==kernel['source_commit'][:len(parser['kernel_revision'])]
 for folder in ('bin','lib','source','evidence','drirc-empty'):(out/folder).mkdir()
 shutil.copy2(a.probe,out/'bin/mesh-nvidia')
@@ -33,7 +36,8 @@ shutil.copy2(prior/'lib/vm-audit.so',out/'lib/vm-audit.so')
 shutil.copytree(a.host/'shaders',out/'shaders')
 for name in ('run.py','check.py','MODEL.md'):shutil.copy2(HERE/name,out/name)
 shutil.copy2(HERE/'MODEL.md',out/'README.md')
-for name in ('KERNEL.json','kmsg.py','native_log_filter.py'):shutil.copy2(prior/name,out/name)
+for name in ('kmsg.py','native_log_filter.py'):shutil.copy2(prior/name,out/name)
+shutil.copy2(kernel_source/'KERNEL.json',out/'KERNEL.json')
 (out/'setup-probe.py').write_text((prior/'setup-probe.py').read_text().replace('mesh-m2','mesh-nvidia'))
 (out/'drirc-empty/README').write_text('Empty isolated drirc directory.\n')
 shutil.copytree(HERE,out/'source/native-mesh-nvidia',ignore=shutil.ignore_patterns('__pycache__'))
@@ -60,9 +64,23 @@ plan.update(cases=cases(),driver_revision=a.driver_revision,driver_sha256=sha(a.
         format='R8G8B8A8_UNORM',comparison='byte-exact',blend='ONE/ONE ADD'),
     queue_prerequisites=['Air 39b3a F1 corrected destination publication PASS',
                          'NEXT-38b M3a PASS','NEXT-38c Khronos PASS'])
+plan['kernel_profile']='mini-native-blocks' if a.mini_kernel_kit else 'air-native-batch'
+plan['device']='mini' if a.mini_kernel_kit else 'air'
+plan['kernel_version']=kernel['uts_version']
+plan['kernel_release']=kernel['release']
+if a.mini_kernel_kit:
+    plan['queue_prerequisites']=['Air DONE-39b7c2 NVIDIA unchanged shader pipeline PASS']
 write('PLAN.json',plan)
 kit=json.loads((prior/'KIT.json').read_text());kit.update(name=out.name,budget_seconds=60)
 kit['stage']['dir']='/root/kit-'+out.name
+if a.mini_kernel_kit:
+    mini=json.loads((kernel_source/'KIT.json').read_text())
+    for key in ('device','boot','requires','inputs'):kit[key]=mini[key]
+    kit['boot']['fresh']=True
+    kit['boot']['kernel']['extra_args_append']='asahi_m4.native_mesh=0'
+    # The runner checks mode 0 after this fresh boot. An older snapshot may
+    # have mode 4 latched, so require presence here rather than stale value.
+
 kit['setup_probe']['files']=[f.replace('mesh-m2','mesh-nvidia') for f in kit['setup_probe']['files']]
 measurements=[]
 for directory in [a.host/cases()[0]['name'],*sorted(a.host.glob('control-*'))]:
