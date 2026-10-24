@@ -58,6 +58,11 @@ def analyze(I, kinds=('DEVICE_LOAD',)):
     return t
 
 def foz_hashes(foz, sample):
+    # A sampled capture may carry a fixed list of replayable hashes beside it
+    # (the Steam CS2 cache replays only ~20% of its pipelines on the host).
+    fixed = os.path.join(os.path.dirname(os.path.realpath(foz)), 'identity-hashes.txt')
+    if sample and os.path.exists(fixed):
+        return open(fixed).read().split()
     hs = []
     for tag, limit in [(6, 128), (7, 32)]:
         h = sorted(subprocess.check_output([R + '/tmp/fossilize-build-x86/cli/fossilize-list', foz, '--tag', str(tag)], text=True).split())
