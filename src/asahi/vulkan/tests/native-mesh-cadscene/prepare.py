@@ -38,7 +38,7 @@ for name in ('run.py','check.py','MODEL.md'):shutil.copy2(HERE/name,out/name)
 shutil.copy2(HERE/'MODEL.md',out/'README.md')
 for name in ('kmsg.py','native_log_filter.py'):shutil.copy2(prior/name,out/name)
 shutil.copy2(kernel_source/'KERNEL.json',out/'KERNEL.json')
-(out/'setup-probe.py').write_text((prior/'setup-probe.py').read_text().replace('mesh-m2','mesh-cadscene').replace('mesh-nvidia','mesh-cadscene'))
+(out/'setup-probe.py').write_text((prior/'setup-probe.py').read_text().replace('mesh-m2','mesh-cadscene').replace('mesh-nvidia','mesh-cadscene').replace('mesh-niagara','mesh-cadscene'))
 (out/'drirc-empty/README').write_text('Empty isolated drirc directory.\n')
 shutil.copytree(HERE,out/'source/native-mesh-cadscene',ignore=shutil.ignore_patterns('__pycache__'))
 (out/'source/corpus').mkdir()
@@ -80,7 +80,7 @@ if a.mini_kernel_kit:
     # The runner checks mode 0 after this fresh boot. An older snapshot may
     # have mode 4 latched, so require presence here rather than stale value.
 
-kit['setup_probe']['files']=[f.replace('mesh-m2','mesh-cadscene').replace('mesh-nvidia','mesh-cadscene').replace('mesh-nvidia','mesh-cadscene') for f in kit['setup_probe']['files']]
+kit['setup_probe']['files']=[f.replace('mesh-m2','mesh-cadscene').replace('mesh-nvidia','mesh-cadscene').replace('mesh-niagara','mesh-cadscene').replace('mesh-nvidia','mesh-cadscene').replace('mesh-niagara','mesh-cadscene') for f in kit['setup_probe']['files']]
 measurements=[]
 for directory in [a.host/cases()[0]['name'],*sorted(a.host.glob('control-*'))]:
     files=[f for f in directory.iterdir() if f.is_file()]
