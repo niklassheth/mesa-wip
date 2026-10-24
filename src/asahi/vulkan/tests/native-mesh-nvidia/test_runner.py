@@ -45,7 +45,8 @@ class Audit(unittest.TestCase):
     def test_environment(self):
         env=run.environment(Path('/tmp/native-nvidia'),self.case)
         self.assertEqual(env['HK_APPLE9_NATIVE_MESH'],'1')
-        self.assertEqual(env['HK_APPLE9_NATIVE_MESH_ROUNDS'],'32')
+        self.assertNotIn('HK_APPLE9_NATIVE_MESH_ROUNDS',env)
+        self.assertNotIn('HK_APPLE9_RESEARCH_NATIVE_BATCH',env)
         self.assertNotIn('HK_APPLE9_NATIVE_MESH_WIDE',env)
 
 if __name__=='__main__':unittest.main()
