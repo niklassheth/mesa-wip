@@ -1,0 +1,66 @@
+#version 460
+// SPDX-License-Identifier: MIT
+// Multi-round publication fixture. Vertex v sits at a corner of cell v/4 in
+// an 8x4 grid of 12x11-pixel quads; every vertex is referenced and moves
+// pixels. Primitives cycle through the unique triangles, so P > unique count
+// repeats triangles and the additive image counts multiplicity.
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=LOGICAL_THREADS) in;
+layout(triangles,max_vertices=MAX_VERTICES,max_primitives=MAX_PRIMITIVES) out;
+layout(push_constant) uniform Counts { uint vertices; uint primitives; uint cookie; } pc;
+layout(set=0,binding=0,std430) buffer Witness { uint q[]; } witness;
+#if CLIP_DISTANCES
+// Global screen-space half-planes on integer pixel lines: x >= 40, y <= 24.
+out gl_MeshPerVertexEXT { vec4 gl_Position; float gl_ClipDistance[CLIP_DISTANCES]; } gl_MeshVerticesEXT[];
+#endif
+vec4 position(uint v) {
+   uint cell=v/4,corner=v%4;
+   uvec2 pixel=uvec2(2+16*(cell%8)+((corner&1u)!=0u ? 12u : 0u),
+                     2+16*(cell/8)+((corner&2u)!=0u ? 11u : 0u));
+   return vec4(float(pixel.x)/64.0-1.0,float(pixel.y)/32.0-1.0,0.5,1.0);
+}
+uvec3 triangle(uint p) {
+   uint full=pc.vertices/4,remaining=pc.vertices%4;
+   uint unique=2*full+(remaining==0 ? 0 : 1);
+   uint t=p%unique;
+   if(t<2*full) {
+      uint base=4*(t/2);
+      return (t&1u)==0u ? uvec3(base,base+1,base+2) : uvec3(base+1,base+3,base+2);
+   }
+   uint a=4*full;
+   return remaining==3 ? uvec3(a,a+1,a+2) :
+          remaining==2 ? uvec3(a,a+1,a-1) : uvec3(a,a-1,a-2);
+}
+#if SHARED_WORDS
+// API shared storage: lane 0 publishes a cookie-derived word to every lane;
+// the remaining words are filled and read back to cover the whole allocation.
+shared uint exchange[SHARED_WORDS];
+#endif
+void main() {
+   uint lane=gl_LocalInvocationIndex;
+   SetMeshOutputsEXT(pc.vertices,pc.primitives);
+#if SHARED_WORDS
+   for(uint w=lane;w<SHARED_WORDS;w+=LOGICAL_THREADS)exchange[w]=pc.cookie^(0x5a5a0000u+w);
+   barrier();
+   uint mix=0;
+   for(uint w=0;w<SHARED_WORDS;w++)mix+=exchange[(w+lane)%SHARED_WORDS];
+   witness.q[1024+lane]=mix+lane;
+#else
+   witness.q[1024+lane]=pc.cookie+lane;
+#endif
+   if(lane==0) {witness.q[4]=pc.vertices;witness.q[5]=pc.primitives;witness.q[6]=pc.cookie;}
+   for(uint v=lane;v<pc.vertices;v+=LOGICAL_THREADS) {
+      vec4 p=position(v);gl_MeshVerticesEXT[v].gl_Position=p;
+#if CLIP_DISTANCES
+      gl_MeshVerticesEXT[v].gl_ClipDistance[0]=(p.x+1.0)*64.0-40.0;
+#if CLIP_DISTANCES > 1
+      gl_MeshVerticesEXT[v].gl_ClipDistance[1]=24.0-(p.y+1.0)*32.0;
+#endif
+#endif
+      for(uint c=0;c<4;c++)witness.q[2048+4*v+c]=floatBitsToUint(p[c]);
+   }
+   for(uint p=lane;p<pc.primitives;p+=LOGICAL_THREADS) {
+      uvec3 tri=triangle(p);gl_PrimitiveTriangleIndicesEXT[p]=tri;
+      for(uint c=0;c<3;c++)witness.q[4096+3*p+c]=tri[c];
+   }
+}

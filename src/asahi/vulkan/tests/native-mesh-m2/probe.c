@@ -14,6 +14,12 @@
 #define W 128
 #define H 64
 #define Q_BYTES (512*1024)
+#ifndef M3_MAX_VERTICES
+#define M3_MAX_VERTICES 64
+#endif
+#ifndef M3_MAX_PRIMITIVES
+#define M3_MAX_PRIMITIVES 126
+#endif
 #ifdef M3A_INTERFACE
 #define TARGET_FORMAT VK_FORMAT_R32G32B32A32_SFLOAT
 #define PIXEL_BYTES 16
@@ -70,7 +76,7 @@ int main(int argc,char **argv) {
    if(argc!=8) {fprintf(stderr,"usage: probe mesh.spv count.frag.spv out V P maxP cookie\n");return 2;}
    uint32_t v=strtoul(argv[4],NULL,0),p=strtoul(argv[5],NULL,0),maxp=strtoul(argv[6],NULL,0),cookie=strtoul(argv[7],NULL,0);
 #ifdef M3_WIDE
-   if(v<3||v>64||!p||p>maxp||maxp>126)return 2;
+   if(v<3||v>M3_MAX_VERTICES||!p||p>maxp||maxp>M3_MAX_PRIMITIVES)return 2;
 #else
    if(v!=3||p!=1||maxp!=1)return 2;
 #endif
