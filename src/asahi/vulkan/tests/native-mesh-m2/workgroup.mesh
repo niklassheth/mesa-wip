@@ -1,0 +1,80 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_KHR_shader_subgroup_basic : require
+#ifdef HOST_SUBGROUP_SUBSET
+#extension GL_KHR_shader_subgroup_ballot : require
+#endif
+#ifndef SIZE_X
+#define SIZE_X 64
+#define SIZE_Y 1
+#define SIZE_Z 1
+#endif
+layout(local_size_x=SIZE_X,local_size_y=SIZE_Y,local_size_z=SIZE_Z) in;
+layout(triangles,max_vertices=3,max_primitives=1) out;
+layout(push_constant) uniform Counts { uint vertices; uint primitives; uint cookie; } pc;
+layout(set=0,binding=0,std430) coherent buffer Witness { uint q[]; } witness;
+#if USE_SHARED
+shared uint exchange[SIZE_X*SIZE_Y*SIZE_Z];
+#endif
+
+void main() {
+    uint lane=gl_LocalInvocationIndex;
+    uint threads=SIZE_X*SIZE_Y*SIZE_Z;
+    SetMeshOutputsEXT(3,1);
+    witness.q[1024+lane]=pc.cookie+lane;
+#if USE_SHARED
+    exchange[lane]=pc.cookie+lane;
+#endif
+    memoryBarrierBuffer();
+    barrier();
+    uint neighbor=(lane+33)%threads;
+#if USE_SHARED
+    uint seen=exchange[neighbor];
+#else
+    uint seen=witness.q[1024+neighbor];
+#endif
+    uint at=2048+16*lane;
+    witness.q[at+0]=lane;
+    witness.q[at+1]=gl_LocalInvocationID.x;
+    witness.q[at+2]=gl_LocalInvocationID.y;
+    witness.q[at+3]=gl_LocalInvocationID.z;
+    witness.q[at+4]=gl_SubgroupID;
+    witness.q[at+5]=gl_SubgroupInvocationID;
+    witness.q[at+6]=gl_SubgroupSize;
+    witness.q[at+7]=gl_NumSubgroups;
+    witness.q[at+8]=seen;
+    witness.q[at+9]=pc.cookie+lane;
+    witness.q[at+10]=gl_WorkGroupSize.x*gl_WorkGroupSize.y*gl_WorkGroupSize.z;
+    witness.q[at+11]=0x18000000u+lane;
+#ifdef HOST_SUBGROUP_SUBSET
+    witness.q[at+12]=subgroupBallot(true).x;
+    witness.q[at+13]=subgroupElect() ? 1u : 0u;
+    if ((lane&1u)!=0u) {
+        witness.q[at+14]=subgroupBallot(true).x;
+        witness.q[at+15]=subgroupElect() ? 1u : 0u;
+    }
+    // Uniform push-constant loop bound prevents front-end constant unrolling.
+    // Both barriers are inside a workgroup-uniform branch; the SSA accumulator
+    // survives each barrier and logical-subgroup scheduling phase.
+    uint sum=0;
+    for(uint round=0;round<pc.vertices;round++) {
+        if(pc.primitives!=0) {
+            witness.q[8192+lane]=pc.cookie+lane+1000u*round;
+            memoryBarrierBuffer(); barrier();
+            sum+=witness.q[8192+(lane+33u)%threads];
+            memoryBarrierBuffer(); barrier();
+        }
+    }
+    witness.q[8448+lane]=sum;
+#endif
+    if(lane==0) {
+        vec4 a=vec4(-0.875,-0.75,0.5,1.0);
+        vec4 b=vec4(-0.625,-0.75,0.5,1.0);
+        vec4 c=vec4(-0.875,-0.28125,0.5,1.0);
+        gl_MeshVerticesEXT[0].gl_Position=a;
+        gl_MeshVerticesEXT[1].gl_Position=b;
+        gl_MeshVerticesEXT[2].gl_Position=c;
+        gl_PrimitiveTriangleIndicesEXT[0]=uvec3(0,1,2);
+        witness.q[4]=3; witness.q[5]=1; witness.q[6]=pc.cookie;
+    }
+}

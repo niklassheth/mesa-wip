@@ -1,0 +1,5 @@
+project('native-mesh-m3a-probe', 'c', default_options : ['buildtype=release', 'c_std=gnu11', 'warning_level=2'])
+cc=meson.get_compiler('c')
+vk=cc.find_library('vulkan')
+headers=include_directories('../../../../../include')
+executable('mesh-m3a', '../native-mesh-m2/probe.c', c_args : ['-DM3A_INTERFACE'], include_directories : headers, dependencies : vk)
