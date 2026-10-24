@@ -36,16 +36,29 @@ def require(value, reason):
         raise RuntimeError(reason)
 
 
-def counts(raw):
+def kernel_profile(name):
+    if name == 'air-native-batch':
+        return (['asahi_m4.native_batch=16', 'asahi_m4.native_batch_payload=0'],
+                dict(native_renders=1, native_dispatches=1))
+    if name == 'mini-native-blocks':
+        # This kernel exposes rejection/block counters, not research admission
+        # counters. Route, own-VM audit, fence and exact readback remain mandatory.
+        return (['asahi_m4.native_mesh=0'],
+                dict(submit_rejected=0, native_block_renders=0,
+                     native_block_dispatches=0))
+    raise RuntimeError('unsupported kernel profile: ' + name)
+
+
+def counts(raw, expected=None):
     result = {}
-    for key in ('native_renders', 'native_dispatches'):
+    for key in (expected if expected is not None else kernel_profile('air-native-batch')[1]):
         matches = re.findall(r'^' + key + r'[ \t]+(\d+)[ \t]*$', raw, re.M)
         require(len(matches) == 1, 'missing/ambiguous counter ' + key)
         result[key] = int(matches[0])
     return result
 
 
-def audit(log, case, revision, before, after):
+def audit(log, case, revision, before, after, expected_counters=None):
     require('Apple M4' in log and 'Honeykrisp' in log and 'git-' + revision[:10] in log,
             'wrong renderer/revision')
     rows = re.findall(r'VM_AUDIT (before|after) fd=(\d+) dev=(\d+:\d+) result=(-?\d+) '
@@ -65,7 +78,9 @@ def audit(log, case, revision, before, after):
     delta = {k: after[k] - before[k] for k in before}
     # Admission counters are usable only after checking the retired fence and
     # complete readback. A failed submit never becomes completed native work.
-    require(delta == dict(native_renders=1, native_dispatches=1), 'admission counter mismatch: ' + str(delta))
+    expected = expected_counters if expected_counters is not None else kernel_profile('air-native-batch')[1]
+    require(set(before) == set(after) == set(expected) and delta == expected,
+            'kernel counter mismatch: ' + str(delta))
     return dict(vm_audit=rows, counters=delta, routes=routes)
 
 
@@ -93,6 +108,7 @@ def main(out):
     out.mkdir(parents=True, exist_ok=True)
     require(not (out/'START.json').exists(), 'output already used')
     plan = json.loads((HERE/'PLAN.json').read_text())
+    boot_args, expected_counters = kernel_profile(plan.get('kernel_profile', 'air-native-batch'))
     selected = cases()[:1] if REHEARSAL else cases()
     write(out/'START.json', dict(rehearsal=REHEARSAL, planned_draws=len(selected),
         driver_sha256=hashlib.sha256((HERE/'lib/libvulkan_asahi.so').read_bytes()).hexdigest()))
@@ -124,8 +140,7 @@ def main(out):
         require(os.uname().version == plan['kernel_version'] and
                 os.uname().release == plan['kernel_release'], 'wrong kernel')
         args = Path('/proc/cmdline').read_text().split()
-        require('asahi_m4.native_batch=16' in args and 'asahi_m4.native_batch_payload=0' in args,
-                'wrong research boot parameters')
+        require(all(arg in args for arg in boot_args), 'wrong research boot parameters')
         require(not (Path.home()/'.drirc').exists(), 'unexpected per-user drirc')
         require(KNOB.read_text().strip() == '0', 'mode must start at 0')
         (out/'config').mkdir()
@@ -144,7 +159,7 @@ def main(out):
                 directory.mkdir()
                 raw = DEP.read_text()
                 (directory/'dep-before.txt').write_text(raw)
-                before = counts(raw)
+                before = counts(raw, expected_counters)
                 e = environment(out, case)
                 argv = list(map(str, [HERE/'bin/mesh-nvidia',
                     HERE/'shaders'/(case['name']+'.mesh.spv'), HERE/'shaders'/case['fragment'],
@@ -190,7 +205,8 @@ def main(out):
                     require(row['readback']['verdict'] == 'PASS', 'pixel/buffer mismatch')
                     raw = DEP.read_text()
                     (directory/'dep-after.txt').write_text(raw)
-                    row['audit'] = audit(log, case, plan['driver_revision'], before, counts(raw))
+                    row['audit'] = audit(log, case, plan['driver_revision'], before,
+                                         counts(raw, expected_counters), expected_counters)
                     require(KNOB.read_text().strip() == str(case['mode']), 'mode changed during process')
                     row['native_pass'] = not REHEARSAL
                     row['verdict'] = 'PASS'

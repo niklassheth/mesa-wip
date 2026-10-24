@@ -42,6 +42,34 @@ class Audit(unittest.TestCase):
         for after in (self.before,dict(native_renders=4,native_dispatches=6)):
             with self.subTest(after=after),self.assertRaises(RuntimeError):self.audit(after=after)
 
+    def test_mini_profile(self):
+        args, expected = run.kernel_profile('mini-native-blocks')
+        self.assertEqual(args, ['asahi_m4.native_mesh=0'])
+        before = dict(submit_rejected=3, native_block_renders=7, native_block_dispatches=8)
+        self.assertEqual(run.audit(self.log, self.case, '0123456789abc',
+                                  before, before, expected)['counters'], expected)
+        for key in expected:
+            after = dict(before)
+            after[key] += 1
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                run.audit(self.log, self.case, '0123456789abc', before, after, expected)
+        with self.assertRaises(RuntimeError):
+            run.audit(self.log.replace('native=1', 'native=0'), self.case,
+                      '0123456789abc', before, before, expected)
+
+    def test_counter_presence(self):
+        for profile in ('air-native-batch', 'mini-native-blocks'):
+            expected = run.kernel_profile(profile)[1]
+            raw = ''.join(f'{key} 4\n' for key in expected)
+            self.assertEqual(run.counts(raw, expected), dict.fromkeys(expected, 4))
+            for key in expected:
+                with self.subTest(profile=profile, key=key), self.assertRaises(RuntimeError):
+                    run.counts(raw.replace(f'{key} 4\n', ''), expected)
+            with self.assertRaises(RuntimeError):
+                run.counts(raw + raw, expected)
+        with self.assertRaises(RuntimeError):
+            run.kernel_profile('unknown')
+
     def test_environment(self):
         env=run.environment(Path('/tmp/native-nvidia'),self.case)
         self.assertEqual(env['HK_APPLE9_NATIVE_MESH'],'1')
