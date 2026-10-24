@@ -60,5 +60,6 @@ subprocess.run(command,check=True);records=json.loads((out/'native-records/RESUL
 assert records['verdict']=='PASS' and len(records['cases'])==1
 write('RESULT.json',dict(verdict='PASS',gpu_execution=False,software=software,native_pipeline_recordings=1,
     mesh_sha256=MESH_SHA,fragment_sha256=sha(shaders/case['fragment']),original_mesh_and_fragment=True,
+    state_adaptations=json.loads((out/'INPUTS.json').read_text())['state_adaptations'],
     driver_sha256=records['driver_sha256'],scope='CADSCENE basic taskless original mesh/fragment, adapted subgroup state and isolated inputs; not a complete application'))
 print('CADSCENE original mesh/fragment: exact software and native pipeline recording PASS')
