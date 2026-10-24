@@ -36,6 +36,10 @@ for software rehearsal. The native recording verifies a real ARM compilation,
 T32 route and 15 output planes. The paired kernel parser must accept research
 and reject qualified mode, including relocation and truncation checks.
 
+Software rehearsal requires the complete exact readback and a fail-fast broken-GPU
+run. Native renderer, own-VM and counter evidence are explicitly unmodelled there
+and receive no credit.
+
 The device run additionally requires a retired fence, correct mapped Mesa
 hash/revision, own-file-descriptor VM profile and generation, exact native
 counter deltas, and continuous kernel-log coverage. The canonical operator
