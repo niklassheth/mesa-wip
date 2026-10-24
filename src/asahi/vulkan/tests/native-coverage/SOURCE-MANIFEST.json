@@ -1,0 +1,1469 @@
+[
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "CMakeLists.txt",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/CMakeLists.txt",
+    "sha256": "b0c31f72dd76d75a8369ec11f9764a516c9305f78944804a005a52433fc8d509",
+    "bytes": 3555,
+    "git_blob": "82d664ee3bfefd2d1968b84d444303415e2f3904"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "LICENSE.md",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/LICENSE.md",
+    "sha256": "f8560db5cbd0127f429b92594b100eb031eb9296b9c6b5eaced01017462aa2af",
+    "bytes": 1074,
+    "git_blob": "3103996190cd6587d1a67dacb362b6ba54b923db"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/niagara.cpp",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/niagara.cpp",
+    "sha256": "d015bdda25c3d5261dfcdf81eb05162eb574239e3c58103ea555282d143f8b11",
+    "bytes": 86556,
+    "git_blob": "e59c8e5504457bdefe1a6ba37c3981033f4d25cf"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/bloom.comp.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/bloom.comp.glsl",
+    "sha256": "43e7d4c7bc7d46926f2c821b5de1d3ae06d3f66244b5a901ae5ff579326704f0",
+    "bytes": 5991,
+    "git_blob": "76aa4cba32adb622505ff58e0d0247d61a231c1c"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/clustercull.comp.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/clustercull.comp.glsl",
+    "sha256": "6e8bb4947363c0b602faa0214581fb6f6736c8196ed53acc3b973d271eccf134",
+    "bytes": 4903,
+    "git_blob": "f0ca36562ce5679ba8cc0c2ce1e1f2b7cf04a01d"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/clustersubmit.comp.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/clustersubmit.comp.glsl",
+    "sha256": "928b47b6e42ebe296d7f733ba7298626874216cba91bdaea7128ebc06fe38f79",
+    "bytes": 1338,
+    "git_blob": "e1f668af85dc45fe583e73dbf7bfe74504fa80ad"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/debugtext.comp.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/debugtext.comp.glsl",
+    "sha256": "c6eda1d540cc77bde11f4294359445024dd4e55bcb637672fffa8631b7b96113",
+    "bytes": 6388,
+    "git_blob": "6760dcb9ce44b3f67e10e28e17492468b469799c"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/depthreduce.comp.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/depthreduce.comp.glsl",
+    "sha256": "ba2dccb76ba3a4e1c1b9d396256100ce4cddcd70f902233d09e44fc35ee79e9e",
+    "bytes": 601,
+    "git_blob": "949df165bf0c7cbdfa40252c562508b2a5469014"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/drawcull.comp.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/drawcull.comp.glsl",
+    "sha256": "844e7ee7d73f9fc7e6c8e1718dcff22bfa87794c3d6b0d0261f2d41e4efa1571",
+    "bytes": 4739,
+    "git_blob": "ce583d705f6d3947dc20a97f1ef38088b503805f"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/final.comp.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/final.comp.glsl",
+    "sha256": "5a1f890d5b9d6ba99702ea373afb36823b7bf09051550e44a10d050a1aabcfbf",
+    "bytes": 2313,
+    "git_blob": "57b70da11d2101f6134b03699f155b728e40fb30"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/math.h",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/math.h",
+    "sha256": "9728a124d7dcfdfb9c2d324cf23ce1d5798a8a7e515d0a35fde7c7e0707c9cfe",
+    "bytes": 3552,
+    "git_blob": "106ab8a6ed65b8d1ad33d402e22d5447b7e41583"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/mesh.frag.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/mesh.frag.glsl",
+    "sha256": "a904c1ed3d0811013ff07d8d1af9c97e533e54a41c6abaa34b97496742f9d197",
+    "bytes": 2540,
+    "git_blob": "52110e96a75c73959f57af3f09ab1b506ed2326d"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/mesh.h",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/mesh.h",
+    "sha256": "712a83826deef0728d7fa1c6b07b92165c243b50f39792b7291efad54fe4e320",
+    "bytes": 2012,
+    "git_blob": "7c30e6493b80475b037bd758c5d73af419be109b"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/mesh.vert.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/mesh.vert.glsl",
+    "sha256": "f2392673bcc72380dc60e01e8ae0613fe516c040f2fdc3d85f300d8f0e21ef31",
+    "bytes": 1498,
+    "git_blob": "3af821664f04b638bed6599252d6e9304035c4c0"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/meshlet.mesh.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/meshlet.mesh.glsl",
+    "sha256": "e11790df1aa0687fb7380715f95fd726c95662b547deddf6e9afa9ae67e4011f",
+    "bytes": 5243,
+    "git_blob": "7bdf2b09dbda1791d0edb9c5f5469b2d234671b9"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/meshlet.task.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/meshlet.task.glsl",
+    "sha256": "cfcb2910686b630c27eecef8ff1890e5df355d95d7fda47571651fb4aad316b2",
+    "bytes": 4934,
+    "git_blob": "03c161fa72ed124786614099c22be742fef134a6"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/shadow.comp.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/shadow.comp.glsl",
+    "sha256": "161de07992cd7aa1cd08599abb46f769aaf856df0ba41d69b6c15c0d4b6ee05b",
+    "bytes": 4765,
+    "git_blob": "8c01b08e8449b712d06699436a7df53068080d36"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/shadowblur.comp.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/shadowblur.comp.glsl",
+    "sha256": "005b80b7f2debe891e245246f554d64f872f6b5b8eb16d1599948b4e32b6f842",
+    "bytes": 1498,
+    "git_blob": "c5e848760447be5e29aa1d40e7a1135bbbcc229a"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/shadowfill.comp.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/shadowfill.comp.glsl",
+    "sha256": "e41eb97006c386bf764c148163a79a8134fa0650ed558e038a8937ff25946629",
+    "bytes": 1190,
+    "git_blob": "e9743cb7251e95fdde1a5e0a32bdc6235f989c67"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/shaders/tasksubmit.comp.glsl",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/shaders/tasksubmit.comp.glsl",
+    "sha256": "fac61df0cb1be8236d68eb4913226b599899dc55e626964621356df05f2c0421",
+    "bytes": 1246,
+    "git_blob": "8075db6a147bdb3eb3fdd7ba7ae8d927b4ae6466"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "LICENSE",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/LICENSE",
+    "sha256": "9c18288ad9997b4b8d62a544e01d960d3effa28e45e8cfcea6e0cacb9db33f6b",
+    "bytes": 11355,
+    "git_blob": "d3f888a0b2d042b2cd326bf2f45b644a62f19277"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader.frag",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader.frag",
+    "sha256": "ad1696261f6b4c0defc0dbce152172474ab373d95b161b8f07af12cddec2c416",
+    "bytes": 1308,
+    "git_blob": "4460cb74413126af21366b381d5d6febe394ad9d"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader.frag.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader.frag.spv",
+    "sha256": "9920330361298f6cd9cb239dafa4240ca7c4dfa52bf677a8b247a29176db3837",
+    "bytes": 1860,
+    "git_blob": "5c14846c1fac98392443742266eae0e5e15cbee9"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader.geom",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader.geom",
+    "sha256": "396eb8ef06349663ba0ed73c244e172e3fe5040c14d445bf864fd0b2f8b9aebb",
+    "bytes": 1454,
+    "git_blob": "7de58bf0555ee4b617cf2d3b56f7a7ce54a3f32d"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader.geom.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader.geom.spv",
+    "sha256": "d336d3b9a0c38bdc819f17f56585e64c38a9e643143b761d2b95311ab5dae2f5",
+    "bytes": 3020,
+    "git_blob": "bff3c8f5ece802fceef1046b4f388fbffdae317b"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader.mesh",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader.mesh",
+    "sha256": "2cabe5f4e61496b19f2dc92b2ede2e07b929f1e01c6fd0379ed1289773700ef9",
+    "bytes": 2688,
+    "git_blob": "d99a4616ba7a7da68290cbec08b1cb3fe8a27ae0"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader.mesh.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader.mesh.spv",
+    "sha256": "a0f870bb5f9d92171e31707816c1cf8acad9271c5a05eac24923874983f5a106",
+    "bytes": 6048,
+    "git_blob": "2c96f75743a72e10f1e9a4725d61b770d9d96339"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader.vert",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader.vert",
+    "sha256": "e5fdd32655e02eb585347e92b18d95001f9ce93dcff0d26934a33a903863b77e",
+    "bytes": 1487,
+    "git_blob": "e6f0d54772d4ad26c2e10c228dcadb2f51ace3d3"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader.vert.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader.vert.spv",
+    "sha256": "57dc2943e10e14293dffea04fe4ccf62fd8beff8f22d242e7ce0d4e28b000bb0",
+    "bytes": 3232,
+    "git_blob": "eb2852e78b3cddc521c1ca919e8031488c4eacc7"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader_base.frag",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader_base.frag",
+    "sha256": "eb4f72b357415773e50bcebd9c1c1b249d129ac5c7627b45dc29819470253bdf",
+    "bytes": 802,
+    "git_blob": "c4a34be5399418711b1e7ba425fa8b874b7f70f6"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader_base.frag.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader_base.frag.spv",
+    "sha256": "582b4ca64325fa3a5d7dc4f1ef09d4677a5ba3de85414251e8217dca44abe513",
+    "bytes": 572,
+    "git_blob": "7cd7470de95a1f40a9d59e6349ed5cf97387d774"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader_base.vert",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader_base.vert",
+    "sha256": "731c10d5c24721fc214cb3d04cafe2f0e5e0e2632b8ca9795975f670fe2e0359",
+    "bytes": 861,
+    "git_blob": "283e64af1f376936925dce401a3c2bc8324a4ac7"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader_base.vert.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader_base.vert.spv",
+    "sha256": "28d0a7fe003cd5eee3644b4cf21c343ef240fb260b3cf99d538405c25690f9bb",
+    "bytes": 1052,
+    "git_blob": "bcd71f34b934feee4e62477eb805897aac3b79c5"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader_mesh.frag",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader_mesh.frag",
+    "sha256": "a67f8e3207771aa8d9ac652481a1c5138e11a07de8d779edeefe795835f46448",
+    "bytes": 772,
+    "git_blob": "1f40549f0ecb9873d57840aca29c642950acfeab"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/glsl/gshader_to_mshader_mesh.frag.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/glsl/gshader_to_mshader_mesh.frag.spv",
+    "sha256": "e8a87b71450d59e1ef0cf2c1bd7db267a0367777cb04fb45e5b7de608d6d2281",
+    "bytes": 444,
+    "git_blob": "0d245eb18d2fffe9630668034728475a6d2635f9"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader.frag.slang",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader.frag.slang",
+    "sha256": "2e24996832ef084b21d94902bd36077372ca24ca7e39a4207c038bef3bffa018",
+    "bytes": 1338,
+    "git_blob": "b1248ca0761fe0b8826f9061ee319c03a799c982"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader.frag.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader.frag.spv",
+    "sha256": "694a1696ca6591994b7e1dff43f96f56cc6e6a9c21fe7f41509fb4575719c223",
+    "bytes": 1164,
+    "git_blob": "bbd30b3a5333349c1ad698e9c22b24b505ea88eb"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader.geom.slang",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader.geom.slang",
+    "sha256": "b6b8b8b5b1b11978566fdc359b3c1a39a6dd48b0050cec490007e1c3e1f26e06",
+    "bytes": 1661,
+    "git_blob": "439a4b24c15659d1bf28ba26c821b225517f42ef"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader.geom.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader.geom.spv",
+    "sha256": "5d9b4f307e7c65a08a91ac9d3a02c6f2478f9896ef9bca2f00a6288ee169a233",
+    "bytes": 3628,
+    "git_blob": "a2525eb65c9fdc71c76f80914a6f57744c368ba1"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader.mesh.slang",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader.mesh.slang",
+    "sha256": "227ed5c430f86c98d7387fe0d06ef5449f3a5098ad87d903318272c94930fff9",
+    "bytes": 2759,
+    "git_blob": "269dce1630484a528f72678f22dc13ac6db60cfc"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader.mesh.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader.mesh.spv",
+    "sha256": "75f33ce20a798e58b9d7356f8ea3392ab07ebf484bb15c078f37eac047d16b9c",
+    "bytes": 6768,
+    "git_blob": "e3be80d38ce3bc70e473dc1f1edc0dc39d5694e3"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader.vert.slang",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader.vert.slang",
+    "sha256": "cf4802b0e527a338937bcf136b5f436a669ae552bf22e03cd8629c9d6f11f5a4",
+    "bytes": 1578,
+    "git_blob": "01f23cf6dd23c5e93b0eaa922dbea80a25e94b4c"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader.vert.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader.vert.spv",
+    "sha256": "65362e23b95c6879ae3b670fa61f9c2baeb704aa81deeeddda74992578f89cc1",
+    "bytes": 4212,
+    "git_blob": "fdf81d885d838e9a401479415c75b06f07c9d3de"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader_base.frag.slang",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader_base.frag.slang",
+    "sha256": "c48f019e770571b0e926c5ea4ff1ee7951cb7907370d1c17d6902427f716c23e",
+    "bytes": 841,
+    "git_blob": "5f4ebe2f00f224541c0c2ff49762483e800036f2"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader_base.frag.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader_base.frag.spv",
+    "sha256": "1e6db4081deb83ede780cde35451e05b5dd308b6af581dd95cfa4eae55beb3b7",
+    "bytes": 420,
+    "git_blob": "57e6ef985cdaf64b3d117eb85df53d38b4166692"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader_base.vert.slang",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader_base.vert.slang",
+    "sha256": "dd03013eb448e422312b95b8695f00340f0155682ca2d1d88459f215118bb104",
+    "bytes": 980,
+    "git_blob": "55e202897b09e7052a3235f06edb5f86ea0a4c43"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader_base.vert.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader_base.vert.spv",
+    "sha256": "cc7cecd24c9261aa9ca4005831093914fdc4fd5a68d23784184b6aa31e5700a7",
+    "bytes": 600,
+    "git_blob": "a81a2a5598f8c20a16217f442ec6a9a55a212d9f"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader_mesh.frag.slang",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader_mesh.frag.slang",
+    "sha256": "c06bb73ea42aa3241bab89e0f38e214074f062112e6e5adc5fef70563f8ecc66",
+    "bytes": 831,
+    "git_blob": "cf009f07c9f338087a920b1cbd50edc8318e9277"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/gshader_to_mshader/slang/gshader_to_mshader_mesh.frag.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/gshader_to_mshader/slang/gshader_to_mshader_mesh.frag.spv",
+    "sha256": "4d74d5af5b79f7e877006fbe4575400a9e54dee5110e0f22356122785a2abbb4",
+    "bytes": 368,
+    "git_blob": "d6f2503d7d5dc09375dc821646edbbd164d831e8"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shader_culling/mesh_shader_culling.frag",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shader_culling/mesh_shader_culling.frag",
+    "sha256": "f679a87210b57cd038728e8024892a9813e71528709e9b865366287b545245f0",
+    "bytes": 790,
+    "git_blob": "d2f88193ad03ae6c061c8ed6dfef25eee5b3fe96"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shader_culling/mesh_shader_culling.frag.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shader_culling/mesh_shader_culling.frag.spv",
+    "sha256": "ccab4cf21ee24cd9925ac6e93a921031767b8fc5b643f0931594f3e25d01bb68",
+    "bytes": 568,
+    "git_blob": "6c1b0824eefa8e3928bdf840511cbb498ad2e184"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shader_culling/mesh_shader_culling.mesh",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shader_culling/mesh_shader_culling.mesh",
+    "sha256": "be1b5f85d2a30736a545dc4c096d37299f4c9c59d8a7c99d0cf56ed9385cba93",
+    "bytes": 2981,
+    "git_blob": "94cd089f73310522a00c051e143fc247bb75441f"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shader_culling/mesh_shader_culling.mesh.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shader_culling/mesh_shader_culling.mesh.spv",
+    "sha256": "0cfec189eaa42f474c107870db26dd94da860d96716ef6f40fd8281b90c02a42",
+    "bytes": 4368,
+    "git_blob": "21fec77b851b5b81f972996c274115ce4789da6c"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shader_culling/mesh_shader_culling.task",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shader_culling/mesh_shader_culling.task",
+    "sha256": "f0ff76ad3d136b3b207f20f8d3a07eb137ae569ce4819a064849fc71513e5d75",
+    "bytes": 3084,
+    "git_blob": "732beb69f1bb703d7f0fdc79b75bf74edcc980b1"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shader_culling/mesh_shader_culling.task.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shader_culling/mesh_shader_culling.task.spv",
+    "sha256": "0f0a5cf3b7d4dfa456771b5adf1101b938c9321408204aa1fc14a2930da6e964",
+    "bytes": 4424,
+    "git_blob": "1d4811628dca3c566b2c734f12a3bfc745b6dfe7"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shader_culling/mesh_shader_shared.h",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shader_culling/mesh_shader_shared.h",
+    "sha256": "c42d7241f8b7c0b6a7629127ef215f6aa9e0d6a6aa9257dba5a6c434f14738f8",
+    "bytes": 1252,
+    "git_blob": "9628e1e436b552df0b7633aa27f922d45f8818ae"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shading/glsl/ms.mesh",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shading/glsl/ms.mesh",
+    "sha256": "2d703bb1935f94dc469607cb8653d639d0f34724ab09f918a9849efe6675f0f7",
+    "bytes": 1183,
+    "git_blob": "917ee39ff52a8d92c2683972160f9f313563d31b"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shading/glsl/ms.mesh.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shading/glsl/ms.mesh.spv",
+    "sha256": "c586ece96461c09d93636ddebf8eb2a239d3992f9cbf25ec13750e9f0d8daccd",
+    "bytes": 1544,
+    "git_blob": "5fceab89e0718d355a7c0314dee8554992f5ecf1"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shading/glsl/ps.frag",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shading/glsl/ps.frag",
+    "sha256": "945eac4dbcbed17f6d234d89d5ba67c14e75ceeaf301023d7034fda6e12ba923",
+    "bytes": 753,
+    "git_blob": "92b1e82f6c44fdf5c8959ffd392fc22967c1d8e1"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shading/glsl/ps.frag.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shading/glsl/ps.frag.spv",
+    "sha256": "ed646b7bea77fcfc82a156d3acfbebe692d282ea8a13aceaae33eeab66d594b0",
+    "bytes": 420,
+    "git_blob": "2c36477d306b2b343e28a3493a891f39b066793e"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shading/hlsl/ms.mesh.hlsl",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shading/hlsl/ms.mesh.hlsl",
+    "sha256": "d0632e0629db65dbd7a2bc63a4a47175b3f81a9b18fd1e5a26c5f15fea3558ed",
+    "bytes": 1109,
+    "git_blob": "dded270d07087e1b5907c3944fa75186cb2ebaed"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shading/hlsl/ms.mesh.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shading/hlsl/ms.mesh.spv",
+    "sha256": "287e6d0a343cae4c309d11a070b9a7e95b5c3e0166ada29e2943d4c7df0cd372",
+    "bytes": 904,
+    "git_blob": "56379574c6ebae744d34a82a1087660986e8080e"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shading/hlsl/ps.frag.hlsl",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shading/hlsl/ps.frag.hlsl",
+    "sha256": "c9574d05308b67ea8121c7941fe44478fb434d4ecaf80c7531ff3273b00e6ce2",
+    "bytes": 708,
+    "git_blob": "325aecb467261fd591869ba97d294396f7e5655c"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shading/hlsl/ps.frag.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shading/hlsl/ps.frag.spv",
+    "sha256": "7dc1c40da83e10969f7730e52de4d2771c00a7ca185db54d72c842faed305079",
+    "bytes": 336,
+    "git_blob": "6aba3d112ab526c60f8830eae17ed94c1ff6e6f1"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shading/slang/ms.mesh.slang",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shading/slang/ms.mesh.slang",
+    "sha256": "9af2bf92df0e6e905e2c34560f7eab0769931e7bfeb940867fe9cf0668d9a611",
+    "bytes": 1120,
+    "git_blob": "84dc914bd893772439e71d86bd655514d00da257"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shading/slang/ms.mesh.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shading/slang/ms.mesh.spv",
+    "sha256": "4d226c0bc08059228bc1420ca1bdb623a3f2db95c1f350837115fa708da1f020",
+    "bytes": 896,
+    "git_blob": "10a5b827f3486f4ea77e5a1248e626f183752f78"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shading/slang/ps.frag.slang",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shading/slang/ps.frag.slang",
+    "sha256": "be17d14658723838e85d896f52ea0d3264283e978cc8a0e5a3805779bcea9dd2",
+    "bytes": 719,
+    "git_blob": "f9be0d8335e0789531e3bbfb3516d3b99e9aeaf7"
+  },
+  {
+    "repository": "KhronosGroup/Vulkan-Samples",
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "path": "shaders/mesh_shading/slang/ps.frag.spv",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Samples/69622af06f7652c7fc9b9a9180e7142046315cbc/shaders/mesh_shading/slang/ps.frag.spv",
+    "sha256": "3bbdc050c22c760cd94938cb2e8dd7faedc95097d7e5f546f90e9f03348006c5",
+    "bytes": 340,
+    "git_blob": "f9fb85491a166e7deac7d88ae4588fa837afbac6"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "LICENSE.md",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/LICENSE.md",
+    "sha256": "d8db1712b2a1383b27cebeab2ddb8840a6e31ea820b0d56552a0f1c65f920983",
+    "bytes": 1081,
+    "git_blob": "2c4cfd5b79da02f28b91dc25819205196ee1819f"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/glsl/meshshader/meshshader.frag",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/glsl/meshshader/meshshader.frag",
+    "sha256": "4aba387f51a19bc64d99493aa5c33f6ca5aa85d2f94709f6178baed0927dbdbd",
+    "bytes": 262,
+    "git_blob": "f425dd4c2d1a486b93d59dcc429eb7197132df2e"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/glsl/meshshader/meshshader.frag.spv",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/glsl/meshshader/meshshader.frag.spv",
+    "sha256": "79220f400f24d47cd6e8e3fdcb644df3576b417ce59ac13ef1b2e6298faf79a4",
+    "bytes": 516,
+    "git_blob": "14a5c003a5af50a8b999b9eb3a70f4c88ae2a356"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/glsl/meshshader/meshshader.mesh",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/glsl/meshshader/meshshader.mesh",
+    "sha256": "0a9739a56f257acba557235f019d39f3782ab0ac61745c83e580a69f6ba2cd9b",
+    "bytes": 1228,
+    "git_blob": "2e0a34ceaf77d6dac2be80b36f7860080248496d"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/glsl/meshshader/meshshader.mesh.spv",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/glsl/meshshader/meshshader.mesh.spv",
+    "sha256": "0543f9c590a1c02923815f832ce6abd7d152c9dd80477e8ac724c0276b3143de",
+    "bytes": 3016,
+    "git_blob": "d9dcb786c3ec88981e584ba31655131273f45533"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/glsl/meshshader/meshshader.task",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/glsl/meshshader/meshshader.task",
+    "sha256": "db2bcbb33476312f7f703eabb44313fb42f275f567af23c2abadc2cc8cc94fc7",
+    "bytes": 179,
+    "git_blob": "47439e9163bcb61f062e3de830d83791af7e210a"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/glsl/meshshader/meshshader.task.spv",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/glsl/meshshader/meshshader.task.spv",
+    "sha256": "e2bd93521f8057dc47d3ebdcd2d8ee3d6b6e148cbc75e1a1292fbaf3c518317d",
+    "bytes": 300,
+    "git_blob": "abcbc5df4b76778a6847080adcdcb9eea13ddf5e"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/hlsl/meshshader/meshshader.frag",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/hlsl/meshshader/meshshader.frag",
+    "sha256": "f2dc167ca6b08f4d52ab5e4d3b8db917b9f0e3c0c4fa3b2074a8fc123f64c3a1",
+    "bytes": 218,
+    "git_blob": "d4e1e8debd192e2d73ac6c32948d8f5560c60aee"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/hlsl/meshshader/meshshader.frag.spv",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/hlsl/meshshader/meshshader.frag.spv",
+    "sha256": "7cc87086c3464e8155d0d5aa3d342ae65182ec27b618e73adfad05e32234dc4e",
+    "bytes": 368,
+    "git_blob": "6c5341846afea4300869c5138cfd52f5007f3399"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/hlsl/meshshader/meshshader.mesh",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/hlsl/meshshader/meshshader.mesh",
+    "sha256": "41750a2df33631ba760b7aeee1d7c4b172f51b9605bbf2c2a71c4f26940aea7e",
+    "bytes": 1058,
+    "git_blob": "840e009b27cf8860625856b63b7b8b8d74ab88c1"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/hlsl/meshshader/meshshader.mesh.spv",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/hlsl/meshshader/meshshader.mesh.spv",
+    "sha256": "e6c7d36ceefdacdf46f594fa48fa3f220aa2c12447266c02d016c815418cfcb3",
+    "bytes": 2192,
+    "git_blob": "e29bbb2c6a7d8aa4555290919d49107d1d5f9720"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/hlsl/meshshader/meshshader.task",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/hlsl/meshshader/meshshader.task",
+    "sha256": "966e29749bd92171e1ecbea6fc9b4170d89dc4bf7f7f9ef8bdd25bb620d9d287",
+    "bytes": 316,
+    "git_blob": "3b3b524e8339e32bcc5a54392b6bd69a8b89b3db"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/hlsl/meshshader/meshshader.task.spv",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/hlsl/meshshader/meshshader.task.spv",
+    "sha256": "216737a882dd1ba38b0ea4f7b827c9fe045385cc21f82766962e6db01a8e34cf",
+    "bytes": 448,
+    "git_blob": "62823391c2324fd5dd3560bab677eebab9d5b6c7"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/slang/meshshader/meshshader.frag.spv",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/slang/meshshader/meshshader.frag.spv",
+    "sha256": "100500eaa6fe85c9ed53a393fccaf33909e8f9c5e3c8f131547a11143b75d947",
+    "bytes": 384,
+    "git_blob": "3d2c3eee80b3d2543b4c8b8a4a83f8238cbba25c"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/slang/meshshader/meshshader.mesh.spv",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/slang/meshshader/meshshader.mesh.spv",
+    "sha256": "505f2d6befeb184b42117cb0437188f16d530f86e6ccbde2a7a7a27d5c207c46",
+    "bytes": 4088,
+    "git_blob": "582ac173835d5a4c82b35c08bc2d1b3e18e55447"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/slang/meshshader/meshshader.slang",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/slang/meshshader/meshshader.slang",
+    "sha256": "2b04e91dfbd65f17603db4e7ed0ebd3aae341602067375c76c0ec359d1fd9946",
+    "bytes": 1430,
+    "git_blob": "652b3411f8f64530d23c6720ee79032cbb59b02d"
+  },
+  {
+    "repository": "SaschaWillems/Vulkan",
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "path": "shaders/slang/meshshader/meshshader.task.spv",
+    "url": "https://raw.githubusercontent.com/SaschaWillems/Vulkan/1cbc8d87b731b438f47dea00a2e083ba7d59051d/shaders/slang/meshshader/meshshader.task.spv",
+    "sha256": "287475aa14d4186f8c1b06fc3f01af47003ba56dc01b7384ada60628db4f6323",
+    "bytes": 396,
+    "git_blob": "735495e2fff73f6ddb9cc15761fed1cbedfd7f7b"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "LICENSE.txt",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/LICENSE.txt",
+    "sha256": "5c48360ddec789b6333413d2e52a1f3b45174dfd9f8d8575c78dc64a6d877f9f",
+    "bytes": 1084,
+    "git_blob": "58e05c35ecd234a8d46336131a2bf2f3d1ec6b03"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/offlineshadercompiler.cpp",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/offlineshadercompiler.cpp",
+    "sha256": "395b1045dcbc78790d9a967aa68cf4d48decea08d31d742df047316104388ba2",
+    "bytes": 34999,
+    "git_blob": "49a1d323ef5cb0ddc944544a9c10eac91ddcdff9"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/objectAS.hlsl",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/objectAS.hlsl",
+    "sha256": "354644a783e0dd51e7d34267c03c891abe0499569422b580215c6202eda1b00a",
+    "bytes": 71,
+    "git_blob": "723fac5d4b30b104975533ccae04f9d54344f22c"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/objectMS.hlsl",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/objectMS.hlsl",
+    "sha256": "d76d8097e88996ed72c007d220f08a8362778b833e97e72124f5108fc862b74d",
+    "bytes": 106,
+    "git_blob": "0a1fcbc9a7c8599985707063a4622221e3ba861b"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/objectMS_prepass.hlsl",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/objectMS_prepass.hlsl",
+    "sha256": "744947aecf116b19ae36df016cd6b137fea491ae43ef2b74a74f1ae971bfada2",
+    "bytes": 107,
+    "git_blob": "0d0dac56b355d7cf98eda5c97aa8004466ac07a4"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/objectMS_prepass_alphatest.hlsl",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/objectMS_prepass_alphatest.hlsl",
+    "sha256": "2a0e51f11da1ed7a3ed229bdfccbd5211a51d2ccfcea09002ffe76d73f3fbb9e",
+    "bytes": 111,
+    "git_blob": "e8a5638bc4c448199f60cd1cb5ce7c1f7db1f86f"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/objectMS_simple.hlsl",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/objectMS_simple.hlsl",
+    "sha256": "c949b645ae188d06f4de232f0822ebf516979e1eb0affcc644057ded1a3e190b",
+    "bytes": 141,
+    "git_blob": "5001826c9d2331e6aa2df201b231c8dc067dd5f2"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/wiShaderCompiler.cpp",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/wiShaderCompiler.cpp",
+    "sha256": "bb6816e42a578a9b724d6d50199eaf1b0917757be2fc791cc217499b5138950b",
+    "bytes": 41933,
+    "git_blob": "2b9efa271c927615192ad6e4da0ae3b93e41b215"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "LICENSE",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/LICENSE",
+    "sha256": "0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9",
+    "bytes": 10173,
+    "git_blob": "4947287f7b5ccb5d1e8b7b2d3aa5d89f322c160d"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "cadscene.cpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/cadscene.cpp",
+    "sha256": "7ff8ecd7aaf75ec1287b3d3b4e1d77df4e59e023dc64aeb79269ef1e1f3780e9",
+    "bytes": 18032,
+    "git_blob": "2c550f71a09375d5d89c1daa3e177423e951c68c"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "cadscene.hpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/cadscene.hpp",
+    "sha256": "c0885791a3b05848ce9c9c35b108f1f3557b2421c1c39612b0b2ed1664518f90",
+    "bytes": 7015,
+    "git_blob": "9ec95575a82f1f017301417645b841d32784ae07"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "cadscene_gl.cpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/cadscene_gl.cpp",
+    "sha256": "e8f3d7d6456bb6623f4cf47934dba3b02d17f935374d8eec326e22b2d1198933",
+    "bytes": 10911,
+    "git_blob": "67a8b699cb5880d622cb5ad37a59ae0ec43c3198"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "cadscene_gl.hpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/cadscene_gl.hpp",
+    "sha256": "be334032d5887cc7d675a761b76e191f96ba3263ddede54d0f464000d561fabf",
+    "bytes": 3809,
+    "git_blob": "8abd31b1e5a78f3a60c25f116806d00ea51479a8"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "cadscene_vk.cpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/cadscene_vk.cpp",
+    "sha256": "c458c795de2e9bab21f3d2d497be1c08e836f640e67de5be8ff487e3d990b897",
+    "bytes": 11472,
+    "git_blob": "32324e53df26f81b663ad99383f3265b80a625cd"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "cadscene_vk.hpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/cadscene_vk.hpp",
+    "sha256": "093c6c59c93fa0ac5a43179bf5f59fa6cb63d5fa0f04e5f0b37f8dcaa0ec88dc",
+    "bytes": 6301,
+    "git_blob": "c495530506fe2c17a3ef4467a9f089f59877d1a8"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "common.h",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/common.h",
+    "sha256": "5c9fd377bd0dbe5a8143aa0af422c6a188c06b99b6f231f5e9b423504e72f06b",
+    "bytes": 7341,
+    "git_blob": "fbee73a192e403b521d48b050eedb10ae4e3fe39"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "config.h",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/config.h",
+    "sha256": "90406ce73fdc4efa637f7cd4873d51e1f030351c21a2639e1cd2af5f6182a6a7",
+    "bytes": 1685,
+    "git_blob": "36a754f92b77d5a24cb248604c5360752053ee3c"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "csf.cpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/csf.cpp",
+    "sha256": "ac0aae2e0e6950d45f3cb7cb35eeb4f2675349ddcabddfeeb2ae26f0fb72400c",
+    "bytes": 925,
+    "git_blob": "a9079d0f5c60b398401b95598304c527f6eb1992"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "draw.frag.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/draw.frag.glsl",
+    "sha256": "1409a96f915da86432fe014bb163fa3ae4fca4ba22650341af9ca5ba276b4507",
+    "bytes": 2420,
+    "git_blob": "9c08d52ec7e291b50e49b1670eadead2f127feed"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "draw.vert.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/draw.vert.glsl",
+    "sha256": "a096d69fc1d6af00c05e15d98838a826fdb8e0118b3d8aabd41da48009567324",
+    "bytes": 3147,
+    "git_blob": "8560fb19e1c6f72a6431bbf33050f408e827f3cf"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "draw_shading.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/draw_shading.glsl",
+    "sha256": "b91227b7346c2cf85cd354d77ce0332aae6f8f7d9a36ebfae5b89d7951b91dcf",
+    "bytes": 1576,
+    "git_blob": "9c2e12875c56a81c2bddfa6cf1d0eea6a7a0d6dd"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "drawmeshlet_ext.frag.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/drawmeshlet_ext.frag.glsl",
+    "sha256": "4cc6a2d07bb8a24c6c89228f5d2e6faf4909e3ad909d6e9f81359f7ba05d59f9",
+    "bytes": 7709,
+    "git_blob": "939fddd3fb2fb41ca3effb9c42dfd44ada5d5e3b"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "drawmeshlet_ext.task.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/drawmeshlet_ext.task.glsl",
+    "sha256": "384a16d707bffbfabb58f79e8998e6e8af91cc54522c7818a08e3afa192c3604",
+    "bytes": 4988,
+    "git_blob": "820b6732473bf1cb421ec6cf50bfd0bc37c3116e"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "drawmeshlet_ext_basic.mesh.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/drawmeshlet_ext_basic.mesh.glsl",
+    "sha256": "033b60233cca55138543c4d27e8b8f8bc0d01a7f7307f087158534e89e14d91c",
+    "bytes": 10844,
+    "git_blob": "5feb110acb5802b73efe60040fe88aaaa8453693"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "drawmeshlet_ext_cull.mesh.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/drawmeshlet_ext_cull.mesh.glsl",
+    "sha256": "f84682897dd983db1597ec7cc518754301cd39f3d7be2d88882507e25a0e3b5a",
+    "bytes": 26956,
+    "git_blob": "dfa61bf5ea037360b8137480b6ba1c5e56d9ae56"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "drawmeshlet_ext_scull.mesh.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/drawmeshlet_ext_scull.mesh.glsl",
+    "sha256": "fedfce7f77a72ea08a44ffaaeeb39c9c6b11dd56847dad5bc80bbac886034105",
+    "bytes": 29764,
+    "git_blob": "8241da01fe5505a14c3da1f79c36b85f9660825b"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "drawmeshlet_nv.frag.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/drawmeshlet_nv.frag.glsl",
+    "sha256": "686e2c9928f2b0cfd2de861f6f30c71d79d171f487300ad3512ac6eb34997605",
+    "bytes": 8437,
+    "git_blob": "f44f3ad8a4a21f1f764fee34215132b8442d7c75"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "drawmeshlet_nv.task.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/drawmeshlet_nv.task.glsl",
+    "sha256": "404c34bc7d060ea5f88d870315d4e3bac91f99ce0daa93cb0f043cbae5fed236",
+    "bytes": 5437,
+    "git_blob": "8e1638d1729503619d2e65afcc2afbd6aa1af451"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "drawmeshlet_nv_basic.mesh.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/drawmeshlet_nv_basic.mesh.glsl",
+    "sha256": "e28dbbf6ea1e7793ba042809c7f052e996ac07d65add61b49ddd29f357f31a4e",
+    "bytes": 13144,
+    "git_blob": "f3c8e84b4040088ca8c61f8125abafe44964328e"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "drawmeshlet_nv_cull.mesh.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/drawmeshlet_nv_cull.mesh.glsl",
+    "sha256": "e50c23e7c56ce97b191bfbc52e12612c56f32b973bbbd026dca3540aa60eda69",
+    "bytes": 17607,
+    "git_blob": "25b6c6af3b5f384c97231c77ef317dec0fdd7d4c"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "meshletbbox.frag.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/meshletbbox.frag.glsl",
+    "sha256": "48cbb82bc39b2dbf1f56f2cc256b6b600dce6befa495a4419dec7be16b027b87",
+    "bytes": 1089,
+    "git_blob": "f0ddd837972217cfbaf93504b899a21b087430c2"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "meshletbbox.geo.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/meshletbbox.geo.glsl",
+    "sha256": "1cf01b4fd95f695196668dcfcd6d137fe5a39d154202fb850b16f84f575a2dd2",
+    "bytes": 4803,
+    "git_blob": "e836a42cb452ac645a5108bedd3c1149054e620b"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "meshletbbox.vert.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/meshletbbox.vert.glsl",
+    "sha256": "2dd9a904d6dab139f31b4abdaea1b993069cc9ea1a4c0a8421a87ebe5ae36e76",
+    "bytes": 3265,
+    "git_blob": "c49a3510814c304a50c480acd4c766b98d11c3a3"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "meshlettest.cpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/meshlettest.cpp",
+    "sha256": "119b5e8ea3572940d8b18b56cf4dad85ecda15ef35323f5c95807270344a0543",
+    "bytes": 49815,
+    "git_blob": "5f621e4b0df93d60c0e3d9dbeffb3d5b58e62ac0"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "nvmeshlet_builder.hpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/nvmeshlet_builder.hpp",
+    "sha256": "29e6717a603dc8c421d28a48e4fe8d9fea9a8221b566a333c8bc2bbc65cfcd8d",
+    "bytes": 16201,
+    "git_blob": "602fb982c3b1e763b4e26bbf9dd2e12fc813bf36"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "nvmeshlet_packbasic.hpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/nvmeshlet_packbasic.hpp",
+    "sha256": "e74826475ac842e4b74ee00f4b7f2c1945ada24d90615b988bf2bbc21cb54add",
+    "bytes": 22238,
+    "git_blob": "0fc150f379eedadd9569811dde2d6163712572f0"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "nvmeshlet_utils.glsl",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/nvmeshlet_utils.glsl",
+    "sha256": "807c78ed55f1f3d643be3d9e05ce781b86989490b5c7976ec41937632ae23d00",
+    "bytes": 8099,
+    "git_blob": "d57197410426965144533d02af5ca0cec642fc39"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "renderer.cpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/renderer.cpp",
+    "sha256": "d15527dbb170bf1388297fca3e41f96f57f9b39c8f250f00d153906ff770d432",
+    "bytes": 4839,
+    "git_blob": "1c5bb09702d0b9c1198aeb6c13727bf2796be51e"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "renderer.hpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/renderer.hpp",
+    "sha256": "3c658eb17c7c476c872cddbbd68f51ebf9758103063bd3017b3983a0efa41c68",
+    "bytes": 2834,
+    "git_blob": "bf2dc249582668c54f72e9c82657effb62f60f8c"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "renderer_gl.cpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/renderer_gl.cpp",
+    "sha256": "b3cacd6a0ed81b2ed09d6a4a93ebbc1b8243d1dd0110cf97f664c222be47711d",
+    "bytes": 8034,
+    "git_blob": "ba791bb606f843811cff72fddacaa65320ffcd87"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "renderer_gl_mesh.cpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/renderer_gl_mesh.cpp",
+    "sha256": "b9440d2fa5cf1e51192049590423858dec15c4e94af47a1d8f2e18ab5e4ec742",
+    "bytes": 8727,
+    "git_blob": "0cedf81831554da874005ad0c622c174681fbfd3"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "renderer_vk.cpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/renderer_vk.cpp",
+    "sha256": "893914bc9d1f96dea84ec84a6e64160df824ce43d0e7e5025d2206dcd4b9a059",
+    "bytes": 6703,
+    "git_blob": "7750ccb2f52adff659c7904e9f11fc9bbaaa8c79"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "renderer_vk_mesh.cpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/renderer_vk_mesh.cpp",
+    "sha256": "b59a45eb5bd6553a1c19ffa2f5f67788efede18393a73de47e21944c88333e66",
+    "bytes": 9802,
+    "git_blob": "578d8c81ebf3f8decce7759f7407b4cacddcd42a"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "resources.hpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/resources.hpp",
+    "sha256": "f5f51c14b3695f703eaa1ecc07354e8e430503b80461f583aef97a257939e137",
+    "bytes": 3303,
+    "git_blob": "b77ef789b449e2f5fe4775551031f50ea6721b4b"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "resources_gl.cpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/resources_gl.cpp",
+    "sha256": "969029bb592766cbf6305e0ae65815f5975d9eaa7aebaeac52eb42c8e5334b13",
+    "bytes": 13060,
+    "git_blob": "8254566ed96dee6255027612bf3533a5ff8d0a3b"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "resources_gl.hpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/resources_gl.hpp",
+    "sha256": "c12bf94daa4c04ad3dedc7afdca630a0259ac4e5db19cdc83818cd22ab36b34e",
+    "bytes": 3406,
+    "git_blob": "a330ae05ba5b464ce10b7397b0e0fbb81a8f8f5d"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "resources_vk.cpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/resources_vk.cpp",
+    "sha256": "77f4ae948413ebfea234dc8a93bcd6205f61ef8361299b0264015667867eb692",
+    "bytes": 63574,
+    "git_blob": "c848a4752424c179deb18be2b5f5172d963ea77c"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "resources_vk.hpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/resources_vk.hpp",
+    "sha256": "aa6ef58abf6fa66b4fd68e36b5aadba399a4a10ba2845ecdcceb95ed85fbaa68",
+    "bytes": 7420,
+    "git_blob": "0eb97b00a451726584a31721686f3878ea4a1f76"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "vk_ext_mesh_shader.cpp",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/vk_ext_mesh_shader.cpp",
+    "sha256": "0bf64a28ea2f20a7e1a8c37b1669f4c182f27a5f90ffad5a119e1936cebe6bca",
+    "bytes": 2992,
+    "git_blob": "8c9b5f166f5354abe693b473369523c07386ebd3"
+  },
+  {
+    "repository": "nvpro-samples/gl_vk_meshlet_cadscene",
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "path": "vk_ext_mesh_shader.h",
+    "url": "https://raw.githubusercontent.com/nvpro-samples/gl_vk_meshlet_cadscene/4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8/vk_ext_mesh_shader.h",
+    "sha256": "ed89097c22364d8d7e8a6d55272f5b27c2a2af0d0fe85cb9a0b5bba2f2be05cc",
+    "bytes": 6766,
+    "git_blob": "a37a2855e09ffd50b094ea468ea94ee9678b4a63"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/objectHF_mesh_shading.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/objectHF_mesh_shading.hlsli",
+    "sha256": "578ce21433eb66206478f9aa7fe6b2323244d7bc1fb9f018b6ea7de4bba29d4c",
+    "bytes": 10218,
+    "git_blob": "79090f519856397410ade3f4349eedfe51ac485d"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/globals.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/globals.hlsli",
+    "sha256": "2aaafefc45a6c0d928b21751302a461e6349e37675fd786f1a8c0f33391e84d7",
+    "bytes": 107248,
+    "git_blob": "88d4c7f9039038c1fc79f704e43a334a9e6e7745"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/objectHF.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/objectHF.hlsli",
+    "sha256": "537300e9bbffd1502d85f018500dc34f1cb632fdbf999bba53a6a03edbf7ee0b",
+    "bytes": 38070,
+    "git_blob": "959001388874cf918f44a046241a466b0b740485"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/brdf.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/brdf.hlsli",
+    "sha256": "8356d07165925ec06c9ed3beb0d7943e0e3bdd01d05b0be275ce6d930bbc1b11",
+    "bytes": 7086,
+    "git_blob": "716ccb5b2ab21f1e6f17169805970e1b9a4a069e"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/lightingHF.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/lightingHF.hlsli",
+    "sha256": "7ede106833fdb4b3cf18c27167265ede6390c1afb29fd61ffc50ff08335d0e7a",
+    "bytes": 24830,
+    "git_blob": "62f79d4bc82dcdadf6cd92a343cf6508a5417c56"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/skyAtmosphere.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/skyAtmosphere.hlsli",
+    "sha256": "d5251d9228c1f1293b744f24d7231d1f3f053efbeb20e0fb87ee6cbf1d619dd9",
+    "bytes": 26952,
+    "git_blob": "98c150712ee35243b87c366c23c6736cece3a041"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/fogHF.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/fogHF.hlsli",
+    "sha256": "9d32c5aa2ce604d640c77845e14ba0d3960c07ee063c97c27c6ccca40cb27d33",
+    "bytes": 3273,
+    "git_blob": "990d4a0c25ab58b2fc51ab96621e1f97137ee21a"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/ShaderInterop_SurfelGI.h",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/ShaderInterop_SurfelGI.h",
+    "sha256": "dac8786b983a23b0adcd22e30f0699187b28b30a4f1e2a700b38ff775981103f",
+    "bytes": 43491,
+    "git_blob": "4afded2da20d9889cf7dd458f672ff30a2b12f40"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/ShaderInterop_DDGI.h",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/ShaderInterop_DDGI.h",
+    "sha256": "6ed0e4213d515e33cbd72331c7797d7b053e0733ccfe587fb122f24bf482a912",
+    "bytes": 15223,
+    "git_blob": "0d058a306df2c69d1f98bca2ff4bbb000fe4d5de"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/shadingHF.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/shadingHF.hlsli",
+    "sha256": "e10f34a8c3838cd14147d69d6b5a64688d6c4f5f83d24f759ad6ba01f6347e2a",
+    "bytes": 25084,
+    "git_blob": "60d455d22ab2d7dcbe5b8c210097c434882a4671"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/surfaceHF.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/surfaceHF.hlsli",
+    "sha256": "3fc56075e4eb079e90dea852c3d4b61fb2c6d27eaa5dd1afb4a1251f3d966f33",
+    "bytes": 43110,
+    "git_blob": "18248740effe1c5dd9e20cc88cbd5c51fe51d321"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/capsuleShadowHF.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/capsuleShadowHF.hlsli",
+    "sha256": "79509c6d2d2f507af51de1f9c99f9ed2a007534363d42a61200e1b051ad93f69",
+    "bytes": 2128,
+    "git_blob": "863be6649621885b664f50f7a6a4b87587e9513c"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/ShaderInterop.h",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/ShaderInterop.h",
+    "sha256": "9f2ff4c0763ff4e5d955fe1da10f1b2b87a935fe1e07ba86bdcc75cacdddec7e",
+    "bytes": 3779,
+    "git_blob": "9e55feb8ec21577fe9ef210d40e92dfb6d974707"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/ShaderInterop_Renderer.h",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/ShaderInterop_Renderer.h",
+    "sha256": "2d836597d593bedfaf05a9928d7824d3cddd1e625724b33f0fab5aa0d1c89ab9",
+    "bytes": 52394,
+    "git_blob": "70468c2f328851a39e98517a3b2764c9a388f791"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/ShaderInterop_Weather.h",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/ShaderInterop_Weather.h",
+    "sha256": "ccc654f39ec11f61ad88b19d5c177eab01be4a73560014d0335adfc77bf0878d",
+    "bytes": 11803,
+    "git_blob": "45a3ea5a3a4e9baa8861280dbb8c24463d82d5f7"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/ShaderInterop_VXGI.h",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/ShaderInterop_VXGI.h",
+    "sha256": "f67a4ae19b49dc5d1e1472e9158319424febcd482bdc86b7bffcd1a05cc3bc6f",
+    "bytes": 6193,
+    "git_blob": "64f5ddcbc4ba52bf2965fe6a9bceca48e76427bc"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/ShaderInterop_Terrain.h",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/ShaderInterop_Terrain.h",
+    "sha256": "9da1c9ac31cbb1e0dda9aea80c888552ef5bcefe1cc32a4a343ac2a84eeb20dc",
+    "bytes": 582,
+    "git_blob": "d8f941dbae67b0a27cafa197f6c28eebfa303bca"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/ShaderInterop_VoxelGrid.h",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/ShaderInterop_VoxelGrid.h",
+    "sha256": "972a69713f9d86c12b1a10e74f9ae2a9e2d8b45c6f0752913d9337548cfc6ca3",
+    "bytes": 1854,
+    "git_blob": "93b5a11592ed8233c9713f3d3f33ade254b2cd44"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/shadowHF.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/shadowHF.hlsli",
+    "sha256": "f26d8ef2bfec5b340fd446e308f7b986d503a22ecf4a080ceaac0fccf6451eba",
+    "bytes": 18051,
+    "git_blob": "60bbefe5013296d2cf5c74ae3322703758383ba4"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/voxelConeTracingHF.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/voxelConeTracingHF.hlsli",
+    "sha256": "7b9dd26ce62d0b4dd3955a5dc69b386e2edc70953aba31860afd8b7181739ca0",
+    "bytes": 9509,
+    "git_blob": "fde7ddfc009eeae1e409afddac70a9f0871d5a82"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/skyHF.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/skyHF.hlsli",
+    "sha256": "51cc988afeffae8a9b4f06d279f6006d0126f595ad918808f6efef90c9403fa8",
+    "bytes": 7862,
+    "git_blob": "2a882b63ba87ac0bce1b419e772fdeaa984570d8"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/ColorSpaceUtility.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/ColorSpaceUtility.hlsli",
+    "sha256": "d65b7366580574c9088e5c3036b0a064c204e44cf027ce8f605eef49c928d41e",
+    "bytes": 5954,
+    "git_blob": "e5c422c493560c7b4472f0d3107951e69fd563e3"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/PixelPacking_R11G11B10.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/PixelPacking_R11G11B10.hlsli",
+    "sha256": "677e2813188b2ae69bc9772d6c8b3e3f811682bc9de58fec02a5902146e156d0",
+    "bytes": 5384,
+    "git_blob": "2493e295c9986c80fde6ae2d8d8895fb1be84e49"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/PixelPacking_RGBE.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/PixelPacking_RGBE.hlsli",
+    "sha256": "0d65fe2bddc9e8e5d3c8791ad8ae73d0cfb388a87f952f9621880872a288bf60",
+    "bytes": 3324,
+    "git_blob": "d38d0c969c393df2ca6f9779330af8b6a07e5c47"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/SH_Lite.hlsli",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/SH_Lite.hlsli",
+    "sha256": "9ce39bed38dd62119a78cf8df4a8d4ef1cfdfe004a8653952c8a1733be82ebbd",
+    "bytes": 29556,
+    "git_blob": "105667bc38ef6b8ee86bb6f5d7f9e1200b6e2eff"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/shaders/ShaderInterop_GaussianSplat.h",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/shaders/ShaderInterop_GaussianSplat.h",
+    "sha256": "9701a2d8ab042837a07b29b4ccb86ee56d9d5bff5e3686b080c59794a8f1b19a",
+    "bytes": 1137,
+    "git_blob": "dbb765ac3707b513ca576f36da8cea74ab61518e"
+  },
+  {
+    "repository": "zeux/niagara",
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "path": "src/config.h",
+    "url": "https://raw.githubusercontent.com/zeux/niagara/567ebe331247e122425eaf1a6319d8c64daf816d/src/config.h",
+    "sha256": "c3df7631bd9dbb83bd4e5c737a4e800120c766396697d3a83408645b17767b10",
+    "bytes": 1969,
+    "git_blob": "7234237b88f7e9aeb4bc982e67f8a0bd5128077e"
+  },
+  {
+    "repository": "turanszkij/WickedEngine",
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "path": "WickedEngine/wiGraphicsDevice_Vulkan.h",
+    "url": "https://raw.githubusercontent.com/turanszkij/WickedEngine/ef6721eaf810d7ce72bd248a5c1e4e38836a16e3/WickedEngine/wiGraphicsDevice_Vulkan.h",
+    "sha256": "31f47243bde92e7d41f40ab70432e8abc4cd7c0023c11fb7abfbb2904690d307",
+    "bytes": 42931,
+    "git_blob": "d433e779461acf68d33d7032669225af3f1fd552"
+  }
+]

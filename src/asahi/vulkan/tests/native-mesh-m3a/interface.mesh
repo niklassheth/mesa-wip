@@ -1,0 +1,30 @@
+/* SPDX-License-Identifier: MIT */
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=3,max_primitives=1) out;
+layout(location=0) out vec2 smooth_value[];
+layout(location=1) noperspective out float linear_value[];
+layout(location=2) perprimitiveEXT out vec2 primitive_value[];
+layout(location=3) perprimitiveEXT out int primitive_signed[];
+layout(location=4) perprimitiveEXT out uint primitive_unsigned[];
+void main()
+{
+   SetMeshOutputsEXT(3,1);
+   uint lane=gl_LocalInvocationIndex;
+   if (lane<3) {
+      const vec2 xy[3]=vec2[3](vec2(0,-.21875),vec2(-.25,.25),vec2(.25,.25));
+      const float w[3]=float[3](1,2,4);
+      const vec2 values[3]=vec2[3](vec2(.125,.25),vec2(.5,.75),vec2(.875,1));
+      const float linear[3]=float[3](2,4,8);
+      gl_MeshVerticesEXT[lane].gl_Position=vec4(xy[lane]*w[lane],.25*w[lane],w[lane]);
+      smooth_value[lane]=values[lane];
+      linear_value[lane]=linear[lane];
+   }
+   if (lane==17) {
+      primitive_value[0]=vec2(.25,.75);
+      primitive_signed[0]=-23;
+      primitive_unsigned[0]=0x87654321u;
+      gl_PrimitiveTriangleIndicesEXT[0]=uvec3(0,1,2);
+   }
+}

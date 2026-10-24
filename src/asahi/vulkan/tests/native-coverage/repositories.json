@@ -1,0 +1,27 @@
+{
+  "zeux/niagara": {
+    "commit": "567ebe331247e122425eaf1a6319d8c64daf816d",
+    "tree": "6c6c070511bd2b3e57462d922a6412c3b92c4c8c",
+    "inventory_sha": "567ebe331247e122425eaf1a6319d8c64daf816d"
+  },
+  "KhronosGroup/Vulkan-Samples": {
+    "commit": "69622af06f7652c7fc9b9a9180e7142046315cbc",
+    "tree": "2b7d9cc28c2032598d1da94715e1aad4195eff4e",
+    "inventory_sha": "69622af06f7652c7fc9b9a9180e7142046315cbc"
+  },
+  "SaschaWillems/Vulkan": {
+    "commit": "1cbc8d87b731b438f47dea00a2e083ba7d59051d",
+    "tree": "effa7163fd2ef03c060ddc4fb57df6b9ca88b639",
+    "inventory_sha": "1cbc8d87b731b438f47dea00a2e083ba7d59051d"
+  },
+  "turanszkij/WickedEngine": {
+    "commit": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3",
+    "tree": "81952a76574334167b2d93d80c0085b98eb5c789",
+    "inventory_sha": "ef6721eaf810d7ce72bd248a5c1e4e38836a16e3"
+  },
+  "nvpro-samples/gl_vk_meshlet_cadscene": {
+    "commit": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8",
+    "tree": "87c08458b210f9a21890456043fbba77d6de2d14",
+    "inventory_sha": "4f6f7f19f34482a5c4c0424116bdfe3f5baa9db8"
+  }
+}
