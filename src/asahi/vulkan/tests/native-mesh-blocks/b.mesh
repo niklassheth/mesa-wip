@@ -1,0 +1,21 @@
+#version 460
+// SPDX-License-Identifier: MIT
+// Pipeline B: a 16-invocation V4/P2 meshlet; workgroup i draws horizontal
+// slice i of the rectangle in the bound uniform buffer (the draw dispatches
+// two groups). Invocation n writes vertex n and primitive n.
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=16) in;
+layout(triangles, max_vertices=4, max_primitives=2) out;
+layout(set=0, binding=0) uniform U { vec4 rect; float weight; float slices; } u;
+vec4 ndc(vec2 p) { return vec4(p / 32.0 - 1.0, 0, 1); }
+void main() {
+    SetMeshOutputsEXT(4, 2);
+    uint n = gl_LocalInvocationIndex;
+    float h = (u.rect.w - u.rect.y) / u.slices;
+    float y0 = u.rect.y + h * float(gl_WorkGroupID.x);
+    if (n < 4)
+        gl_MeshVerticesEXT[n].gl_Position =
+            ndc(vec2((n & 1) != 0 ? u.rect.z : u.rect.x, (n & 2) != 0 ? y0 + h : y0));
+    if (n < 2)
+        gl_PrimitiveTriangleIndicesEXT[n] = n == 0 ? uvec3(0, 1, 2) : uvec3(2, 1, 3);
+}
