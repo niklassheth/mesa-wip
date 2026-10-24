@@ -81,6 +81,19 @@ int main(int argc,char **argv) {
    setvbuf(stdout,NULL,_IOLBF,0);
    if(argc!=8) {fprintf(stderr,"usage: probe mesh.spv count.frag.spv out V P maxP cookie\n");return 2;}
    uint32_t v=strtoul(argv[4],NULL,0),p=strtoul(argv[5],NULL,0),maxp=strtoul(argv[6],NULL,0),cookie=strtoul(argv[7],NULL,0);
+   VkShaderStageFlags producer_stages = VK_SHADER_STAGE_MESH_BIT_EXT;
+   VkPipelineStageFlags2 producer_pipeline_stages = VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
+   uint32_t groups[3] = {1,1,1};
+#ifdef M5_TASK
+   const char *task_path = getenv("TASK_PROBE_TASK_SHADER");
+   if (!task_path) return 2;
+   producer_stages |= VK_SHADER_STAGE_TASK_BIT_EXT;
+   producer_pipeline_stages |= VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT;
+   const char *grid = getenv("TASK_PROBE_GRID");
+   char trailing;
+   if (grid && sscanf(grid, "%u,%u,%u%c", &groups[0], &groups[1], &groups[2], &trailing) != 3) return 2;
+   for (unsigned axis=0; axis<3; ++axis) if (!groups[axis] || groups[axis]>65535) return 2;
+#endif
 #ifdef M3_WIDE
    if(v<3||v>M3_MAX_VERTICES||!p||p>maxp||maxp>M3_MAX_PRIMITIVES)return 2;
 #else
@@ -107,6 +120,9 @@ int main(int argc,char **argv) {
    VkPhysicalDeviceFeatures2 features={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,.pNext=&f13};
    vkGetPhysicalDeviceFeatures2(phys,&features);
    if(!mesh.meshShader||!f13.synchronization2){fprintf(stderr,"required Vulkan features missing\n");return 2;}
+#ifdef M5_TASK
+   if (!mesh.taskShader) return 2;
+#endif
    VkFormatProperties fp;vkGetPhysicalDeviceFormatProperties(phys,TARGET_FORMAT,&fp);
    if(!(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)){fprintf(stderr,"R32 float blend unsupported\n");return 2;}
    uint32_t qcount=0;vkGetPhysicalDeviceQueueFamilyProperties(phys,&qcount,NULL);
@@ -115,6 +131,9 @@ int main(int argc,char **argv) {
    free(families);if(family==qcount)return 2;float priority=1;
    VkDeviceQueueCreateInfo qi={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=family,.queueCount=1,.pQueuePriorities=&priority};
    mesh=(VkPhysicalDeviceMeshShaderFeaturesEXT){.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,.meshShader=VK_TRUE};
+#ifdef M5_TASK
+   mesh.taskShader=VK_TRUE;
+#endif
    f13=(VkPhysicalDeviceVulkan13Features){.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,.pNext=&mesh,.synchronization2=VK_TRUE};
    /* Mesh-stage stores do not require vertexPipelineStoresAndAtomics. */
    VkPhysicalDeviceFeatures base={0};
@@ -136,6 +155,13 @@ int main(int argc,char **argv) {
    };
    memcpy(q.map,matrices,sizeof(matrices));
 #endif
+#ifdef M5_TASK
+   const char *input = getenv("TASK_PROBE_INPUT");
+   if (input) {
+      FILE *f=fopen(input,"rb");
+      if (!f || fread(q.map,1,Q_BYTES,f)!=Q_BYTES || fgetc(f)!=EOF || fclose(f)) return 2;
+   }
+#endif
    VkImageCreateInfo imci={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=TARGET_FORMAT,
       .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
       .usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
@@ -154,10 +180,10 @@ int main(int argc,char **argv) {
    VkRenderPass pass;CHECK(vkCreateRenderPass(dev,&rpci,NULL,&pass));
    VkFramebufferCreateInfo fbci={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=pass,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
    VkFramebuffer fb;CHECK(vkCreateFramebuffer(dev,&fbci,NULL,&fb));
-   VkDescriptorSetLayoutBinding binding={.binding=0,.descriptorType=BINDING_TYPE,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_MESH_BIT_EXT};
+   VkDescriptorSetLayoutBinding binding={.binding=0,.descriptorType=BINDING_TYPE,.descriptorCount=1,.stageFlags=producer_stages};
    VkDescriptorSetLayoutCreateInfo slci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=1,.pBindings=&binding};
    VkDescriptorSetLayout setlayout;CHECK(vkCreateDescriptorSetLayout(dev,&slci,NULL,&setlayout));
-   VkPushConstantRange push={VK_SHADER_STAGE_MESH_BIT_EXT,0,12};
+   VkPushConstantRange push={producer_stages,0,12};
    VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&setlayout,.pushConstantRangeCount=1,.pPushConstantRanges=&push};
    VkPipelineLayout layout;CHECK(vkCreatePipelineLayout(dev,&plci,NULL,&layout));
    VkDescriptorPoolSize poolsize={BINDING_TYPE,1};
@@ -168,9 +194,16 @@ int main(int argc,char **argv) {
    VkDescriptorBufferInfo bi={q.buffer,0,BINDING_BYTES};VkWriteDescriptorSet write={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=set,.dstBinding=0,.descriptorCount=1,.descriptorType=BINDING_TYPE,.pBufferInfo=&bi};
    vkUpdateDescriptorSets(dev,1,&write,0,NULL);
    VkShaderModule ms=module(argv[1]),fs=module(argv[2]);
+#ifdef M5_TASK
+   VkShaderModule ts=module(task_path);
+#endif
    VkPipelineShaderStageCreateInfo stages[]={
       {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_MESH_BIT_EXT,.module=ms,.pName="main"},
-      {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=fs,.pName="main"}};
+      {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=fs,.pName="main"},
+#ifdef M5_TASK
+      {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_TASK_BIT_EXT,.module=ts,.pName="main"},
+#endif
+   };
    VkViewport viewport={0,0,W,H,0,1};VkRect2D scissor={{0,0},{W,H}};
    VkPipelineViewportStateCreateInfo vs={.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,.viewportCount=1,.pViewports=&viewport,.scissorCount=1,.pScissors=&scissor};
    VkPipelineRasterizationStateCreateInfo rs={.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,.polygonMode=VK_POLYGON_MODE_FILL,.cullMode=VK_CULL_MODE_NONE,.frontFace=VK_FRONT_FACE_COUNTER_CLOCKWISE,.lineWidth=1};
@@ -178,20 +211,20 @@ int main(int argc,char **argv) {
    VkPipelineColorBlendAttachmentState blend={.blendEnable=VK_TRUE,.srcColorBlendFactor=VK_BLEND_FACTOR_ONE,.dstColorBlendFactor=VK_BLEND_FACTOR_ONE,.colorBlendOp=VK_BLEND_OP_ADD,
       .srcAlphaBlendFactor=VK_BLEND_FACTOR_ONE,.dstAlphaBlendFactor=VK_BLEND_FACTOR_ONE,.alphaBlendOp=VK_BLEND_OP_ADD,.colorWriteMask=TARGET_MASK};
    VkPipelineColorBlendStateCreateInfo cb={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,.attachmentCount=1,.pAttachments=&blend};
-   VkGraphicsPipelineCreateInfo pci={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=2,.pStages=stages,.pViewportState=&vs,.pRasterizationState=&rs,
+   VkGraphicsPipelineCreateInfo pci={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=sizeof(stages)/sizeof(stages[0]),.pStages=stages,.pViewportState=&vs,.pRasterizationState=&rs,
       .pMultisampleState=&samples,.pColorBlendState=&cb,.layout=layout,.renderPass=pass};
    VkPipeline pipeline;CHECK(vkCreateGraphicsPipelines(dev,VK_NULL_HANDLE,1,&pci,NULL,&pipeline));
    VkCommandPoolCreateInfo cpci={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=family};VkCommandPool pool;
    CHECK(vkCreateCommandPool(dev,&cpci,NULL,&pool));VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=pool,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
    VkCommandBuffer cmd;CHECK(vkAllocateCommandBuffers(dev,&cai,&cmd));VkCommandBufferBeginInfo begin={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};CHECK(vkBeginCommandBuffer(cmd,&begin));
    VkMemoryBarrier2 host={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,.srcStageMask=VK_PIPELINE_STAGE_2_HOST_BIT,.srcAccessMask=VK_ACCESS_2_HOST_WRITE_BIT,
-      .dstStageMask=VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT,.dstAccessMask=VK_ACCESS_2_UNIFORM_READ_BIT|VK_ACCESS_2_SHADER_STORAGE_READ_BIT|VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT};
+      .dstStageMask=producer_pipeline_stages,.dstAccessMask=VK_ACCESS_2_UNIFORM_READ_BIT|VK_ACCESS_2_SHADER_STORAGE_READ_BIT|VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT};
    VkDependencyInfo dep={.sType=VK_STRUCTURE_TYPE_DEPENDENCY_INFO,.memoryBarrierCount=1,.pMemoryBarriers=&host};vkCmdPipelineBarrier2(cmd,&dep);
    VkClearValue clear={.color={{0,0,0,0}}};VkRenderPassBeginInfo rpbegin={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=pass,.framebuffer=fb,.renderArea={{0,0},{W,H}},.clearValueCount=1,.pClearValues=&clear};
    vkCmdBeginRenderPass(cmd,&rpbegin,VK_SUBPASS_CONTENTS_INLINE);vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);
    vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,layout,0,1,&set,0,NULL);
-   uint32_t counts[]={v,p,cookie};vkCmdPushConstants(cmd,layout,VK_SHADER_STAGE_MESH_BIT_EXT,0,sizeof(counts),counts);
-   draw(cmd,1,1,1);vkCmdEndRenderPass(cmd);
+   uint32_t counts[]={v,p,cookie};vkCmdPushConstants(cmd,layout,producer_stages,0,sizeof(counts),counts);
+   draw(cmd,groups[0],groups[1],groups[2]);vkCmdEndRenderPass(cmd);
    VkMemoryBarrier2 before_copy={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,.srcStageMask=VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
       .srcAccessMask=VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
       .dstStageMask=VK_PIPELINE_STAGE_2_TRANSFER_BIT|VK_PIPELINE_STAGE_2_HOST_BIT,.dstAccessMask=VK_ACCESS_2_TRANSFER_READ_BIT|VK_ACCESS_2_HOST_READ_BIT};
@@ -208,6 +241,9 @@ int main(int argc,char **argv) {
    printf("READBACK_OK V=%u P=%u maxP=%u cookie=%u draws=1\n",v,p,maxp,cookie);
    vkDestroyFence(dev,fence,NULL);vkDestroyCommandPool(dev,pool,NULL);vkDestroyPipeline(dev,pipeline,NULL);
    vkDestroyShaderModule(dev,ms,NULL);vkDestroyShaderModule(dev,fs,NULL);vkDestroyDescriptorPool(dev,dp,NULL);
+#ifdef M5_TASK
+   vkDestroyShaderModule(dev,ts,NULL);
+#endif
    vkDestroyPipelineLayout(dev,layout,NULL);vkDestroyDescriptorSetLayout(dev,setlayout,NULL);
    vkDestroyFramebuffer(dev,fb,NULL);vkDestroyRenderPass(dev,pass,NULL);vkDestroyImageView(dev,view,NULL);
    vkDestroyImage(dev,image,NULL);vkFreeMemory(dev,image_mem,NULL);
