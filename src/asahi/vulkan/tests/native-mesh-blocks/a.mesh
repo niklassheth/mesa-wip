@@ -1,0 +1,15 @@
+#version 460
+// SPDX-License-Identifier: MIT
+// Pipeline A: one workgroup, V3/P1, geometry and weight from push constants.
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=1) in;
+layout(triangles, max_vertices=3, max_primitives=1) out;
+layout(push_constant) uniform P { vec4 p01; vec2 p2; float weight; } pc;
+vec4 ndc(vec2 p) { return vec4(p / 32.0 - 1.0, 0, 1); }
+void main() {
+    SetMeshOutputsEXT(3, 1);
+    gl_MeshVerticesEXT[0].gl_Position = ndc(pc.p01.xy);
+    gl_MeshVerticesEXT[1].gl_Position = ndc(pc.p01.zw);
+    gl_MeshVerticesEXT[2].gl_Position = ndc(pc.p2);
+    gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+}

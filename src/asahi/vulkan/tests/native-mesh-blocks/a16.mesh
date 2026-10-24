@@ -1,0 +1,19 @@
+#version 460
+// SPDX-License-Identifier: MIT
+// Pipeline A for the qualified path: a 16-invocation V3/P1 meshlet (the
+// qualified packed classes need logical width = physical T16). Geometry and
+// weight from push constants, one group.
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=16) in;
+layout(triangles, max_vertices=3, max_primitives=1) out;
+layout(push_constant) uniform P { vec4 p01; vec2 p2; float weight; } pc;
+vec4 ndc(vec2 p) { return vec4(p / 32.0 - 1.0, 0, 1); }
+void main() {
+    SetMeshOutputsEXT(3, 1);
+    uint n = gl_LocalInvocationIndex;
+    if (n < 3)
+        gl_MeshVerticesEXT[n].gl_Position =
+            ndc(n == 0 ? pc.p01.xy : n == 1 ? pc.p01.zw : pc.p2);
+    if (n == 0)
+        gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+}
