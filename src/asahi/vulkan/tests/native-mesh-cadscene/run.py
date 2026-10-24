@@ -210,7 +210,7 @@ def main(out):
                         row['audit'] = audit(log, case, plan['driver_revision'], before,
                                              counts(raw, expected_counters), expected_counters)
                     else:
-                        row['native_audit'] = 'not modelled by software rehearsal' 
+                        row['native_audit'] = 'not modelled by software rehearsal'
                     require(KNOB.read_text().strip() == str(case['mode']), 'mode changed during process')
                     row['native_pass'] = not REHEARSAL
                     row['verdict'] = 'PASS'
