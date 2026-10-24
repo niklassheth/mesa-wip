@@ -1,0 +1,28 @@
+[
+  {
+    "caseset": "shared",
+    "queue_item": "39b7c9g-native-m3b-shared",
+    "driver_revision": "fea439f95208b4e021a01c4a17f82fee212735b4",
+    "source_revision": "a9b0b86fd501e995a16fed7a74a4d6ee41b96bab",
+    "kit": "/home/nsheth/Projects/asahi/tmp/claude-meshwide/kits/native-m3b-shared-air-v1",
+    "kit_manifest_sha256": "5ef9992e396b116078993f8e0d7939842e0e184b32c0339362f97885513738f2",
+    "done": "/home/nsheth/Projects/asahi/tmp/manager-queue/air/DONE-39b7c9g-native-m3b-shared.json",
+    "done_sha256": "f6c95b521eb0c5b77fca29263fff3cc39d201b4f284f6251622fe0f8eb53fd37",
+    "verdict": "/home/nsheth/Projects/asahi/tmp/codex-air/native-m3b-shared-air-v1-20261024/out/VERDICT.json",
+    "draws": 4,
+    "native_application_credit": false
+  },
+  {
+    "caseset": "single",
+    "queue_item": "39b7c9m-native-m3b-single",
+    "driver_revision": "7412825808932ba9eaa7653419d2bccf565b1cb7",
+    "source_revision": "6e356213d1a0d335ee61ae0253b198c4de9c7bd6",
+    "kit": "/home/nsheth/Projects/asahi/tmp/claude-meshwide/kits/native-m3b-single-air-v1",
+    "kit_manifest_sha256": "ed2bd5a58cf3c3de2cfd0ebbf0fc4c1d5bb500fc26539f0dcf6c4ef008f8967d",
+    "done": "/home/nsheth/Projects/asahi/tmp/manager-queue/air/DONE-39b7c9m-native-m3b-single.json",
+    "done_sha256": "ace6d1e8fe13140d7402fab39d75b1e16a81f0dcdf2f72e9813e78e86c2bc4d0",
+    "verdict": "/home/nsheth/Projects/asahi/tmp/codex-air/native-m3b-single-air-v1-20261024/out/VERDICT.json",
+    "draws": 5,
+    "native_application_credit": false
+  }
+]
