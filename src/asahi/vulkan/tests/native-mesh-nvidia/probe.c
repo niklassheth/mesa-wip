@@ -77,7 +77,7 @@ int main(int argc,char **argv) {
    VkPhysicalDeviceVulkan13Features f13={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,.pNext=&f12};
    VkPhysicalDeviceFeatures2 features={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,.pNext=&f13};
    vkGetPhysicalDeviceFeatures2(phys,&features);
-   if(!mesh.meshShader||(task_path&&!mesh.taskShader)||!f13.synchronization2||!f12.storageBuffer8BitAccess){fprintf(stderr,"required Vulkan features missing\n");return 2;}
+   if(!mesh.meshShader||(task_path&&!mesh.taskShader)||!f13.synchronization2||!f13.maintenance4||!f12.storageBuffer8BitAccess||!f12.shaderInt8){fprintf(stderr,"required Vulkan features missing\n");return 2;}
    VkFormatProperties fp;vkGetPhysicalDeviceFormatProperties(phys,VK_FORMAT_R8G8B8A8_UNORM,&fp);
    if(!(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)){fprintf(stderr,"R32 float blend unsupported\n");return 2;}
    uint32_t qcount=0;vkGetPhysicalDeviceQueueFamilyProperties(phys,&qcount,NULL);
@@ -86,8 +86,8 @@ int main(int argc,char **argv) {
    free(families);if(family==qcount)return 2;float priority=1;
    VkDeviceQueueCreateInfo qi={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=family,.queueCount=1,.pQueuePriorities=&priority};
    mesh=(VkPhysicalDeviceMeshShaderFeaturesEXT){.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,.meshShader=VK_TRUE,.taskShader=task_path!=NULL};
-   f12=(VkPhysicalDeviceVulkan12Features){.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,.pNext=&mesh,.storageBuffer8BitAccess=VK_TRUE};
-   f13=(VkPhysicalDeviceVulkan13Features){.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,.pNext=&f12,.synchronization2=VK_TRUE};
+   f12=(VkPhysicalDeviceVulkan12Features){.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,.pNext=&mesh,.storageBuffer8BitAccess=VK_TRUE,.shaderInt8=VK_TRUE};
+   f13=(VkPhysicalDeviceVulkan13Features){.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,.pNext=&f12,.synchronization2=VK_TRUE,.maintenance4=VK_TRUE};
    /* Mesh-stage stores do not require vertexPipelineStoresAndAtomics. */
    VkPhysicalDeviceFeatures base={0};
    const char *extension=VK_EXT_MESH_SHADER_EXTENSION_NAME;
