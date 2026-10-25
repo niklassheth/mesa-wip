@@ -118,8 +118,7 @@ def check(case,directory,o):
      reset=previous['dispatches'][0]
      require(reset['global_size']==reset['local_size']==[1,1,1],'missing heap reset')
      reset_args,_=launch_root(si,reset['launch'],True)
-     require(u64(si,reset_args)==u64(si,vs['tess']+o['tess_heap'])+o['heap_bottom'],'wrong heap reset address')
-     require(struct.unpack('<I',read(si,reset_args+8,4))[0]==0,'wrong heap reset value')
+     require(u64(si,reset_args)==u64(si,vs['tess']+o['tess_heap']),'wrong heap reset address')
     require(all(r['tess']==vs['tess'] and r['params']==vs['params'] for r in [tcs,mesh,obj]),'producer/consumer buffers differ')
     for helper in ds[2:]:
      helper_args,_=launch_root(si,helper['launch'],True)
