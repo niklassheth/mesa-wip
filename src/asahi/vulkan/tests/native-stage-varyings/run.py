@@ -118,6 +118,17 @@ def main(out):
                 after_raw=DEP.read_text();(d/'dep-after.txt').write_text(after_raw)
                 row['audit']=audit(log,case,arm,plan['driver_revision'],before,counts(after_raw),library)
                 write(d/'AUDIT.json',row['audit']);fault_class='harness'
+                # Verify fresh VM admission/reclamation once, after retirement
+                # and after every native evidence parser has run. This is a
+                # real kernel operation, not a substitute for the draw audit.
+                if attempted==1:
+                    vm=subprocess.run([sys.executable,'-I',str(HERE/'native-vm.py')],
+                        capture_output=True,text=True,timeout=10)
+                    (d/'vm-lifecycle.log').write_text(vm.stdout+vm.stderr)
+                    row['vm_lifecycle']=json.loads(vm.stdout)
+                    write(d/'VM_LIFECYCLE.json',row['vm_lifecycle'])
+                    require(vm.returncode==0 and row['vm_lifecycle']['verdict']=='PASS',
+                        'VM admission/reclamation failed: '+str(row['vm_lifecycle'].get('errors')))
                 require(row['audit']['verdict']=='PASS','; '.join(row['audit']['errors']))
                 require(KNOB.read_text().strip()=='3','mode changed during draw')
                 fault_class='product'
