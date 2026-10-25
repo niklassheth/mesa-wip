@@ -9,6 +9,8 @@ from pathlib import Path
 def cases():
     return [dict(name='Khronos-'+language,language=language,threads=1,
         logical=[1,1,1],physical=16,shared=False,mode=4,cookie=0,
+        max_vertices=3,max_primitives=1,vertices=3,primitives=1,pixel_bytes=16,
+        env={'HK_APPLE9_NATIVE_INDEX':'1'},
         fragment='Khronos-'+language+'.frag.spv')
         for language in ('glsl','hlsl','slang')]
 
@@ -17,11 +19,14 @@ def expected():
     # Public source positions (0.5,-0.5),(0.5,0.5),(-0.5,0.5) in a
     # positive 128x64 viewport give (96,16),(96,48),(32,48).
     # At pixel centers, the diagonal inequality never ties (odd parity).
-    pixels=[float(32<=x<96 and 16<=y<48 and (2*x+1)+2*(2*y+1)>256)
-            for y in range(64) for x in range(128)]
+    pixels=[]
+    for y in range(64):
+        for x in range(128):
+            covered=32<=x<96 and 16<=y<48 and (2*x+1)+2*(2*y+1)>256
+            pixels.extend((1.,0.,0.,1.) if covered else (0.,0.,0.,0.))
     # Original shaders have no SSBO writes. The entire guarded allocation
     # must remain at initialization, not a witness inserted into the module.
-    return struct.pack('<8192f',*pixels),bytes([0xcc])*(512*1024)
+    return struct.pack('<32768f',*pixels),bytes([0xcc])*(512*1024)
 
 
 def compare(actual,reference):
@@ -49,6 +54,9 @@ def mutations():
         assert verify_bytes(pixels,buffer)['verdict']=='FAIL';names.append(name)
     index=32*128+80
     for name,value in [('missing',0),('duplicate',2),('incorrect-fragment',0.5)]:
-        changed=bytearray(p);struct.pack_into('<f',changed,4*index,value)
+        changed=bytearray(p);struct.pack_into('<f',changed,16*index,value)
         assert verify_bytes(changed,q)['verdict']=='FAIL';names.append(name)
+    for component in range(4):
+        changed=bytearray(p);struct.pack_into('<f',changed,16*index+4*component,0.25)
+        assert verify_bytes(changed,q)['verdict']=='FAIL';names.append('channel-'+str(component))
     return dict(verdict='PASS',mutations_detected=len(names),names=names)

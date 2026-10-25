@@ -13,7 +13,7 @@ coverage=json.loads(a.coverage.read_text());selected=[];rows=[];pins={}
 for case in cases():
     folder='sources/KhronosGroup-Vulkan-Samples/shaders/mesh_shading/'+case['language']
     entry=next(e for e in coverage['entries'] if e['path']==folder+'/ms.mesh.spv')
-    assert entry['status']=='NEEDS_PIPELINE_COMPILE'
+    assert entry['stage']=='mesh'
     for stage,basename in [('mesh','ms.mesh.spv'),('frag','ps.frag.spv')]:
         source=a.corpus/folder/basename;data=source.read_bytes();sha=hashlib.sha256(data).hexdigest()
         if stage=='mesh':assert sha==entry['sha256']
@@ -34,6 +34,7 @@ for case in selected:
     rows.append(dict(case=case,readback=result));print(case['name'],'software PASS',flush=True)
 cmd=[sys.executable,str(HERE.parent/'native-mesh-m2/host-record.py'),'--cases',str(out/'CASES.json'),'--shaders',str(out/'shaders'),'--out',str(out/'native-records')]
 for key in ('driver','shim','probe','sysroot'):cmd+=['--'+key,str(getattr(a,key).resolve())]
+cmd+=['--completion-shim',str(a.probe.resolve().parent/'libhost-record-sync.so')]
 subprocess.run(cmd,check=True)
 records=json.loads((out/'native-records/RESULT.json').read_text());assert records['verdict']=='PASS' and len(records['cases'])==3
 (out/'RESULT.json').write_text(json.dumps(dict(verdict='PASS',gpu_execution=False,software=rows,native_pipeline_recordings=3,original_mesh_and_fragment=True,driver_sha256=records['driver_sha256']),indent=2)+'\n')

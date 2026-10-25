@@ -10,28 +10,32 @@ driver. No shader-generated witness, substitute fragment, patched entry point
 or source translation is used. This is execution of corpus shader pairs, not
 a run of the complete Vulkan-Samples application.
 
-The existing Air-passed M2a driver f987032b1d0 and kernel 4b1e8012b687 are used.
-All three draws select qualified mode 4 without native/shape overrides, one
-process/draw/submission each. Each has a retired fence, exact mapped-driver
-revision, own-FD VM profile/generation/class hash, native T16/V3/P1 route and
-native-render/object-dispatch deltas 1/1. The check covers the complete 128x64
-R32_FLOAT target with additive blending and an untouched 512-KiB buffer.
-The original fragment shaders output constant red. This target checks their
-red component; it does not claim green/blue/alpha attachment coverage.
+The fixture uses the current merged driver with HK_APPLE9_NATIVE_INDEX=1,
+qualified mode 4 and no research/shape overrides. Each process must retire one
+native T16/V3/P1 draw, report its exact renderer and mapped driver, pass its own
+FD's VM profile/generation/class audit, and advance native render and object
+counters by one. Missing or zero native routes stop the kit immediately.
 
-The independent pixel oracle derives the triangle from public source positions:
-(96,16), (96,48), (32,48) in this viewport. It checks all 8192 pixels, including
-background and multiplicity. The SSBO is not referenced by the original
-modules and must remain 0xcc throughout. Seven checker mutations cover empty,
-unexecuted, missing/duplicate, wrong fragment value, truncated readback and
-guard corruption. All three software controls pass. Three real ARM-driver
-host recordings compile/link the original pairs and emit native packets;
-these host results are not GPU execution. Paired kernel-parser replay checks
-both research and qualified profiles, relocations and every truncated prefix.
+All 32,768 floating-point color components in R32G32B32A32_SFLOAT are checked
+byte for byte, including alpha and the background. Additive blending also
+makes duplicated primitives visible. The original fragments output red with
+alpha one; no channels are discarded. The full unreferenced 512 KiB buffer
+must remain 0xcc. The independent edge oracle has no pixel-center ties.
+Eleven mutations cover missing/duplicate fragments, each color channel,
+truncation, unexecuted output and guard corruption.
 
-The budget is three draws, 100 seconds, zero retries, stop on first failure.
-The manager owns the device run and recovery. A successful native draw earns
-one exact corpus entry, potentially moving native execution from 0 to 3/18.
-Failure or unattempted entries retain their separate counts. Wide M3 publication
-and per-primitive interfaces are separate research; this kit does not exercise
-the new subgroup-control prototype.
+The prior three-pair device fixture checked only R32 red; its component credit
+stays separate. This kit closes that color-interface gap using unchanged
+original SPIR-V. It is not a complete Vulkan-Samples application run.
+
+Host validation runs all three original pairs on software and records all
+three through the ARM native compiler. The paired kernel parser accepts
+research and qualified profiles, checks relocations and rejects every prefix
+truncation. Full rehearsal runs all three arms and injects broken GPU init.
+Native VM/renderer/counter audits cannot be modelled by the software driver
+and receive no rehearsal credit; actual device execution requires them.
+
+Budget: three draws, 100 seconds, zero retries, stop on first failure. The
+canonical operator owns device state, staging, collection and recovery.
+
+Host packet recording uses the historical no-op DRM shim and an explicitly enabled synchronous fence model. It does not execute a GPU and cannot model the kernel qualification advertisement, so that recording uses the research override. The Air harness does not use either host helper or that override: every draw requires INDEX=1, a qualified own-FD VM, a native route, retired submission and exact readback.

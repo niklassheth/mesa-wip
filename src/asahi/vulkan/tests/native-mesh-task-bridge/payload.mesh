@@ -1,0 +1,33 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// SPDX-License-Identifier: MIT
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=3,max_primitives=1) out;
+layout(set=0,binding=0,std430) buffer Witness { uint q[]; };
+layout(push_constant) uniform Push { uint vertices, primitives, cookie; } pc;
+struct Payload { uint words[4096]; };
+taskPayloadSharedEXT Payload payload;
+layout(location=0) out vec4 color[];
+void main() {
+   uint t=(payload.words[0]^pc.cookie)/0x10001u;
+   uint g=gl_WorkGroupID.x+gl_NumWorkGroups.x*(gl_WorkGroupID.y+gl_NumWorkGroups.y*gl_WorkGroupID.z);
+   uint slot=t*8+g;
+   for(uint i=gl_LocalInvocationIndex;i<4096;i+=32)
+      q[4096+slot*4096+i]=payload.words[i];
+   SetMeshOutputsEXT(3,1);
+   if(gl_LocalInvocationIndex==0) {
+      uint base=256+slot*16;
+      q[base+0]=t;
+      q[base+1]=gl_WorkGroupID.x;q[base+2]=gl_WorkGroupID.y;q[base+3]=gl_WorkGroupID.z;
+      q[base+4]=gl_NumWorkGroups.x;q[base+5]=gl_NumWorkGroups.y;q[base+6]=gl_NumWorkGroups.z;
+      q[base+7]=gl_GlobalInvocationID.x;q[base+8]=gl_GlobalInvocationID.y;q[base+9]=gl_GlobalInvocationID.z;
+      q[base+10]=payload.words[0];q[base+11]=payload.words[4095];
+      vec2 origin=vec2(slot%8,slot/8)*16.0;
+      const vec2 corners[3]=vec2[3](vec2(2,2),vec2(14,2),vec2(2,13));
+      for(uint v=0;v<3;++v) {
+         gl_MeshVerticesEXT[v].gl_Position=vec4((origin+corners[v])/vec2(64,32)-1.0,0.5,1.0);
+         color[v]=vec4(t+1,g+1,pc.cookie,1);
+      }
+      gl_PrimitiveTriangleIndicesEXT[0]=uvec3(0,1,2);
+   }
+}

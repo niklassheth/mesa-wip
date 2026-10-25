@@ -1,0 +1,33 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// SPDX-License-Identifier: MIT
+layout(local_size_x=128) in;
+layout(set=0,binding=0,std430) buffer Witness { uint q[]; };
+layout(push_constant) uniform Push { uint vertices, primitives, cookie; } pc;
+struct Payload { uint words[4096]; };
+taskPayloadSharedEXT Payload payload;
+#ifndef CHILD_X
+#define CHILD_X 2
+#endif
+#ifndef CHILD_Y
+#define CHILD_Y 2
+#endif
+#ifndef CHILD_Z
+#define CHILD_Z 2
+#endif
+#ifndef SKIP_MIDDLE
+#define SKIP_MIDDLE 0
+#endif
+void main() {
+   uint t=gl_WorkGroupID.x+gl_NumWorkGroups.x*(gl_WorkGroupID.y+gl_NumWorkGroups.y*gl_WorkGroupID.z);
+   for(uint i=gl_LocalInvocationIndex;i<4096;i+=128)
+      payload.words[i]=pc.cookie^(t*0x10001u)^(i*0x101u);
+   if(gl_LocalInvocationIndex==0) {
+      q[t*4+0]=pc.cookie^t;
+      q[t*4+1]=gl_NumWorkGroups.x;
+      q[t*4+2]=gl_NumWorkGroups.y;
+      q[t*4+3]=gl_NumWorkGroups.z;
+   }
+   barrier();
+   EmitMeshTasksEXT(SKIP_MIDDLE!=0 && t==1 ? 0 : CHILD_X,CHILD_Y,CHILD_Z);
+}
