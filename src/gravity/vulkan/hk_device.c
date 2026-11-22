@@ -471,7 +471,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    /* XXX: error handling, and should this even go on the device? */
    agx_bg_eot_init(&dev->bg_eot, &dev->dev);
-   if (!dev->bg_eot.ht) {
+   if (!dev->bg_eot.mem_ctx) {
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
       goto fail_rodata;
    }

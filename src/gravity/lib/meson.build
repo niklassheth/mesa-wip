@@ -17,7 +17,6 @@ libgravity_lib_files = files(
   'agx_bg_eot.c',
   'agx_tilebuffer.c',
   'agx_nir_apple9_tilebuffer.c',
-  'agx_nir_lower_uvs.c',
   'agx_nir_lower_vbo.c',
   'agx_nir_prolog_epilog.c',
   'agx_ppp.h',

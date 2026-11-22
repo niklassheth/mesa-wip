@@ -446,8 +446,7 @@ agx_get_params(struct agx_device *dev, void *buf, size_t size)
 }
 
 static int
-agx_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
-           struct agx_submit_virt *virt)
+agx_submit(struct agx_device *dev, struct drm_asahi_submit *submit)
 {
    return U_WATCHDOG_IOCTL("DRM_IOCTL_ASAHI_SUBMIT", dev->fd,
                            drmIoctl(dev->fd, DRM_IOCTL_ASAHI_SUBMIT, submit));
@@ -509,7 +508,6 @@ agx_open_device(void *memctx, struct agx_device *dev)
       if (!is_asahi)
          return false;
 
-      dev->is_virtio = false;
       dev->ops = agx_device_drm_ops;
    }
 

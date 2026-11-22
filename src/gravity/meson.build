@@ -14,7 +14,6 @@ libgravity_debug = static_library(
 )
 idep_gravity_debug = declare_dependency(link_with : [libgravity_debug])
 
-subdir('isa')
 subdir('genxml')
 subdir('libcl')
 subdir('compiler')

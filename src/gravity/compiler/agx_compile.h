@@ -542,9 +542,6 @@ bool agx_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
                           int64_t hole_size, nir_intrinsic_instr *low,
                           nir_intrinsic_instr *high, void *data);
 
-void agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
-                            struct agx_shader_part *out);
-
 struct agx_occupancy {
    unsigned max_registers;
    unsigned max_threads;

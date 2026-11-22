@@ -320,16 +320,6 @@ main(int argc, char **argv)
    nir_precomp_print_extern_binary_map(fp_h, "libagx", "nir");
    nir_precomp_print_binary_map(fp_c, nir, "libagx", "nir", NULL);
 
-   /* TEMP_STUB_PHASE1: empty placeholder tables so lib/agx_device.c links
-    * before lib-strip merges. Delete in Gate 1 integration.
-    */
-   fprintf(fp_h, "/* TEMP_STUB_PHASE1 */\n");
-   fprintf(fp_h, "extern const uint32_t *libagx_g13g[LIBAGX_NUM_PROGRAMS];\n");
-   fprintf(fp_h, "extern const uint32_t *libagx_g13x[LIBAGX_NUM_PROGRAMS];\n");
-   fprintf(fp_c, "/* TEMP_STUB_PHASE1 */\n");
-   fprintf(fp_c, "const uint32_t *libagx_g13g[LIBAGX_NUM_PROGRAMS] = {0};\n");
-   fprintf(fp_c, "const uint32_t *libagx_g13x[LIBAGX_NUM_PROGRAMS] = {0};\n");
-
    glsl_type_singleton_decref();
    fclose(fp_c);
    fclose(fp_h);

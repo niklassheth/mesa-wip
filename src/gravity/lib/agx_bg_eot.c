@@ -15,7 +15,7 @@ void
 agx_bg_eot_init(struct agx_bg_eot_cache *cache, struct agx_device *dev)
 {
    simple_mtx_init(&cache->lock, mtx_plain);
-   cache->ht = ralloc_context(NULL);
+   cache->mem_ctx = ralloc_context(NULL);
    cache->dev = dev;
 }
 
@@ -26,9 +26,9 @@ agx_bg_eot_cleanup(struct agx_bg_eot_cache *cache)
       if (cache->precomp[i])
          agx_bo_unreference(cache->dev, cache->precomp[i]->bo);
    }
-   ralloc_free(cache->ht);
+   ralloc_free(cache->mem_ctx);
    simple_mtx_destroy(&cache->lock);
-   cache->ht = NULL;
+   cache->mem_ctx = NULL;
    cache->dev = NULL;
 }
 
@@ -77,7 +77,7 @@ agx_get_precompiled_locked(struct agx_bg_eot_cache *cache, unsigned program)
       return cache->precomp[program];
 
    struct agx_precompiled_shader *p =
-      rzalloc(cache->ht, struct agx_precompiled_shader);
+      rzalloc(cache->mem_ctx, struct agx_precompiled_shader);
 
    if (!agx_compile_apple9_precompiled(cache, p, program)) {
       ralloc_free(p);

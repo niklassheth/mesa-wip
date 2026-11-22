@@ -414,13 +414,3 @@ agx_nir_lower_printf_buffer(nir_shader *nir)
    return nir_shader_intrinsics_pass(nir, lower_printf_buffer,
                                      nir_metadata_control_flow, NULL);
 }
-
-/* TEMP_STUB_PHASE1: AGX2 compiler removed; stub kept only until lib-strip and
- * vk-shader-draw remove remaining references. Delete in Gate 1 integration.
- */
-void
-agx_compile_shader_nir(UNUSED nir_shader *nir, UNUSED struct agx_shader_key *key,
-                       UNUSED struct agx_shader_part *out)
-{
-   UNREACHABLE("AGX2 removed");
-}

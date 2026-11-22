@@ -21,7 +21,6 @@
 #include "agx_bo.h"
 #include "agx_apple9_layout.h"
 #include "agx_pack.h"
-#include "decode.h" /* TEMP_STUB_PHASE1 */
 #include "layout.h"
 #include "libagx_dgc.h"
 
@@ -66,23 +65,6 @@ struct nir_shader;
 #define BARRIER_RENDER  (1 << DRM_ASAHI_SUBQUEUE_RENDER)
 #define BARRIER_COMPUTE (1 << DRM_ASAHI_SUBQUEUE_COMPUTE)
 
-/* TEMP_STUB_PHASE1: virtio submit compat stubs; remove once vulkan/ strips
- * virtio paths from hk_queue.c, hk_device_memory.c, and hk_wsi.c.
- */
-#define ASAHI_EXTRES_READ  0x01
-#define ASAHI_EXTRES_WRITE 0x02
-
-struct asahi_ccmd_submit_res {
-   uint32_t res_id;
-   uint32_t flags;
-};
-
-struct agx_submit_virt {
-   uint32_t extres_count;
-   struct asahi_ccmd_submit_res *extres;
-   uint32_t ring_idx;
-};
-
 typedef struct {
    struct agx_bo *(*bo_alloc)(struct agx_device *dev, size_t size, size_t align,
                               enum agx_bo_flags flags,
@@ -94,8 +76,7 @@ typedef struct {
    void *(*bo_mmap)(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
                     size_t size);
    ssize_t (*get_params)(struct agx_device *dev, void *buf, size_t size);
-   int (*submit)(struct agx_device *dev, struct drm_asahi_submit *submit,
-                 struct agx_submit_virt *virt);
+   int (*submit)(struct agx_device *dev, struct drm_asahi_submit *submit);
    int (*bo_bind_object)(struct agx_device *dev,
                          struct drm_asahi_gem_bind_object *bind);
    int (*bo_unbind_object)(struct agx_device *dev, uint32_t object_handle);
@@ -119,8 +100,6 @@ struct agx_device {
 
    char name[64];
    struct drm_asahi_params_global params;
-   /* TEMP_STUB_PHASE1: always false; remove once vulkan/ drops virtio refs. */
-   bool is_virtio;
    agx_device_ops_t ops;
 
    /* Device handle */
@@ -250,12 +229,6 @@ struct agx_device {
       uint64_t hits, misses;
    } bo_cache;
 
-   /* TEMP_STUB_PHASE1: always NULL; remove once vulkan/ drops agxdecode refs. */
-   struct agxdecode_ctx *agxdecode;
-
-   /* TEMP_STUB_PHASE1: remove once hk_device.c stops packing txf_sampler. */
-   struct agx_usc_sampler_packed txf_sampler;
-
    /* Simplified device selection */
    enum agx_chip chip;
 
@@ -266,17 +239,6 @@ struct agx_device {
 
    struct u_printf_ctx printf;
 };
-
-/* TEMP_STUB_PHASE1: Gravity opens only Apple9 GPUs (gpu_generation >= 16).
- * Keep the chip check during Phase 1 so vulkan/tests/ mock-chip tests keep
- * passing until vk-core-strip & vk-shader-draw remove all callers.
- */
-static inline bool
-agx_is_apple9(const struct agx_device *dev)
-{
-   return dev->chip == AGX_CHIP_G16G || dev->chip == AGX_CHIP_G16C ||
-          dev->chip == AGX_CHIP_G17P;
-}
 
 /*
  * Determine if an address is in the read-only section. See the documentation

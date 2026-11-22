@@ -215,13 +215,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
               mem->bo->va ? mem->bo->va->addr : 0);
    }
 
-   /* Under virtio the host compositor reads WSI images with implicit sync,
-    * which virglrenderer derives from a submission's external resources.
-    * Other external memory uses explicit sync, as on native.
-    */
-   mem->implicit_sync = dev->dev.is_virtio &&
-      vk_find_struct_const(pAllocateInfo->pNext,
-                           WSI_MEMORY_ALLOCATE_INFO_MESA) != NULL;
+   mem->implicit_sync = false;
 
    if (fd_info && fd_info->handleType) {
       /* From the Vulkan spec:

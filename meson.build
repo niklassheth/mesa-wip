@@ -365,7 +365,6 @@ with_vdrm = [
   with_gallium_asahi,
   with_panfrost_vdrm,
   with_asahi_vk,
-  with_gravity_vk,
   with_intel_virtio,
 ].contains(true)
 

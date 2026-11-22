@@ -20,18 +20,12 @@ hk_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
 static bool
 hk_wsi_can_present_on_device(VkPhysicalDevice physicalDevice, int fd)
 {
-   VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
-   if (pdev->dev.is_virtio) {
-      return false;
-   }
-
    drmDevicePtr device;
    if (drmGetDevice2(fd, 0, &device) != 0) {
       return false;
    }
 
-   /* Allow on-device presentation for all non-virtio devices with bus type
-    * PLATFORM */
+   /* Allow on-device presentation for platform DRM devices */
    bool match = device->bustype == DRM_BUS_PLATFORM;
 
    drmFreeDevice(&device);

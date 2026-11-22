@@ -37,8 +37,6 @@ test_libagx_expected_to_fail(unsigned program)
    case LIBAGX_DECOMPRESS_0:
    case LIBAGX_DECOMPRESS_1:
    case LIBAGX_DECOMPRESS_2:
-   /* Scratch/helper protocol, which Apple9 dispatches never request. */
-   case LIBAGX_HELPER:
       return true;
    default:
       return false;

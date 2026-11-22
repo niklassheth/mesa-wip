@@ -11,7 +11,6 @@ gravity_libcl_shader_files = files(
   'tessellation.cl',
   'tessellator.cl',
   'texture.cl',
-  'helper.cl',
 )
 
 gravity_libcl_spv = custom_target(

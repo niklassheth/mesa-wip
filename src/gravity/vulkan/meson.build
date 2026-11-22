@@ -144,8 +144,6 @@ libgravity_vk = static_library(
     inc_include,
     inc_src,
     inc_gravity,
-    inc_virtio_gpu,
-    inc_virtio_vdrm,
   ],
   link_with : [libgravity_lib, libgravity_layout, libgravity_compiler],
   c_args : ['-Wno-c2x-extensions'] + gravity_diagnostic_c_args,
@@ -177,7 +175,7 @@ if with_tests
   foreach t : ['hk-index-aperture', 'hk-index-memory', 'hk-variant-retry', 'hk-variant-cache', 'hk-texture-upload-failure', 'hk-line-stipple-limit']
     gravity_shader_test = executable('gravity-' + t, 'tests/' + t + '.c',
       include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                             inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                             inc_src, inc_gravity],
       dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
       link_args : {'hk-index-aperture': ['-Wl,--wrap=hk_dispatch_precomp'],
                    'hk-index-memory': ['-Wl,--wrap=agx_va_alloc', '-Wl,--wrap=agx_bo_bind', '-Wl,--wrap=agx_va_free'],
@@ -198,7 +196,7 @@ if with_tests
     executable(
       'gravity-hk-heap-oom', 'tests/hk-heap-oom.c',
       include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                             inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                             inc_src, inc_gravity],
       dependencies : [gravity_vk_deps],
       link_with : [libgravity_vk],
       link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_va_alloc',
@@ -208,21 +206,21 @@ if with_tests
   )
   test('gravity-hk-heap-grow', executable('gravity-hk-heap-grow', 'tests/hk-heap-grow.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_unreference',
                  '-Wl,--wrap=agx_bo_bind']),
     suite : ['gravity'])
   test('gravity-hk-cmd-bo-cache', executable('gravity-hk-cmd-bo-cache', 'tests/hk-cmd-bo-cache.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_unreference',
                  '-Wl,--wrap=agx_bo_cache_evict_all']),
     suite : ['gravity'])
   test('gravity-hk-feedback-oom', executable('gravity-hk-feedback-oom', 'tests/hk-feedback-oom.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=hk_meta_decompress_view', '-Wl,--wrap=__vk_errorf']),
     suite : ['gravity'])
@@ -231,7 +229,7 @@ if with_tests
     executable(
       'gravity-hk-tess-fold-oom', 'tests/hk-tess-fold-oom.c',
       include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                             inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                             inc_src, inc_gravity],
       dependencies : [gravity_vk_deps],
       link_with : [libgravity_vk],
       link_args : ['-Wl,--wrap=hk_pool_alloc_internal', '-Wl,--wrap=__vk_errorf'],
@@ -243,7 +241,7 @@ if with_tests
       'gravity-' + t,
       'tests/' + t + '.c',
       include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                             inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                             inc_src, inc_gravity],
       dependencies : [gravity_vk_deps],
       link_with : [libgravity_vk],
       link_args : t in ['hk-heap-addresses', 'hk-heap-resubmit'] ? ['-Wl,--wrap=hk_dispatch_precomp'] : [],
@@ -263,7 +261,7 @@ if with_tests
   # Corpus inspection is an explicit host tool, not part of the driver.
   executable('gravity-hk-native-mesh-coverage', 'tests/hk-native-mesh-coverage.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk], build_by_default : false)
   test('gravity-hk-native-batch-admits',
        executable('gravity-hk-native-batch-admits', 'tests/hk-native-batch-admits.c',
@@ -272,7 +270,7 @@ if with_tests
   test('gravity-hk-native-mesh-open', executable('gravity-hk-native-mesh-open',
     'tests/hk-native-mesh-open.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=drmGetVersion', '-Wl,--wrap=drmFreeVersion',
                  '-Wl,--wrap=drmIoctl', '-Wl,--wrap=agx_native_mesh_probe',
@@ -281,19 +279,19 @@ if with_tests
   gravity_routing_test = executable(
     'gravity-hk-native-mesh-routing', 'tests/hk-native-mesh-routing.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
   )
   test('gravity-hk-native-task-bridge', executable(
     'gravity-hk-native-task-bridge', 'tests/hk-native-task-bridge.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk]),
     suite : ['gravity'])
   gravity_compiler_env_test = executable(
     'gravity-hk-compiler-env', 'tests/hk-compiler-env.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
   )
   test('gravity-hk-compiler-env', prog_python,
@@ -302,32 +300,32 @@ if with_tests
   )
   test('gravity-hk-shader-memory', executable('gravity-hk-shader-memory', 'tests/hk-shader-memory.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_reference',
                  '-Wl,--wrap=agx_bo_unreference',
                  '-Wl,--wrap=agx_bo_note_cpu_write']), suite : ['gravity'])
   test('gravity-hk-sliced-3d', executable('gravity-hk-sliced-3d', 'tests/hk-sliced-3d.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk]),
     suite : ['gravity'])
   test('gravity-hk-structural-uploads', executable('gravity-hk-structural-uploads', 'tests/hk-structural-uploads.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_unreference',
                  '-Wl,--wrap=agx_bo_cache_evict_all', '-Wl,--wrap=__vk_errorf']), suite : ['gravity'])
   test('gravity-hk-push-uploads', executable('gravity-hk-push-uploads', 'tests/hk-push-uploads.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_unreference',
                  '-Wl,--wrap=agx_bo_cache_evict_all', '-Wl,--wrap=__vk_errorf']),
     suite : ['gravity'])
   test('gravity-hk-memory', executable('gravity-hk-memory', 'tests/hk-memory.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_unreference',
                  '-Wl,--wrap=agx_bo_cache_evict_all']), suite : ['gravity'])
@@ -336,7 +334,7 @@ if with_tests
     executable(
       'gravity-hk-fragment-tri-merging', 'tests/hk-fragment-tri-merging.c',
       include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                             inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                             inc_src, inc_gravity],
       dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
       link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_reference',
                    '-Wl,--wrap=agx_bo_unreference'],
@@ -348,7 +346,7 @@ if with_tests
     suite : ['gravity'])
   test('gravity-hk-native-draw-state', executable('gravity-hk-native-draw-state', 'tests/hk-native-draw-state.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=__vk_errorf']),
     env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_GS_NATIVE=1',
@@ -368,7 +366,7 @@ if with_tests
   gravity_hybrid_test = executable(
     'gravity-hk-native-mesh-hybrid', 'tests/hk-native-mesh-hybrid.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_reference',
                  '-Wl,--wrap=agx_bo_unreference', '-Wl,--wrap=__vk_errorf',
@@ -379,7 +377,7 @@ if with_tests
   gravity_native_stage_policy = executable(
     'gravity-hk-native-stage-policy', 'tests/hk-native-stage-policy.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_reference',
                  '-Wl,--wrap=agx_bo_unreference', '-Wl,--wrap=agx_bo_cache_evict_all',
@@ -401,7 +399,7 @@ if with_tests
   gravity_native_index_identity = executable(
     'gravity-hk-native-index-identity', 'tests/hk-native-index-identity.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_reference',
                  '-Wl,--wrap=agx_bo_unreference', '-Wl,--wrap=__vk_errorf',
@@ -412,7 +410,7 @@ if with_tests
   gravity_native_index_recording = executable(
     'gravity-hk-native-index-recording', 'tests/hk-native-index-recording.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_unreference',
                  '-Wl,--wrap=agx_bo_cache_evict_all'],
@@ -445,7 +443,7 @@ if with_tests
     executable(
       'gravity-hk-native-mesh-options', 'tests/hk-native-mesh-options.c',
       include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                             inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                             inc_src, inc_gravity],
       dependencies : [gravity_vk_deps],
       link_with : [libgravity_vk],
     ),
@@ -456,7 +454,7 @@ if with_tests
   gravity_native_stage_varyings = executable(
     'gravity-hk-native-stage-varyings', 'tests/hk-native-stage-varyings.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
   )
   foreach packed : ['0', '1']
@@ -469,7 +467,7 @@ if with_tests
   gravity_native_rounds_test = executable(
     'gravity-hk-native-mesh-rounds', 'tests/hk-native-mesh-rounds.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
   )
   test('gravity-hk-native-mesh-rounds-off', gravity_native_rounds_test,
@@ -480,7 +478,7 @@ if with_tests
   gravity_native_cull_test = executable(
     'gravity-hk-native-mesh-cull', 'tests/hk-native-mesh-cull.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
   )
   test('gravity-hk-native-mesh-cull', gravity_native_cull_test,
@@ -488,7 +486,7 @@ if with_tests
   gravity_native_lines_test = executable(
     'gravity-hk-native-mesh-lines', 'tests/hk-native-mesh-lines.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
   )
   test('gravity-hk-native-mesh-lines', gravity_native_lines_test,
@@ -497,7 +495,7 @@ if with_tests
   gravity_native_primitive_test = executable(
     'gravity-hk-native-mesh-primitive', 'tests/hk-native-mesh-primitive.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
   )
   test('gravity-hk-native-mesh-primitive', gravity_native_primitive_test,
@@ -507,7 +505,7 @@ if with_tests
   gravity_packed_indices_test = executable(
     'gravity-hk-native-packed-indices', 'tests/hk-native-packed-indices.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                           inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                           inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
   )
   foreach mode, selection : {
@@ -550,7 +548,7 @@ if with_tests
       'gravity_sparse_residency',
       'tests/hk-sparse-residency.c',
       include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                             inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                             inc_src, inc_gravity],
       dependencies : [gravity_vk_deps],
       link_with : [libgravity_vk],
     ),
@@ -562,7 +560,7 @@ if with_tests
       'gravity_barrier_recording',
       'tests/hk_barrier_recording.c',
       include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                             inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                             inc_src, inc_gravity],
       dependencies : [gravity_vk_deps],
       link_with : [libgravity_vk],
     ),
@@ -574,7 +572,7 @@ if with_tests
       'gravity_texel_encode',
       'tests/hk-texel-encode.c',
       include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                             inc_src, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+                             inc_src, inc_gravity],
       dependencies : [gravity_vk_deps],
       link_with : [libgravity_vk],
     ),

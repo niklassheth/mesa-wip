@@ -19,7 +19,6 @@
 #include "agx_linker.h"
 #include "agx_pack.h"
 #include "agx_tilebuffer.h"
-#include "agx_uvs.h"
 #include "libagx_dgc.h"
 #include "shader_enums.h"
 
@@ -462,7 +461,6 @@ struct hk_graphics_state {
 
    /* Fast linked shader data structures */
    uint64_t varyings;
-   struct agx_varyings_vs linked_varyings;
 
    uint32_t linked_dirty;
    bool generate_primitive_id;

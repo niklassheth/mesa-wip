@@ -24,11 +24,7 @@ struct agx_precompiled_shader {
 struct agx_bg_eot_cache {
    struct agx_device *dev;
    simple_mtx_t lock;
-
-   /* TEMP_STUB_PHASE1: ralloc context for cached entries; hk_device.c still
-    * checks `!dev->bg_eot.ht`. Rename or drop check in Gate 1.
-    */
-   void *ht;
+   void *mem_ctx;
 
    struct agx_precompiled_shader *precomp[LIBAGX_NUM_PROGRAMS];
 };

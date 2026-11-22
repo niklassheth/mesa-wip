@@ -315,25 +315,9 @@ max_commands_per_submit(struct hk_device *dev)
                    DRM_ASAHI_BARRIER_NONE - 1)) : 1;
 }
 
-/* Virtio external resources of one submission: the implicit-sync (WSI)
- * memory its command buffers access. virglrenderer waits for the host
- * dma-buf fences of each (e.g. the compositor still reading a swapchain
- * image) and attaches the submission's fence to them, so the compositor waits
- * for the rendering. Submissions without WSI memory send none and synchronize
- * explicitly only.
- */
-struct hk_extres {
-   uint32_t count;
-   struct asahi_ccmd_submit_res *res;
-
-   /* HK_TIMELINE_FILE: per command, enum hk_cs_end | (meta << 8), or NULL
-    * when the timeline is not recording. */
-   const uint16_t *reasons;
-};
-
 static VkResult
 queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
-                    struct hk_queue *queue, const struct hk_extres *extres)
+                    struct hk_queue *queue, const uint16_t *reasons)
 {
    /* A binary output keeps the underlying error-bearing fence alive without
     * a transfer from the timeline. Reuse the syncobj; retain only its immutable
@@ -358,12 +342,6 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
          return VK_ERROR_DEVICE_LOST;
    }
 
-   struct agx_submit_virt virt = {
-      .ring_idx = queue->drm.virt_ring_idx,
-      .extres_count = extres->count,
-      .extres = extres->res,
-   };
-
 #ifdef HK_WAIT_WATCHDOG
    const struct drm_asahi_sync *wd_syncs = (const void *)(uintptr_t)submit->syncs;
    const struct drm_asahi_sync *wd_signals = wd_syncs + submit->in_sync_count;
@@ -386,8 +364,8 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
    /* HK_TIMELINE_FILE: ioctl begin/end records around the submit. */
    uint64_t trace_id = agx_timeline_enabled() ? agx_timeline_id() : 0;
    agx_timeline_submit(TL_IOCTL_BEGIN, trace_id, dev->dev.fd, submit, 0,
-                       extres->reasons);
-   int ret = dev->dev.ops.submit(&dev->dev, submit, &virt);
+                       reasons);
+   int ret = dev->dev.ops.submit(&dev->dev, submit);
    agx_timeline_emit(TL_IOCTL_END, 0, trace_id, (uint64_t)(int64_t)ret,
                      errno, 0, 0, 0, 0, 0);
    int submit_errno = errno;
@@ -422,7 +400,7 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
 static VkResult
 queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
                     unsigned command_count, struct hk_queue *queue,
-                    const struct hk_extres *extres)
+                    const uint16_t *reasons)
 {
    uint8_t *cmdbuf = (uint8_t *)(uintptr_t)submit->cmdbuf;
    uint32_t offs = 0;
@@ -465,13 +443,10 @@ queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
          .out_sync_count = has_out_syncs ? submit->out_sync_count : 0,
       };
 
-      /* Each slice lists the external resources: the first waits for the
-       * compositor, the last hands its fence to it. */
-      struct hk_extres slice_extres = *extres;
-      if (slice_extres.reasons)
-         slice_extres.reasons += command_count - commands_remaining - count;
+      const uint16_t *slice_reasons =
+         reasons ? reasons + (command_count - commands_remaining - count) : NULL;
       VkResult result =
-         queue_submit_single(dev, &submit_ioctl, queue, &slice_extres);
+         queue_submit_single(dev, &submit_ioctl, queue, slice_reasons);
       if (result != VK_SUCCESS)
          return result;
 
@@ -1235,25 +1210,6 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       .cmdbuf = (uint64_t)(uintptr_t)(payload.data),
    };
 
-   struct util_dynarray extres_list = UTIL_DYNARRAY_INIT;
-   if (dev->dev.is_virtio) {
-      for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
-         struct hk_cmd_buffer *cmdbuf =
-            (struct hk_cmd_buffer *)submit->command_buffers[i];
-         util_dynarray_foreach(&cmdbuf->implicit_sync_res, uint32_t, res) {
-            bool seen = false;
-            util_dynarray_foreach(&extres_list, struct asahi_ccmd_submit_res, e)
-               seen |= e->res_id == *res;
-            if (!seen) {
-               struct asahi_ccmd_submit_res e = {
-                  .res_id = *res,
-                  .flags = ASAHI_EXTRES_READ | ASAHI_EXTRES_WRITE,
-               };
-               util_dynarray_append(&extres_list, e);
-            }
-         }
-      }
-   }
    uint16_t *reasons = NULL;
    if (agx_timeline_enabled()) {
       reasons = malloc(command_count * sizeof(*reasons));
@@ -1265,23 +1221,16 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             reasons[r++] = cs->end_reason | (cs->meta << 8);
       }
    }
-   const struct hk_extres extres = {
-      .count = util_dynarray_num_elements(&extres_list,
-                                          struct asahi_ccmd_submit_res),
-      .res = util_dynarray_begin(&extres_list),
-      .reasons = reasons,
-   };
 
    VkResult result;
    if (command_count <= max_commands_per_submit(dev)) {
-      result = queue_submit_single(dev, &submit_ioctl, queue, &extres);
+      result = queue_submit_single(dev, &submit_ioctl, queue, reasons);
    } else {
       result = queue_submit_looped(dev, &submit_ioctl, command_count,
-                                   queue, &extres);
+                                   queue, reasons);
    }
 
    free(reasons);
-   util_dynarray_fini(&extres_list);
    util_dynarray_fini(&payload);
    if (result == VK_SUCCESS) {
       hk_sync_next_submit(&sync);
@@ -1414,22 +1363,7 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
    queue->vk.driver_submit = hk_queue_submit;
    hk_sync_init(&queue->sync);
 
-   /* Under virtio, the host's native context gives each kernel queue the
-    * fence timeline of its priority (ring = priority + 1) and retires a ring's
-    * guest fences when the latest submission on that timeline completes, while
-    * the guest kernel skips waits on fences from the submitting ring. Two
-    * queues of equal priority on independent kernel queues would share a
-    * timeline: a fence could retire on the other queue's work, and waits
-    * between them would be dropped. Give the second family its own priority
-    * bucket, and so its own timeline and ring. */
-   if (dev->dev.is_virtio && pCreateInfo->queueFamilyIndex != 0) {
-      drm_priority = drm_priority == DRM_ASAHI_PRIORITY_LOW
-                        ? DRM_ASAHI_PRIORITY_MEDIUM
-                        : DRM_ASAHI_PRIORITY_LOW;
-   }
-
    queue->drm.id = agx_create_command_queue(&dev->dev, drm_priority);
-   queue->drm.virt_ring_idx = drm_priority + 1;
 
    if (drmSyncobjCreate(dev->dev.fd, 0, &queue->drm.syncobj)) {
       mesa_loge("drmSyncobjCreate() failed %d\n", errno);
@@ -1448,15 +1382,13 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
                        "DRM_IOCTL_TIMELINE_SYNCOBJ_SIGNAL failed: %m");
    }
 
-   if (!dev->dev.is_virtio) {
-      queue->completion_initialized = true;
-      int status = hk_queue_completion_init(&queue->completion, dev->dev.fd);
-      if (status < 0) {
-         hk_queue_finish(dev, queue);
-         return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
-                          "Queue completion initialization failed: %s",
-                          strerror(-status));
-      }
+   queue->completion_initialized = true;
+   int status = hk_queue_completion_init(&queue->completion, dev->dev.fd);
+   if (status < 0) {
+      hk_queue_finish(dev, queue);
+      return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
+                       "Queue completion initialization failed: %s",
+                       strerror(-status));
    }
 
    hk_gpu_busy_init(queue);
