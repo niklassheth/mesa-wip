@@ -327,8 +327,6 @@ bool agx_apple9_update_draw_tables_alloc(
 #define AGX_APPLE9_COMPUTE_INDIRECT_LOCAL_CDM_RECORD_SIZE 0x1cu
 #define AGX_APPLE9_RENDER_CONTEXT_BASE UINT64_C(0x1000000000)
 
-bool agx_apple9_compute_enabled(const struct agx_device *dev);
-
 size_t agx_apple9_compute_launch_size(
    const struct agx_apple9_compute_profile *profile);
 

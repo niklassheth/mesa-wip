@@ -14,33 +14,15 @@ libgravity_lib_files = files(
   'agx_border.c',
   'agx_device.c',
   'agx_native_mesh.c',
-  'agx_device_virtio.c',
-  'agx_linker.c',
   'agx_bg_eot.c',
   'agx_tilebuffer.c',
-  'agx_nir_lower_tilebuffer.c',
   'agx_nir_apple9_tilebuffer.c',
   'agx_nir_lower_uvs.c',
   'agx_nir_lower_vbo.c',
   'agx_nir_prolog_epilog.c',
   'agx_ppp.h',
-  'agx_scratch.c',
   'agx_va.c',
   'pool.c',
-)
-
-libgravity_decode_files = files(
-  'decode.c',
-)
-
-libgravity_decode = static_library(
-  'gravity_decode',
-  [libgravity_decode_files, gravity_pack],
-  dependencies : [dep_valgrind, idep_mesautil],
-  c_args : [no_override_init_args, '-Wno-c2x-extensions'],
-  gnu_symbol_visibility : 'hidden',
-  link_with : [libgravity_agx2_disasm],
-  build_by_default : false,
 )
 
 gravity_libcl_shaders = custom_target(
@@ -58,10 +40,10 @@ idep_gravity_cl_shaders_h = declare_dependency(
 libgravity_lib = static_library(
   'gravity_lib',
   [libgravity_lib_files, gravity_libcl_shaders, gravity_pack, sha1_h],
-  include_directories : [inc_gallium, inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+  include_directories : [inc_gallium, inc_gravity],
   c_args : [no_override_init_args, '-Wno-c2x-extensions'],
   gnu_symbol_visibility : 'hidden',
-  link_with: [libgravity_decode, libvdrm, libpoly_nir],
+  link_with: [libpoly_nir],
   dependencies: [idep_gravity_debug, dep_libdrm, dep_valgrind, idep_nir, idep_mesautil, idep_gravity_cl, idep_libpoly],
   build_by_default : false,
 )
@@ -74,11 +56,11 @@ if with_tests
     suite : ['gravity'])
   test('gravity-apple9-draw-tables', executable('gravity-apple9-draw-tables',
     'tests/test-apple9-draw-tables.c',
-    include_directories : [inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+    include_directories : [inc_gravity],
     dependencies : [idep_mesautil, idep_nir, idep_gravity_cl],
     link_with : [libgravity_lib, libgravity_compiler]), suite : ['gravity'])
   test('gravity-bo-reaper', executable('gravity-bo-reaper', 'tests/test-bo-reaper.c',
-    include_directories : [inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+    include_directories : [inc_gravity],
     dependencies : [idep_mesautil, idep_nir, idep_gravity_cl],
     link_with : [libgravity_lib, libgravity_compiler],
     link_args : ['-Wl,--wrap=drmIoctl', '-Wl,--wrap=drmPrimeFDToHandle',
@@ -86,18 +68,18 @@ if with_tests
                  '-Wl,--wrap=agx_va_free', '-Wl,--wrap=agx_va_retire']),
     suite : ['gravity'], timeout : 40)
   test('gravity-va-quarantine', executable('gravity-va-quarantine', 'tests/test-va-quarantine.c',
-    include_directories : [inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+    include_directories : [inc_gravity],
     dependencies : [idep_mesautil, idep_nir, idep_gravity_cl],
     link_with : [libgravity_lib, libgravity_compiler]),
     suite : ['gravity'])
   test('gravity-apple9-coefficients', executable('gravity-apple9-coefficients',
     'tests/test-apple9-coefficients.c',
-    include_directories : [inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+    include_directories : [inc_gravity],
     dependencies : [idep_mesautil, idep_nir, idep_gravity_cl],
     link_with : [libgravity_lib, libgravity_compiler]), suite : ['gravity'])
   test('gravity-apple9-graphics-roots', executable('gravity-apple9-graphics-roots',
     'tests/test-apple9-graphics-roots.c',
-    include_directories : [inc_gravity, inc_virtio_gpu, inc_virtio_vdrm],
+    include_directories : [inc_gravity],
     dependencies : [idep_mesautil, idep_nir, idep_gravity_cl],
     link_with : [libgravity_lib, libgravity_compiler]), suite : ['gravity'])
   test(

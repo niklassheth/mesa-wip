@@ -690,14 +690,6 @@ agx_apple9_prepare_compute_dispatch(
       textures, samplers, geometry, preamble_address, launch_address);
 }
 
-bool
-agx_apple9_compute_enabled(const struct agx_device *dev)
-{
-   /* G16G/G16C/G17P use the native Apple9 launch and resource encodings.
-    * Never send a fixed-aperture shader through the legacy USC packet path. */
-   return agx_is_apple9(dev);
-}
-
 void
 agx_apple9_set_compute_barrier(void *record, unsigned record_size)
 {

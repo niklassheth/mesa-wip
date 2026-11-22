@@ -105,9 +105,7 @@ struct agx_bo {
    /* Process-local index */
    uint32_t handle;
 
-   /* Handle to refer to this BO in uAPI calls. This is either the GEM handle
-    * on native Linux, or the virtio resource ID with virtgpu.
-    */
+   /* Handle to refer to this BO in uAPI calls (GEM handle). */
    uint32_t uapi_handle;
 
    /* DMA-BUF fd clone for adding fences to imports/exports */

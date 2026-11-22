@@ -16,7 +16,6 @@
 #include "util/hash_table.h"
 #include "util/ralloc.h"
 #include "agx_device.h"
-#include "decode.h"
 #include "layout.h"
 
 static pthread_mutex_t agx_reaper_devices_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -677,9 +676,6 @@ agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo)
 
       agx_shader_body_finish(dev, &bo->apple9_body);
 
-      if (dev->debug & AGX_DBG_TRACE)
-         agxdecode_track_free(dev->agxdecode, bo);
-
       if (!agx_bo_cache_put(dev, bo))
          agx_bo_free(dev, bo);
    }
@@ -778,11 +774,6 @@ agx_bo_finish_create(struct agx_device *dev, struct agx_bo *bo,
       fprintf(stderr, "AGX_BO_LABEL fd=%d handle=%u flags=%u size=%zu label=%s\n",
               dev->fd, bo->uapi_handle, bo->flags, bo->size, label);
    p_atomic_set(&bo->refcnt, 1);
-
-   if (dev->debug & AGX_DBG_TRACE) {
-      agx_bo_map(bo);
-      agxdecode_track_alloc(dev->agxdecode, bo);
-   }
 
    if (unlikely(dev->debug & (AGX_DBG_BODUMP | AGX_DBG_BODUMPVERBOSE))) {
       pthread_mutex_lock(&dev->bo_map_lock);

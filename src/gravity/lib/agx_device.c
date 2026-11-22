@@ -21,20 +21,15 @@
 #include "agx_abi.h"
 #include "agx_bo.h"
 #include "agx_compile.h"
-#include "agx_device_virtio.h"
-#include "agx_scratch.h"
-#include "decode.h"
 #include "glsl_types.h"
 #include "layout.h"
 #include "libagx_dgc.h"
-#include "libagx_shaders.h"
 
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <xf86drm.h>
 #include "drm-uapi/dma-buf.h"
-#include "util/blob.h"
 #include "util/log.h"
 #include "util/mesa-blake3.h"
 #include "util/os_file.h"
@@ -44,20 +39,14 @@
 #include "util/u_math.h"
 #include "util/u_printf.h"
 #include "git_sha1.h"
-#include "nir_serialize.h"
-#include "vdrm.h"
 
 static void agx_finish_device(struct agx_device *dev);
 
 static inline int
 asahi_simple_ioctl(struct agx_device *dev, unsigned cmd, void *req)
 {
-   if (dev->is_virtio) {
-      return agx_virtio_simple_ioctl(dev, cmd, req);
-   } else {
-      return U_WATCHDOG_IOCTL("asahi_simple_ioctl", dev->fd,
-                              drmIoctl(dev->fd, cmd, req));
-   }
+   return U_WATCHDOG_IOCTL("asahi_simple_ioctl", dev->fd,
+                           drmIoctl(dev->fd, cmd, req));
 }
 
 /* clang-format off */
@@ -328,11 +317,7 @@ retry:
          abort();
       }
 
-      if (dev->is_virtio) {
-         bo->uapi_handle = vdrm_handle_to_res_id(dev->vdrm, bo->handle);
-      } else {
-         bo->uapi_handle = bo->handle;
-      }
+      bo->uapi_handle = bo->handle;
 
       ret = agx_bo_bind(dev, bo, bo->va->addr, bo->size, 0,
                         DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE);
@@ -361,11 +346,6 @@ retry:
    pthread_mutex_unlock(&dev->bo_map_lock);
 
    assert(bo->dev != NULL && "post-condition");
-
-   if (dev->debug & AGX_DBG_TRACE) {
-      agx_bo_map(bo);
-      agxdecode_track_alloc(dev->agxdecode, bo);
-   }
 
    return bo;
 }
@@ -521,25 +501,16 @@ agx_open_device(void *memctx, struct agx_device *dev)
       drmVersionPtr version = drmGetVersion(dev->fd);
       if (!version) {
          fprintf(stderr, "cannot get version: %s", strerror(errno));
-         return NULL;
-      }
-
-      if (!strcmp(version->name, "asahi")) {
-         dev->is_virtio = false;
-         dev->ops = agx_device_drm_ops;
-      } else if (!strcmp(version->name, "virtio_gpu")) {
-         dev->is_virtio = true;
-         if (!agx_virtio_open_device(dev)) {
-            fprintf(
-               stderr,
-               "Error opening virtio-gpu device for Asahi native context\n");
-            return false;
-         }
-      } else {
          return false;
       }
 
+      bool is_asahi = !strcmp(version->name, "asahi");
       drmFreeVersion(version);
+      if (!is_asahi)
+         return false;
+
+      dev->is_virtio = false;
+      dev->ops = agx_device_drm_ops;
    }
 
    params_size = dev->ops.get_params(dev, &dev->params, sizeof(dev->params));
@@ -549,33 +520,28 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
    assert(params_size >= sizeof(dev->params));
 
-   assert(dev->params.gpu_generation >= 13);
+   /* Gravity targets Apple9 (G16+) GPUs unconditionally. */
+   if (dev->params.gpu_generation < 16)
+      return false;
 
    /* Identify the chip before any helpers consume device state. */
    switch (dev->params.gpu_generation) {
-   case 13:
-      dev->chip = dev->params.num_clusters_total > 1 ? AGX_CHIP_G13X
-                                                     : AGX_CHIP_G13G;
-      break;
-   case 14:
-   case 15:
-      dev->chip = dev->params.num_clusters_total > 1 ? AGX_CHIP_G14X
-                                                     : AGX_CHIP_G14G;
-      break;
    case 16:
-      assert(dev->params.gpu_variant == 'G' ||
-             dev->params.gpu_variant == 'S' ||
-             dev->params.gpu_variant == 'C');
+      if (dev->params.gpu_variant != 'G' &&
+          dev->params.gpu_variant != 'S' &&
+          dev->params.gpu_variant != 'C')
+         return false;
       /* Pro shares the multi-cluster Max graphics path and ISA. */
       dev->chip = dev->params.gpu_variant != 'G' ? AGX_CHIP_G16C
-                                               : AGX_CHIP_G16G;
+                                                 : AGX_CHIP_G16G;
       break;
    case 17:
-      assert(dev->params.gpu_variant == 'P');
+      if (dev->params.gpu_variant != 'P')
+         return false;
       dev->chip = AGX_CHIP_G17P;
       break;
    default:
-      UNREACHABLE("Unsupported AGX generation");
+      return false;
    }
 
    const char *variant = " Unknown";
@@ -621,21 +587,12 @@ agx_open_device(void *memctx, struct agx_device *dev)
    dev->guard_size = AIL_PAGESIZE;
    uint64_t default_shader_base =
       ALIGN_POT(MAX2(dev->params.vm_start, reservation), 0x100000000ull);
-   bool fixed_apple9_usc_base = dev->params.gpu_generation == 16 ||
-                                dev->params.gpu_generation == 17;
 
    /* Apple9 compact shader references resolve through the fixed native 1-TiB
-    * USC aperture on both G16 and G17.  A relocatable G17 base was an early
-    * shim assumption, not a hardware capability.  The 42-bit UAT leaves room
-    * for the complete 4-GiB heap there, so use the hardware address directly
-    * instead of requiring a kernel-side alias.
+    * USC aperture on both G16 and G17.  The 42-bit UAT leaves room for the
+    * complete 4-GiB heap there, so use the hardware address directly.
     */
-   if (fixed_apple9_usc_base) {
-      dev->shader_base = 1ull << 40;
-   } else {
-      // Put the USC heap at the bottom of the user address space, 4GiB aligned
-      dev->shader_base = default_shader_base;
-   }
+   dev->shader_base = 1ull << 40;
 
    if (dev->shader_base < reservation) {
       /* Our robustness implementation requires the bottom unmapped */
@@ -646,21 +603,13 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
    uint64_t shader_size = 0x100000000ull;
    /* Apple9 leaves the ordinary resource/descriptor heap below the fixed USC
-    * aperture. Besides avoiding a wasted 1-TiB hole, this temporarily keeps
-    * unported generic pipeline records inside their legacy 39-bit pointer
-    * field. Native Apple9 sampling uses full 64-bit Tier-2 resource pointers,
-    * so this is a Mesa compatibility guard, not a hardware address limit.
-    * Executable/AGX_BO_LOW_VA allocations still use usc_heap.
+    * aperture. Executable/AGX_BO_LOW_VA allocations use usc_heap.
     */
-   uint64_t user_start = fixed_apple9_usc_base
-                            ? default_shader_base
-                            : dev->shader_base + shader_size;
+   uint64_t user_start = default_shader_base;
 
    assert(dev->shader_base >= dev->params.vm_start);
    assert(dev->shader_base + shader_size < dev->params.vm_end);
    assert(user_start < dev->params.vm_end);
-
-   dev->agxdecode = agxdecode_new_context(dev->shader_base);
 
    agx_init_timestamps(dev);
 
@@ -670,7 +619,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
    agx_bo_cache_init(dev);
 
    /* The generic ABI puts a generous kernel-private heap at the top of the
-    * VM.  G16 render Work instead addresses that backend-owned state relative
+    * VM.  G16 render work instead addresses that backend-owned state relative
     * to the fixed 0x1000000000 context and has a 4-GiB reach.  Keep its UAPI
     * carveout after the small fixed client graph and before the ordinary Mesa
     * heap, with exactly the advertised minimum capacity. */
@@ -700,18 +649,16 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
 
    /* Keep Apple9's ordinary heap and its sparse read-only mirror below the
-    * legacy generic-pipeline ceiling until Apple9 Tier-2 resource binding is
-    * used throughout. The separate USC heap remains at 1 TiB and is not part
+    * 512-GiB ceiling. The separate USC heap remains at 1 TiB and is not part
     * of this partition.
     */
-   uint64_t user_end =
-      fixed_apple9_usc_base ? (1ull << 39) : vm_create.kernel_start;
+   uint64_t user_end = 1ull << 39;
    assert(user_start < user_end);
    uint64_t user_size = user_end - user_start;
 
    /* Only native G16G VMs can qualify for the current mesh profile. */
    const char *classes = dev->params.gpu_generation == 16 &&
-                         dev->params.gpu_variant == 'G' && !dev->is_virtio
+                         dev->params.gpu_variant == 'G'
                             ? dev->native_mesh_classes : NULL;
    struct agx_native_mesh_support before =
       agx_native_mesh_probe(dev->fd, classes);
@@ -791,48 +738,35 @@ agx_open_device(void *memctx, struct agx_device *dev)
       MIN2(vm_create.kernel_start,
            AGX_APPLE9_RENDER_CONTEXT_BASE + (1ull << 32));
    util_vma_heap_init(&dev->context_heap, context_start,
-                      fixed_apple9_usc_base ? context_end - context_start : 0);
+                      context_end - context_start);
    dev->context_heap.alloc_high = false;
    agx_va_quarantine_init(dev, user_size - replay_size,
                           shader_size - replay_usc_size,
-                          fixed_apple9_usc_base ? context_end - context_start : 0);
+                          context_end - context_start);
 
    /* The compact Apple9 entry arena must start at the USC base. Allocate
     * it first from the bottom of the heap; shader bodies and batch state can
     * use the remaining 4-GiB aperture. Resource tables use full addresses.
-    * Older generations retain Mesa's usual high-to-low allocation policy.
     */
-   if (dev->params.gpu_generation >= 16)
-      dev->usc_heap.alloc_high = false;
+   dev->usc_heap.alloc_high = false;
 
    dev->vm_id = vm_create.vm_id;
 
    glsl_type_singleton_init_or_ref();
 
-   if (agx_gather_device_key(dev).needs_g13x_coherency == U_TRISTATE_YES) {
-      dev->libagx_programs = libagx_g13x;
-   } else {
-      dev->libagx_programs = libagx_g13g;
-   }
-
-   /* Apple9 GPUs require their generation-specific graphics path. */
-   dev->apple9_direct_render = agx_is_apple9(dev);
    dev->apple9_trace = agx_apple9_trace_enabled();
 
-   if (agx_is_apple9(dev)) {
-      simple_mtx_init(&dev->apple9_entry_lock, mtx_plain);
-      list_inithead(&dev->apple9_entry_lru);
-      util_vma_heap_init(&dev->apple9_entry_heap, AGX_APPLE9_ENTRY_HEADER_SIZE,
-                        AGX_APPLE9_ENTRY_ARENA_SIZE - AGX_APPLE9_ENTRY_HEADER_SIZE);
-      dev->apple9_entry_heap.alloc_high = false;
-   }
+   simple_mtx_init(&dev->apple9_entry_lock, mtx_plain);
+   list_inithead(&dev->apple9_entry_lru);
+   util_vma_heap_init(&dev->apple9_entry_heap, AGX_APPLE9_ENTRY_HEADER_SIZE,
+                     AGX_APPLE9_ENTRY_ARENA_SIZE - AGX_APPLE9_ENTRY_HEADER_SIZE);
+   dev->apple9_entry_heap.alloc_high = false;
 
    /* Entry instructions are CPU-authored and GPU-read-only. The same mapping
     * remains installed for every graphics and compute job. Reserve the arena
     * and back its first chunk, which holds the header; later chunks are backed
     * as entries reach them. */
-   if (agx_is_apple9(dev) &&
-       !dev->probe_only) {
+   if (!dev->probe_only) {
       dev->apple9_entry_va =
          agx_va_alloc(dev, AGX_APPLE9_ENTRY_ARENA_SIZE,
                       AGX_APPLE9_ENTRY_ARENA_SIZE, AGX_VA_USC | AGX_VA_FIXED,
@@ -961,13 +895,10 @@ agx_finish_device(struct agx_device *dev)
    u_printf_destroy(&dev->printf);
    agx_bo_cache_finish(dev);
    agx_va_quarantine_finish(dev);
-   if (agx_is_apple9(dev)) {
-      util_vma_heap_finish(&dev->apple9_entry_heap);
-      simple_mtx_destroy(&dev->apple9_entry_lock);
-   }
+   util_vma_heap_finish(&dev->apple9_entry_heap);
+   simple_mtx_destroy(&dev->apple9_entry_lock);
    util_sparse_array_finish(&dev->bo_map);
    pthread_mutex_destroy(&dev->bo_map_lock);
-   agxdecode_destroy_context(dev->agxdecode);
 
    util_vma_heap_finish(&dev->main_heap);
    util_vma_heap_finish(&dev->replay_heap);
@@ -1213,20 +1144,4 @@ agx_get_num_cores(const struct agx_device *dev)
    }
 
    return n;
-}
-
-struct agx_device_key
-agx_gather_device_key(struct agx_device *dev)
-{
-   bool g13x_coh = (dev->params.gpu_generation == 13 &&
-                    dev->params.num_clusters_total > 1) ||
-                   dev->params.num_dies > 1;
-
-   return (struct agx_device_key){
-      .shader_isa = dev->params.gpu_generation >= 16
-                       ? AGX_SHADER_ISA_APPLE9
-                       : AGX_SHADER_ISA_APPLE8,
-      .needs_g13x_coherency = u_tristate_make(g13x_coh),
-      .soft_fault = agx_has_soft_fault(dev),
-   };
 }

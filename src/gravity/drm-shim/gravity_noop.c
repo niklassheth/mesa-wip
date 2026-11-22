@@ -5,11 +5,11 @@
  */
 
 /* A DRM shim that accepts every submission without a GPU. It lets host CI
- * run the Gallium and Vulkan drivers through their CPU-side paths (shader
+ * run the Gravity Vulkan driver through its CPU-side paths (shader
  * compilation, state emission, command stream construction). Rendered
  * results are meaningless.
  *
- * ASAHI_NOOP_GPU selects the reported GPU: g13g (default) or g16g.
+ * Reports an Apple M4 (G16G / T8132) GPU by default.
  */
 
 #include <stdlib.h>
@@ -19,17 +19,20 @@
 #include "drm-uapi/asahi_drm.h"
 
 static struct drm_asahi_params_global params = {
-   .gpu_generation = 13,
+   .gpu_generation = 16,
    .gpu_variant = 'G',
    .gpu_revision = 0,
-   .chip_id = 0x8103,
+   .chip_id = 0x8132,
    .num_dies = 1,
    .num_clusters_total = 1,
-   .num_cores_per_cluster = 8,
+   .num_cores_per_cluster = 10,
    .max_frequency_khz = 1278000,
-   .core_masks = {0xff},
+   .core_masks = {0x3ff},
    .vm_start = 0x4000,
-   .vm_end = 0x7fffff8000ull,
+   /* 42-bit UAT with the fixed 1-TiB USC aperture, and a kernel-private
+    * heap inside the compact render context. */
+   .vm_end = (1ull << 42) - 0x4000,
+   .vm_kernel_min_size = 0x10000000,
    .max_commands_per_submission = 64,
    .max_attachments = 64,
    .command_timestamp_frequency_hz = 1000000000,
@@ -130,19 +133,5 @@ drm_shim_driver_init(void)
    shim_device.driver_ioctls = driver_ioctls;
    shim_device.driver_ioctl_count = ARRAY_SIZE(driver_ioctls);
 
-   const char *compatible = "apple,gpu-g13g";
-   const char *gpu = getenv("ASAHI_NOOP_GPU");
-   if (gpu && !strcmp(gpu, "g16g")) {
-      params.gpu_generation = 16;
-      params.chip_id = 0x8132;
-      params.num_cores_per_cluster = 10;
-      params.core_masks[0] = 0x3ff;
-      /* 42-bit UAT with the fixed 1-TiB USC aperture, and a kernel-private
-       * heap inside the compact render context. */
-      params.vm_end = (1ull << 42) - 0x4000;
-      params.vm_kernel_min_size = 0x10000000;
-      compatible = "apple,gpu-g16g";
-   }
-
-   drm_shim_platform_device_setup("asahi", "/soc/agx", compatible);
+   drm_shim_platform_device_setup("asahi", "/soc/agx", "apple,gpu-g16g");
 }

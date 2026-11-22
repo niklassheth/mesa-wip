@@ -21,13 +21,9 @@
 #include "agx_bo.h"
 #include "agx_apple9_layout.h"
 #include "agx_pack.h"
-#include "decode.h"
+#include "decode.h" /* TEMP_STUB_PHASE1 */
 #include "layout.h"
 #include "libagx_dgc.h"
-
-#include "vdrm.h"
-
-#include "asahi_proto.h"
 
 enum agx_dbg {
    AGX_DBG_TRACE = BITFIELD_BIT(0),
@@ -70,6 +66,17 @@ struct nir_shader;
 #define BARRIER_RENDER  (1 << DRM_ASAHI_SUBQUEUE_RENDER)
 #define BARRIER_COMPUTE (1 << DRM_ASAHI_SUBQUEUE_COMPUTE)
 
+/* TEMP_STUB_PHASE1: virtio submit compat stubs; remove once vulkan/ strips
+ * virtio paths from hk_queue.c, hk_device_memory.c, and hk_wsi.c.
+ */
+#define ASAHI_EXTRES_READ  0x01
+#define ASAHI_EXTRES_WRITE 0x02
+
+struct asahi_ccmd_submit_res {
+   uint32_t res_id;
+   uint32_t flags;
+};
+
 struct agx_submit_virt {
    uint32_t extres_count;
    struct asahi_ccmd_submit_res *extres;
@@ -108,20 +115,13 @@ struct agx_device {
    uint32_t debug;
 
    /* Environment options captured at device creation, immutable while in use. */
-   bool apple9_direct_render;
    bool apple9_trace;
-
-   /* Precompiled libagx binary table */
-   const uint32_t **libagx_programs;
 
    char name[64];
    struct drm_asahi_params_global params;
+   /* TEMP_STUB_PHASE1: always false; remove once vulkan/ drops virtio refs. */
    bool is_virtio;
    agx_device_ops_t ops;
-
-   /* vdrm device */
-   struct vdrm_device *vdrm;
-   uint32_t next_blob_id;
 
    /* Device handle */
    int fd;
@@ -250,11 +250,10 @@ struct agx_device {
       uint64_t hits, misses;
    } bo_cache;
 
+   /* TEMP_STUB_PHASE1: always NULL; remove once vulkan/ drops agxdecode refs. */
    struct agxdecode_ctx *agxdecode;
 
-   /* Prepacked USC Sampler word to bind the txf sampler, used for
-    * precompiled shaders on both drivers.
-    */
+   /* TEMP_STUB_PHASE1: remove once hk_device.c stops packing txf_sampler. */
    struct agx_usc_sampler_packed txf_sampler;
 
    /* Simplified device selection */
@@ -268,18 +267,15 @@ struct agx_device {
    struct u_printf_ctx printf;
 };
 
-/* Native Apple9 launch and resource encoding, independent of cluster count. */
+/* TEMP_STUB_PHASE1: Gravity opens only Apple9 GPUs (gpu_generation >= 16).
+ * Keep the chip check during Phase 1 so vulkan/tests/ mock-chip tests keep
+ * passing until vk-core-strip & vk-shader-draw remove all callers.
+ */
 static inline bool
 agx_is_apple9(const struct agx_device *dev)
 {
    return dev->chip == AGX_CHIP_G16G || dev->chip == AGX_CHIP_G16C ||
           dev->chip == AGX_CHIP_G17P;
-}
-
-static inline bool
-agx_apple9_direct_render_enabled(const struct agx_device *dev)
-{
-   return dev->apple9_direct_render;
 }
 
 /*
@@ -391,8 +387,6 @@ agx_gpu_timestamp_to_ns(struct agx_device *dev, uint64_t gpu_timestamp)
 void agx_get_device_uuid(const struct agx_device *dev, void *uuid);
 void agx_get_driver_uuid(void *uuid);
 unsigned agx_get_num_cores(const struct agx_device *dev);
-
-struct agx_device_key agx_gather_device_key(struct agx_device *dev);
 
 struct agx_va *agx_va_alloc(struct agx_device *dev, uint64_t size_B,
                             uint64_t align_B, enum agx_va_flags flags,
