@@ -18,6 +18,7 @@
 #include "nir_serialize.h"
 #include "shader_enums.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -25,12 +26,6 @@
 #include <unistd.h>
 #include "util/macros.h"
 #include <sys/mman.h>
-
-const char *targets[] = {"g13g", "g13x"};
-
-#define foreach_target(target)                                                 \
-   for (const char **target = &targets[0];                                     \
-        target < &targets[ARRAY_SIZE(targets)]; ++target)
 
 static const struct spirv_to_nir_options spirv_options = {
    .environment = NIR_SPIRV_OPENCL,
@@ -184,56 +179,6 @@ compile(void *memctx, const uint32_t *spirv, size_t spirv_size)
    return nir;
 }
 
-static void
-print_shader(FILE *fp, const char *name, const char *suffix, uint32_t variant,
-             struct agx_shader_part *p)
-{
-   struct agx_precompiled_kernel_info info = agx_compact_kernel_info(&p->info);
-   size_t sz_B = sizeof(info) + p->info.binary_size;
-   size_t sz_el = DIV_ROUND_UP(sz_B, 4);
-   uint32_t *mem = calloc(sz_el, 4);
-
-   memcpy(mem, &info, sizeof(info));
-   memcpy((uint8_t *)mem + sizeof(info), p->binary, p->info.binary_size);
-
-   nir_precomp_print_blob(fp, name, suffix, variant, mem, sz_B, true);
-   free(mem);
-}
-
-static bool
-gather_atomic_info(nir_builder *b, nir_intrinsic_instr *intr, void *data)
-{
-   bool *any = data;
-
-   switch (intr->intrinsic) {
-   case nir_intrinsic_global_atomic:
-   case nir_intrinsic_global_atomic_agx:
-   case nir_intrinsic_deref_atomic:
-   case nir_intrinsic_global_atomic_swap:
-   case nir_intrinsic_global_atomic_swap_agx:
-   case nir_intrinsic_deref_atomic_swap:
-      *any = true;
-      return false;
-   default:
-      return false;
-   }
-}
-
-/* G13X variants are only compiled when atomics are used */
-static const char *
-remap_variant(nir_function *func, unsigned variant, const char *target)
-{
-   /* pass_flags is only 32-bit */
-   assert(variant < 32 && "maximum # of variants");
-
-   bool has_atomic = func->pass_flags & BITFIELD_BIT(variant);
-
-   if (!has_atomic && !strcmp(target, "g13x"))
-      return "g13g";
-   else
-      return target;
-}
-
 static nir_def *
 load_kernel_input(nir_builder *b, unsigned num_components, unsigned bit_size,
                   unsigned offset_B)
@@ -287,9 +232,6 @@ main(int argc, char **argv)
    struct nir_precomp_opts opt = {.arg_align_B = 2};
 
    nir_foreach_entrypoint(libfunc, nir) {
-      libfunc->pass_flags = 0;
-      struct nir_precomp_layout layout =
-         nir_precomp_derive_layout(&opt, libfunc);
       unsigned nr_vars = nir_precomp_nr_variants(libfunc);
 
       nir_precomp_print_layout_struct(fp_h, &opt, libfunc);
@@ -317,22 +259,18 @@ main(int argc, char **argv)
          NIR_PASS(_, s, nir_lower_explicit_io, nir_var_mem_shared,
                   nir_address_format_62bit_generic);
 
-         /* Preserve a target-independent helper for ISAs with a separate
-          * backend. In particular Apple9 must never execute the Apple8 blob
-          * emitted below. The argument layout stays shared by both paths. */
-         nir_shader *portable = nir_shader_clone(NULL, s);
-         NIR_PASS(_, portable, nir_lower_array_deref_of_vec,
+         NIR_PASS(_, s, nir_lower_array_deref_of_vec,
                   nir_var_function_temp, NULL,
                   nir_lower_indirect_array_deref_of_vec_load |
                      nir_lower_indirect_array_deref_of_vec_store);
-         NIR_PASS(_, portable, nir_lower_indirect_derefs_to_if_else_trees,
+         NIR_PASS(_, s, nir_lower_indirect_derefs_to_if_else_trees,
                   nir_var_function_temp, 32);
-         optimize(portable);
-         NIR_PASS(_, portable, nir_lower_explicit_io,
+         optimize(s);
+         NIR_PASS(_, s, nir_lower_explicit_io,
                   nir_var_shader_temp | nir_var_function_temp |
                      nir_var_mem_shared | nir_var_mem_global,
                   nir_address_format_62bit_generic);
-         NIR_PASS(_, portable, nir_remove_dead_variables, nir_var_all, NULL);
+         NIR_PASS(_, s, nir_remove_dead_variables, nir_var_all, NULL);
 
          /* Full-shader NIR serialization embeds shader_info verbatim, which
           * cannot be shared by a 64-bit build tool and a 32-bit driver. These
@@ -340,95 +278,38 @@ main(int argc, char **argv)
           * serialize that function with fixed-width kernel metadata instead.
           * Reject additional module state rather than silently dropping it.
           */
-         if (portable->info.stage != MESA_SHADER_COMPUTE ||
-             !exec_list_is_empty(&portable->variables) ||
-             exec_list_length(&portable->functions) != 1 ||
-             portable->constant_data_size || portable->info.uses_printf ||
-             portable->xfb_info) {
+         if (s->info.stage != MESA_SHADER_COMPUTE ||
+             !exec_list_is_empty(&s->variables) ||
+             exec_list_length(&s->functions) != 1 ||
+             s->constant_data_size || s->info.uses_printf ||
+             s->xfb_info) {
             fprintf(stderr, "Unsupported module state in libagx kernel %s\n",
                     libfunc->name);
             exit(EXIT_FAILURE);
          }
          const struct agx_apple9_libagx_metadata metadata = {
             .format = AGX_APPLE9_LIBAGX_FORMAT,
-            .workgroup_size = {portable->info.workgroup_size[0],
-                               portable->info.workgroup_size[1],
-                               portable->info.workgroup_size[2]},
-            .shared_size = portable->info.shared_size,
-            .scratch_size = portable->scratch_size,
-            .float_controls = portable->info.float_controls_execution_mode,
-            .api_subgroup_size = portable->info.api_subgroup_size,
-            .min_subgroup_size = portable->info.min_subgroup_size,
-            .max_subgroup_size = portable->info.max_subgroup_size,
-            .variable_local_size = portable->info.workgroup_size_variable,
+            .workgroup_size = {s->info.workgroup_size[0],
+                               s->info.workgroup_size[1],
+                               s->info.workgroup_size[2]},
+            .shared_size = s->info.shared_size,
+            .scratch_size = s->scratch_size,
+            .float_controls = s->info.float_controls_execution_mode,
+            .api_subgroup_size = s->info.api_subgroup_size,
+            .min_subgroup_size = s->info.min_subgroup_size,
+            .max_subgroup_size = s->info.max_subgroup_size,
+            .variable_local_size = s->info.workgroup_size_variable,
          };
          struct blob serialized;
          blob_init(&serialized);
          blob_write_uint32(&serialized, 0);
          blob_write_bytes(&serialized, &metadata, sizeof(metadata));
          nir_serialize_function(&serialized,
-                                nir_shader_get_entrypoint(portable)->function);
+                                nir_shader_get_entrypoint(s)->function);
          blob_overwrite_uint32(&serialized, 0, serialized.size - 4);
          nir_precomp_print_blob(fp_c, libfunc->name, "nir", v,
                                (uint32_t *)serialized.data, serialized.size, true);
          blob_finish(&serialized);
-         ralloc_free(portable);
-
-         agx_preprocess_nir(s);
-
-         NIR_PASS(_, s, nir_opt_deref);
-         NIR_PASS(_, s, nir_lower_vars_to_ssa);
-         NIR_PASS(_, s, nir_lower_explicit_io,
-                  nir_var_shader_temp | nir_var_function_temp |
-                     nir_var_mem_shared | nir_var_mem_global,
-                  nir_address_format_62bit_generic);
-
-         bool has_atomic = false;
-         nir_shader_intrinsics_pass(s, gather_atomic_info, nir_metadata_all,
-                                    &has_atomic);
-         if (has_atomic) {
-            libfunc->pass_flags |= BITFIELD_BIT(v);
-         }
-
-         foreach_target(target)
-         {
-            /* Skip unused variants */
-            if (strcmp(*target, remap_variant(libfunc, v, *target)))
-               continue;
-
-            struct agx_shader_part compiled;
-            bool is_helper = !strcmp(libfunc->name, "libagx_helper");
-            struct agx_shader_key key = {
-               .promote_constants = !is_helper,
-
-               /* Most of the internal programs don't use textures at all, but
-                * the few that do are exclusively bindless, so we want to
-                * promote their access.
-                */
-               .promote_textures = true,
-
-               .reserved_preamble = layout.size_B / 2,
-               .is_helper = is_helper,
-            };
-
-            if (has_atomic) {
-               key.dev.needs_g13x_coherency =
-                  u_tristate_make(!strcmp(*target, "g13x"));
-            }
-
-            nir_shader *clone = nir_shader_clone(NULL, s);
-            agx_compile_shader_nir(clone, &key, &compiled);
-            print_shader(fp_c, libfunc->name, *target, v, &compiled);
-            free(compiled.binary);
-            ralloc_free(clone);
-
-            assert(compiled.info.scratch_size == 0 &&
-                   "internal shaders do not spill");
-
-            assert(compiled.info.preamble_scratch_size == 0 &&
-                   "internal shader preambles do not spill");
-         }
-
          ralloc_free(s);
       }
    }
@@ -436,15 +317,18 @@ main(int argc, char **argv)
    nir_precomp_print_program_enum(fp_h, nir, "libagx");
    nir_precomp_print_dispatch_macros(fp_h, &opt, nir);
 
-   /* For each target, generate a table mapping programs to binaries */
-   foreach_target(target)
-   {
-      nir_precomp_print_extern_binary_map(fp_h, "libagx", *target);
-      nir_precomp_print_binary_map(fp_c, nir, "libagx", *target, remap_variant);
-   }
-
    nir_precomp_print_extern_binary_map(fp_h, "libagx", "nir");
-   nir_precomp_print_binary_map(fp_c, nir, "libagx", "nir", remap_variant);
+   nir_precomp_print_binary_map(fp_c, nir, "libagx", "nir", NULL);
+
+   /* TEMP_STUB_PHASE1: empty placeholder tables so lib/agx_device.c links
+    * before lib-strip merges. Delete in Gate 1 integration.
+    */
+   fprintf(fp_h, "/* TEMP_STUB_PHASE1 */\n");
+   fprintf(fp_h, "extern const uint32_t *libagx_g13g[LIBAGX_NUM_PROGRAMS];\n");
+   fprintf(fp_h, "extern const uint32_t *libagx_g13x[LIBAGX_NUM_PROGRAMS];\n");
+   fprintf(fp_c, "/* TEMP_STUB_PHASE1 */\n");
+   fprintf(fp_c, "const uint32_t *libagx_g13g[LIBAGX_NUM_PROGRAMS] = {0};\n");
+   fprintf(fp_c, "const uint32_t *libagx_g13x[LIBAGX_NUM_PROGRAMS] = {0};\n");
 
    glsl_type_singleton_decref();
    fclose(fp_c);

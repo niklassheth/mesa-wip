@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include "gravity/isa/agx_minifloat.h"
+#include "agx_minifloat.h"
 #include "compiler/nir/nir.h"
 #include "util/bitset.h"
 #include "util/half_float.h"
@@ -1095,23 +1095,12 @@ agx_builder_insert(agx_cursor *cursor, agx_instr *I)
    UNREACHABLE("Invalid cursor option");
 }
 
-bool agx_instr_accepts_uniform(enum agx_opcode op, unsigned src_index,
-                               unsigned value, enum agx_size size);
-
 /* Routines defined for AIR */
 void agx_print_index(agx_index index, bool is_float, FILE *fp);
 void agx_print_instr(const agx_instr *I, FILE *fp);
 void agx_print_block(const agx_block *block, FILE *fp);
 void agx_print_shader(const agx_context *ctx, FILE *fp);
-void agx_optimizer_forward(agx_context *ctx);
-void agx_optimizer_backward(agx_context *ctx);
-void agx_lower_divergent_shuffle(agx_context *ctx);
-void agx_lower_pseudo(agx_context *ctx);
 void agx_lower_spill(agx_context *ctx);
-void agx_lower_uniform_sources(agx_context *ctx);
-void agx_opt_cse(agx_context *ctx);
-void agx_opt_compact_constants(agx_context *ctx);
-void agx_opt_promote_constants(agx_context *ctx);
 void agx_dce(agx_context *ctx, bool partial);
 void agx_pressure_schedule(agx_context *ctx);
 void agx_spill(agx_context *ctx, unsigned k, bool remat_only);
@@ -1124,13 +1113,6 @@ bool agx_spill_coalesce_apply(agx_context *ctx,
                               unsigned *half_slots);
 void agx_reindex_ssa(agx_context *ctx);
 bool agx_ra(agx_context *ctx);
-void agx_lower_64bit_postra(agx_context *ctx);
-void agx_insert_waits(agx_context *ctx);
-void agx_opt_empty_else(agx_context *ctx);
-void agx_opt_register_cache(agx_context *ctx);
-void agx_opt_break_if(agx_context *ctx);
-void agx_opt_jmp_none(agx_context *ctx);
-void agx_pack_binary(agx_context *ctx, struct util_dynarray *emission);
 
 #ifndef NDEBUG
 void agx_validate(agx_context *ctx, const char *after_str);
@@ -1181,28 +1163,7 @@ void agx_emit_parallel_copies(agx_builder *b, struct agx_copy *copies,
 void agx_compute_liveness(agx_context *ctx);
 void agx_liveness_ins_update(struct u_sparse_bitset *live, agx_instr *I);
 
-bool agx_nir_opt_preamble(nir_shader *s, unsigned *sizes);
-bool agx_nir_lower_load_mask(nir_shader *shader);
-bool agx_nir_lower_ubo(nir_shader *shader);
-bool agx_nir_lower_shared_bitsize(nir_shader *shader);
 bool agx_nir_lower_frag_sidefx(nir_shader *s);
-
-struct agx_cycle_estimate {
-   /* ALU throughput */
-   unsigned alu;
-
-   /* Floating point and SCIB (select, conditional, integer, and boolean)
-    * throughput.
-    */
-   unsigned f_scib;
-
-   /* IC (Integer and complex) throughput */
-   unsigned ic;
-};
-
-struct agx_cycle_estimate agx_estimate_cycles(agx_context *ctx);
-
-bool agx_is_alu(const agx_instr *I);
 
 extern int agx_compiler_debug;
 
