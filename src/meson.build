@@ -122,6 +122,9 @@ if (with_gallium_asahi or with_asahi_vk or with_tools.contains('asahi') or
     with_tools.contains('drm-shim'))
   subdir('asahi')
 endif
+if with_gravity_vk
+  subdir('gravity')
+endif
 if with_kosmickrisp_vk
   subdir('kosmickrisp')
 endif

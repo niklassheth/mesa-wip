@@ -1,0 +1,22 @@
+/* SPDX-License-Identifier: MIT */
+#ifndef AGX_APPLE9_LAYOUT_H
+#define AGX_APPLE9_LAYOUT_H
+
+#define AGX_APPLE9_TEXTURE_TABLE_STRIDE 32
+
+/* The launch target carries 2 * entry_offset + 0x2a in 24 bits. Entries
+ * reside in this compact USC range and branch to independently allocated
+ * shader bodies anywhere in the 4-GiB USC heap. An entry belongs to its
+ * shader BO and cannot be recycled while any batch references that BO. */
+#define AGX_APPLE9_ENTRY_ARENA_SIZE  0x00800000u
+/* The arena is backed on demand in chunks of this size, see
+ * agx_apple9_entry_back. */
+#define AGX_APPLE9_ENTRY_CHUNK_SIZE  0x00100000u
+#define AGX_APPLE9_ENTRY_CHUNKS      (AGX_APPLE9_ENTRY_ARENA_SIZE / AGX_APPLE9_ENTRY_CHUNK_SIZE)
+#define AGX_APPLE9_ENTRY_HEADER_SIZE 0x00000340u
+#define AGX_APPLE9_ENTRY_BLOCK_SIZE  0x000000c0u
+#define AGX_APPLE9_ENTRY_CODE_OFFSET 0x00000080u
+#define AGX_APPLE9_ENTRY_ALIGNMENT   0x00000040u
+#define AGX_APPLE9_ENTRY_MAX_OFFSET  ((0xffffffu - 0x2au) / 2u)
+
+#endif

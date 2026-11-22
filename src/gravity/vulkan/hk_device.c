@@ -1,0 +1,715 @@
+/*
+ * Copyright 2024 Valve Corporation
+ * Copyright 2024 Alyssa Rosenzweig
+ * Copyright 2022-2023 Collabora Ltd. and Red Hat Inc.
+ * SPDX-License-Identifier: MIT
+ */
+#include "hk_device.h"
+#include "hk_apple9_mesh.h"
+#include "pipe/p_defines.h"
+#include "agx_timeline.h"
+#include "vk_util.h"
+#include "wsi_common_entrypoints.h"
+
+#include "agx_bg_eot.h"
+#include "agx_apple9.h"
+#include "agx_helpers.h"
+#include "agx_scratch.h"
+#include "hk_cmd_buffer.h"
+#include "hk_descriptor_table.h"
+#include "hk_entrypoints.h"
+#include "hk_image.h"
+#include "hk_instance.h"
+#include "hk_physical_device.h"
+#include "hk_shader.h"
+
+#include "gravity/genxml/agx_pack.h"
+#include "gravity/lib/agx_bo.h"
+#include "gravity/lib/agx_device.h"
+#include "compiler/nir/nir_builder.h"
+#include "poly/geometry.h"
+#include "util/hash_table.h"
+#include "util/ralloc.h"
+#include "util/simple_mtx.h"
+#include "vulkan/vulkan_core.h"
+#include "vulkan/wsi/wsi_common.h"
+#include "layout.h"
+#include "vk_cmd_enqueue_entrypoints.h"
+#include "vk_common_entrypoints.h"
+#include "vk_debug_utils.h"
+#include "vk_device.h"
+#include "vk_pipeline_cache.h"
+#include "vk_shader.h"
+#include "hk_queue.h"
+#include "util/u_debug.h"
+#include <xf86drm.h>
+
+#include <fcntl.h>
+#include <xf86drm.h>
+
+/* clang-format off */
+static const struct debug_named_value hk_perf_options[] = {
+   {"notess",    HK_PERF_NOTESS,   "Skip draws with tessellation"},
+   {"noborder",  HK_PERF_NOBORDER, "Disable custom border colour emulation"},
+   {"nobarrier", HK_PERF_NOBARRIER,"Ignore pipeline barriers"},
+   {"batch",     HK_PERF_BATCH,    "Batch submissions"},
+   {"norobust",  HK_PERF_NOROBUST, "Disable robustness"},
+   DEBUG_NAMED_VALUE_END
+};
+/* clang-format on */
+
+/*
+ * We preupload some constants so we can cheaply reference later without extra
+ * allocation and copying.
+ *
+ * TODO: This is small, don't waste a whole BO.
+ */
+static VkResult
+hk_upload_rodata(struct hk_device *dev)
+{
+   dev->rodata.bo =
+      agx_bo_create(&dev->dev, AGX_SAMPLER_LENGTH, 0, 0, "Read only data");
+
+   if (!dev->rodata.bo)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   uint8_t *map = agx_bo_map(dev->rodata.bo);
+   uint32_t offs = 0;
+
+   offs = align(offs, 8);
+   agx_pack(&dev->dev.txf_sampler, USC_SAMPLER, cfg) {
+      cfg.start = 0;
+      cfg.count = 1;
+      cfg.buffer = dev->rodata.bo->va->addr + offs;
+   }
+
+   agx_pack_txf_sampler((struct agx_sampler_packed *)(map + offs));
+   offs += AGX_SAMPLER_LENGTH;
+
+   /* The heap descriptor isn't strictly readonly data, but we only have a
+    * single instance of it device-wide and -- after initializing at heap
+    * allocate time -- it is read-only from the CPU perspective. The GPU uses it
+    * for scratch, but is required to reset it after use to ensure resubmitting
+    * the same command buffer works.
+    *
+    * So, we allocate it here for convenience.
+    */
+   offs = align(offs, sizeof(uint64_t));
+   dev->rodata.heap = dev->rodata.bo->va->addr + offs;
+   offs += sizeof(struct poly_heap);
+   dev->rodata.mesh_heap = dev->rodata.bo->va->addr + offs;
+   offs += sizeof(struct poly_heap);
+
+   return VK_SUCCESS;
+}
+
+static uint32_t
+internal_key_hash(const void *key_)
+{
+   const struct hk_internal_key *key = key_;
+
+   return _mesa_hash_data(key, sizeof(struct hk_internal_key) + key->key_size);
+}
+
+static bool
+internal_key_equal(const void *a_, const void *b_)
+{
+   const struct hk_internal_key *a = a_;
+   const struct hk_internal_key *b = b_;
+
+   return a->builder == b->builder && a->key_size == b->key_size &&
+          memcmp(a->key, b->key, a->key_size) == 0;
+}
+
+static VkResult
+hk_init_internal_shaders(struct hk_internal_shaders *s)
+{
+   s->ht = _mesa_hash_table_create(NULL, internal_key_hash, internal_key_equal);
+   if (!s->ht)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   simple_mtx_init(&s->lock, mtx_plain);
+   return VK_SUCCESS;
+}
+
+static void
+hk_destroy_internal_shaders(struct hk_device *dev,
+                            struct hk_internal_shaders *s, bool part)
+{
+   hash_table_foreach(s->ht, ent) {
+      if (part) {
+         struct agx_shader_part *part = ent->data;
+         free(part->binary);
+
+         /* The agx_shader_part itself is ralloc'd against the hash table so
+          * will be freed.
+          */
+      } else {
+         struct hk_api_shader *obj = ent->data;
+         hk_api_shader_destroy(&dev->vk, &obj->vk, NULL);
+      }
+   }
+
+   _mesa_hash_table_destroy(s->ht, NULL);
+   simple_mtx_destroy(&s->lock);
+}
+
+/* Immutable state shares device-owned USC slabs. Each shader or view owns
+ * its allocation; addresses stay fixed for the lifetime of that object. */
+static bool
+hk_usc_slab_create(void *data, uint64_t size, uint64_t reserve,
+                   struct hk_descriptor_backing *out)
+{
+   struct hk_device *dev = data;
+   assert(!reserve);
+   struct agx_bo *bo = agx_bo_create(
+      &dev->dev, size, 0, AGX_BO_LOW_VA | AGX_BO_READONLY | AGX_BO_WRITEBACK,
+      "Immutable USC state");
+   if (!bo)
+      return false;
+   *out = (struct hk_descriptor_backing){
+      .bo = bo, .addr = bo->va->addr, .map = agx_bo_map(bo), .size = bo->size,
+   };
+   return true;
+}
+
+static void
+hk_usc_slab_destroy(void *data, struct hk_descriptor_backing *backing)
+{
+   struct hk_device *dev = data;
+   agx_bo_unreference(&dev->dev, backing->bo);
+}
+
+static const struct hk_descriptor_memory_ops hk_usc_ops = {
+   .create = hk_usc_slab_create,
+   .destroy = hk_usc_slab_destroy,
+};
+
+void
+hk_device_init_usc_heap(struct hk_device *dev)
+{
+   simple_mtx_init(&dev->usc_heap_lock, mtx_plain);
+   hk_usc_heap_init(&dev->usc_heap, &hk_usc_ops, dev);
+}
+
+void
+hk_device_finish_usc_heap(struct hk_device *dev)
+{
+   hk_usc_heap_finish(&dev->usc_heap);
+   simple_mtx_destroy(&dev->usc_heap_lock);
+}
+
+DERIVE_HASH_TABLE(agx_sampler_packed);
+
+static VkResult
+hk_init_sampler_heap(struct hk_device *dev, struct hk_sampler_heap *h)
+{
+   h->ht = agx_sampler_packed_table_create(NULL);
+   if (!h->ht)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   VkResult result =
+      hk_descriptor_table_init(dev, &h->table, AGX_SAMPLER_LENGTH, 1024, 1024);
+
+   if (result != VK_SUCCESS) {
+      ralloc_free(h->ht);
+      return result;
+   }
+
+   simple_mtx_init(&h->lock, mtx_plain);
+   return VK_SUCCESS;
+}
+
+static void
+hk_destroy_sampler_heap(struct hk_device *dev, struct hk_sampler_heap *h)
+{
+   hk_descriptor_table_finish(dev, &h->table);
+   ralloc_free(h->ht);
+   simple_mtx_destroy(&h->lock);
+}
+
+static VkResult
+hk_sampler_heap_add_locked(struct hk_device *dev, struct hk_sampler_heap *h,
+                           struct agx_sampler_packed desc, uint32_t index,
+                           struct hk_rc_sampler **out)
+{
+   struct hash_entry *ent = _mesa_hash_table_search(h->ht, &desc);
+   if (ent != NULL) {
+      /* Identical samplers share an entry at capture, and so at replay. */
+      if (index != HK_DESCRIPTOR_TABLE_ANY_INDEX &&
+          ((struct hk_rc_sampler *)ent->data)->index != index)
+         return vk_errorf(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+                          "Sampler replayed at index %u, already at %u",
+                          index, ((struct hk_rc_sampler *)ent->data)->index);
+
+      *out = ent->data;
+
+      assert((*out)->refcount != 0);
+      (*out)->refcount++;
+
+      return VK_SUCCESS;
+   }
+
+   struct hk_rc_sampler *rc = ralloc(h->ht, struct hk_rc_sampler);
+   if (!rc)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   VkResult result =
+      hk_descriptor_table_add(dev, &h->table, &desc, sizeof(desc), &index);
+   if (result != VK_SUCCESS) {
+      ralloc_free(rc);
+      return result;
+   }
+
+   *rc = (struct hk_rc_sampler){
+      .key = desc,
+      .refcount = 1,
+      .index = index,
+   };
+
+   _mesa_hash_table_insert(h->ht, &rc->key, rc);
+   *out = rc;
+
+   return VK_SUCCESS;
+}
+
+VkResult
+hk_sampler_heap_add(struct hk_device *dev, struct agx_sampler_packed desc,
+                    uint32_t index, struct hk_rc_sampler **out)
+{
+   struct hk_sampler_heap *h = &dev->samplers;
+
+   simple_mtx_lock(&h->lock);
+   VkResult result = hk_sampler_heap_add_locked(dev, h, desc, index, out);
+   simple_mtx_unlock(&h->lock);
+
+   return result;
+}
+
+static void
+hk_sampler_heap_remove_locked(struct hk_device *dev, struct hk_sampler_heap *h,
+                              struct hk_rc_sampler *rc)
+{
+   assert(rc->refcount != 0);
+   rc->refcount--;
+
+   if (rc->refcount == 0) {
+      hk_descriptor_table_remove(dev, &h->table, rc->index);
+      _mesa_hash_table_remove_key(h->ht, &rc->key);
+      ralloc_free(rc);
+   }
+}
+
+void
+hk_sampler_heap_remove(struct hk_device *dev, struct hk_rc_sampler *rc)
+{
+   struct hk_sampler_heap *h = &dev->samplers;
+
+   simple_mtx_lock(&h->lock);
+   hk_sampler_heap_remove_locked(dev, h, rc);
+   simple_mtx_unlock(&h->lock);
+}
+
+static VkResult
+hk_check_status(struct vk_device *device)
+{
+   struct hk_device *dev = container_of(device, struct hk_device, vk);
+
+   /* A GPU fault or timeout completes the affected fences with an error, so
+    * waits succeed. Without this check the application would read garbage
+    * instead of seeing VK_ERROR_DEVICE_LOST. Guest fences under virtio carry
+    * no error; there only failed submissions report device loss.
+    */
+   vk_foreach_queue(vk_queue, &dev->vk) {
+      struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
+      int status = queue->completion_initialized
+                      ? hk_queue_completion_status(&queue->completion) : 1;
+      if (status < 0) {
+         return vk_device_set_lost(&dev->vk, "GPU work failed: %s",
+                                   strerror(-status));
+      }
+   }
+
+   return vk_check_printf_status(&dev->vk, &dev->dev.printf);
+}
+
+static VkResult
+hk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
+{
+   struct hk_device *dev = container_of(device, struct hk_device, vk);
+   *timestamp = agx_get_gpu_timestamp(&dev->dev);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_CreateDevice(VkPhysicalDevice physicalDevice,
+                const VkDeviceCreateInfo *pCreateInfo,
+                const VkAllocationCallbacks *pAllocator, VkDevice *pDevice)
+{
+   VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
+   VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
+   struct hk_device *dev;
+   struct hk_instance *instance = (struct hk_instance *)pdev->vk.instance;
+
+   dev = vk_zalloc2(&instance->vk.alloc, pAllocator, sizeof(*dev), 8,
+                    VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (!dev)
+      return vk_error(pdev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   struct vk_device_dispatch_table dispatch_table;
+
+   /* For secondary command buffer support, overwrite any command entrypoints
+    * in the main device-level dispatch table with
+    * vk_cmd_enqueue_unless_primary_Cmd*.
+    */
+   vk_device_dispatch_table_from_entrypoints(
+      &dispatch_table, &vk_cmd_enqueue_unless_primary_device_entrypoints, true);
+
+   vk_device_dispatch_table_from_entrypoints(&dispatch_table,
+                                             &hk_device_entrypoints, false);
+   vk_device_dispatch_table_from_entrypoints(&dispatch_table,
+                                             &wsi_device_entrypoints, false);
+
+   /* Populate primary cmd_dispatch table */
+   vk_device_dispatch_table_from_entrypoints(&dev->cmd_dispatch,
+                                             &hk_device_entrypoints, true);
+   vk_device_dispatch_table_from_entrypoints(&dev->cmd_dispatch,
+                                             &wsi_device_entrypoints, false);
+   vk_device_dispatch_table_from_entrypoints(
+      &dev->cmd_dispatch, &vk_common_device_entrypoints, false);
+
+   result = vk_device_init(&dev->vk, &pdev->vk, &dispatch_table, pCreateInfo,
+                           pAllocator);
+   if (result != VK_SUCCESS)
+      goto fail_alloc;
+
+   dev->vk.shader_ops = &hk_device_shader_ops;
+   dev->vk.command_dispatch_table = &dev->cmd_dispatch;
+   hk_cpu_timing_install(&dev->vk.dispatch_table);
+
+   drmDevicePtr drm_device = NULL;
+   int ret = drmGetDeviceFromDevId(pdev->render_dev, 0, &drm_device);
+   if (ret != 0) {
+      result = vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                         "Failed to get DRM device: %m");
+      goto fail_init;
+   }
+
+   const char *path = drm_device->nodes[DRM_NODE_RENDER];
+   dev->dev.fd = open(path, O_RDWR | O_CLOEXEC);
+   if (dev->dev.fd < 0) {
+      drmFreeDevice(&drm_device);
+      result = vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                         "failed to open device %s", path);
+      goto fail_init;
+   }
+
+   dev->perftest = debug_get_flags_option("HK_PERFTEST", hk_perf_options, 0);
+
+   /* Apple9 does not advertise custom border colours. */
+   if (instance->drirc.misc.disable_border_emulation ||
+       agx_is_apple9(&dev->dev)) {
+      dev->perftest |= HK_PERF_NOBORDER;
+   }
+
+   if (HK_PERF(dev, NOROBUST)) {
+      dev->vk.enabled_features.robustBufferAccess = false;
+      dev->vk.enabled_features.robustBufferAccess2 = false;
+      dev->vk.enabled_features.robustImageAccess = false;
+      dev->vk.enabled_features.robustImageAccess2 = false;
+      dev->vk.enabled_features.pipelineRobustness = false;
+   }
+
+   /* Reserve the capture-replay VA ranges only for devices that capture or
+    * replay; other devices keep their heaps whole. */
+   dev->dev.capture_replay =
+      dev->vk.enabled_features.bufferDeviceAddressCaptureReplay ||
+      dev->vk.enabled_features.bufferDeviceAddressCaptureReplayEXT ||
+      dev->vk.enabled_features.descriptorBufferCaptureReplay;
+
+   dev->dev.native_mesh_classes = hk_apple9_native_index_class_hash();
+   bool succ = agx_open_device(NULL, &dev->dev);
+   drmFreeDevice(&drm_device);
+   if (!succ) {
+      result = vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                         "Failed to get DRM device: %m");
+      goto fail_fd;
+   }
+
+   hk_device_init_usc_heap(dev);
+
+   if (agx_is_apple9(&dev->dev))
+      agx_apple9_initialize_entries(&dev->dev);
+
+   vk_device_set_drm_fd(&dev->vk, dev->dev.fd);
+   dev->vk.command_buffer_ops = &hk_cmd_buffer_ops;
+   dev->vk.check_status = hk_check_status;
+   dev->vk.get_timestamp = hk_get_timestamp;
+
+   /* This holds for current platforms. We do not currently implement
+    * timestamp scaling, this would require changes in the query copy kernel
+    * as well. Calibrated timestamps depends on this.
+    */
+   assert(dev->dev.user_timestamp_to_ns.num ==
+             dev->dev.user_timestamp_to_ns.den &&
+          "user timestamps are in ns");
+
+   result = hk_init_sampler_heap(dev, &dev->samplers);
+   if (result != VK_SUCCESS)
+      goto fail_dev;
+
+   if (agx_is_apple9(&dev->dev)) {
+      dev->apple9_fetch_sampler =
+         agx_bo_create(&dev->dev, 64 + AGX_APPLE9_SAMPLER_TABLE_STRIDE, 0,
+                       AGX_BO_LOW_VA, "Apple9 immutable samplers");
+      if (!dev->apple9_fetch_sampler) {
+         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         goto fail_samplers;
+      }
+      uint8_t *samplers = agx_bo_map(dev->apple9_fetch_sampler);
+      memset(samplers, 0, 64 + AGX_APPLE9_SAMPLER_TABLE_STRIDE);
+      agx_apple9_pack_fetch_sampler(samplers);
+      agx_apple9_pack_sampler(samplers + 64, false, false, 1, 0, 14,
+                              PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+                              PIPE_TEX_WRAP_CLAMP_TO_EDGE, 1);
+      dev->apple9_reload_sampler = dev->apple9_fetch_sampler->va->addr + 64;
+
+      dev->apple9_compute_sysvals =
+         agx_bo_create(&dev->dev, AGX_APPLE9_RUNTIME_SYSVAL_SIZE, 0, 0,
+                       "Apple9 compute sysvals");
+      if (!dev->apple9_compute_sysvals) {
+         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         goto fail_samplers;
+      }
+      hk_apple9_compute_sysvals(dev, agx_bo_map(dev->apple9_compute_sysvals));
+   }
+
+   result = hk_upload_rodata(dev);
+   if (result != VK_SUCCESS)
+      goto fail_samplers;
+
+   /* XXX: error handling, and should this even go on the device? */
+   agx_bg_eot_init(&dev->bg_eot, &dev->dev);
+   if (!dev->bg_eot.ht) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_rodata;
+   }
+
+   result = hk_init_internal_shaders(&dev->kernels);
+   if (result != VK_SUCCESS)
+      goto fail_bg_eot;
+
+   for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
+      for (unsigned q = 0; q < pCreateInfo->pQueueCreateInfos[i].queueCount;
+           q++) {
+         result = hk_queue_init(dev, &pCreateInfo->pQueueCreateInfos[i], q);
+         if (result != VK_SUCCESS)
+            goto fail_queues;
+      }
+   }
+
+   struct vk_pipeline_cache_create_info cache_info = {
+      .weak_ref = true,
+   };
+   dev->vk.mem_cache = vk_pipeline_cache_create(&dev->vk, &cache_info, NULL);
+   if (dev->vk.mem_cache == NULL) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_queues;
+   }
+
+   simple_mtx_init(&dev->heap_lock, mtx_plain);
+   simple_mtx_init(&dev->apple9_variants.lock, mtx_plain);
+   simple_mtx_init(&dev->apple9_bodies.lock, mtx_plain);
+   list_inithead(&dev->apple9_bodies.slabs);
+   dev->dev.apple9_pin_entry = hk_apple9_pin_entry;
+   simple_mtx_init(&dev->apple9_tile_helpers.lock, mtx_plain);
+   simple_mtx_init(&dev->apple9_vs_prologs.lock, mtx_plain);
+   simple_mtx_init(&dev->apple9_fs_epilogs.lock, mtx_plain);
+   simple_mtx_init(&dev->apple9_linked_entries.lock, mtx_plain);
+   list_inithead(&dev->apple9_linked_entries.lru);
+   simple_mtx_init(&dev->apple9_vs_vary_variants.lock, mtx_plain);
+   list_inithead(&dev->apple9_vs_vary_variants.lru);
+   result = hk_device_init_meta(dev);
+   if (result != VK_SUCCESS)
+      goto fail_mem_cache;
+
+   /* Precompile empty fragment shaders for API-level null fragment shaders. */
+   result = hk_apple9_create_null_fs(dev, pAllocator, true, &dev->null_fs);
+   if (result != VK_SUCCESS)
+      goto fail_meta;
+   result = hk_apple9_create_null_fs(dev, pAllocator, false,
+                                     &dev->null_fs_trivial);
+   if (result != VK_SUCCESS)
+      goto fail_null_fs;
+
+   hk_apple9_precompile_init(dev);
+
+   *pDevice = hk_device_to_handle(dev);
+
+   simple_mtx_init(&dev->events.lock, mtx_plain);
+   list_inithead(&dev->events.available);
+
+   return VK_SUCCESS;
+
+fail_null_fs:
+   hk_api_shader_destroy(&dev->vk, &dev->null_fs->vk, pAllocator);
+fail_meta:
+   hk_device_finish_meta(dev);
+fail_mem_cache:
+   vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
+   hk_cmd_bo_cache_finish(dev);
+   hk_apple9_linked_entries_finish(dev);
+   hk_apple9_vs_vary_variants_finish(dev);
+   hk_apple9_vs_prologs_finish(dev);
+   hk_apple9_fs_epilogs_finish(dev);
+   hk_apple9_variants_finish(dev);
+   hk_apple9_bodies_finish(dev);
+   hk_apple9_tile_helpers_finish(dev);
+   assert(list_is_empty(&dev->apple9_bodies.slabs));
+   simple_mtx_destroy(&dev->apple9_vs_vary_variants.lock);
+   simple_mtx_destroy(&dev->apple9_linked_entries.lock);
+   simple_mtx_destroy(&dev->apple9_fs_epilogs.lock);
+   simple_mtx_destroy(&dev->apple9_vs_prologs.lock);
+   simple_mtx_destroy(&dev->apple9_variants.lock);
+   simple_mtx_destroy(&dev->apple9_bodies.lock);
+   simple_mtx_destroy(&dev->apple9_tile_helpers.lock);
+fail_queues:
+   vk_foreach_queue_safe(iter, &dev->vk) {
+      struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
+      hk_queue_finish(dev, queue);
+   }
+   hk_destroy_internal_shaders(dev, &dev->kernels, false);
+fail_bg_eot:
+   agx_bg_eot_cleanup(&dev->bg_eot);
+fail_rodata:
+   agx_bo_unreference(&dev->dev, dev->rodata.bo);
+fail_samplers:
+   if (dev->apple9_fetch_sampler)
+      agx_bo_unreference(&dev->dev, dev->apple9_fetch_sampler);
+   if (dev->apple9_compute_sysvals)
+      agx_bo_unreference(&dev->dev, dev->apple9_compute_sysvals);
+   hk_destroy_sampler_heap(dev, &dev->samplers);
+fail_dev:
+   hk_device_finish_usc_heap(dev);
+   agx_close_device(&dev->dev);
+fail_fd:
+   close(dev->dev.fd);
+fail_init:
+   vk_device_finish(&dev->vk);
+fail_alloc:
+   vk_free(&dev->vk.alloc, dev);
+   return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(hk_device, dev, _device);
+
+   if (!dev)
+      return;
+
+   hk_apple9_precompile_finish(dev);
+   hk_device_finish_meta(dev);
+   hk_apple9_linked_entries_finish(dev);
+   hk_apple9_vs_vary_variants_finish(dev);
+   hk_apple9_vs_prologs_finish(dev);
+   hk_apple9_fs_epilogs_finish(dev);
+   hk_apple9_variants_finish(dev);
+   hk_apple9_bodies_finish(dev);
+   hk_apple9_tile_helpers_finish(dev);
+   hk_destroy_internal_shaders(dev, &dev->kernels, false);
+
+   vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
+
+   vk_foreach_queue_safe(iter, &dev->vk) {
+      struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
+      hk_queue_finish(dev, queue);
+   }
+
+   vk_device_finish(&dev->vk);
+
+   assert(list_is_empty(&dev->events.available));
+   simple_mtx_destroy(&dev->events.lock);
+
+   if (dev->null_fs) {
+      hk_api_shader_destroy(&dev->vk, &dev->null_fs->vk, pAllocator);
+   }
+   if (dev->null_fs_trivial)
+      hk_api_shader_destroy(&dev->vk, &dev->null_fs_trivial->vk, pAllocator);
+   simple_mtx_destroy(&dev->apple9_vs_vary_variants.lock);
+   simple_mtx_destroy(&dev->apple9_linked_entries.lock);
+   simple_mtx_destroy(&dev->apple9_fs_epilogs.lock);
+   simple_mtx_destroy(&dev->apple9_vs_prologs.lock);
+   simple_mtx_destroy(&dev->apple9_variants.lock);
+   assert(list_is_empty(&dev->apple9_bodies.slabs));
+   simple_mtx_destroy(&dev->apple9_bodies.lock);
+   simple_mtx_destroy(&dev->apple9_tile_helpers.lock);
+
+   if (dev->apple9_fetch_sampler)
+      agx_bo_unreference(&dev->dev, dev->apple9_fetch_sampler);
+   if (dev->apple9_compute_sysvals)
+      agx_bo_unreference(&dev->dev, dev->apple9_compute_sysvals);
+   hk_cmd_bo_cache_finish(dev);
+   hk_destroy_sampler_heap(dev, &dev->samplers);
+   agx_bo_unreference(&dev->dev, dev->rodata.bo);
+   if (dev->heap_va) {
+      if (dev->heap_overflows) {
+         mesa_logw("hk: geometry heap overflowed %u times, up to %" PRIu64
+                   " MiB", dev->heap_overflows, dev->heap_reported_B >> 20);
+      }
+      agx_va_free(&dev->dev, dev->heap_va, true);
+   }
+   agx_bo_unreference(&dev->dev, dev->heap);
+   simple_mtx_destroy(&dev->heap_lock);
+   agx_bo_unreference(&dev->dev, dev->mesh_heap);
+   agx_bg_eot_cleanup(&dev->bg_eot);
+   hk_device_finish_usc_heap(dev);
+   agx_close_device(&dev->dev);
+   vk_free(&dev->vk.alloc, dev);
+}
+
+/* HK_TIMELINE_FILE: present records (flag 100 is the presentation API scope;
+ * f is the dynamic present mode, or UINT32_MAX when not given). */
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info)
+{
+   const VkSwapchainPresentModeInfoKHR *mode_info =
+      vk_find_struct_const(info->pNext, SWAPCHAIN_PRESENT_MODE_INFO_KHR);
+   uint64_t mode = UINT32_MAX;
+   if (mode_info && info->swapchainCount == 1 && mode_info->swapchainCount == 1)
+      mode = mode_info->pPresentModes[0];
+   struct agx_timeline_scope trace = agx_timeline_scope_begin(
+      100, (uintptr_t)queue, info->swapchainCount, 0, 0, mode);
+   VkResult result = wsi_QueuePresentKHR(queue, info);
+   agx_timeline_scope_end(&trace, result);
+   if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
+      agx_timeline_presented();
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_CreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+                        const VkGraphicsPipelineCreateInfo *infos,
+                        const VkAllocationCallbacks *alloc, VkPipeline *pipelines)
+{
+   struct agx_timeline_scope trace = agx_timeline_scope_begin(
+      101, (uintptr_t)device, count, 0, 0, 0);
+   VkResult result = vk_common_CreateGraphicsPipelines(device, cache, count,
+                                                   infos, alloc, pipelines);
+   agx_timeline_scope_end(&trace, result);
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_CreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+                        const VkComputePipelineCreateInfo *infos,
+                        const VkAllocationCallbacks *alloc, VkPipeline *pipelines)
+{
+   struct agx_timeline_scope trace = agx_timeline_scope_begin(
+      102, (uintptr_t)device, count, 0, 0, 0);
+   VkResult result = vk_common_CreateComputePipelines(device, cache, count,
+                                                   infos, alloc, pipelines);
+   agx_timeline_scope_end(&trace, result);
+   return result;
+}

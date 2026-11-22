@@ -303,7 +303,7 @@ elif _vulkan_drivers.contains('all')
    _vulkan_drivers = ['amd', 'intel', 'intel_hasvk', 'swrast',
                       'freedreno', 'panfrost', 'virtio', 'broadcom',
                       'imagination', 'microsoft-experimental',
-                      'nouveau', 'asahi', 'gfxstream', 'kosmickrisp']
+                      'nouveau', 'asahi', 'gravity', 'gfxstream', 'kosmickrisp']
 endif
 
 with_intel_vk = _vulkan_drivers.contains('intel')
@@ -319,6 +319,7 @@ with_imagination_srv = get_option('imagination-srv')
 with_microsoft_vk = _vulkan_drivers.contains('microsoft-experimental')
 with_nouveau_vk = _vulkan_drivers.contains('nouveau')
 with_asahi_vk = _vulkan_drivers.contains('asahi')
+with_gravity_vk = _vulkan_drivers.contains('gravity')
 with_gfxstream_vk = _vulkan_drivers.contains('gfxstream')
 with_kosmickrisp_vk = _vulkan_drivers.contains('kosmickrisp')
 with_any_vk = _vulkan_drivers.length() != 0
@@ -364,6 +365,7 @@ with_vdrm = [
   with_gallium_asahi,
   with_panfrost_vdrm,
   with_asahi_vk,
+  with_gravity_vk,
   with_intel_virtio,
 ].contains(true)
 
@@ -1029,7 +1031,7 @@ endif
 
 with_driver_using_cl = [
   with_gallium_iris, with_gallium_crocus, with_intel_vk, with_intel_hasvk,
-  with_gallium_asahi, with_asahi_vk, with_tools.contains('asahi'),
+  with_gallium_asahi, with_asahi_vk, with_gravity_vk, with_tools.contains('asahi'),
   with_gallium_panfrost, with_panfrost_vk,
   with_gallium_rusticl,
   with_nouveau_vk, with_imagination_vk,
@@ -1051,7 +1053,7 @@ with_llvm = with_llvm \
   .enable_if(with_clc, error_message : 'CLC requires LLVM')
 
 with_poly = [
-  with_gallium_asahi, with_asahi_vk, with_tools.contains('asahi'),
+  with_gallium_asahi, with_asahi_vk, with_gravity_vk, with_tools.contains('asahi'),
   with_kosmickrisp_vk,
 ].contains(true)
 

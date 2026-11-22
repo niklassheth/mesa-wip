@@ -235,6 +235,7 @@ foreach i : [
   [with_gallium_asahi, 'src/gallium/drivers/asahi', '00-asahi-defaults.conf'],
   [with_gallium_v3d, 'src/gallium/drivers/v3d', '00-v3d-defaults.conf'],
   [with_asahi_vk, 'src/asahi/vulkan', '00-hk-defaults.conf'],
+  [with_gravity_vk, 'src/gravity/vulkan', '00-gravity-defaults.conf'],
   [with_panfrost_vk, 'src/panfrost/vulkan', '00-panvk-defaults.conf'],
   [with_gallium_virgl, 'src/gallium/drivers/virgl', '00-virtio_gpu-defaults.conf'],
   [with_gallium_panfrost, 'src/gallium/drivers/panfrost', '00-panfrost-defaults.conf'],

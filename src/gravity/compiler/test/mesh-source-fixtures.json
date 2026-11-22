@@ -1,0 +1,22 @@
+{
+  "qualification": "Authored Position/index inputs only. Native completion preserves XYZW and indices; no resource bindings or software DATA formation.",
+  "source_commit": "151c366e0b3",
+  "research_archive": "../review-evidence/v0-data-oracle",
+  "groups": [
+    "mesh-native-fixtures.h"
+  ],
+  "rows": [
+    {
+      "case": "H1_BASE",
+      "source": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/SOURCE-INPUTS.json",
+      "source_sha256": "ebded1ca857e1b564e141cdcec06320378811d01b4ee4d2eec5668fc14f87bc9",
+      "source_name": "BASE"
+    },
+    {
+      "case": "H1_SHIFT_X",
+      "source": "/home/nsheth/Projects/asahi/tmp/codex-hw/mesh-h1-u0-validation/SOURCE-INPUTS.json",
+      "source_sha256": "ebded1ca857e1b564e141cdcec06320378811d01b4ee4d2eec5668fc14f87bc9",
+      "source_name": "SHIFT_X"
+    }
+  ]
+}

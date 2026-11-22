@@ -1,0 +1,358 @@
+/*
+ * Copyright 2024 Valve Corporation
+ * Copyright 2024 Alyssa Rosenzweig
+ * Copyright 2022-2023 Collabora Ltd. and Red Hat Inc.
+ * SPDX-License-Identifier: MIT
+ */
+#include "hk_sampler.h"
+
+#include "hk_device.h"
+#include "hk_entrypoints.h"
+#include "hk_instance.h"
+#include "hk_physical_device.h"
+
+#include "vk_format.h"
+#include "vk_sampler.h"
+
+#include "gravity/genxml/agx_pack.h"
+#include "gravity/lib/agx_helpers.h"
+
+static inline uint32_t
+translate_address_mode(VkSamplerAddressMode addr_mode)
+{
+#define MODE(VK, AGX_) [VK_SAMPLER_ADDRESS_MODE_##VK] = AGX_WRAP_##AGX_
+   static const uint8_t translate[] = {
+      MODE(REPEAT, REPEAT),
+      MODE(MIRRORED_REPEAT, MIRRORED_REPEAT),
+      MODE(CLAMP_TO_EDGE, CLAMP_TO_EDGE),
+      MODE(CLAMP_TO_BORDER, CLAMP_TO_BORDER),
+      MODE(MIRROR_CLAMP_TO_EDGE, MIRRORED_CLAMP_TO_EDGE),
+   };
+#undef MODE
+
+   assert(addr_mode < ARRAY_SIZE(translate));
+   return translate[addr_mode];
+}
+
+static uint32_t
+translate_texsamp_compare_op(VkCompareOp op)
+{
+#define OP(VK, AGX_) [VK_COMPARE_OP_##VK] = AGX_COMPARE_FUNC_##AGX_
+   static const uint8_t translate[] = {
+      OP(NEVER, NEVER),
+      OP(LESS, LESS),
+      OP(EQUAL, EQUAL),
+      OP(LESS_OR_EQUAL, LEQUAL),
+      OP(GREATER, GREATER),
+      OP(NOT_EQUAL, NOT_EQUAL),
+      OP(GREATER_OR_EQUAL, GEQUAL),
+      OP(ALWAYS, ALWAYS),
+   };
+#undef OP
+
+   assert(op < ARRAY_SIZE(translate));
+   return translate[op];
+}
+
+static enum agx_filter
+translate_filter(VkFilter filter)
+{
+   static_assert((enum agx_filter)VK_FILTER_NEAREST == AGX_FILTER_NEAREST);
+   static_assert((enum agx_filter)VK_FILTER_LINEAR == AGX_FILTER_LINEAR);
+
+   return (enum agx_filter)filter;
+}
+
+static enum agx_mip_filter
+translate_mipfilter(VkSamplerMipmapMode mode)
+{
+   switch (mode) {
+   case VK_SAMPLER_MIPMAP_MODE_NEAREST:
+      return AGX_MIP_FILTER_NEAREST;
+
+   case VK_SAMPLER_MIPMAP_MODE_LINEAR:
+      return AGX_MIP_FILTER_LINEAR;
+
+   default:
+      UNREACHABLE("Invalid filter");
+   }
+}
+
+static bool
+uses_border(const VkSamplerCreateInfo *info)
+{
+   return info->addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
+          info->addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
+          info->addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+}
+
+static enum agx_border_colour
+is_border_color_custom(VkBorderColor color, bool workaround_rgba4)
+{
+   switch (color) {
+   case VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK:
+      /* We may need to workaround RGBA4 UNORM issues with opaque black. This
+       * only affects float opaque black, there are no pure integer RGBA4
+       * formats to worry about.
+       */
+      return workaround_rgba4;
+
+   case VK_BORDER_COLOR_INT_CUSTOM_EXT:
+   case VK_BORDER_COLOR_FLOAT_CUSTOM_EXT:
+      return true;
+
+   default:
+      return false;
+   }
+}
+
+/* Translate an American VkBorderColor into a Canadian agx_border_colour */
+static enum agx_border_colour
+translate_border_color(VkBorderColor color, bool custom_to_1,
+                       bool workaround_rgba4)
+{
+   if (is_border_color_custom(color, workaround_rgba4)) {
+      return custom_to_1 ? AGX_BORDER_COLOUR_OPAQUE_WHITE
+                         : AGX_BORDER_COLOUR_TRANSPARENT_BLACK;
+   }
+
+   switch (color) {
+   case VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK:
+   case VK_BORDER_COLOR_INT_TRANSPARENT_BLACK:
+      return AGX_BORDER_COLOUR_TRANSPARENT_BLACK;
+
+   case VK_BORDER_COLOR_INT_OPAQUE_BLACK:
+   case VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK:
+      return AGX_BORDER_COLOUR_OPAQUE_BLACK;
+
+   case VK_BORDER_COLOR_INT_OPAQUE_WHITE:
+   case VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE:
+      return AGX_BORDER_COLOUR_OPAQUE_WHITE;
+
+   default:
+      UNREACHABLE("invalid");
+   }
+}
+
+static void
+pack_sampler(const struct hk_physical_device *pdev,
+             const struct VkSamplerCreateInfo *info, bool custom_to_1,
+             bool workaround_rgba4, bool native_custom,
+             struct agx_sampler_packed *out)
+{
+   agx_pack(out, SAMPLER, cfg) {
+      cfg.minimum_lod = info->minLod;
+      cfg.maximum_lod = info->maxLod;
+      /* A positive minimum LOD always minifies, but the 4.6 fixed-point
+       * field truncates small minimums to zero, where the hardware would
+       * magnify. Selecting the minification filter keeps the API result. */
+      cfg.magnify = translate_filter(info->minLod > 0.0f ? info->minFilter
+                                                         : info->magFilter);
+      cfg.minify = translate_filter(info->minFilter);
+      cfg.mip_filter = translate_mipfilter(info->mipmapMode);
+      cfg.wrap_s = translate_address_mode(info->addressModeU);
+      cfg.wrap_t = translate_address_mode(info->addressModeV);
+      cfg.wrap_r = translate_address_mode(info->addressModeW);
+      cfg.pixel_coordinates = info->unnormalizedCoordinates;
+
+      cfg.seamful_cube_maps =
+         info->flags & VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT;
+
+      if (info->compareEnable) {
+         cfg.compare_func = translate_texsamp_compare_op(info->compareOp);
+         cfg.compare_enable = true;
+      }
+
+      if (info->anisotropyEnable) {
+         cfg.maximum_anisotropy =
+            util_next_power_of_two(MAX2(info->maxAnisotropy, 1));
+      } else {
+         cfg.maximum_anisotropy = 1;
+      }
+
+      if (uses_border(info)) {
+         cfg.border_colour =
+            native_custom ? AGX_BORDER_COLOUR_CUSTOM
+                          : translate_border_color(info->borderColor,
+                                                   custom_to_1, workaround_rgba4);
+      }
+   }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_CreateSampler(VkDevice device,
+                 const VkSamplerCreateInfo *info /* pCreateInfo */,
+                 const VkAllocationCallbacks *pAllocator, VkSampler *pSampler)
+{
+   VK_FROM_HANDLE(hk_device, dev, device);
+   struct hk_physical_device *pdev = hk_device_physical(dev);
+   struct hk_sampler *sampler;
+   VkResult result;
+
+   sampler = vk_sampler_create(&dev->vk, info, pAllocator, sizeof(*sampler));
+   if (!sampler)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   /* Descriptors carry the sampler heap index of each plane. A replayed
+    * sampler takes the indices it was captured with.
+    */
+   struct hk_sampler_capture_data replay = {
+      .index = {HK_DESCRIPTOR_TABLE_ANY_INDEX, HK_DESCRIPTOR_TABLE_ANY_INDEX},
+   };
+   if (info->flags & VK_SAMPLER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT) {
+      const VkOpaqueCaptureDescriptorDataCreateInfoEXT *cap_info =
+         vk_find_struct_const(info->pNext,
+                              OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT);
+      if (cap_info && cap_info->opaqueCaptureDescriptorData)
+         memcpy(&replay, cap_info->opaqueCaptureDescriptorData, sizeof(replay));
+   }
+
+   /* Apple9 samples custom border colours natively, with the border format the
+    * application provides (customBorderColorWithoutFormat is not exposed). */
+   bool custom_border =
+      uses_border(info) &&
+      is_border_color_custom(info->borderColor, false);
+   bool native_custom =
+      custom_border && sampler->vk.format != VK_FORMAT_UNDEFINED;
+
+   /* Sanity check the noborder setting. There's no way to recover from it being
+    * wrong but at least we can make noise to lint for errors in the driconf.
+    */
+   static bool warned_custom_border = false;
+   if (HK_PERF(dev, NOBORDER) && custom_border && !warned_custom_border) {
+      fprintf(stderr, "custom border colour used, but emulation is disabled\n");
+      fprintf(stderr, "border %u\n", info->borderColor);
+      fprintf(stderr, "unnorm %X\n", info->unnormalizedCoordinates);
+      fprintf(stderr, "compare %X\n", info->compareEnable);
+      fprintf(stderr, "value: %X, %X, %X, %X\n",
+              sampler->vk.border_color_value.uint32[0],
+              sampler->vk.border_color_value.uint32[1],
+              sampler->vk.border_color_value.uint32[2],
+              sampler->vk.border_color_value.uint32[3]);
+      fprintf(stderr, "wraps: %X, %X, %X\n", info->addressModeU,
+              info->addressModeV, info->addressModeW);
+      warned_custom_border = true;
+   }
+
+   if (native_custom) {
+      /* The hardware applies the image view's swizzle to the native border
+       * colour itself, so the border colour component mapping hint must not
+       * be applied again here (it is for the emulated path below). */
+      VkClearColorValue bc = sampler->vk.border_color_value;
+      static_assert(sizeof(sampler->apple9_border) ==
+                       sizeof(struct agx_border_packed),
+                    "G13 border layout");
+      agx_pack_border((struct agx_border_packed *)sampler->apple9_border,
+                      bc.uint32, vk_format_to_pipe_format(sampler->vk.format));
+   }
+
+   struct agx_sampler_packed samp;
+   pack_sampler(pdev, info, true, false, native_custom, &samp);
+
+   /* LOD bias passed in the descriptor set */
+   sampler->lod_bias_fp16 = _mesa_float_to_half(info->mipLodBias);
+
+   /* Vulkan rounds a NEAREST mip selection exactly halfway between levels
+    * down, D3D up. The sampler resolves the LOD in 1/64 steps, so one step
+    * added to explicit LODs rounds exact halves up, see
+    * hk_lower_d3d_txl_rounding. Computed LODs are left alone: the hardware's
+    * estimate is not exact to a step, and a step there moves real results.
+    */
+   if (pdev->apple9_d3d_mip_rounding &&
+       info->mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST)
+      sampler->txl_nudge_fp16 = _mesa_float_to_half(1.0f / 64.0f);
+
+   result =
+      hk_sampler_heap_add(dev, samp, replay.index[sampler->plane_count],
+                          &sampler->planes[sampler->plane_count].hw);
+   if (result != VK_SUCCESS) {
+      hk_DestroySampler(device, hk_sampler_to_handle(sampler), pAllocator);
+      return result;
+   }
+
+   sampler->plane_count++;
+
+   /* In order to support CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT, we
+    * need multiple sampler planes: at minimum we will need one for luminance
+    * (the default), and one for chroma.  Each sampler plane needs its own
+    * sampler table entry.  However, sampler table entries are very rare on
+    * G13, and each plane would burn one of those. So we make sure to allocate
+    * only the minimum amount that we actually need (i.e., either 1 or 2), and
+    * then just copy the last sampler plane out as far as we need to fill the
+    * number of image planes.
+    */
+   if (sampler->vk.ycbcr_conversion) {
+      assert(!uses_border(info) &&
+             "consequence of VUID-VkSamplerCreateInfo-addressModeU-01646");
+
+      const VkFilter chroma_filter =
+         sampler->vk.ycbcr_conversion->state.chroma_filter;
+      if (info->magFilter != chroma_filter ||
+          info->minFilter != chroma_filter) {
+         VkSamplerCreateInfo plane2_info = *info;
+         plane2_info.magFilter = chroma_filter;
+         plane2_info.minFilter = chroma_filter;
+
+         pack_sampler(pdev, &plane2_info, false, false, false, &samp);
+         result = hk_sampler_heap_add(
+            dev, samp, replay.index[sampler->plane_count],
+            &sampler->planes[sampler->plane_count].hw);
+
+         if (result != VK_SUCCESS) {
+            hk_DestroySampler(device, hk_sampler_to_handle(sampler),
+                              pAllocator);
+            return result;
+         }
+
+         sampler->plane_count++;
+      }
+   }
+
+   for (unsigned p = 0; p < sampler->plane_count; ++p) {
+      struct hk_apple9_sampler_part *part = &sampler->planes[p].apple9;
+      hk_apple9_native_sampler(part->sampler, &sampler->planes[p].hw->key,
+                               false, sampler->apple9_border);
+      hk_apple9_runtime_sampler(part->runtime_sampler,
+                                &sampler->planes[p].hw->key, false);
+      part->lod_bias_fp16 = sampler->lod_bias_fp16;
+      part->txl_nudge_fp16 = sampler->txl_nudge_fp16;
+   }
+
+   *pSampler = hk_sampler_to_handle(sampler);
+
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_DestroySampler(VkDevice device, VkSampler _sampler,
+                  const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(hk_device, dev, device);
+   VK_FROM_HANDLE(hk_sampler, sampler, _sampler);
+
+   if (!sampler)
+      return;
+
+   for (uint8_t plane = 0; plane < sampler->plane_count; plane++) {
+      hk_sampler_heap_remove(dev, sampler->planes[plane].hw);
+   }
+
+   vk_sampler_destroy(&dev->vk, pAllocator, &sampler->vk);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetSamplerOpaqueCaptureDescriptorDataEXT(
+   UNUSED VkDevice device, const VkSamplerCaptureDescriptorDataInfoEXT *pInfo,
+   void *pData)
+{
+   VK_FROM_HANDLE(hk_sampler, sampler, pInfo->sampler);
+
+   struct hk_sampler_capture_data data = {
+      .index = {HK_DESCRIPTOR_TABLE_ANY_INDEX, HK_DESCRIPTOR_TABLE_ANY_INDEX},
+   };
+   for (unsigned i = 0; i < sampler->plane_count; i++)
+      data.index[i] = sampler->planes[i].hw->index;
+
+   memcpy(pData, &data, sizeof(data));
+   return VK_SUCCESS;
+}
