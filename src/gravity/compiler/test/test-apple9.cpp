@@ -9047,13 +9047,10 @@ TEST(Apple9Compiler, TextureLodQueryUsesNativeSamplerOperation)
       b.shader->info.io_lowered = true;
       agx_apple9_sampler_key key[32] = {};
       key[5].mip_filter = filter;
-      key[5].flags = AGX_APPLE9_CUSTOM_BORDER;
-      key[5].border[0] = .375;
       agx_apple9_texture_mapping mapping = {};
       const char *reason = nullptr;
       ASSERT_TRUE(agx_nir_lower_apple9_sampler_state(b.shader, key, &mapping, &reason))
          << (reason ?: "");
-      EXPECT_EQ(mapping.white_samplers, 0u);
       agx_shader_part compiled = {};
       ASSERT_TRUE(agx_compile_apple9_fragment(b.shader, &compiled, &reason))
          << (reason ?: "");
@@ -14690,18 +14687,13 @@ TEST(Apple9Compiler, SamplerArrayStateIsAppliedAfterUnrolling)
    b.shader->info.io_lowered = true;
    agx_apple9_sampler_key key[32] = {};
    for (unsigned j = 0; j < 16; ++j) {
-      key[j].flags = AGX_APPLE9_CUSTOM_BORDER;
-      key[j].border[0] = j / 16.0f;
-      key[j].border[3] = 1;
-      key[j].wrap[0] = key[j].wrap[1] = key[j].wrap[2] = PIPE_TEX_WRAP_CLAMP_TO_BORDER;
+      key[j].wrap[0] = key[j].wrap[1] = key[j].wrap[2] = PIPE_TEX_WRAP_CLAMP_TO_EDGE;
       key[j].min_filter = key[j].mag_filter = PIPE_TEX_FILTER_LINEAR;
    }
    agx_apple9_texture_mapping mapping = {};
    const char *reason = nullptr;
    ASSERT_TRUE(agx_nir_lower_apple9_sampler_state(b.shader, key, &mapping, &reason))
       << (reason ?: "");
-   EXPECT_EQ(mapping.white_samplers, 1u << 16);
-   EXPECT_LT(mapping.samplers[16], 16u);
    unsigned count = 0;
    nir_foreach_block(block, b.impl) {
       nir_foreach_instr(instr, block) {
@@ -14709,88 +14701,20 @@ TEST(Apple9Compiler, SamplerArrayStateIsAppliedAfterUnrolling)
             continue;
          nir_tex_instr *t = nir_instr_as_tex(instr);
          EXPECT_LT(t->texture_index, 16u);
-         EXPECT_TRUE(t->sampler_index == t->texture_index || t->sampler_index == 16);
+         EXPECT_EQ(t->sampler_index, t->texture_index);
          EXPECT_LT(nir_tex_instr_src_index(t, nir_tex_src_texture_offset), 0);
          EXPECT_LT(nir_tex_instr_src_index(t, nir_tex_src_sampler_offset), 0);
          ++count;
       }
    }
-   EXPECT_EQ(count, 32u);
+   EXPECT_EQ(count, 16u);
    agx_shader_part compiled = {};
    ASSERT_TRUE(agx_compile_apple9_fragment(b.shader, &compiled, &reason)) << (reason ?: "");
    EXPECT_EQ(compiled.info.apple9_texture_mask, 0xffffu);
-   EXPECT_EQ(compiled.info.apple9_sampler_mask, 0x1ffffu);
+   EXPECT_EQ(compiled.info.apple9_sampler_mask, 0xffffu);
    free(compiled.binary);
    ralloc_free(b.shader);
    glsl_type_singleton_decref();
-}
-
-TEST(Apple9Compiler, CustomBordersPreserveIntegerBitsAndArrayCoordinates)
-{
-   for (auto type : {nir_type_float32, nir_type_int32, nir_type_uint32}) {
-      for (bool array : {false, true}) {
-         SCOPED_TRACE(type);
-         SCOPED_TRACE(array);
-         nir_builder b = nir_builder_init_simple_shader(
-            MESA_SHADER_FRAGMENT, &agx_nir_options, "typed_custom_border");
-         nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
-         tex->op = nir_texop_tex;
-         tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
-         tex->is_array = array;
-         tex->dest_type = type;
-         tex->coord_components = array ? 3 : 2;
-         tex->texture_index = 3;
-         tex->sampler_index = 5;
-         tex->src[0].src_type = nir_tex_src_coord;
-         tex->src[0].src = nir_src_for_ssa(array
-            ? nir_imm_vec3(&b, -.125, .5, 7)
-            : nir_imm_vec2(&b, -.125, .5));
-         nir_def_init(&tex->instr, &tex->def, 4, 32);
-         nir_builder_instr_insert(&b, &tex->instr);
-         nir_store_output(&b, &tex->def, nir_imm_int(&b, 0),
-            .write_mask = 15, .src_type = type,
-            .io_semantics = {.location = FRAG_RESULT_DATA0, .num_slots = 1});
-         b.shader->info.io_lowered = true;
-         agx_apple9_sampler_key key[32] = {};
-         key[5].flags = AGX_APPLE9_CUSTOM_BORDER;
-         const uint32_t border[] = {0xdeadbeef, 0x81234567, 0x3f800000, 0xffffffff};
-         memcpy(key[5].border, border, sizeof(border));
-         if (type == nir_type_float32) {
-            key[5].border[0] = .25;
-            key[5].border[1] = .5;
-            key[5].border[2] = -.25;
-            key[5].border[3] = 1;
-         }
-         agx_apple9_texture_mapping mapping = {};
-         const char *reason = nullptr;
-         ASSERT_TRUE(agx_nir_lower_apple9_sampler_state(b.shader, key, &mapping, &reason))
-            << (reason ?: "");
-         EXPECT_EQ(mapping.white_samplers, 1u);
-         EXPECT_EQ(mapping.samplers[0], 5);
-         unsigned samples = 0;
-         nir_foreach_block(block, b.impl) {
-            nir_foreach_instr(instr, block) {
-               if (instr->type == nir_instr_type_tex) {
-                  nir_tex_instr *t = nir_instr_as_tex(instr);
-                  EXPECT_EQ(t->is_array, array);
-                  EXPECT_EQ(t->coord_components, array ? 3 : 2);
-                  EXPECT_EQ(t->dest_type, type);
-                  ++samples;
-               } else if (instr->type == nir_instr_type_alu && type != nir_type_float32) {
-                  EXPECT_NE(nir_instr_as_alu(instr)->op, nir_op_flrp);
-               }
-            }
-         }
-         EXPECT_EQ(samples, 2u);
-         agx_shader_part compiled = {};
-         ASSERT_TRUE(agx_compile_apple9_fragment(b.shader, &compiled, &reason))
-            << (reason ?: "");
-         EXPECT_EQ(compiled.info.apple9_texture_mask, 1u << 3);
-         EXPECT_EQ(compiled.info.apple9_sampler_mask, (1u << 5) | 1u);
-         free(compiled.binary);
-         ralloc_free(b.shader);
-      }
-   }
 }
 
 TEST(Apple9Packer, RegisterTextureOperandsReachEntireGprFile)
@@ -16086,6 +16010,552 @@ TEST(Apple9Compiler, EpilogFragmentStatsOnlyNoDiscard)
       EXPECT_EQ(ep.info.apple9_uses_discard, !stats_only);
       free(ep.binary);
       free(out.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+static size_t
+apple9_find_bytes(const agx_shader_part &out, const uint8_t *needle,
+                  size_t needle_len, unsigned *count_out = nullptr)
+{
+   const uint8_t *bytes = static_cast<const uint8_t *>(out.binary);
+   size_t first = SIZE_MAX;
+   unsigned count = 0;
+   for (size_t i = 0; i + needle_len <= out.info.main_size; ++i) {
+      if (!memcmp(bytes + i, needle, needle_len)) {
+         if (first == SIZE_MAX)
+            first = i;
+         ++count;
+      }
+   }
+   if (count_out)
+      *count_out = count;
+   return first;
+}
+
+static size_t
+apple9_find_coverage(const agx_shader_part &out, unsigned *count_out = nullptr)
+{
+   const uint8_t *code = static_cast<const uint8_t *>(out.binary);
+   size_t first = SIZE_MAX;
+   unsigned count = 0;
+   for (size_t i = 0; i + 4 <= out.info.main_size; ++i) {
+      if (code[i] == 0x57 && (code[i + 1] & 0x0f) == 0x04 &&
+          (code[i + 2] & ~3) == 0x54 && code[i + 3] == 0) {
+         if (first == SIZE_MAX)
+            first = i;
+         ++count;
+      }
+   }
+   if (count_out)
+      *count_out = count;
+   return first;
+}
+
+static size_t
+apple9_find_tex_sample(const agx_shader_part &out)
+{
+   const uint8_t *code = static_cast<const uint8_t *>(out.binary);
+   for (size_t i = 0; i + 14 <= out.info.main_size; ++i) {
+      if ((code[i] & 7) == 5 && (code[i + 4] & 0x0f) == 0x00 &&
+          (code[i + 12] == 0 || code[i + 12] == 1 || code[i + 12] == 2))
+         return i;
+   }
+   return SIZE_MAX;
+}
+
+static nir_def *
+apple9_emit_test_tex2d(nir_builder *b)
+{
+   nir_def *bary =
+      nir_load_barycentric_pixel(b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *uv = nir_load_interpolated_input(
+      b, 2, 32, bary, nir_imm_int(b, 0), .dest_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+   nir_tex_instr *tex = nir_tex_instr_create(b->shader, 1);
+   tex->op = nir_texop_tex;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->dest_type = nir_type_float32;
+   tex->coord_components = 2;
+   tex->texture_index = 0;
+   tex->sampler_index = 0;
+   tex->src[0] = (nir_tex_src){
+      .src = nir_src_for_ssa(uv),
+      .src_type = nir_tex_src_coord,
+   };
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(b, &tex->instr);
+   return &tex->def;
+}
+
+TEST(Apple9Compiler, LazyFragmentTileLockPlacement)
+{
+   const uint8_t tile_600[6] = {0x87, 0x02, 0x54, 0x00, 0x06, 0x00};
+   const uint8_t tile_80c[6] = {0x87, 0x02, 0x54, 0x0c, 0x08, 0x00};
+   const uint8_t tile_808[6] = {0x87, 0x02, 0x54, 0x08, 0x08, 0x00};
+   const uint8_t tile_001[6] = {0x87, 0x02, 0x54, 0x01, 0x00, 0x00};
+   const uint8_t fence_20c[6] = {0x07, 0x02, 0x54, 0x0c, 0x02, 0x00};
+
+   /* 1. Monolithic FS: texture + discard (COVERAGE) + color store.
+    * 0x600 and 0x80c must be deferred past both TEXTURE_SAMPLE and COVERAGE. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "lazy_mono_tex_discard");
+      nir_def *c = apple9_emit_test_tex2d(&b);
+      nir_demote_if(&b, nir_flt_imm(&b, nir_channel(&b, c, 3), 0.5f));
+      nir_store_output(&b, c, nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+      b.shader->info.io_lowered = true;
+      agx_shader_part out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_inputs(b.shader, nullptr, &out,
+                                                     &reason))
+         << (reason ?: "");
+      unsigned n600 = 0, n80c = 0, n20c = 0, ncov = 0;
+      size_t off_tex = apple9_find_tex_sample(out);
+      size_t off_cov = apple9_find_coverage(out, &ncov);
+      size_t off_600 = apple9_find_bytes(out, tile_600, sizeof(tile_600), &n600);
+      size_t off_80c = apple9_find_bytes(out, tile_80c, sizeof(tile_80c), &n80c);
+      size_t off_20c = apple9_find_bytes(out, fence_20c, sizeof(fence_20c), &n20c);
+      EXPECT_EQ(n600, 1u);
+      EXPECT_EQ(n80c, 1u);
+      EXPECT_EQ(n20c, 1u);
+      EXPECT_GE(ncov, 1u);
+      EXPECT_NE(off_tex, SIZE_MAX);
+      EXPECT_LT(off_tex, off_cov);
+      EXPECT_LT(off_cov, off_600);
+      EXPECT_LT(off_600, off_80c);
+      EXPECT_LT(off_80c, off_20c);
+      free(out.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* 2. Epilog-split FS (99% case): textured + discard fs_main emits ZERO
+    * 0x600 / 0x80c / 0x020c; fs_epilog emits 0x600 + 0x80c AFTER COVERAGE. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "lazy_epilog_tex_discard");
+      nir_def *c = apple9_emit_test_tex2d(&b);
+      nir_demote_if(&b, nir_flt_imm(&b, nir_channel(&b, c, 3), 0.5f));
+      nir_store_output(&b, c, nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+      b.shader->info.io_lowered = true;
+      agx_apple9_blend blend = {.use_epilog = 1, .dynamic_samples = 1};
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      EXPECT_FALSE(main_out.info.apple9_fs_epilog.has_tile_lock);
+      EXPECT_FALSE(main_out.info.apple9_fs_epilog.has_tile_preamble);
+      EXPECT_FALSE(apple9_binary_contains(main_out, tile_600, sizeof(tile_600)));
+      EXPECT_FALSE(apple9_binary_contains(main_out, tile_80c, sizeof(tile_80c)));
+      EXPECT_FALSE(apple9_binary_contains(main_out, fence_20c, sizeof(fence_20c)));
+
+      agx_apple9_fs_epilog_key ekey = {};
+      ekey.iface = main_out.info.apple9_fs_epilog;
+      ekey.nr_targets = 1;
+      ekey.blend[0].format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      ekey.blend[0].samples = 1;
+      ekey.blend[0].colormask = 0xf;
+      ekey.blend[0].rgb_src = ekey.blend[0].alpha_src = PIPE_BLENDFACTOR_ONE;
+      ekey.blend[0].rgb_dst = ekey.blend[0].alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      ekey.blend[0].rgb_func = ekey.blend[0].alpha_func = PIPE_BLEND_ADD;
+      agx_shader_part ep_out = {};
+      ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                         &reason))
+         << (reason ?: "");
+      unsigned n600 = 0, n80c = 0, n20c = 0, ncov = 0;
+      size_t off_cov = apple9_find_coverage(ep_out, &ncov);
+      size_t off_600 = apple9_find_bytes(ep_out, tile_600, sizeof(tile_600), &n600);
+      size_t off_80c = apple9_find_bytes(ep_out, tile_80c, sizeof(tile_80c), &n80c);
+      size_t off_20c = apple9_find_bytes(ep_out, fence_20c, sizeof(fence_20c), &n20c);
+      EXPECT_EQ(n600, 1u);
+      EXPECT_EQ(n80c, 1u);
+      EXPECT_EQ(n20c, 1u);
+      EXPECT_GE(ncov, 1u);
+      EXPECT_LT(off_cov, off_600);
+      EXPECT_LT(off_600, off_80c);
+      EXPECT_LT(off_80c, off_20c);
+      free(ep_out.binary);
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* 3. pixel_interlock: texture sample runs BEFORE 0x600+0x80c at
+    * begin_invocation_interlock (both monolithic and epilog handoff). */
+   for (bool use_epilog : {false, true}) {
+      SCOPED_TRACE(use_epilog);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "lazy_interlock");
+      b.shader->info.fs.pixel_interlock_ordered = true;
+      nir_def *c = apple9_emit_test_tex2d(&b);
+      nir_begin_invocation_interlock(&b);
+      nir_store_ssbo(&b, nir_channel(&b, c, 0), nir_imm_int(&b, 0),
+                     nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
+      nir_end_invocation_interlock(&b);
+      nir_store_output(&b, c, nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+      b.shader->info.io_lowered = true;
+      agx_apple9_blend blend = {};
+      blend.use_epilog = use_epilog;
+      blend.dynamic_samples = use_epilog;
+      blend.format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      blend.samples = 1;
+      blend.colormask = 0xf;
+      blend.rgb_src = blend.alpha_src = PIPE_BLENDFACTOR_ONE;
+      blend.rgb_dst = blend.alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      blend.rgb_func = blend.alpha_func = PIPE_BLEND_ADD;
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      unsigned n600 = 0, n80c = 0, n20c = 0;
+      size_t off_tex = apple9_find_tex_sample(main_out);
+      size_t off_600 = apple9_find_bytes(main_out, tile_600, sizeof(tile_600), &n600);
+      size_t off_80c = apple9_find_bytes(main_out, tile_80c, sizeof(tile_80c), &n80c);
+      size_t off_20c = apple9_find_bytes(main_out, fence_20c, sizeof(fence_20c), &n20c);
+      EXPECT_EQ(n600, 1u);
+      EXPECT_EQ(n80c, 1u);
+      EXPECT_NE(off_tex, SIZE_MAX);
+      EXPECT_LT(off_tex, off_600);
+      EXPECT_LT(off_600, off_80c);
+      if (use_epilog) {
+         EXPECT_EQ(n20c, 0u);
+         EXPECT_TRUE(main_out.info.apple9_fs_epilog.has_tile_lock);
+         EXPECT_TRUE(main_out.info.apple9_fs_epilog.has_tile_preamble);
+         agx_apple9_fs_epilog_key ekey = {};
+         ekey.iface = main_out.info.apple9_fs_epilog;
+         ekey.nr_targets = 1;
+         ekey.blend[0] = blend;
+         ekey.blend[0].use_epilog = 0;
+         ekey.blend[0].dynamic_samples = 0;
+         agx_shader_part ep_out = {};
+         ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                            &reason))
+            << (reason ?: "");
+         EXPECT_FALSE(apple9_binary_contains(ep_out, tile_600, sizeof(tile_600)));
+         EXPECT_FALSE(apple9_binary_contains(ep_out, tile_80c, sizeof(tile_80c)));
+         EXPECT_TRUE(apple9_binary_contains(ep_out, fence_20c, sizeof(fence_20c)));
+         free(ep_out.binary);
+      } else {
+         EXPECT_EQ(n20c, 1u);
+         EXPECT_LT(off_80c, off_20c);
+      }
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* 4. zs_export (gl_FragDepth from texture sample):
+    * Monolithic depth-only defers 0x600 past TEXTURE_SAMPLE, right before
+    * store_zs_agx (TILE_ACCESS 0x001), with 0 0x80c / 0x020c.
+    * Epilog fs_main emits 0 tile ops; depth-only epilog emits 0x600 before 0x001. */
+   for (bool use_epilog : {false, true}) {
+      SCOPED_TRACE(use_epilog);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "lazy_zs_export");
+      nir_def *c = apple9_emit_test_tex2d(&b);
+      nir_store_output(&b, nir_channel(&b, c, 0), nir_imm_int(&b, 0),
+                       .write_mask = 1, .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DEPTH,
+                                        .num_slots = 1});
+      b.shader->info.io_lowered = true;
+      agx_apple9_blend blend = {};
+      blend.use_epilog = use_epilog;
+      blend.dynamic_samples = use_epilog;
+      blend.samples = 1;
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 0,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      if (use_epilog) {
+         EXPECT_FALSE(main_out.info.apple9_fs_epilog.has_tile_lock);
+         EXPECT_FALSE(main_out.info.apple9_fs_epilog.has_tile_preamble);
+         EXPECT_FALSE(apple9_binary_contains(main_out, tile_600, sizeof(tile_600)));
+         EXPECT_FALSE(apple9_binary_contains(main_out, tile_80c, sizeof(tile_80c)));
+         EXPECT_FALSE(apple9_binary_contains(main_out, fence_20c, sizeof(fence_20c)));
+
+         agx_apple9_fs_epilog_key ekey = {};
+         ekey.iface = main_out.info.apple9_fs_epilog;
+         ekey.nr_targets = 0;
+         ekey.blend[0].samples = 1;
+         agx_shader_part ep_out = {};
+         ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                            &reason))
+            << (reason ?: "");
+         unsigned n600 = 0, n001 = 0;
+         size_t off_600 = apple9_find_bytes(ep_out, tile_600, sizeof(tile_600), &n600);
+         size_t off_001 = apple9_find_bytes(ep_out, tile_001, sizeof(tile_001), &n001);
+         EXPECT_EQ(n600, 1u);
+         EXPECT_EQ(n001, 1u);
+         EXPECT_LT(off_600, off_001);
+         EXPECT_FALSE(apple9_binary_contains(ep_out, tile_80c, sizeof(tile_80c)));
+         EXPECT_FALSE(apple9_binary_contains(ep_out, fence_20c, sizeof(fence_20c)));
+         free(ep_out.binary);
+      } else {
+         unsigned n600 = 0, n001 = 0;
+         size_t off_tex = apple9_find_tex_sample(main_out);
+         size_t off_600 = apple9_find_bytes(main_out, tile_600, sizeof(tile_600), &n600);
+         size_t off_001 = apple9_find_bytes(main_out, tile_001, sizeof(tile_001), &n001);
+         EXPECT_EQ(n600, 1u);
+         EXPECT_EQ(n001, 1u);
+         EXPECT_NE(off_tex, SIZE_MAX);
+         EXPECT_LT(off_tex, off_600);
+         EXPECT_LT(off_600, off_001);
+         EXPECT_FALSE(apple9_binary_contains(main_out, tile_80c, sizeof(tile_80c)));
+         EXPECT_FALSE(apple9_binary_contains(main_out, fence_20c, sizeof(fence_20c)));
+      }
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* 5. Input attachment (load_local_pixel_agx) after texture sample:
+    * - Monolithic read-only uses 0x600 + 0x808 after TEXTURE_SAMPLE.
+    * - Epilog fs_main uses 0x600 + 0x80c after TEXTURE_SAMPLE and hands off
+    *   has_tile_lock so fs_epilog emits 0 0x600 / 0 0x80c / 1 0x020c. */
+   for (bool use_epilog : {false, true}) {
+      SCOPED_TRACE(use_epilog);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "lazy_input_attachment");
+      nir_def *tex = apple9_emit_test_tex2d(&b);
+      nir_def *pix = nir_load_local_pixel_agx(
+         &b, 4, 32, nir_imm_intN_t(&b, 1, 16),
+         .base = 0, .format = PIPE_FORMAT_R32G32B32A32_UINT);
+      nir_def *sum = nir_fadd(&b, tex, pix);
+      if (use_epilog) {
+         nir_store_output(&b, sum, nir_imm_int(&b, 0), .write_mask = 0xf,
+                          .src_type = nir_type_float32,
+                          .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                           .num_slots = 1});
+      } else {
+         nir_store_ssbo(&b, nir_channel(&b, sum, 0), nir_imm_int(&b, 0),
+                        nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
+      }
+      b.shader->info.io_lowered = true;
+      agx_apple9_blend blend = {};
+      blend.use_epilog = use_epilog;
+      blend.dynamic_samples = use_epilog;
+      blend.format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      blend.samples = 1;
+      blend.colormask = 0xf;
+      blend.rgb_src = blend.alpha_src = PIPE_BLENDFACTOR_ONE;
+      blend.rgb_dst = blend.alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      blend.rgb_func = blend.alpha_func = PIPE_BLEND_ADD;
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(
+         b.shader, nullptr, &blend, use_epilog ? 1 : 0, &main_out, &reason))
+         << (reason ?: "");
+      unsigned n600 = 0, nlock = 0, n20c = 0;
+      const uint8_t *lock_pat = use_epilog ? tile_80c : tile_808;
+      size_t off_tex = apple9_find_tex_sample(main_out);
+      size_t off_600 = apple9_find_bytes(main_out, tile_600, sizeof(tile_600), &n600);
+      size_t off_lock = apple9_find_bytes(main_out, lock_pat, 6, &nlock);
+      size_t off_20c = apple9_find_bytes(main_out, fence_20c, sizeof(fence_20c), &n20c);
+      EXPECT_EQ(n600, 1u);
+      EXPECT_EQ(nlock, 1u);
+      EXPECT_NE(off_tex, SIZE_MAX);
+      EXPECT_LT(off_tex, off_600);
+      EXPECT_LT(off_600, off_lock);
+      if (use_epilog) {
+         EXPECT_EQ(n20c, 0u);
+         EXPECT_TRUE(main_out.info.apple9_fs_epilog.has_tile_lock);
+         EXPECT_TRUE(main_out.info.apple9_fs_epilog.has_tile_preamble);
+         agx_apple9_fs_epilog_key ekey = {};
+         ekey.iface = main_out.info.apple9_fs_epilog;
+         ekey.nr_targets = 1;
+         ekey.blend[0] = blend;
+         ekey.blend[0].use_epilog = 0;
+         ekey.blend[0].dynamic_samples = 0;
+         agx_shader_part ep_out = {};
+         ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                            &reason))
+            << (reason ?: "");
+         EXPECT_FALSE(apple9_binary_contains(ep_out, tile_600, sizeof(tile_600)));
+         EXPECT_FALSE(apple9_binary_contains(ep_out, tile_80c, sizeof(tile_80c)));
+         EXPECT_TRUE(apple9_binary_contains(ep_out, fence_20c, sizeof(fence_20c)));
+         free(ep_out.binary);
+      } else {
+         EXPECT_EQ(n20c, 1u);
+         EXPECT_LT(off_lock, off_20c);
+         EXPECT_FALSE(apple9_binary_contains(main_out, tile_80c, sizeof(tile_80c)));
+      }
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* 6. early_fragment_tests + writes_memory + discard epilog handoff:
+    * fs_main emits 0x600 (before early store_zs_agx) and sets has_tile_preamble
+    * without has_tile_lock; fs_epilog emits 0 0x600 (no duplicate!), 1 0x80c,
+    * and 1 0x020c. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "lazy_early_z_preamble_handoff");
+      b.shader->info.fs.early_fragment_tests = true;
+      b.shader->info.writes_memory = true;
+      b.shader->info.fs.uses_discard = true;
+      nir_def *coord = nir_load_pixel_coord(&b);
+      nir_demote_if(&b, nir_ieq_imm(&b, nir_channel(&b, coord, 0), 0));
+      nir_store_ssbo(&b, nir_imm_int(&b, 1), nir_imm_int(&b, 0),
+                     nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
+      nir_store_output(&b, nir_imm_vec4(&b, 0, 1, 0, 1), nir_imm_int(&b, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+      agx_apple9_blend blend = {.use_epilog = 1, .dynamic_samples = 1};
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      unsigned n600 = 0;
+      apple9_find_bytes(main_out, tile_600, sizeof(tile_600), &n600);
+      EXPECT_EQ(n600, 1u);
+      EXPECT_TRUE(main_out.info.apple9_fs_epilog.has_tile_preamble);
+      EXPECT_FALSE(main_out.info.apple9_fs_epilog.has_tile_lock);
+      EXPECT_FALSE(apple9_binary_contains(main_out, tile_80c, sizeof(tile_80c)));
+      EXPECT_FALSE(apple9_binary_contains(main_out, fence_20c, sizeof(fence_20c)));
+
+      agx_apple9_fs_epilog_key ekey = {};
+      ekey.iface = main_out.info.apple9_fs_epilog;
+      ekey.nr_targets = 1;
+      ekey.blend[0].format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      ekey.blend[0].samples = 1;
+      ekey.blend[0].colormask = 0xf;
+      ekey.blend[0].rgb_src = ekey.blend[0].alpha_src = PIPE_BLENDFACTOR_ONE;
+      ekey.blend[0].rgb_dst = ekey.blend[0].alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      ekey.blend[0].rgb_func = ekey.blend[0].alpha_func = PIPE_BLEND_ADD;
+      agx_shader_part ep_out = {};
+      ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                         &reason))
+         << (reason ?: "");
+      unsigned ep_n80c = 0, ep_n20c = 0;
+      apple9_find_bytes(ep_out, tile_80c, sizeof(tile_80c), &ep_n80c);
+      apple9_find_bytes(ep_out, fence_20c, sizeof(fence_20c), &ep_n20c);
+      EXPECT_FALSE(apple9_binary_contains(ep_out, tile_600, sizeof(tile_600)));
+      EXPECT_EQ(ep_n80c, 1u);
+      EXPECT_EQ(ep_n20c, 1u);
+      free(ep_out.binary);
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* 7. Texture-only SSBO-writing fragment shader with NO color stores:
+    * Zero 0x600 / 0x80c / 0x020c in both monolithic and epilog modes. */
+   for (bool use_epilog : {false, true}) {
+      SCOPED_TRACE(use_epilog);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "lazy_tex_ssbo_only");
+      nir_def *c = apple9_emit_test_tex2d(&b);
+      nir_store_ssbo(&b, nir_channel(&b, c, 0), nir_imm_int(&b, 0),
+                     nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
+      b.shader->info.io_lowered = true;
+      agx_apple9_blend blend = {};
+      blend.use_epilog = use_epilog;
+      blend.dynamic_samples = use_epilog;
+      blend.samples = 1;
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 0,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      EXPECT_FALSE(apple9_binary_contains(main_out, tile_600, sizeof(tile_600)));
+      EXPECT_FALSE(apple9_binary_contains(main_out, tile_80c, sizeof(tile_80c)));
+      EXPECT_FALSE(apple9_binary_contains(main_out, fence_20c, sizeof(fence_20c)));
+      if (use_epilog) {
+         agx_apple9_fs_epilog_key ekey = {};
+         ekey.iface = main_out.info.apple9_fs_epilog;
+         ekey.nr_targets = 0;
+         ekey.blend[0].samples = 1;
+         agx_shader_part ep_out = {};
+         ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                            &reason))
+            << (reason ?: "");
+         EXPECT_FALSE(apple9_binary_contains(ep_out, tile_600, sizeof(tile_600)));
+         EXPECT_FALSE(apple9_binary_contains(ep_out, tile_80c, sizeof(tile_80c)));
+         EXPECT_FALSE(apple9_binary_contains(ep_out, fence_20c, sizeof(fence_20c)));
+         free(ep_out.binary);
+      }
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* 8. Fragment image_store_apple9_agx after texture sample:
+    * Defers 0x600 past TEXTURE_SAMPLE, emits 0x600 right before IMAGE_WRITE,
+    * and hands off has_tile_preamble (without has_tile_lock) so fs_epilog
+    * never duplicates 0x600. */
+   for (bool use_epilog : {false, true}) {
+      SCOPED_TRACE(use_epilog);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "lazy_fs_image_write");
+      nir_def *c = apple9_emit_test_tex2d(&b);
+      nir_image_store_apple9_agx(&b, nir_imm_int(&b, 0), nir_imm_ivec2(&b, 1, 2),
+                                 c, .src_type = nir_type_float32,
+                                 .image_array = false);
+      nir_store_output(&b, c, nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+      b.shader->info.io_lowered = true;
+      agx_apple9_blend blend = {};
+      blend.use_epilog = use_epilog;
+      blend.dynamic_samples = use_epilog;
+      blend.format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      blend.samples = 1;
+      blend.colormask = 0xf;
+      blend.rgb_src = blend.alpha_src = PIPE_BLENDFACTOR_ONE;
+      blend.rgb_dst = blend.alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      blend.rgb_func = blend.alpha_func = PIPE_BLEND_ADD;
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      unsigned n600 = 0, n80c = 0, n20c = 0;
+      size_t off_tex = apple9_find_tex_sample(main_out);
+      size_t off_600 = apple9_find_bytes(main_out, tile_600, sizeof(tile_600), &n600);
+      size_t off_80c = apple9_find_bytes(main_out, tile_80c, sizeof(tile_80c), &n80c);
+      size_t off_20c = apple9_find_bytes(main_out, fence_20c, sizeof(fence_20c), &n20c);
+      EXPECT_EQ(n600, 1u);
+      EXPECT_NE(off_tex, SIZE_MAX);
+      EXPECT_LT(off_tex, off_600);
+      if (use_epilog) {
+         EXPECT_EQ(n80c, 0u);
+         EXPECT_EQ(n20c, 0u);
+         EXPECT_TRUE(main_out.info.apple9_fs_epilog.has_tile_preamble);
+         EXPECT_FALSE(main_out.info.apple9_fs_epilog.has_tile_lock);
+         agx_apple9_fs_epilog_key ekey = {};
+         ekey.iface = main_out.info.apple9_fs_epilog;
+         ekey.nr_targets = 1;
+         ekey.blend[0] = blend;
+         ekey.blend[0].use_epilog = 0;
+         ekey.blend[0].dynamic_samples = 0;
+         agx_shader_part ep_out = {};
+         ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                            &reason))
+            << (reason ?: "");
+         unsigned ep_n80c = 0, ep_n20c = 0;
+         apple9_find_bytes(ep_out, tile_80c, sizeof(tile_80c), &ep_n80c);
+         apple9_find_bytes(ep_out, fence_20c, sizeof(fence_20c), &ep_n20c);
+         EXPECT_FALSE(apple9_binary_contains(ep_out, tile_600, sizeof(tile_600)));
+         EXPECT_EQ(ep_n80c, 1u);
+         EXPECT_EQ(ep_n20c, 1u);
+         free(ep_out.binary);
+      } else {
+         EXPECT_EQ(n80c, 1u);
+         EXPECT_EQ(n20c, 1u);
+         EXPECT_LT(off_600, off_80c);
+         EXPECT_LT(off_80c, off_20c);
+      }
+      free(main_out.binary);
       ralloc_free(b.shader);
    }
 }

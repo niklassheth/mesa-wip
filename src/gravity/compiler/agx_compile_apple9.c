@@ -1119,6 +1119,7 @@ struct apple9_dag_lower {
    uint8_t cf_base;
    uint8_t z_cf_index;
    bool handed_off_tile_lock;
+   bool handed_off_tile_preamble;
    bool reads_point_coord;
    bool reads_primitive_id;
    /* Barycentric weights (bit 0 perspective, bit 1 linear) and the varying
@@ -1137,6 +1138,11 @@ struct apple9_dag_lower {
    uint32_t entry_vreg[AGX_APPLE9_GPR_COUNT];
    bool tile_access;
    bool tile_coords;
+   bool tile_preamble_needed;
+   uint32_t tile_preamble_imm;
+   bool tile_lock_needed;
+   bool tile_lock_acquired;
+   uint32_t tile_lock_imm;
    /* Fragment shader interlock holds the pixel acquired for writing. */
    bool interlock;
    uint32_t coverage_control;
@@ -1178,6 +1184,67 @@ apple9_current_load_flags(struct apple9_dag_lower *lower)
                       : 0;
 
    return flags;
+}
+
+static bool
+apple9_acquire_tile_preamble(struct apple9_dag_lower *lower)
+{
+   if (!lower->tile_preamble_needed || lower->tile_access)
+      return true;
+   lower->tile_access = true;
+   return agx_apple9_vir_emit_side_effect(
+      &lower->program, AGX_APPLE9_VIR_TILE_ACCESS, AGX_APPLE9_ENC_TILE_ACCESS,
+      NULL, 0, lower->tile_preamble_imm);
+}
+
+static bool
+apple9_acquire_tile_lock(struct apple9_dag_lower *lower)
+{
+   if (!apple9_acquire_tile_preamble(lower))
+      return false;
+   if (!lower->tile_lock_needed || lower->tile_lock_acquired)
+      return true;
+   lower->tile_lock_acquired = true;
+   return agx_apple9_vir_emit_side_effect(
+      &lower->program, AGX_APPLE9_VIR_TILE_ACCESS, AGX_APPLE9_ENC_TILE_ACCESS,
+      NULL, 0, lower->tile_lock_imm);
+}
+
+static bool
+apple9_cf_node_needs_tile_lock(nir_cf_node *node)
+{
+   nir_foreach_block_in_cf_node(block, node) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+         if (op == nir_intrinsic_load_local_pixel_agx ||
+             op == nir_intrinsic_store_local_pixel_agx ||
+             op == nir_intrinsic_begin_invocation_interlock)
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
+apple9_cf_node_needs_tile_preamble(nir_cf_node *node)
+{
+   nir_foreach_block_in_cf_node(block, node) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+         if (op == nir_intrinsic_load_local_pixel_agx ||
+             op == nir_intrinsic_store_local_pixel_agx ||
+             op == nir_intrinsic_begin_invocation_interlock ||
+             op == nir_intrinsic_store_zs_agx ||
+             op == nir_intrinsic_image_store_apple9_agx ||
+             op == nir_intrinsic_image_store_block_agx)
+            return true;
+      }
+   }
+   return false;
 }
 
 static uint32_t
@@ -2225,12 +2292,6 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
          coords[2] = apple9_lower_dag_scalar(lower,
             nir_get_scalar(tex->src[comparator].src.ssa, 0));
       }
-      if (lower->nir->info.stage == MESA_SHADER_FRAGMENT &&
-          !lower->tile_access && !lower->tile_read &&
-          !agx_apple9_vir_emit_side_effect(&lower->program,
-             AGX_APPLE9_VIR_TILE_ACCESS, AGX_APPLE9_ENC_TILE_ACCESS, NULL, 0, 0x600))
-         return AGX_APPLE9_VREG_INVALID;
-      lower->tile_access |= lower->nir->info.stage == MESA_SHADER_FRAGMENT;
       unsigned texture = util_bitcount(lower->texture_mask &
                                        BITFIELD_MASK(tex->texture_index));
       /* Table indices are emitted before the sample that reads them. */
@@ -2586,7 +2647,6 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
              (intr->src[0].ssa->bit_size != 16 &&
               intr->src[0].ssa->bit_size != 32))
             return AGX_APPLE9_VREG_INVALID;
-         assert(lower->tile_access && lower->tile_read);
          const bool coords =
             intr->intrinsic == nir_intrinsic_load_tile_pixel_agx;
          if (coords && (!nir_src_is_const(intr->src[0]) ||
@@ -2597,6 +2657,11 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
             return AGX_APPLE9_VREG_INVALID;
          uint32_t source = apple9_lower_dag_scalar(
             lower, nir_get_scalar(intr->src[coords ? 1 : 0].ssa, 0));
+         if (source == AGX_APPLE9_VREG_INVALID)
+            return AGX_APPLE9_VREG_INVALID;
+         if (!coords && !apple9_acquire_tile_lock(lower))
+            return AGX_APPLE9_VREG_INVALID;
+         assert(lower->tile_access && lower->tile_read);
          value = apple9_dag_emit(lower, AGX_APPLE9_VIR_TILE_LOAD,
                                  coords ? AGX_APPLE9_ENC_TILE_LOAD_COORDS
                                         : AGX_APPLE9_ENC_TILE_LOAD_MASK,
@@ -3347,6 +3412,7 @@ enum apple9_tile_mode {
    APPLE9_TILE_EPILOG_TAIL_LOCKED = 3,
    APPLE9_TILE_PROLOG = 4,
    APPLE9_TILE_EPILOG_PER_SAMPLE = 5,
+   APPLE9_TILE_EPILOG_TAIL_PREAMBLE = 6,
 };
 
 struct apple9_buffer_map {
@@ -4167,17 +4233,23 @@ apple9_emit_graphics_output(struct apple9_dag_lower *lower,
           intr->num_components < 1 || intr->num_components > 4)
          return false;
       lower->color_stores = true;
-      assert(lower->tile_access && lower->tile_write);
       uint32_t sample_mask = apple9_lower_dag_scalar(lower,
          nir_get_scalar(intr->src[1].ssa, 0));
       if (sample_mask == AGX_APPLE9_VREG_INVALID)
          return false;
+      uint32_t colors[4];
       for (unsigned word = 0; word < intr->num_components; ++word) {
-         uint32_t color = apple9_lower_dag_scalar(
+         colors[word] = apple9_lower_dag_scalar(
             lower, nir_get_scalar(intr->src[0].ssa, word));
-         uint32_t store_sources[] = {color, sample_mask};
-         if (color == AGX_APPLE9_VREG_INVALID ||
-             !agx_apple9_vir_emit_side_effect(
+         if (colors[word] == AGX_APPLE9_VREG_INVALID)
+            return false;
+      }
+      if (!apple9_acquire_tile_lock(lower))
+         return false;
+      assert(lower->tile_access && lower->tile_write);
+      for (unsigned word = 0; word < intr->num_components; ++word) {
+         uint32_t store_sources[] = {colors[word], sample_mask};
+         if (!agx_apple9_vir_emit_side_effect(
                 &lower->program, AGX_APPLE9_VIR_TILE_STORE,
                 AGX_APPLE9_ENC_TILE_STORE_MASK, store_sources, 2,
                 nir_intrinsic_base(intr) / 4 + word))
@@ -4316,11 +4388,14 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
             return false;
          if (intr->intrinsic == nir_intrinsic_load_barycentric_pixel)
             continue; /* Interpolation mode is consumed by the input operation. */
-         /* The pixel is acquired in raster order at entry and released at
-          * the end, so the critical section spans the whole shader. Its end
-          * only orders the section's memory accesses before the release. */
-         if (intr->intrinsic == nir_intrinsic_begin_invocation_interlock)
+         /* Acquire the pixel lock at begin_invocation_interlock (or earlier
+          * if a prior tile access already opened it). Its end orders the
+          * section's memory accesses before the release at exit. */
+         if (intr->intrinsic == nir_intrinsic_begin_invocation_interlock) {
+            if (!apple9_acquire_tile_lock(lower))
+               return false;
             continue;
+         }
          if (intr->intrinsic == nir_intrinsic_end_invocation_interlock) {
             if (!agx_apple9_vir_emit_side_effect(&lower->program,
                    AGX_APPLE9_VIR_DEVICE_FENCE, AGX_APPLE9_ENC_DEVICE_FENCE,
@@ -4636,6 +4711,7 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
                &lower->program, fields, zs == 2);
             uint32_t pair[] = {value, value + 1};
             if (value == AGX_APPLE9_VREG_INVALID ||
+                !apple9_acquire_tile_preamble(lower) ||
                 !agx_apple9_vir_emit_side_effect(&lower->program,
                    AGX_APPLE9_VIR_TILE_ACCESS, AGX_APPLE9_ENC_TILE_ACCESS, NULL, 0, 1) ||
                 !agx_apple9_vir_emit_side_effect(&lower->program,
@@ -4700,6 +4776,8 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
                rgba[c] = apple9_lower_dag_scalar(lower, nir_get_scalar(intr->src[2].ssa, c));
             if (index == AGX_APPLE9_VREG_INVALID ||
                 (nir_intrinsic_image_array(intr) && layer == AGX_APPLE9_VREG_INVALID) ||
+                (lower->nir->info.stage == MESA_SHADER_FRAGMENT &&
+                 !apple9_acquire_tile_preamble(lower)) ||
                 !agx_apple9_vir_emit_image_store(&lower->program, xy, rgba, index, layer,
                    nir_alu_type_get_base_type(nir_intrinsic_src_type(intr)) !=
                       nir_type_float &&
@@ -5359,10 +5437,30 @@ apple9_emit_cf_list(struct apple9_dag_lower *lower,
          break;
       }
       case nir_cf_node_if:
+         if (!lower->mask_depth && !lower->loop_depth && !lower->object_region) {
+            if (lower->tile_lock_needed && !lower->tile_lock_acquired &&
+                apple9_cf_node_needs_tile_lock(node) &&
+                !apple9_acquire_tile_lock(lower))
+               return false;
+            if (lower->tile_preamble_needed && !lower->tile_access &&
+                apple9_cf_node_needs_tile_preamble(node) &&
+                !apple9_acquire_tile_preamble(lower))
+               return false;
+         }
          if (!apple9_emit_if(lower, stores, nir_cf_node_as_if(node)))
             return false;
          break;
       case nir_cf_node_loop:
+         if (!lower->mask_depth && !lower->loop_depth && !lower->object_region) {
+            if (lower->tile_lock_needed && !lower->tile_lock_acquired &&
+                apple9_cf_node_needs_tile_lock(node) &&
+                !apple9_acquire_tile_lock(lower))
+               return false;
+            if (lower->tile_preamble_needed && !lower->tile_access &&
+                apple9_cf_node_needs_tile_preamble(node) &&
+                !apple9_acquire_tile_preamble(lower))
+               return false;
+         }
          lower->loop_depth++;
          if (!apple9_emit_loop(lower, stores, nir_cf_node_as_loop(node)))
             return false;
@@ -6372,7 +6470,7 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
    nir_index_ssa_defs(impl);
    nir_index_blocks(impl);
    uint32_t texture_mask = 0, sampler_mask = 0, image_mask = 0;
-   bool uses_texel_fetch = false, has_texture = false;
+   bool uses_texel_fetch = false;
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
          if (instr->type == nir_instr_type_intrinsic &&
@@ -6388,7 +6486,6 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
             nir_tex_instr *tex = nir_instr_as_tex(instr);
             apple9_texture_table_masks(tex, &texture_mask, &sampler_mask,
                                        &uses_texel_fetch);
-            has_texture = true;
          }
       }
    }
@@ -6622,13 +6719,16 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
          goto fail;
    }
 
-   /* Hold the tile transaction across every sample and attachment. Opening
-    * it in the entry block also covers stores in divergent control flow.
-    * Releasing individual stores lets later fragments overtake this one. */
+   /* Hold the tile transaction across every sample and attachment, acquiring
+    * the tile preamble (0x600) and pixel lock (0x80c/0x808) lazily right
+    * before the first tile access or interlock (and hoisting before any
+    * enclosing control flow). Releasing individual stores lets later
+    * fragments overtake this one. */
    const enum apple9_tile_mode tile_mode =
       preamble ? APPLE9_TILE_NORMAL : resources->tile_mode;
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
-      bool reads = false, writes = false;
+      bool reads = false, writes = false, has_store_zs = false,
+           has_image_write = false;
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
@@ -6639,6 +6739,8 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
             lower.tile_coords |= op == nir_intrinsic_load_tile_pixel_agx;
             writes |= op == nir_intrinsic_store_local_pixel_agx;
             lower.interlock |= op == nir_intrinsic_begin_invocation_interlock;
+            has_store_zs |= op == nir_intrinsic_store_zs_agx;
+            has_image_write |= op == nir_intrinsic_image_store_apple9_agx;
          }
       }
       if (lower.interlock && lower.tile_coords) {
@@ -6652,43 +6754,42 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
          /* Per-sample trampoline acquires 0x600/0x80c once before the sample
           * loop and releases 0x020c + ZS once after the final sample. */
          lower.tile_access = true;
+         lower.tile_lock_acquired = true;
          lower.tile_read = reads;
          lower.tile_write = true;
       } else if (tile_mode == APPLE9_TILE_EPILOG_TAIL_LOCKED) {
          /* fs_main already acquired 0x600 + 0x80c (pixel_interlock or tile
           * read) and handed off the lock for this epilog to release. */
          lower.tile_access = true;
+         lower.tile_lock_acquired = true;
          lower.tile_read = reads;
          lower.tile_write = true;
-      } else if (tile_mode == APPLE9_TILE_EPILOG_TAIL) {
-         lower.tile_access = true;
-      } else if (tile_mode == APPLE9_TILE_EPILOG_MAIN ||
-                 reads || writes || image_mask || has_texture ||
-                 lower.interlock || nir->info.fs.uses_discard || zs_export) {
-         if (!agx_apple9_vir_emit_side_effect(
-                &lower.program, AGX_APPLE9_VIR_TILE_ACCESS,
-                AGX_APPLE9_ENC_TILE_ACCESS, NULL, 0,
-                image_mask ? 0x700 : lower.tile_coords ? 0xf00 : 0x600))
-            goto fail;
-         lower.tile_access = true;
+      } else {
+         if (tile_mode == APPLE9_TILE_EPILOG_TAIL_PREAMBLE) {
+            /* fs_main already emitted 0x600 (e.g. early_fragment_tests
+             * store_zs_agx or fragment IMAGE_WRITE), without 0x80c. */
+            lower.tile_access = true;
+         } else if (reads || writes || image_mask || lower.interlock ||
+                    has_store_zs || has_image_write) {
+            lower.tile_preamble_needed = true;
+            lower.tile_preamble_imm =
+               image_mask ? 0x700 : lower.tile_coords ? 0xf00 : 0x600;
+            if (image_mask || lower.tile_coords) {
+               if (!apple9_acquire_tile_preamble(&lower))
+                  goto fail;
+            }
+         }
+         if ((reads || writes || lower.interlock) && !lower.tile_coords) {
+            bool lock_write = writes || lower.interlock ||
+                              tile_mode == APPLE9_TILE_EPILOG_MAIN;
+            lower.tile_lock_needed = true;
+            lower.tile_lock_imm = lock_write ? 0x80c : 0x808;
+            lower.tile_read = reads;
+            lower.tile_write = writes;
+         }
+         if (lower.tile_coords)
+            lower.tile_read = reads;
       }
-      if (tile_mode != APPLE9_TILE_PROLOG &&
-          tile_mode != APPLE9_TILE_EPILOG_PER_SAMPLE &&
-          tile_mode != APPLE9_TILE_EPILOG_TAIL_LOCKED &&
-          (reads || writes || lower.interlock) && !lower.tile_coords) {
-         bool lock_write = writes || lower.interlock ||
-                           tile_mode == APPLE9_TILE_EPILOG_MAIN;
-         if (!agx_apple9_vir_emit_side_effect(&lower.program,
-                AGX_APPLE9_VIR_TILE_ACCESS, AGX_APPLE9_ENC_TILE_ACCESS,
-                NULL, 0, lock_write ? 0x80c : 0x808))
-            goto fail;
-         lower.tile_read = reads;
-         lower.tile_write = writes;
-         if (tile_mode == APPLE9_TILE_EPILOG_MAIN)
-            lower.handed_off_tile_lock = true;
-      }
-      if (lower.tile_coords)
-         lower.tile_read = reads;
    }
 
 
@@ -6697,6 +6798,12 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
                    ? lower.reason
                    : "could not emit Apple9 structured control flow";
       goto fail;
+   }
+
+   if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+       tile_mode == APPLE9_TILE_EPILOG_MAIN) {
+      lower.handed_off_tile_lock = lower.tile_lock_acquired;
+      lower.handed_off_tile_preamble = lower.tile_access;
    }
 
    if (!preamble && !lower.has_abi_return &&
@@ -6712,7 +6819,7 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
       (tile_mode != APPLE9_TILE_PROLOG &&
        tile_mode != APPLE9_TILE_EPILOG_PER_SAMPLE &&
        !(tile_mode == APPLE9_TILE_EPILOG_MAIN && lower.handed_off_tile_lock) &&
-       (lower.color_stores || lower.tile_read || lower.interlock));
+       (lower.tile_coords ? lower.tile_read : lower.tile_lock_acquired));
    if (nir->info.stage == MESA_SHADER_FRAGMENT && need_tile_fence &&
        !agx_apple9_vir_emit_side_effect(
           &lower.program, AGX_APPLE9_VIR_TILE_FENCE, AGX_APPLE9_ENC_TILE_FENCE,
@@ -7027,6 +7134,7 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
       (nir->info.fs.pixel_interlock_ordered ||
        nir->info.fs.pixel_interlock_unordered);
    out->info.apple9_fs_epilog.has_tile_lock = lower.handed_off_tile_lock;
+   out->info.apple9_fs_epilog.has_tile_preamble = lower.handed_off_tile_preamble;
    out->info.disable_tri_merging = nir->info.stage == MESA_SHADER_FRAGMENT &&
       (nir->info.uses_wide_subgroup_intrinsics ||
        nir->info.fs.needs_coarse_quad_helper_invocations || nir->info.writes_memory);
@@ -9174,8 +9282,6 @@ agx_nir_lower_apple9_sampler_state(
    struct agx_apple9_texture_mapping *mapping, const char **reason)
 {
    memset(mapping, 0, sizeof(*mapping));
-   uint8_t sampler_alias[32];
-   memset(sampler_alias, 0xff, sizeof(sampler_alias));
    for (unsigned i = 0; i < 32; ++i) {
       mapping->samplers[i] = i;
    }
@@ -9207,7 +9313,6 @@ agx_nir_lower_apple9_sampler_state(
    if (!agx_nir_lower_apple9_texture_offsets(nir, key, reason))
       return false;
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
-   uint32_t samplers = 0;
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_tex)
@@ -9217,7 +9322,6 @@ agx_nir_lower_apple9_sampler_state(
             *reason = "Apple9 texture binding exceeds 32 entries";
             return false;
          }
-         samplers |= BITFIELD_BIT(tex->sampler_index);
       }
    }
    nir_builder b = nir_builder_create(impl);
@@ -9265,84 +9369,6 @@ agx_nir_lower_apple9_sampler_state(
             mapping->seamful_cubes |= BITFIELD_BIT(tex->texture_index);
             progress = true;
          }
-         if (!(state->flags & AGX_APPLE9_CUSTOM_BORDER))
-            continue;
-         if ((tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
-              tex->sampler_dim != GLSL_SAMPLER_DIM_3D && !cube) || tex->is_shadow ||
-             tex->def.num_components != 4 + tex->is_sparse ||
-             tex->def.bit_size != 32) {
-            *reason = "Apple9 border lowering requires a non-shadow 32-bit sample";
-            return false;
-         }
-         int coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-         if (coord < 0) {
-            *reason = "Apple9 border sample has no coordinates";
-            return false;
-         }
-         progress = true;
-         unsigned s = tex->sampler_index;
-         if (sampler_alias[s] == 0xff) {
-            /* Border values live in the shader. Samplers with otherwise equal
-             * state can share the same all-white helper descriptor. */
-            struct agx_apple9_sampler_key white = *state;
-            memset(white.border, 0, sizeof(white.border));
-            for (unsigned j = 0; j < 32; ++j) {
-               if (sampler_alias[j] == 0xff)
-                  continue;
-               struct agx_apple9_sampler_key other = key[j];
-               memset(other.border, 0, sizeof(other.border));
-               if (!memcmp(&white, &other, sizeof(white))) {
-                  sampler_alias[s] = sampler_alias[j];
-                  break;
-               }
-            }
-         }
-         if (sampler_alias[s] == 0xff) {
-            if (samplers == UINT32_MAX) {
-               *reason = "Apple9 custom border needs an additional sampler entry";
-               return false;
-            }
-            /* Aliases take slots no remaining sample binds. Runtime sampler
-             * records are indexed by API sampler, which stays bound for
-             * offset samples; an offset sample lowered to sampler-less
-             * fetches that still read its record would break this. */
-            unsigned alias = ffs(~samplers) - 1;
-            sampler_alias[s] = alias;
-            samplers |= BITFIELD_BIT(alias);
-            mapping->samplers[alias] = s;
-            mapping->white_samplers |= BITFIELD_BIT(alias);
-         }
-         b.cursor = nir_after_instr(instr);
-         nir_tex_instr *weight = nir_instr_as_tex(nir_instr_clone(nir, instr));
-         weight->sampler_index = sampler_alias[s];
-         weight->is_sparse = false;
-         weight->def.num_components = 4;
-         nir_builder_instr_insert(&b, &weight->instr);
-         nir_def *border = nir_imm_ivec4(&b, fui(state->border[0]), fui(state->border[1]),
-                                        fui(state->border[2]), fui(state->border[3]));
-         nir_def *tex_color = tex->is_sparse ? nir_trim_vector(&b, &tex->def, 4)
-                                             : &tex->def;
-         nir_def *result;
-         if (nir_alu_type_get_base_type(tex->dest_type) == nir_type_float) {
-            /* Match hk_shader.c: filtering is linear, so interpolating samples
-             * with borders 0 and 1 gives the requested custom border. */
-            result = nir_flrp(&b, tex_color, &weight->def, border);
-            nir->info.flrp_lowered = false;
-         } else {
-            /* Integer sampling is nearest-only. The two native samples differ
-             * exactly on border components; select their integer bits without
-             * interpreting either the texel or the border as floating point. */
-            result = nir_bcsel(&b, nir_ine(&b, tex_color, &weight->def),
-                              border, tex_color);
-         }
-         if (tex->is_sparse) {
-            nir_scalar comps[5];
-            for (unsigned c = 0; c < 4; ++c)
-               comps[c] = nir_get_scalar(result, c);
-            comps[4] = nir_get_scalar(&tex->def, 4);
-            result = nir_vec_scalars(&b, comps, 5);
-         }
-         nir_def_rewrite_uses_after(&tex->def, result);
       }
    }
    nir_progress(progress, impl, nir_metadata_control_flow);
@@ -11074,12 +11100,9 @@ apple9_lower_textures(nir_shader *nir)
    nir_shader_instructions_pass(nir, apple9_flag_unencodable_offsets,
                                 nir_metadata_all, &fallback);
    if (fallback) {
-      /* The fallback's border taps take a custom border from sample_border(),
-       * which only the Gallium custom-border pass corrects, and that pass
-       * runs before this one. Today only the shadow 2D array lacks a native
-       * offset form, and shadow samples never take that border path. If a
-       * non-shadow form ever lands here, its custom border needs the same
-       * correction. */
+      /* Format-qualified custom borders are handled directly by the hardware
+       * sampler descriptor (AGX_BORDER_COLOUR_CUSTOM), so sample_border()
+       * returns the swizzled custom border without any shader lowering. */
       const char *offset_reason = NULL;
       agx_nir_lower_apple9_texture_offsets(nir, NULL, &offset_reason);
    }
@@ -12200,6 +12223,7 @@ apple9_compile_graphics(nir_shader *nir, struct agx_shader_part *out,
                            true, reason))
       return false;
    fs_epilog.has_tile_lock = out->info.apple9_fs_epilog.has_tile_lock;
+   fs_epilog.has_tile_preamble = out->info.apple9_fs_epilog.has_tile_preamble;
    out->info.apple9_vs_prolog = vs_prolog;
    out->info.apple9_fs_epilog = fs_epilog;
    out->info.apple9_reads_tile |= preserves_color;
@@ -12469,7 +12493,8 @@ agx_compile_apple9_fragment_epilog_key(
    enum apple9_tile_mode tile_mode =
       key->per_sample ? APPLE9_TILE_EPILOG_PER_SAMPLE
       : key->iface.has_tile_lock ? APPLE9_TILE_EPILOG_TAIL_LOCKED
-                                 : APPLE9_TILE_EPILOG_TAIL;
+      : key->iface.has_tile_preamble ? APPLE9_TILE_EPILOG_TAIL_PREAMBLE
+                                     : APPLE9_TILE_EPILOG_TAIL;
    apple9_seed_fs_epilog_resources(&reserved, tile_mode, key->per_sample);
    reserved.defer_zs_release = key->per_sample;
    if (key->late_zs && !key->iface.writes_depth && !early_z)

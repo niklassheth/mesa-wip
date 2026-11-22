@@ -237,6 +237,7 @@ struct agx_apple9_fs_epilog_iface {
    bool writes_depth;
    bool writes_stencil;
    bool has_tile_lock;
+   bool has_tile_preamble;
    bool early_fragment_tests;
    bool has_killed_mask;
    bool per_sample;

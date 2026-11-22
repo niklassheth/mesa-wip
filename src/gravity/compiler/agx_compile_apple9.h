@@ -420,13 +420,11 @@ agx_apple9_block_export_format(enum pipe_format format)
 }
 
 enum agx_apple9_sampler_flags {
-   AGX_APPLE9_CUSTOM_BORDER = 1 << 0,
    AGX_APPLE9_CLAMP_SHADOW_REFERENCE = 1 << 1,
 };
 
 struct agx_apple9_sampler_key {
    uint32_t flags;
-   float border[4];
    uint8_t wrap[3];
    uint8_t min_filter, mag_filter, mip_filter, compare_func, seamless_cube_map;
    float min_lod, max_lod, lod_bias;
@@ -451,7 +449,6 @@ bool agx_nir_lower_apple9_texture_offsets(
 
 struct agx_apple9_texture_mapping {
    uint8_t samplers[32];
-   uint32_t white_samplers;
    uint32_t seamful_cubes;
    /* Samplers used by texel-offset samples. Offsets the sample instruction
     * cannot encode are lowered with runtime sampler state, so the driver
