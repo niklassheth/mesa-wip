@@ -541,6 +541,10 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
    assert(params_size >= sizeof(dev->params));
 
+   /* Apple9 (G16) and later GPUs are handled by the Gravity driver. */
+   if (dev->params.gpu_generation >= 16)
+      return false;
+
    assert(dev->params.gpu_generation >= 13);
    const char *variant = " Unknown";
    switch (dev->params.gpu_variant) {
