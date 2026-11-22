@@ -16559,3 +16559,165 @@ TEST(Apple9Compiler, LazyFragmentTileLockPlacement)
       ralloc_free(b.shader);
    }
 }
+
+TEST(Apple9Compiler, EarlyZFallbackKeepsDepthStencilTest)
+{
+   const uint8_t tile_001[6] = {0x87, 0x02, 0x54, 0x01, 0x00, 0x00};
+   const uint8_t fence_001[6] = {0x07, 0x02, 0x54, 0x01, 0x00, 0x00};
+
+   /* Epilog early_fragment_tests splits the initial test into
+    * if (do_clamp) store_zs_agx else sample_mask_agx(0xff, 0xff).
+    * Both arms must trigger depth/stencil testing (2x TILE_ACCESS 0x001 and
+    * 2x TILE_FENCE 0x001), while the earlier disabled-API-samples kill
+    * (live == 0) must remain coverage-only. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "early_z_fallback_test");
+      b.shader->info.fs.early_fragment_tests = true;
+      b.shader->info.writes_memory = true;
+      b.shader->info.fs.uses_discard = true;
+      nir_def *coord = nir_load_pixel_coord(&b);
+      nir_demote_if(&b, nir_ieq_imm(&b, nir_channel(&b, coord, 0), 0));
+      nir_store_ssbo(&b, nir_imm_int(&b, 1), nir_imm_int(&b, 0),
+                     nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
+      nir_store_output(&b, nir_imm_vec4(&b, 0, 1, 0, 1), nir_imm_int(&b, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+      b.shader->info.io_lowered = true;
+      agx_apple9_blend blend = {.use_epilog = 1, .dynamic_samples = 1};
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      unsigned n001 = 0, nf001 = 0;
+      apple9_find_bytes(main_out, tile_001, sizeof(tile_001), &n001);
+      apple9_find_bytes(main_out, fence_001, sizeof(fence_001), &nf001);
+      EXPECT_EQ(n001, 2u);
+      EXPECT_EQ(nf001, 2u);
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* Late-Z depth export + discard must keep coverage-only sample_mask_agx
+    * (live == 0) non-testing so Z/S tests execute only once via store_zs_agx. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "late_z_discard_single_test");
+      nir_def *coord = nir_load_pixel_coord(&b);
+      nir_demote_if(&b, nir_ieq_imm(&b, nir_channel(&b, coord, 0), 0));
+      nir_store_output(&b, nir_imm_float(&b, 0.5f), nir_imm_int(&b, 0),
+                       .write_mask = 1, .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DEPTH,
+                                        .num_slots = 1});
+      nir_store_output(&b, nir_imm_vec4(&b, 1, 0, 0, 1), nir_imm_int(&b, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+      b.shader->info.io_lowered = true;
+      agx_apple9_blend blend = {};
+      blend.format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      blend.samples = 1;
+      blend.colormask = 0xf;
+      blend.rgb_src = blend.alpha_src = PIPE_BLENDFACTOR_ONE;
+      blend.rgb_dst = blend.alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      blend.rgb_func = blend.alpha_func = PIPE_BLEND_ADD;
+      agx_shader_part out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                  &out, &reason))
+         << (reason ?: "");
+      unsigned n001 = 0, nf001 = 0;
+      apple9_find_bytes(out, tile_001, sizeof(tile_001), &n001);
+      apple9_find_bytes(out, fence_001, sizeof(fence_001), &nf001);
+      EXPECT_EQ(n001, 1u);
+      EXPECT_EQ(nf001, 1u);
+      free(out.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(Apple9Compiler, EarlyTestAlphaToCoverageMasksAllTargetsBeforeRemapping)
+{
+   auto find_tile_stores = [](const agx_shader_part &out,
+                              std::vector<std::pair<uint8_t, uint8_t>> &stores) {
+      const uint8_t *bytes = static_cast<const uint8_t *>(out.binary);
+      stores.clear();
+      for (size_t i = 0; i + 12 <= out.info.binary_size; i += 2) {
+         if (bytes[i] == 0xe7 && bytes[i + 1] == 0x06 && bytes[i + 2] == 0x54 &&
+             bytes[i + 7] == 0x4e && bytes[i + 9] == 0x00 && bytes[i + 10] == 0x00) {
+            stores.emplace_back(bytes[i + 6], bytes[i + 11]);
+         }
+      }
+   };
+
+   /* Multi-RT + color_map remapping under early_fragment_tests:
+    * Location 0 maps to RT1 and location 1 maps to RT0. A2C must be computed
+    * once from location 0's alpha before remapping and ANDed into EVERY color
+    * target's tile store mask (both RT0 and RT1), without late demote. */
+   for (unsigned samples : {1u, 4u}) {
+      SCOPED_TRACE(samples);
+      agx_apple9_fs_epilog_key ekey = {};
+      ekey.iface.uses_epilog = true;
+      ekey.iface.early_fragment_tests = true;
+      ekey.iface.outputs_written = BITFIELD_BIT(0) | BITFIELD_BIT(1);
+      ekey.nr_targets = 2;
+      ekey.color_map[0] = 1;
+      ekey.color_map[1] = 0;
+      for (unsigned rt = 0; rt < 2; ++rt) {
+         ekey.blend[rt].format = PIPE_FORMAT_R8G8B8A8_UNORM;
+         ekey.blend[rt].samples = samples;
+         ekey.blend[rt].colormask = 0xf;
+         ekey.blend[rt].rgb_src = ekey.blend[rt].alpha_src = PIPE_BLENDFACTOR_ONE;
+         ekey.blend[rt].rgb_dst = ekey.blend[rt].alpha_dst = PIPE_BLENDFACTOR_ZERO;
+         ekey.blend[rt].rgb_func = ekey.blend[rt].alpha_func = PIPE_BLEND_ADD;
+      }
+      ekey.blend[0].alpha_to_coverage = 1;
+
+      agx_shader_part ep_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out, &reason))
+         << (reason ?: "");
+      EXPECT_FALSE(ep_out.info.apple9_uses_discard);
+      std::vector<std::pair<uint8_t, uint8_t>> stores;
+      find_tile_stores(ep_out, stores);
+      ASSERT_EQ(stores.size(), 2u);
+      /* Both RT0 and RT1 must carry dynamic A2C-masked sample masks, sharing
+       * the same computed mask register. */
+      EXPECT_EQ(stores[0].second, 0x08u);
+      EXPECT_EQ(stores[1].second, 0x08u);
+      EXPECT_EQ(stores[0].first, stores[1].first);
+      free(ep_out.binary);
+   }
+
+   /* When location 0 is NOT written and physical RT0 is remapped to location 1,
+    * early-Z A2C must not read location 1's alpha from physical RT0: the
+    * compiled epilog must be byte-identical to alpha_to_coverage = 0. */
+   {
+      agx_apple9_fs_epilog_key ekey = {};
+      ekey.iface.uses_epilog = true;
+      ekey.iface.early_fragment_tests = true;
+      ekey.iface.outputs_written = BITFIELD_BIT(1);
+      ekey.nr_targets = 1;
+      ekey.color_map[0] = 1;
+      ekey.blend[0].format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      ekey.blend[0].samples = 1;
+      ekey.blend[0].colormask = 0xf;
+      ekey.blend[0].rgb_src = ekey.blend[0].alpha_src = PIPE_BLENDFACTOR_ONE;
+      ekey.blend[0].rgb_dst = ekey.blend[0].alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      ekey.blend[0].rgb_func = ekey.blend[0].alpha_func = PIPE_BLEND_ADD;
+
+      agx_shader_part ep_ref = {}, ep_a2c = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_ref, &reason))
+         << (reason ?: "");
+      ekey.blend[0].alpha_to_coverage = 1;
+      ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_a2c, &reason))
+         << (reason ?: "");
+      ASSERT_EQ(ep_a2c.info.binary_size, ep_ref.info.binary_size);
+      EXPECT_EQ(memcmp(ep_a2c.binary, ep_ref.binary, ep_ref.info.binary_size), 0);
+      free(ep_a2c.binary);
+      free(ep_ref.binary);
+   }
+}

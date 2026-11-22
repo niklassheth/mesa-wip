@@ -1115,7 +1115,6 @@ struct apple9_dag_lower {
    unsigned loop_depth;
    bool zs_release_pending;
    bool defer_zs_release;
-   bool zs_export;
    uint8_t cf_base;
    uint8_t z_cf_index;
    bool handed_off_tile_lock;
@@ -4727,12 +4726,14 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
                nir_get_scalar(intr->src[0].ssa, 0));
             uint32_t live = apple9_lower_dag_scalar(lower,
                nir_get_scalar(intr->src[1].ssa, 0));
-            /* A depth/stencil export performs the fragment's only test.
-             * Earlier coverage publications just record killed samples. */
+            /* sample_mask_agx with live == 0 only records killed samples; any
+             * non-zero live mask triggers depth/stencil testing (including the
+             * fallback arm of apple9_clamp_early_depth alongside store_zs_agx). */
+            bool tests =
+               !(nir_src_is_const(intr->src[1]) && !nir_src_as_uint(intr->src[1]));
             if (lower->nir->info.stage != MESA_SHADER_FRAGMENT ||
                 affected == AGX_APPLE9_VREG_INVALID || live == AGX_APPLE9_VREG_INVALID ||
-                !apple9_emit_coverage(lower, affected, live, !lower->zs_export &&
-                   !(nir_src_is_const(intr->src[1]) && !nir_src_as_uint(intr->src[1]))))
+                !apple9_emit_coverage(lower, affected, live, tests))
                return false;
             continue;
          }
@@ -6702,7 +6703,6 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
    const bool zs_export = nir->info.stage == MESA_SHADER_FRAGMENT &&
       (nir->info.outputs_written & (BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
                                     BITFIELD64_BIT(FRAG_RESULT_STENCIL)));
-   lower.zs_export = zs_export;
    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
        (nir->info.fs.uses_discard || zs_export)) {
       uint32_t coverage = apple9_dag_emit(&lower,
@@ -8807,9 +8807,9 @@ apple9_io_size(const struct glsl_type *type, bool bindless)
 struct apple9_color_lower {
    const struct agx_apple9_blend *blend;
    nir_def *src1;
+   nir_def *a2c_mask;
    unsigned nr_targets;
    bool per_sample;
-   bool skip_a2c_demote;
    bool valid;
 };
 
@@ -9968,6 +9968,17 @@ apple9_blend_channel_reads_destination(enum pipe_blend_func func,
 static nir_def *apple9_pack_color(nir_builder *b, enum pipe_format format,
                                   nir_def *color);
 
+static nir_def *
+apple9_a2c_sample_mask(nir_builder *b, nir_def *color, unsigned samples)
+{
+   nir_def *alpha = nir_channel(b, color, 3);
+   alpha = nir_fmin(b, nir_fmax(b, alpha, nir_imm_float(b, 0)),
+                    nir_imm_float(b, 1));
+   nir_def *count =
+      nir_f2u32(b, nir_fadd_imm(b, nir_fmul_imm(b, alpha, samples), 0.5));
+   return nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), count), -1);
+}
+
 static bool
 apple9_lower_color(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -10077,13 +10088,11 @@ apple9_lower_color(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    nir_def *coverage = samples > 1 ? nir_load_sample_mask_in(b) : nir_imm_int(b, 1);
    if (blend && blend->disabled_samples)
       coverage = nir_iand_imm(b, coverage, ~blend->disabled_samples);
+   if (lower->a2c_mask)
+      coverage = nir_iand(b, coverage, lower->a2c_mask);
    if (blend && blend->alpha_to_coverage && rt == 0) {
-      nir_def *alpha = nir_channel(b, color, 3);
-      alpha = nir_fmin(b, nir_fmax(b, alpha, nir_imm_float(b, 0)), nir_imm_float(b, 1));
-      nir_def *count = nir_f2u32(b, nir_fadd_imm(b, nir_fmul_imm(b, alpha, samples), 0.5));
-      nir_def *mask = nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), count), -1);
-      if (!lower->skip_a2c_demote)
-         nir_demote_samples(b, nir_u2u16(b, nir_inot(b, mask)));
+      nir_def *mask = apple9_a2c_sample_mask(b, color, samples);
+      nir_demote_samples(b, nir_u2u16(b, nir_inot(b, mask)));
       coverage = nir_iand(b, coverage, mask);
    }
    if (blend && blend->dynamic_enable) {
@@ -11254,11 +11263,19 @@ moved:;
          b.cursor = nir_before_instr(instr);
          nir_def *dead = nir_load_var(&b, killed);
          if (intr->intrinsic == nir_intrinsic_sample_mask_agx) {
-            /* A later coverage update must not revive a killed sample. */
-            nir_src_rewrite(&intr->src[1],
-                            nir_iand(&b, intr->src[1].ssa, nir_inot(&b, dead)));
-            nir_def *new_dead = nir_iand(&b, intr->src[0].ssa,
-                                        nir_inot(&b, intr->src[1].ssa));
+            /* A later coverage update must not revive a killed sample. Keep
+             * coverage-only kills (live == 0) visibly constant 0 so selection
+             * distinguishes them from test-triggering sample masks. */
+            bool coverage_only =
+               nir_src_is_const(intr->src[1]) && !nir_src_as_uint(intr->src[1]);
+            if (!coverage_only) {
+               nir_src_rewrite(&intr->src[1],
+                               nir_iand(&b, intr->src[1].ssa, nir_inot(&b, dead)));
+            }
+            nir_def *new_dead =
+               coverage_only
+                  ? intr->src[0].ssa
+                  : nir_iand(&b, intr->src[0].ssa, nir_inot(&b, intr->src[1].ssa));
             nir_store_var(&b, killed, nir_ior(&b, dead, new_dead), 1);
          } else if (intr->intrinsic == nir_intrinsic_store_local_pixel_agx) {
             nir_def *mask = intr->src[1].ssa;
@@ -12291,19 +12308,22 @@ agx_compile_apple9_fragment_epilog_key(
       emitted_demote = true;
    }
 
-   /* Alpha-to-coverage reads location 0's alpha even when attachment 0 is
-    * remapped to a different location. Emit it directly if remapped. */
-   if (!early_z && blend[0].alpha_to_coverage && loaded[0] &&
-       !key->iface.writes_frag_color && nr_targets > 0 && key->color_map[0] != 0) {
-      nir_def *alpha = nir_channel(&b, loaded[0], 3);
-      alpha = nir_fmin(&b, nir_fmax(&b, alpha, nir_imm_float(&b, 0)),
-                       nir_imm_float(&b, 1));
-      nir_def *count =
-         nir_f2u32(&b, nir_fadd_imm(&b, nir_fmul_imm(&b, alpha, samples), 0.5));
-      nir_def *mask = nir_iadd_imm(&b, nir_ishl(&b, nir_imm_int(&b, 1), count), -1);
-      nir_demote_samples(&b, nir_u2u16(&b, nir_inot(&b, mask)));
+   /* Alpha-to-coverage always reads fragment output location 0's alpha before
+    * attachment remapping (color_map) and masks every color target (RT0..7).
+    * Under early_fragment_tests, Z/S already ran in fs_main so apply the A2C
+    * mask directly to every tile store without emitting a late demote. */
+   nir_def *a2c_mask = NULL;
+   if (blend[0].alpha_to_coverage) {
+      if (loaded[0]) {
+         nir_def *mask = apple9_a2c_sample_mask(&b, loaded[0], samples);
+         if (early_z) {
+            a2c_mask = mask;
+         } else {
+            nir_demote_samples(&b, nir_u2u16(&b, nir_inot(&b, mask)));
+            emitted_demote = true;
+         }
+      }
       blend[0].alpha_to_coverage = 0;
-      emitted_demote = true;
    }
 
    nir_def *zero = nir_imm_int(&b, 0);
@@ -12314,7 +12334,6 @@ agx_compile_apple9_fragment_epilog_key(
                           .dual_source_blend_index = 1,
                           .num_slots = 1});
    }
-   bool emitted_rt0 = false;
    for (unsigned rt = 0; rt < nr_targets; ++rt) {
       nir_def *val = NULL;
       if (key->iface.writes_frag_color) {
@@ -12326,17 +12345,9 @@ agx_compile_apple9_fragment_epilog_key(
       }
       if (!val)
          continue;
-      if (rt == 0)
-         emitted_rt0 = true;
       nir_store_output(&b, val, zero, .write_mask = 0xf,
          .src_type = nir_type_float32,
          .io_semantics = {.location = FRAG_RESULT_DATA0 + rt, .num_slots = 1});
-   }
-   /* Alpha-to-coverage with 0 color attachments still tests location 0's alpha. */
-   if (!emitted_rt0 && blend[0].alpha_to_coverage && loaded[0]) {
-      nir_store_output(&b, loaded[0], zero, .write_mask = 0xf,
-         .src_type = nir_type_float32,
-         .io_semantics = {.location = FRAG_RESULT_DATA0, .num_slots = 1});
    }
 
    /* Depth/stencil exports (explicit from fs_main, or synthetic late_zs for
@@ -12397,9 +12408,9 @@ agx_compile_apple9_fragment_epilog_key(
 
    struct apple9_color_lower color = {
       .blend = blend,
+      .a2c_mask = a2c_mask,
       .nr_targets = nr_targets,
       .per_sample = key->per_sample,
-      .skip_a2c_demote = early_z,
       .valid = true,
    };
    nir_shader_intrinsics_pass(nir, apple9_lower_color,
