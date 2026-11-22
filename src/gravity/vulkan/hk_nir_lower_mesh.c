@@ -635,12 +635,54 @@ hk_mesh_pp_load(nir_builder *b, void *data, unsigned vertex, unsigned location,
       value = nir_imm_vec4(b, 0.0, 0.0, 0.0, 1.0);
    }
 
-   /* Invisible primitives lie behind the eye, and clip to nothing. */
+   /* Invisible primitives lie behind the eye, and clip to nothing.
+    * Apply dynamic clip_z_coeff before polygon-point clipping so the [0, w]
+    * depth clip planes in hk_apple9_pp_emit_triangle match both [-w, w] and
+    * [0, w] clip modes. */
    if (location == VARYING_SLOT_POS) {
+      unsigned offset = hk_root_descriptor_offset(draw.clip_z_coeff);
+      nir_def *c = nir_load_ubo(b, 1, 32, nir_imm_int(b, 0),
+                                nir_imm_int(b, offset), .align_mul = 4,
+                                .range_base = offset, .range = 4);
+      nir_def *z = nir_channel(b, value, 2);
+      nir_def *w = nir_channel(b, value, 3);
+      nir_def *new_z =
+         nir_ffma_weak(b, nir_fneg(b, z), c, nir_ffma_weak(b, w, c, z));
+      value = nir_vector_insert_imm(b, value, new_z, 2);
       value = nir_bcsel(b, pp->visible, value,
                         nir_imm_vec4(b, 0.0, 0.0, 0.0, -1.0));
    }
    return nir_channels(b, value, BITFIELD_RANGE(component, comps));
+}
+
+static bool
+hk_mesh_split_pp_face_prim(nir_builder *b, nir_intrinsic_instr *intr,
+                           UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output ||
+       nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_FOGC ||
+       intr->src[0].ssa->num_components < 2)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *val = intr->src[0].ssa;
+   nir_store_output(b, nir_channel(b, val, 0), nir_imm_int(b, 0),
+                    .write_mask = 0x1, .src_type = nir_type_uint32,
+                    .io_semantics = {.location = VARYING_SLOT_FOGC,
+                                     .num_slots = 1});
+   nir_store_output(b, nir_channel(b, val, 1), nir_imm_int(b, 0),
+                    .write_mask = 0x1, .src_type = nir_type_uint32,
+                    .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_ID,
+                                     .num_slots = 1});
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+static inline unsigned
+hk_mesh_per_vertex_copy_slot(uint8_t base, unsigned vertex)
+{
+   if (base == VARYING_SLOT_BFC0 && vertex == 2)
+      return VARYING_SLOT_CLIP_VERTEX;
+   return base + vertex;
 }
 
 /* Polygon mode POINT: each triangle draws HK_PP_MAX_VERTICES points, one per
@@ -652,7 +694,7 @@ hk_nir_mesh_rast_pp(const nir_shader *mesh, const struct hk_mesh_info *info,
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_VERTEX, &agx_nir_options, "%s rast points",
-      mesh->info.name ? mesh->info.name : "mesh");
+      mesh && mesh->info.name ? mesh->info.name : "mesh");
    nir_shader *s = b.shader;
 
    unsigned per_group = MAX2(info->max_primitives, 1) * HK_PP_MAX_VERTICES;
@@ -692,7 +734,7 @@ hk_nir_mesh_rast_pp(const nir_shader *mesh, const struct hk_mesh_info *info,
                       ~(VARYING_BIT_PRIMITIVE_INDICES |
                         VARYING_BIT_CULL_PRIMITIVE | VARYING_BIT_CLIP_DIST0 |
                         VARYING_BIT_CLIP_DIST1 | VARYING_BIT_CULL_DIST0 |
-                        VARYING_BIT_CULL_DIST1);
+                        VARYING_BIT_CULL_DIST1 | VARYING_BIT_PRIMITIVE_ID);
    outputs |= VARYING_BIT_POS | VARYING_BIT_LAYER;
    uint64_t memory = 0;
    u_foreach_bit64(slot, info->primitive_slots) {
@@ -713,6 +755,7 @@ hk_nir_mesh_rast_pp(const nir_shader *mesh, const struct hk_mesh_info *info,
    pp_out.output_components = components;
    /* Per-primitive values are equal at the three corners: keep them exact. */
    pp_out.flat |= info->primitive_slots;
+   pp_out.face_slot = VARYING_SLOT_FOGC;
 
    nir_def *last = nir_ieq_imm(
       &b,
@@ -730,6 +773,8 @@ hk_nir_mesh_rast_pp(const nir_shader *mesh, const struct hk_mesh_info *info,
          : nir_imm_int(&b, 0);
    hk_apple9_pp_emit_triangle(&b, &pp_out, hk_mesh_pp_load, &pp, provoking,
                               prim_id, point);
+   nir_shader_intrinsics_pass(s, hk_mesh_split_pp_face_prim,
+                              nir_metadata_control_flow, NULL);
 
    if (memory) {
       nir_def *offset = nir_iadd_imm(
@@ -746,12 +791,11 @@ hk_nir_mesh_rast_pp(const nir_shader *mesh, const struct hk_mesh_info *info,
       outputs |= BITFIELD64_BIT(HK_MESH_PRIMITIVE_SLOT);
    }
 
-   unsigned clip = mesh->info.clip_distance_array_size;
-   unsigned cull = mesh->info.cull_distance_array_size;
+   unsigned clip = mesh ? mesh->info.clip_distance_array_size : 0;
+   unsigned cull = mesh ? mesh->info.cull_distance_array_size : 0;
    if (clip + cull)
       outputs |= VARYING_BIT_CLIP_DIST0 | (clip + cull > 4 ? VARYING_BIT_CLIP_DIST1 : 0);
-   if (pp_out.face_slot)
-      outputs |= BITFIELD64_BIT(pp_out.face_slot);
+   outputs |= VARYING_BIT_FOGC | VARYING_BIT_PRIMITIVE_ID;
    s->info.outputs_written = outputs;
    s->info.clip_distance_array_size = clip;
    s->info.cull_distance_array_size = cull;
@@ -771,7 +815,7 @@ hk_nir_mesh_rast(const nir_shader *mesh, const struct hk_mesh_info *info,
 
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_VERTEX, &agx_nir_options, "%s rast",
-      mesh->info.name ? mesh->info.name : "mesh");
+      mesh && mesh->info.name ? mesh->info.name : "mesh");
    nir_shader *s = b.shader;
 
    unsigned vpp = mesa_vertices_per_prim(info->prim);
@@ -894,7 +938,7 @@ hk_nir_mesh_rast(const nir_shader *mesh, const struct hk_mesh_info *info,
             value = nir_pad_vector_imm_int(&b, value, 0, 4);
          }
 
-         unsigned copy = VARYING_SLOT_VAR0 + copies->copy_base[j] + k;
+         unsigned copy = hk_mesh_per_vertex_copy_slot(copies->copy_base[j], k);
          nir_store_output(&b, value, nir_imm_int(&b, 0), .write_mask = 0xf,
                           .src_type = nir_type_float32,
                           .io_semantics.location = copy,
@@ -907,7 +951,7 @@ hk_nir_mesh_rast(const nir_shader *mesh, const struct hk_mesh_info *info,
    for (unsigned m = 0; copies && m < 2; ++m) {
       if (!copies->bary[m])
          continue;
-      unsigned slot = VARYING_SLOT_VAR0 + copies->bary[m] - 1;
+      unsigned slot = copies->bary[m];
       nir_def *weights = nir_vec3(&b, nir_b2f32(&b, nir_ieq_imm(&b, corner, 0)),
                                   nir_b2f32(&b, nir_ieq_imm(&b, corner, 1)),
                                   nir_b2f32(&b, nir_ieq_imm(&b, corner, 2)));
@@ -934,8 +978,8 @@ hk_nir_mesh_rast(const nir_shader *mesh, const struct hk_mesh_info *info,
    }
 
    s->info.outputs_written = outputs;
-   s->info.clip_distance_array_size = mesh->info.clip_distance_array_size;
-   s->info.cull_distance_array_size = mesh->info.cull_distance_array_size;
+   s->info.clip_distance_array_size = mesh ? mesh->info.clip_distance_array_size : 0;
+   s->info.cull_distance_array_size = mesh ? mesh->info.cull_distance_array_size : 0;
    s->info.io_lowered = true;
    return s;
 }

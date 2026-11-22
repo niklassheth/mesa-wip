@@ -308,6 +308,14 @@ hk_barycentric_for_coord(nir_builder *b, nir_intrinsic_instr *intr)
    }
 }
 
+static inline unsigned
+hk_per_vertex_copy_slot(uint8_t base, unsigned vertex)
+{
+   if (base == VARYING_SLOT_BFC0 && vertex == 2)
+      return VARYING_SLOT_CLIP_VERTEX;
+   return base + vertex;
+}
+
 bool
 hk_apple9_lower_per_vertex_copies(nir_shader *fs, uint64_t producer_outputs,
                                   struct hk_per_vertex_copies *map)
@@ -348,29 +356,34 @@ hk_apple9_lower_per_vertex_copies(nir_shader *fs, uint64_t producer_outputs,
    if (!map->count && !bary[0] && !bary[1])
       return false;
 
-   /* Allocate from the top of the VAR range. */
+   /* Use dedicated Vulkan-unused varying slots so FS can lower independently
+    * of any producer: TEX0..2, TEX3..5, and {BFC0, BFC1, CLIP_VERTEX} for the
+    * first 3 per-vertex inputs (falling back to unused VAR slots only if >3),
+    * and COL0 / COL1 for perspective / noperspective barycentric weights. */
+   static const uint8_t dedicated_copy_bases[3] = {
+      VARYING_SLOT_TEX0,
+      VARYING_SLOT_TEX3,
+      VARYING_SLOT_BFC0,
+   };
    int next = 31;
    for (unsigned j = 0; j < map->count; ++j) {
+      if (j < ARRAY_SIZE(dedicated_copy_bases)) {
+         map->copy_base[j] = dedicated_copy_bases[j];
+         continue;
+      }
       while (next >= 2 &&
              (used & BITFIELD64_RANGE(VARYING_SLOT_VAR0 + next - 2, 3)))
          --next;
       if (next < 2)
          return false;
-      map->copy_base[j] = next - 2;
+      map->copy_base[j] = VARYING_SLOT_VAR0 + next - 2;
       used |= BITFIELD64_RANGE(VARYING_SLOT_VAR0 + next - 2, 3);
       next -= 3;
    }
-   for (unsigned m = 0; m < 2; ++m) {
-      if (!bary[m])
-         continue;
-      while (next >= 0 && (used & BITFIELD64_BIT(VARYING_SLOT_VAR0 + next)))
-         --next;
-      if (next < 0)
-         return false;
-      map->bary[m] = next + 1;
-      used |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + next);
-      --next;
-   }
+   if (bary[0])
+      map->bary[0] = VARYING_SLOT_COL0;
+   if (bary[1])
+      map->bary[1] = VARYING_SLOT_COL1;
 
    nir_builder b = nir_builder_create(impl);
    nir_foreach_block(block, impl) {
@@ -387,7 +400,7 @@ hk_apple9_lower_per_vertex_copies(nir_shader *fs, uint64_t producer_outputs,
                &b, 3, 32, hk_barycentric_for_coord(&b, intr),
                nir_imm_int(&b, 0), .dest_type = nir_type_float32,
                .io_semantics = {
-                  .location = VARYING_SLOT_VAR0 + map->bary[m] - 1,
+                  .location = map->bary[m],
                   .num_slots = 1,
                });
             nir_def_replace(&intr->def, weights);
@@ -407,7 +420,7 @@ hk_apple9_lower_per_vertex_copies(nir_shader *fs, uint64_t producer_outputs,
             .component = nir_intrinsic_component(intr),
             .dest_type = nir_intrinsic_dest_type(intr),
             .io_semantics = {
-               .location = VARYING_SLOT_VAR0 + map->copy_base[j] + vertex,
+               .location = hk_per_vertex_copy_slot(map->copy_base[j], vertex),
                .num_slots = 1,
             });
          nir_def_replace(&intr->def, flat);
@@ -476,7 +489,7 @@ hk_apple9_write_vertex_weights(nir_shader *vs,
    for (unsigned m = 0; m < 2; ++m) {
       if (!map->bary[m])
          continue;
-      unsigned slot = VARYING_SLOT_VAR0 + map->bary[m] - 1;
+      unsigned slot = map->bary[m];
       nir_store_output(&b, weights, nir_imm_int(&b, 0), .write_mask = 0x7,
                        .src_type = nir_type_float32,
                        .io_semantics.location = slot,
@@ -795,33 +808,30 @@ hk_apple9_line_stipple_slots(const nir_shader *last, const nir_shader *fs)
 
 /*
  * Polygon points are rasterized as points: their hardware facing is always
- * front and their hardware primitive ID counts points. When the fragment
- * shader reads either, a flat uvec2 slot carries the polygon's (back-facing,
- * primitive ID). Vertex and evaluation shaders write (0, ~0): front, and the
- * rasterizer's own primitive ID; the software polygon stage writes the
- * polygon's values.
+ * front and their hardware primitive ID counts points. The software polygon
+ * stage writes the polygon's back-facing bit to VARYING_SLOT_FOGC and its
+ * primitive ID to VARYING_SLOT_PRIMITIVE_ID. Fragment shaders select FOGC == 0
+ * when root.draw.polygon_point_facing is set, and hardware gl_FrontFacing
+ * otherwise; gl_PrimitiveID travels directly via VARYING_SLOT_PRIMITIVE_ID.
  */
 bool
 hk_apple9_lower_polygon_slot(nir_builder *b, nir_intrinsic_instr *intr,
                              void *data)
 {
-   unsigned slot = *(const unsigned *)data;
-   bool face = intr->intrinsic == nir_intrinsic_load_front_face;
-   bool prim = intr->intrinsic == nir_intrinsic_load_input &&
-               nir_intrinsic_io_semantics(intr).location == VARYING_SLOT_PRIMITIVE_ID;
-   if (!face && !prim)
+   unsigned slot = data ? *(const unsigned *)data : VARYING_SLOT_FOGC;
+   if (intr->intrinsic != nir_intrinsic_load_front_face)
       return false;
    b->cursor = nir_after_instr(&intr->instr);
-   nir_def *v = nir_load_input(
-      b, 2, 32, nir_imm_int(b, 0), .dest_type = nir_type_uint32,
+   unsigned offset = hk_root_descriptor_offset(draw.polygon_point_facing);
+   nir_def *use_pp = nir_ine_imm(
+      b, nir_load_ubo(b, 1, 16, nir_imm_int(b, 0), nir_imm_int(b, offset),
+                      .align_mul = 2, .range_base = offset, .range = 2),
+      0);
+   nir_def *back = nir_load_input(
+      b, 1, 32, nir_imm_int(b, 0), .dest_type = nir_type_uint32,
       .io_semantics = {.location = slot, .num_slots = 1});
-   if (face) {
-      nir_def_replace(&intr->def, nir_ieq_imm(b, nir_channel(b, v, 0), 0));
-   } else {
-      nir_def *id = nir_channel(b, v, 1);
-      nir_def *sel = nir_bcsel(b, nir_ieq_imm(b, id, ~0u), &intr->def, id);
-      nir_def_rewrite_uses_after(&intr->def, sel);
-   }
+   nir_def *sel = nir_bcsel(b, use_pp, nir_ieq_imm(b, back, 0), &intr->def);
+   nir_def_rewrite_uses_after(&intr->def, sel);
    return true;
 }
 
@@ -830,8 +840,8 @@ hk_apple9_write_polygon_slot(nir_shader *s, unsigned slot)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(s);
    nir_builder b = nir_builder_at(nir_after_impl(impl));
-   nir_store_output(&b, nir_imm_ivec2(&b, 0, ~0), nir_imm_int(&b, 0),
-                    .write_mask = 0x3, .src_type = nir_type_uint32,
+   nir_store_output(&b, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                    .write_mask = 0x1, .src_type = nir_type_uint32,
                     .io_semantics = {.location = slot, .num_slots = 1});
    s->info.outputs_written |= BITFIELD64_BIT(slot);
    nir_progress(true, impl, nir_metadata_control_flow);
@@ -852,9 +862,9 @@ hk_apple9_write_primitive_id(nir_shader *s)
 
 /* Decide whether a pipeline's polygon-mode points use the software stage:
  * its rasterized points publish the stage's outputs, clip and cull distances
- * included, the polygon slot when the fragment shader reads facing or the
- * primitive ID, point size and any layer or viewport word, within the
- * varying bank. Returns the polygon slot through face_slot (0 if unread).
+ * included, VARYING_SLOT_FOGC (facing) and VARYING_SLOT_PRIMITIVE_ID, point
+ * size and any layer or viewport word, within the varying bank. Returns
+ * VARYING_SLOT_FOGC through face_slot when the fragment shader reads facing.
  */
 bool
 hk_apple9_polygon_point_budget(const nir_shader *last, const nir_shader *fs,
@@ -864,23 +874,17 @@ hk_apple9_polygon_point_budget(const nir_shader *last, const nir_shader *fs,
    unsigned generic = MAX2(hk_apple9_generic_components(last, true),
                            hk_apple9_generic_components(fs, false));
    bool reads_face =
-      BITSET_TEST(fs->info.system_values_read, SYSTEM_VALUE_FRONT_FACE) ||
-      (fs->info.inputs_read & VARYING_BIT_PRIMITIVE_ID);
+      BITSET_TEST(fs->info.system_values_read, SYSTEM_VALUE_FRONT_FACE);
+   bool reads_prim = (fs->info.inputs_read & VARYING_BIT_PRIMITIVE_ID) != 0;
    /* The vertex shader rasterizing mesh records always writes the layer. */
    bool layer = (last->info.outputs_written &
                  (VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT)) ||
                 last->info.stage == MESA_SHADER_MESH;
-   if (generic + 2 * reads_face + 1 + layer > AGX_APPLE9_MAX_VARYING_COMPONENTS)
+   if (generic + reads_face + reads_prim + 1 + layer >
+       AGX_APPLE9_MAX_VARYING_COMPONENTS)
       return false;
-   if (reads_face) {
-      uint64_t used = last->info.outputs_written | fs->info.inputs_read | reserved;
-      for (int k = 31; k >= 0 && !*face_slot; --k) {
-         if (!(used & BITFIELD64_BIT(VARYING_SLOT_VAR0 + k)))
-            *face_slot = VARYING_SLOT_VAR0 + k;
-      }
-      if (!*face_slot)
-         return false;
-   }
+   if (reads_face)
+      *face_slot = VARYING_SLOT_FOGC;
    return true;
 }
 

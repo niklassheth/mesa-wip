@@ -818,6 +818,107 @@ hk_apple9_compile_tes_mesh_program(
    return compiled;
 }
 
+static inline unsigned
+hk_compile_per_vertex_copy_slot(uint8_t base, unsigned vertex)
+{
+   if (base == VARYING_SLOT_BFC0 && vertex == 2)
+      return VARYING_SLOT_CLIP_VERTEX;
+   return base + vertex;
+}
+
+static unsigned
+hk_apple9_output_publications(const nir_shader *nir)
+{
+   uint8_t mask[64] = {0};
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_output)
+               continue;
+            unsigned loc = nir_intrinsic_io_semantics(intr).location;
+            if (nir_src_is_const(intr->src[1]))
+               loc += nir_src_as_uint(intr->src[1]);
+            if (loc >= ARRAY_SIZE(mask) || !agx_apple9_varying_supported(loc))
+               continue;
+            mask[loc] |=
+               nir_intrinsic_write_mask(intr) << nir_intrinsic_component(intr);
+         }
+      }
+   }
+   unsigned pubs = 4; /* VARYING_SLOT_POS */
+   for (unsigned i = 0; i < ARRAY_SIZE(mask); ++i)
+      pubs += util_bitcount(mask[i]);
+   if (nir->info.outputs_written & VARYING_BIT_PSIZ)
+      pubs += 1;
+   if (nir->info.outputs_written & (VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT))
+      pubs += 1;
+   pubs += nir->info.clip_distance_array_size;
+   if (nir->info.cull_distance_array_size)
+      pubs += 1;
+   return pubs;
+}
+
+static bool
+hk_apple9_slot_fits(const nir_shader *nir, unsigned extra)
+{
+   return hk_apple9_output_publications(nir) + extra <=
+          AGX_APPLE9_PUBLICATION_COUNT;
+}
+
+static bool
+hk_apple9_psiz_fits(const nir_shader *nir)
+{
+   if (nir->info.outputs_written & VARYING_BIT_PSIZ)
+      return true;
+   return hk_apple9_slot_fits(nir, 1);
+}
+
+static bool
+hk_compile_split_pp_face_prim(nir_builder *b, nir_intrinsic_instr *intr,
+                              UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output ||
+       nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_FOGC ||
+       intr->src[0].ssa->num_components < 2)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *val = intr->src[0].ssa;
+   nir_store_output(b, nir_channel(b, val, 0), nir_imm_int(b, 0),
+                    .write_mask = 0x1, .src_type = nir_type_uint32,
+                    .io_semantics = {.location = VARYING_SLOT_FOGC,
+                                     .num_slots = 1});
+   nir_store_output(b, nir_channel(b, val, 1), nir_imm_int(b, 0),
+                    .write_mask = 0x1, .src_type = nir_type_uint32,
+                    .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_ID,
+                                     .num_slots = 1});
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+static bool
+hk_apple9_lower_viewport_fs(nir_builder *b, nir_intrinsic_instr *intr,
+                            UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_input)
+      return false;
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   if (sem.location != VARYING_SLOT_VIEWPORT)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   unsigned offset = hk_root_descriptor_offset(draw.producer_writes_viewport);
+   nir_def *written = nir_ine_imm(
+      b, nir_load_ubo(b, 1, 16, nir_imm_int(b, 0), nir_imm_int(b, offset),
+                      .align_mul = 2, .range_base = offset, .range = 2),
+      0);
+   nir_def *zero = nir_imm_zero(b, intr->def.num_components, intr->def.bit_size);
+   nir_def *sel = nir_bcsel(b, written, &intr->def, zero);
+   nir_def_rewrite_uses_after(&intr->def, sel);
+   return true;
+}
+
 /* Evaluation shaders run as the hardware vertex program over the tessellated
  * domain, and as a software vertex program when a geometry shader or
  * transform feedback follows. Does not take ownership of nir.
@@ -852,10 +953,20 @@ hk_apple9_compile_tes(struct hk_device *dev, nir_shader *nir,
     * passthrough for transform feedback or a cull mask. */
    nir_shader *clone = nir_shader_clone(NULL, nir);
 
+   bool point_mode = nir->info.tess.point_mode;
+   unsigned psiz_reserve =
+      point_mode && !(nir->info.outputs_written & VARYING_BIT_PSIZ) ? 1 : 0;
+   /* Always publish TES patch ID on the HW variant when it fits, so FS reads
+    * VARYING_SLOT_PRIMITIVE_ID via flat varying without cross-stage recompile. */
+   if (!(nir->info.outputs_written & VARYING_BIT_PRIMITIVE_ID) &&
+       hk_apple9_slot_fits(nir, 1 + psiz_reserve))
+      hk_apple9_write_primitive_id(nir);
+
    struct agx_apple9_vertex_layout layout = *vertex;
-   layout.rasterize_points = nir->info.tess.point_mode;
-   layout.ignore_point_size = !layout.rasterize_points;
+   layout.outputs_flat |= VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_VIEWPORT;
    NIR_PASS(_, nir, poly_nir_lower_tes, true);
+   layout.rasterize_points = point_mode || hk_apple9_psiz_fits(nir);
+   layout.ignore_point_size = !layout.rasterize_points;
    hk_apple9_lower_prerast_sysvals(nir, MESA_SHADER_TESS_EVAL);
    if (agx_apple9_debug_enabled(AGX_A9_DBG_NIR))
       nir_print_shader(nir, stderr);
@@ -1082,13 +1193,20 @@ hk_apple9_lower_gs_polygon_points(nir_shader *gs, struct hk_pp_info info,
    }
    util_dynarray_fini(&todo);
 
+   if (info.face_slot == VARYING_SLOT_FOGC) {
+      nir_shader_intrinsics_pass(gs, hk_compile_split_pp_face_prim,
+                                 nir_metadata_control_flow, NULL);
+   }
    gs->info.gs.output_primitive = MESA_PRIM_POINTS;
    gs->info.gs.vertices_out = MAX2(triangles * per_triangle, 1);
    gs->info.outputs_written &= ~VARYING_BIT_PRIMITIVE_ID;
    if (!point_size)
       gs->info.outputs_written &= ~VARYING_BIT_PSIZ;
-   if (info.face_slot)
+   if (info.face_slot) {
       gs->info.outputs_written |= BITFIELD64_BIT(info.face_slot);
+      if (info.face_slot == VARYING_SLOT_FOGC)
+         gs->info.outputs_written |= VARYING_BIT_PRIMITIVE_ID;
+   }
    nir_progress(true, impl, nir_metadata_none);
    NIR_PASS(_, gs, nir_lower_vars_to_ssa);
 }
@@ -1156,6 +1274,10 @@ hk_apple9_compile_gs(struct hk_device *dev, nir_shader *nir,
                                          reason);
    if (result == VK_SUCCESS) {
       struct agx_apple9_vertex_layout layout = *vertex;
+      layout.outputs_flat |=
+         VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_VIEWPORT |
+         VARYING_BIT_FOGC | VARYING_BIT_TEX6;
+      layout.outputs_linear |= VARYING_BIT_TEX7;
       layout.cull_distance_mask = cull_mask;
       layout.rasterize_points = info.mode == MESA_PRIM_POINTS;
       layout.ignore_point_size = !layout.rasterize_points;
@@ -1182,7 +1304,6 @@ hk_apple9_compile_gs(struct hk_device *dev, nir_shader *nir,
 static VkResult
 hk_apple9_compile_mesh(struct hk_device *dev, nir_shader *nir,
                        const struct agx_apple9_vertex_layout *vertex,
-                       bool clip_negative_one_to_one,
                        const struct hk_per_vertex_copies *copies,
                        struct hk_apple9_stipple_slots stipple,
                        const struct hk_pp_info *polygon_points,
@@ -1218,18 +1339,25 @@ hk_apple9_compile_mesh(struct hk_device *dev, nir_shader *nir,
 
    if (result == VK_SUCCESS) {
       struct agx_apple9_vertex_layout layout = *vertex;
+      layout.outputs_flat |=
+         VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_VIEWPORT |
+         VARYING_BIT_FOGC | VARYING_BIT_TEX6;
+      layout.outputs_linear |= VARYING_BIT_TEX7;
       layout.rasterize_points =
          info.prim == MESA_PRIM_POINTS || info.polygon_points;
       layout.ignore_point_size = !layout.rasterize_points;
       if (stipple.start)
          hk_apple9_write_line_stipple_start(rast_nir, stipple);
       hk_apple9_lower_prerast_sysvals(rast_nir, MESA_SHADER_VERTEX);
-      /* The generated vertex shader writes the rasterized position. */
-      if (clip_negative_one_to_one) {
+      /* Always map depth dynamically via root.draw.clip_z_coeff so emulated
+       * mesh never keys on VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE. Polygon-point
+       * mesh-rast applies clip_z_coeff inside hk_mesh_pp_load before clipping. */
+      if (!info.polygon_points) {
+         bool dynamic_clip = true;
          NIR_PASS(_, rast_nir, nir_lower_clip_halfz_dynamic);
          NIR_PASS(_, rast_nir, nir_shader_intrinsics_pass,
                   hk_apple9_lower_clip_z_coeff, nir_metadata_control_flow,
-                  NULL);
+                  &dynamic_clip);
       }
       if (agx_apple9_debug_enabled(AGX_A9_DBG_NIR))
          nir_print_shader(rast_nir, stderr);
@@ -1617,22 +1745,26 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
    }
 
    /* Per-vertex inputs are read as flat copies, written by the passthrough
-    * geometry shader of vertex-shader pipelines, or by the vertex shader
-    * rasterizing mesh records.
+    * geometry shader of vertex/evaluation-shader pipelines, or by the vertex
+    * shader rasterizing mesh records. Dedicated Vulkan-unused slots let FS
+    * lower per-vertex and barycentric inputs independently of any producer.
     */
    struct hk_per_vertex_copies per_vertex = {0};
    bool copies_from_gs = false;
    struct hk_apple9_stipple_slots stipple = {0};
-   bool stipple_first = false;
    bool polygon_points = false;
+   bool may_polygon_points =
+      key.polygon_points ||
+      !state || !state->rs ||
+      (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ||
+      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE) ||
+      state->rs->polygon_mode == VK_POLYGON_MODE_POINT;
    unsigned polygon_face_slot = 0;
    mesa_shader_stage polygon_stage = MESA_SHADER_NONE;
    mesa_shader_stage stipple_stage = MESA_SHADER_NONE;
-   bool tes_primitive_id = false;
    {
       nir_shader *pre_nir = NULL, *fs_nir = NULL;
       nir_shader *stage_nir[MESA_VULKAN_SHADER_STAGES] = {NULL};
-      bool other = false;
       for (unsigned i = 0; i < count; ++i) {
          stage_nir[infos[i].stage] = infos[i].nir;
          if (infos[i].stage == MESA_SHADER_VERTEX ||
@@ -1640,29 +1772,16 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             pre_nir = infos[i].nir;
          else if (infos[i].stage == MESA_SHADER_FRAGMENT)
             fs_nir = infos[i].nir;
-         else if (infos[i].stage != MESA_SHADER_TASK)
-            other = true;
       }
-      /* After tessellation without a geometry shader, the fragment shader's
-       * primitive ID is the patch ID, numbered per instance. The hardware
-       * counts the tessellated triangles of the whole draw instead, so the
-       * evaluation shader publishes its own primitive ID (the patch ID) as
-       * the flat varying the fragment shader then reads, as RADV's
-       * export_prim_id does. */
-      tes_primitive_id =
-         stage_nir[MESA_SHADER_TESS_EVAL] && !stage_nir[MESA_SHADER_GEOMETRY] &&
-         fs_nir && (fs_nir->info.inputs_read & VARYING_BIT_PRIMITIVE_ID) &&
-         !(stage_nir[MESA_SHADER_TESS_EVAL]->info.outputs_written &
-           VARYING_BIT_PRIMITIVE_ID);
-      if (pre_nir && fs_nir && !other &&
-          hk_apple9_lower_per_vertex_copies(fs_nir,
-                                            pre_nir->info.outputs_written,
-                                            &per_vertex))
-         copies_from_gs = pre_nir->info.stage == MESA_SHADER_VERTEX;
+      if (fs_nir && !stage_nir[MESA_SHADER_GEOMETRY] &&
+          hk_apple9_lower_per_vertex_copies(
+             fs_nir, pre_nir ? pre_nir->info.outputs_written : 0, &per_vertex))
+         copies_from_gs = !pre_nir || pre_nir->info.stage != MESA_SHADER_MESH;
 
-      /* Stippled lines measure their counter from the segment start the last
-       * pre-rasterization stage exports: a vertex shader, an evaluation shader
-       * drawing isolines, or a geometry shader emitting line strips. */
+      /* Stippled lines use dedicated Vulkan-unused slots TEX6 (flat start +
+       * counter) and TEX7 (noperspective axis). For VS/TES, the passthrough
+       * geometry shader computes them directly from POS/VIEWPORT with zero
+       * VS/TES modification; app GS and emulated Mesh emit them directly. */
       nir_shader *last = NULL;
       if (stage_nir[MESA_SHADER_GEOMETRY]) {
          if (stage_nir[MESA_SHADER_GEOMETRY]->info.gs.output_primitive ==
@@ -1682,51 +1801,38 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
          last = pre_nir;
       } else if (pre_nir && pre_nir->info.stage == MESA_SHADER_MESH &&
                  pre_nir->info.mesh.primitive_type == MESA_PRIM_LINES) {
-         /* Mesh lines are independent: the generated rasterizing vertex
-          * shader exports the start as a vertex shader does. */
          last = pre_nir;
       }
       if (key.line_stipple && last && fs_nir) {
-         stipple = hk_apple9_line_stipple_slots(last, fs_nir);
-         if (stipple.start) {
+         if (hk_apple9_slot_fits(last, HK_APPLE9_STIPPLE_COMPONENTS)) {
+            stipple.start = VARYING_SLOT_TEX6;
+            stipple.axis = VARYING_SLOT_TEX7;
             stipple_stage = last->info.stage;
+            hk_apple9_lower_line_stipple_fs(fs_nir, stipple);
          } else {
             static bool warned;
             if (!warned) {
                mesa_logw("Apple9: line stipple is ignored when the last "
                          "pre-rasterization stage uses more than %u of %u "
-                         "output components or 31 generic slots",
+                         "output components",
                          HK_APPLE9_OUTPUT_COMPONENTS -
                             HK_APPLE9_STIPPLE_COMPONENTS,
                          HK_APPLE9_OUTPUT_COMPONENTS);
                warned = true;
             }
          }
-         if (stipple.start) {
-            hk_apple9_lower_line_stipple_fs(fs_nir, stipple);
-            /* The stipple start needs the segment's first vertex. Under the
-             * last-vertex mode it can still provoke when no input the
-             * application can see is taken from the provoking vertex: no
-             * flat varyings, viewport index or layer. Primitive ID is not
-             * taken from a vertex. */
-            const uint64_t provoked =
-               VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT |
-               BITFIELD64_RANGE(VARYING_SLOT_COL0, 2) |
-               BITFIELD64_RANGE(VARYING_SLOT_BFC0, 2) |
-               BITFIELD64_RANGE(VARYING_SLOT_TEX0, 8) |
-               BITFIELD64_BIT(VARYING_SLOT_FOGC) |
-               BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32);
-            uint64_t flat = fs_nir->info.inputs_read &
-                            ~(fs_nir->info.perspective_varyings |
-                              fs_nir->info.linear_varyings) &
-                            ~BITFIELD64_BIT(stipple.start);
-            /* Geometry shaders choose the start for either mode. */
-            stipple_first =
-               stipple_stage != MESA_SHADER_GEOMETRY &&
-               stipple_stage != MESA_SHADER_MESH && !(flat & provoked) &&
-               !(last->info.outputs_written &
-                 (VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT));
-         }
+      }
+
+      /* Lower FS gl_FrontFacing independently when polygon mode may be POINT
+       * (static POINT, dynamic polygon mode, ESO, or GPL): selects flat(FOGC)==0
+       * when root.draw.polygon_point_facing is nonzero, else load_front_face(). */
+      if (fs_nir && !fs_nir->info.internal && may_polygon_points &&
+          BITSET_TEST(fs_nir->info.system_values_read, SYSTEM_VALUE_FRONT_FACE)) {
+         polygon_face_slot = VARYING_SLOT_FOGC;
+         NIR_PASS(_, fs_nir, nir_shader_intrinsics_pass,
+                  hk_apple9_lower_polygon_slot, nir_metadata_control_flow,
+                  &polygon_face_slot);
+         nir_shader_gather_info(fs_nir, nir_shader_get_entrypoint(fs_nir));
       }
 
       /* Polygon-mode points take the software polygon stage when the last
@@ -1752,16 +1858,11 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
          }
          if (mesh_nir)
             reserved |= BITFIELD64_BIT(HK_MESH_PRIMITIVE_SLOT);
+         unsigned budget_face_slot = 0;
          polygon_points = hk_apple9_polygon_point_budget(pp_last, fs_nir, reserved,
-                                                         &polygon_face_slot);
+                                                         &budget_face_slot);
          if (polygon_points)
             polygon_stage = pp_last->info.stage;
-         if (polygon_points && polygon_face_slot) {
-            NIR_PASS(_, fs_nir, nir_shader_intrinsics_pass,
-                     hk_apple9_lower_polygon_slot, nir_metadata_control_flow,
-                     &polygon_face_slot);
-            nir_shader_gather_info(fs_nir, nir_shader_get_entrypoint(fs_nir));
-         }
          if (!polygon_points) {
             static bool warned;
             if (!warned) {
@@ -1870,8 +1971,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
 #endif
          shader->info.set_count = infos[i].set_layout_count;
          shader->info.apple9_render_targets = key.targets;
-         shader->info.apple9_line_stipple_first =
-            stage == MESA_SHADER_FRAGMENT && stipple_first;
+         shader->info.apple9_line_stipple_first = false;
          if (!hk_apple9_texture_bindings(nir) ||
              !agx_nir_lower_apple9_runtime_sampler_state(nir, &reason)) {
             reason = reason ?: "texture operation without a descriptor handle";
@@ -1926,17 +2026,11 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                   }
                }
             }
-            if (stipple_stage == MESA_SHADER_VERTEX)
-               hk_apple9_write_line_stipple_start(nir, stipple);
-            if (polygon_stage == MESA_SHADER_VERTEX && polygon_face_slot)
-               hk_apple9_write_polygon_slot(nir, polygon_face_slot);
-            /* Transform feedback and flat copies of per-vertex inputs are
-             * layered on a passthrough geometry shader, which consumes the
-             * software vertex shader.
+            /* Transform feedback, flat copies of per-vertex inputs, line
+             * stipple, and polygon points are layered on a passthrough
+             * geometry shader, which consumes the software vertex shader
+             * with zero VS output modification for stipple/polygon points.
              */
-            /* The software variant feeds a geometry stage: the
-             * application's, or a passthrough. A cull mask also needs one,
-             * which is known once the hardware variant is compiled. */
             bool sw_needed =
                (infos[i].next_stage_mask &
                 (VK_SHADER_STAGE_GEOMETRY_BIT |
@@ -1966,12 +2060,23 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
              * triangle lists need no passthrough geometry shader. */
             if (!per_vertex.count && hk_per_vertex_copies_used(&per_vertex))
                hk_apple9_write_vertex_weights(nir, &per_vertex);
+            struct agx_apple9_vertex_layout vs_layout = key.vertex;
             if (sw_needed)
-               key.vertex.use_prolog = false;
-            shader->info.apple9_vertex_unbounded = key.vertex.unbounded;
+               vs_layout.use_prolog = false;
+            /* Dynamic topology (or ESO/GPL without IA state): always run
+             * point-size lowering and synthesize default 1.0 when unwritten
+             * if output slots fit. */
+            if (!vs_layout.rasterize_points && !vs_layout.ignore_point_size &&
+                hk_apple9_psiz_fits(nir)) {
+               vs_layout.rasterize_points = true;
+               vs_layout.ignore_point_size = false;
+            }
+            if (nir->info.outputs_written & VARYING_BIT_VIEWPORT)
+               vs_layout.outputs_flat |= VARYING_BIT_VIEWPORT;
+            shader->info.apple9_vertex_unbounded = vs_layout.unbounded;
             bool cull_mask;
             hk_assert_final_push_mask(nir, shader);
-            if (!hk_apple9_compile_vertex_culls(nir, &key.vertex, &shader->b,
+            if (!hk_apple9_compile_vertex_culls(nir, &vs_layout, &shader->b,
                                                 &cull_mask, &reason)) {
                ralloc_free(sw_nir);
                reason = reason ?: "unsupported vertex NIR";
@@ -1981,7 +2086,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             }
             shader->info.cull_mask = sw->info.cull_mask = cull_mask;
             if (sw_needed || cull_mask) {
-               result = hk_apple9_compile_sw_vs(dev, sw_nir, &key.vertex, sw,
+               result = hk_apple9_compile_sw_vs(dev, sw_nir, &vs_layout, sw,
                                                 &reason);
             }
             ralloc_free(sw_nir);
@@ -2016,17 +2121,17 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                varyings = hk_native_producer_main(obj)->b.info.apple9_varyings;
                continue;
             }
-            if (stipple_stage == MESA_SHADER_TESS_EVAL)
-               hk_apple9_write_line_stipple_start(nir, stipple);
-            if (polygon_stage == MESA_SHADER_TESS_EVAL && polygon_face_slot)
-               hk_apple9_write_polygon_slot(nir, polygon_face_slot);
-            if (tes_primitive_id)
-               hk_apple9_write_primitive_id(nir);
+            bool tes_sw_needed =
+               polygon_stage == MESA_SHADER_TESS_EVAL ||
+               stipple_stage == MESA_SHADER_TESS_EVAL ||
+               copies_from_gs || !state ||
+               (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ||
+               BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE) ||
+               BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE);
             result = hk_apple9_compile_tes(
                dev, nir, &key.vertex, obj,
                infos[i].next_stage_mask |
-                  (polygon_stage == MESA_SHADER_TESS_EVAL
-                      ? VK_SHADER_STAGE_GEOMETRY_BIT : 0),
+                  (tes_sw_needed ? VK_SHADER_STAGE_GEOMETRY_BIT : 0),
                &reason);
             if (result != VK_SUCCESS)
                goto done;
@@ -2058,7 +2163,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                   .clip = nir->info.clip_distance_array_size,
                   .cull = nir->info.cull_distance_array_size,
                   .flat = key.vertex.outputs_flat,
-                  .face_slot = polygon_face_slot,
+                  .face_slot = VARYING_SLOT_FOGC,
                };
                hk_apple9_lower_gs_polygon_points(
                   nir, info, hk_device_physical(dev)->vk.properties.polygonModePointSize);
@@ -2088,10 +2193,10 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                .clip = nir->info.clip_distance_array_size,
                .cull = nir->info.cull_distance_array_size,
                .flat = key.vertex.outputs_flat,
-               .face_slot = polygon_face_slot,
+               .face_slot = VARYING_SLOT_FOGC,
             };
             result = hk_apple9_compile_mesh(
-               dev, nir, &key.vertex, key.clip_negative_one_to_one, &per_vertex,
+               dev, nir, &key.vertex, &per_vertex,
                stipple_stage == MESA_SHADER_MESH
                   ? stipple : (struct hk_apple9_stipple_slots){0},
                polygon_stage == MESA_SHADER_MESH ? &pp : NULL,
@@ -2105,9 +2210,9 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             shader->info.fs.interp.linear = key.vertex.outputs_linear;
             shader->info.fs.interp.flat = key.vertex.outputs_flat;
             shader->info.fs.line_stipple_start = stipple.start;
-            shader->info.fs.polygon_points = polygon_points;
+            shader->info.fs.polygon_points = may_polygon_points || polygon_points;
             shader->info.fs.polygon_face_slot = polygon_face_slot;
-            if (copies_from_gs) {
+            if (hk_per_vertex_copies_used(&per_vertex)) {
                shader->info.fs.per_vertex_copies = per_vertex.count;
                memcpy(shader->info.fs.per_vertex_bary, per_vertex.bary,
                       sizeof(per_vertex.bary));
@@ -2130,10 +2235,13 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                              !nir->info.writes_memory &&
                              !key.sample_shading &&
                              !hk_apple9_interpolates_off_center(nir);
-               if (!key.no_fs_statistics)
+               if (dev->vk.enabled_features.pipelineStatisticsQuery)
                   hk_apple9_lower_fs_statistics(nir);
                NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                         hk_apple9_clamp_depth_export,
+                        nir_metadata_control_flow, NULL);
+               NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+                        hk_apple9_lower_viewport_fs,
                         nir_metadata_control_flow, NULL);
             }
             shader->info.fs.writes_memory = nir->info.writes_memory;
@@ -2153,9 +2261,10 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             } else {
                hk_apple9_remap_fs_outputs(nir, key.color_map);
             }
-            /* The passthrough geometry shader produces the flat copies, and
-             * per-vertex inputs read only through copies are not rasterized.
-             * The mesh rasterization shader's layout already has the copies.
+            /* The passthrough geometry shader produces the flat copies,
+             * line-stipple TEX6/TEX7, and polygon-point FOGC. Keep them in
+             * the producer layout passed to the fragment compiler so
+             * apple9_strip_unread_fragment_inputs does not strip them.
              */
             for (unsigned j = 0; copies_from_gs && j < per_vertex.count; ++j) {
                unsigned source = VARYING_SLOT_VAR0 + per_vertex.location[j];
@@ -2168,7 +2277,8 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             }
             for (unsigned j = 0; copies_from_gs && j < per_vertex.count; ++j) {
                for (unsigned k = 0; k < 3; ++k) {
-                  unsigned slot = VARYING_SLOT_VAR0 + per_vertex.copy_base[j] + k;
+                  unsigned slot =
+                     hk_compile_per_vertex_copy_slot(per_vertex.copy_base[j], k);
                   if (!varyings.mask[slot]) {
                      varyings.mask[slot] = 0xf;
                      varyings.group[slot] = 1;
@@ -2177,12 +2287,31 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                }
             }
             for (unsigned m = 0; copies_from_gs && m < 2; ++m) {
-               unsigned slot = VARYING_SLOT_VAR0 + per_vertex.bary[m] - 1;
-               if (per_vertex.bary[m] && !varyings.mask[slot]) {
+               unsigned slot = per_vertex.bary[m];
+               if (slot && !varyings.mask[slot]) {
                   varyings.mask[slot] = 0x7;
                   varyings.group[slot] = m ? 2 : 0;
                   varyings.count += 3;
                }
+            }
+            if (stipple.start &&
+                (stipple_stage == MESA_SHADER_VERTEX ||
+                 stipple_stage == MESA_SHADER_TESS_EVAL)) {
+               if (!varyings.mask[stipple.start]) {
+                  varyings.mask[stipple.start] = 0x7;
+                  varyings.group[stipple.start] = 1;
+                  varyings.count += 3;
+               }
+               if (!varyings.mask[stipple.axis]) {
+                  varyings.mask[stipple.axis] = 0x3;
+                  varyings.group[stipple.axis] = 2;
+                  varyings.count += 2;
+               }
+            }
+            if (polygon_face_slot && !varyings.mask[polygon_face_slot]) {
+               varyings.mask[polygon_face_slot] = 0x1;
+               varyings.group[polygon_face_slot] = 1;
+               varyings.count += 1;
             }
             struct blob dump_nir;
             const bool dump = hk_apple9_fragment_dump_begin(nir, &dump_nir);
@@ -2342,7 +2471,7 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
       }
    }
 
-   nir_shader *mesh = NULL, *gs = NULL, *tes = NULL, *tcs = NULL;
+   nir_shader *mesh = NULL, *gs = NULL, *tes = NULL;
    bool task = false, tess = false, per_vertex = false, fs_inputs = false;
    bool producer_effects = false;
    for (unsigned i = 0; i < count; ++i) {
@@ -2354,8 +2483,6 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
          gs = infos[i].nir;
       if (infos[i].stage == MESA_SHADER_TESS_EVAL)
          tes = infos[i].nir;
-      if (infos[i].stage == MESA_SHADER_TESS_CTRL)
-         tcs = infos[i].nir;
       tess |= infos[i].stage == MESA_SHADER_TESS_CTRL ||
               infos[i].stage == MESA_SHADER_TESS_EVAL;
       task |= infos[i].stage == MESA_SHADER_TASK;
@@ -2389,7 +2516,7 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
             !producer_effects &&
             !key.polygon_points && !key.line_stipple)
       result = hk_apple9_native_gs_check(gs, &key, &native, &reason);
-   else if (tes && tcs && !gs && !mesh && !task && !per_vertex &&
+   else if (tes && !gs && !mesh && !task && !per_vertex &&
             (!fs_inputs || hk_apple9_native_tess_enabled()) &&
             !producer_effects &&
             !key.polygon_points && !key.line_stipple)
@@ -2547,11 +2674,82 @@ hk_apple9_compile_internal_gs(struct hk_device *dev, nir_shader *nir,
    };
    struct hk_apple9_graphics_key key;
    hk_apple9_graphics_key_device(&key, NULL, hk_device_physical(dev));
+   /* The SW-VS/SW-TES feeding a passthrough GS already applied clip-space
+    * depth mapping; passthrough GS forwards scalarized POS untouched. */
+   key.clip_negative_one_to_one = false;
+   key.clip_negative_one_to_one_dynamic = false;
    key.gs_cull_planes = !cull_mask;
    struct vk_shader *shader = NULL;
    VkResult result =
       hk_apple9_compile_graphics(dev, 1, &info, NULL, &key, fs_interp, NULL, &shader);
    *out = shader ? container_of(shader, struct hk_api_shader, vk) : NULL;
    return result;
+}
+
+/* Compile an internal mesh-rasterization vertex shader (for hk_meta_shader
+ * cache variants: per_vertex, line_stipple, polygon_points). Takes ownership
+ * of nir.
+ */
+VkResult
+hk_apple9_compile_internal_mesh_rast(struct hk_device *dev, nir_shader *nir,
+                                     const struct hk_mesh_info *info,
+                                     const uint64_t fs_interp[2],
+                                     bool polygon_points,
+                                     struct hk_api_shader **out)
+{
+   size_t size = sizeof(struct hk_api_shader) +
+                 hk_num_variants(MESA_SHADER_VERTEX) * sizeof(struct hk_shader);
+   struct hk_api_shader *obj =
+      vk_shader_zalloc(&dev->vk, &hk_shader_ops, MESA_SHADER_VERTEX, NULL, size);
+   if (!obj) {
+      ralloc_free(nir);
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+   hk_foreach_variant(obj, variant) {
+      variant->info.stage = MESA_SHADER_VERTEX;
+      variant->info.mesh = *info;
+      variant->info.mesh.polygon_points = polygon_points;
+      variant->b.info.stats.instrs = 1;
+#ifndef NDEBUG
+      variant->debug_owner = obj;
+#endif
+   }
+   obj->pre_raster_reads = HK_READS_INTERNAL;
+
+   struct hk_shader *rast = &obj->variants[HK_VS_VARIANT_HW];
+   hk_apple9_lower_prerast_sysvals(nir, MESA_SHADER_VERTEX);
+   if (!polygon_points) {
+      bool dynamic_clip = true;
+      NIR_PASS(_, nir, nir_lower_clip_halfz_dynamic);
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_apple9_lower_clip_z_coeff,
+               nir_metadata_control_flow, &dynamic_clip);
+   }
+
+   struct agx_apple9_vertex_layout layout = {
+      .outputs_flat = (fs_interp ? fs_interp[0] : 0) |
+                      VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_VIEWPORT |
+                      VARYING_BIT_FOGC | VARYING_BIT_TEX6,
+      .outputs_linear = (fs_interp ? fs_interp[1] : 0) | VARYING_BIT_TEX7,
+      .rasterize_points = info->prim == MESA_PRIM_POINTS || polygon_points,
+   };
+   layout.ignore_point_size = !layout.rasterize_points;
+
+   const char *reason = NULL;
+   VkResult result = VK_SUCCESS;
+   if (agx_compile_apple9_vertex_inputs(nir, &layout, &rast->b, &reason))
+      result = hk_apple9_finish_shader(dev, rast, nir);
+   else
+      result = vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                         "Apple9 mesh rast meta: %s",
+                         reason ? reason : "unsupported NIR");
+   ralloc_free(nir);
+   if (result != VK_SUCCESS) {
+      hk_api_shader_destroy(&dev->vk, &obj->vk, NULL);
+      *out = NULL;
+      return result;
+   }
+   hk_api_shader_init_constant_data(obj);
+   *out = obj;
+   return VK_SUCCESS;
 }
 

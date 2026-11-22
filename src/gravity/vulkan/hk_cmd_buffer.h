@@ -98,11 +98,14 @@ struct hk_root_descriptor_table {
 
          float blend_constant[4];
          uint16_t no_epilog_discard;
-         uint16_t _pad1;
+         /* Nonzero if the bound pre-rast producer writes VARYING_SLOT_VIEWPORT. */
+         uint16_t producer_writes_viewport;
          uint16_t api_sample_mask;
-         uint16_t _pad2;
+         /* Nonzero if software polygon-mode POINT supplies facing via FOGC. */
+         uint16_t polygon_point_facing;
          uint16_t force_never_in_shader;
-         uint16_t _pad3;
+         /* Nonzero if depth clamping is enabled (guards early-depth clamp). */
+         uint16_t depth_clamp_enable;
          uint16_t provoking;
          /* Rasterized primitive class for per-vertex fragment inputs:
           * 0 triangles, 1 lines, 2 points; bit 2 if the rasterizer's vertex
@@ -114,7 +117,8 @@ struct hk_root_descriptor_table {
           * should not contribute to pipeline statistics.
           */
          uint16_t api_gs;
-         uint16_t _pad5;
+         /* log2(rasterization_samples) for dynamic MSAA sysvals. */
+         uint16_t samples_log2;
 
          uint16_t rasterization_stream;
          uint16_t _pad6;
@@ -154,7 +158,7 @@ struct hk_root_descriptor_table {
 
 /* Bumped whenever hk_root_descriptor_table offsets change: compiled shaders
  * bake them, so pipeline and disk cache keys include it. */
-#define HK_ROOT_LAYOUT_VERSION 5
+#define HK_ROOT_LAYOUT_VERSION 6
 
 /* helper macro for computing root descriptor byte offsets */
 #define hk_root_descriptor_offset(member)                                      \
@@ -1608,6 +1612,18 @@ void hk_apple9_compute_sysvals(struct hk_device *dev, void *out);
 bool hk_apple9_upload_textures(struct hk_cmd_buffer *cmd,
    const struct hk_shader *shader, bool graphics, bool first_fan, bool lines,
    uint64_t *textures, uint64_t *samplers, uint64_t *sysvals);
+
+/* Cached mesh-rasterization vertex shader variants for per_vertex,
+ * line_stipple, and polygon_points without cross-stage recompilation. */
+struct hk_api_shader *
+hk_apple9_mesh_rast_meta(struct hk_device *dev,
+                         const struct hk_shader *mesh_main,
+                         const struct hk_shader *fs,
+                         bool line_stipple, bool polygon_points);
+VkResult hk_apple9_compile_internal_mesh_rast(
+   struct hk_device *dev, nir_shader *nir, const struct hk_mesh_info *info,
+   const uint64_t fs_interp[2], bool polygon_points,
+   struct hk_api_shader **out);
 
 /* Discard retained CPU storage of an initial command buffer. */
 void hk_trim_cmd_buffer(struct hk_cmd_buffer *cmd);
