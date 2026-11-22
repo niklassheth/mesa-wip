@@ -5,6 +5,7 @@
 
 #include "agx_apple9_ir.h"
 #include "agx_apple9_machine.h"
+#include "agx_apple9_mesh.h"
 #include "agx_compile_apple9.h"
 #include "agx_debug.h"
 #include "gravity/lib/agx_abi.h"
@@ -15403,4 +15404,597 @@ TEST(Apple9Compiler, PatchVsVaryingsMatchesRecompileBitForBit)
    free(ref_out.binary);
    ralloc_free(vs_base);
    ralloc_free(vs_ref);
+}
+
+static bool
+apple9_binary_contains(const agx_shader_part &out, const uint8_t *needle,
+                       size_t needle_len)
+{
+   if (!out.binary || out.info.main_size < needle_len)
+      return false;
+   const uint8_t *bytes = (const uint8_t *)out.binary;
+   for (size_t i = 0; i + needle_len <= out.info.main_size; ++i) {
+      if (!memcmp(bytes + i, needle, needle_len))
+         return true;
+   }
+   return false;
+}
+
+TEST(Apple9Compiler, CullPrologLinkedAndStandalone)
+{
+   const uint8_t abi_ret[4] = {0x8f, 0x02, 0x54, 0x00};
+   const uint8_t tile_600[6] = {0x87, 0x02, 0x54, 0x00, 0x06, 0x00};
+   const uint8_t tile_80c[6] = {0x87, 0x02, 0x54, 0x0c, 0x08, 0x00};
+
+   /* Linked mask prolog */
+   {
+      agx_apple9_cull_prolog_key key = {
+         .mask = true, .count = 1, .cf_base = 5, .standalone = false,
+      };
+      agx_shader_part out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_cull_prolog(&key, &out, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(out.info.apple9_uses_discard);
+      EXPECT_EQ(out.info.apple9_resource_count, 0u);
+      EXPECT_FALSE(apple9_binary_contains(out, tile_600, sizeof(tile_600)));
+      EXPECT_FALSE(apple9_binary_contains(out, tile_80c, sizeof(tile_80c)));
+      EXPECT_TRUE(apple9_binary_contains(out, abi_ret, sizeof(abi_ret)));
+      free(out.binary);
+   }
+
+   /* Linked linear planes prolog (4 cull distances) */
+   {
+      agx_apple9_cull_prolog_key key = {
+         .mask = false, .count = 4, .cf_base = 3, .standalone = false,
+      };
+      agx_shader_part out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_cull_prolog(&key, &out, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(out.info.apple9_uses_discard);
+      EXPECT_FALSE(apple9_binary_contains(out, tile_600, sizeof(tile_600)));
+      EXPECT_TRUE(apple9_binary_contains(out, abi_ret, sizeof(abi_ret)));
+      free(out.binary);
+   }
+
+   /* Standalone depth-only cull prologs (mask & planes) */
+   for (bool mask : {false, true}) {
+      agx_apple9_cull_prolog_key key = {
+         .mask = mask, .count = mask ? (uint8_t)1 : (uint8_t)2,
+         .cf_base = 1, .standalone = true,
+      };
+      agx_shader_part out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_cull_prolog(&key, &out, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(out.info.apple9_uses_discard);
+      EXPECT_FALSE(apple9_binary_contains(out, abi_ret, sizeof(abi_ret)));
+      free(out.binary);
+   }
+}
+
+TEST(Apple9Compiler, StipplePrologLinkedAndStandalone)
+{
+   const uint8_t abi_ret[4] = {0x8f, 0x02, 0x54, 0x00};
+   const uint8_t tile_600[6] = {0x87, 0x02, 0x54, 0x00, 0x06, 0x00};
+
+   for (bool standalone : {false, true}) {
+      agx_apple9_stipple_prolog_key key = {
+         .cf_base = standalone ? (uint8_t)1 : (uint8_t)6,
+         .standalone = standalone,
+      };
+      agx_shader_part out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_stipple_prolog(&key, &out, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(out.info.apple9_uses_discard);
+      ASSERT_GE(out.info.apple9_resource_count, 1u);
+      EXPECT_EQ(out.info.apple9_resource_binding[0],
+                AGX_APPLE9_GRAPHICS_SYSVAL_BINDING);
+      EXPECT_FALSE(apple9_binary_contains(out, tile_600, sizeof(tile_600)));
+      EXPECT_EQ(apple9_binary_contains(out, abi_ret, sizeof(abi_ret)),
+                !standalone);
+      free(out.binary);
+   }
+}
+
+TEST(Apple9Compiler, PatchVsVaryingsPreservesCullPlanesGroup2)
+{
+   auto build_vs = []() {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "patch_vs_cull_planes");
+      b.shader->info.cull_distance_array_size = 3;
+      nir_def *vf = nir_u2f32(&b, nir_load_vertex_id(&b));
+      nir_io_semantics sem = {.num_slots = 1};
+      sem.location = VARYING_SLOT_POS;
+      nir_store_output(&b, nir_vec4(&b, vf, vf, nir_imm_float(&b, 0.5f),
+                                    nir_imm_float(&b, 1.0f)),
+                       nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32, .io_semantics = sem);
+      sem.location = VARYING_SLOT_VAR0;
+      nir_store_output(&b, nir_vec2(&b, vf, nir_fadd_imm(&b, vf, 1.0f)),
+                       nir_imm_int(&b, 0), .write_mask = 0x3,
+                       .src_type = nir_type_float32, .io_semantics = sem);
+      sem.location = VARYING_SLOT_CLIP_DIST0;
+      nir_store_output(&b, nir_vec3(&b, vf, nir_fsub_imm(&b, 1.0f, vf),
+                                    nir_imm_float(&b, 0.25f)),
+                       nir_imm_int(&b, 0), .write_mask = 0x7,
+                       .src_type = nir_type_float32, .io_semantics = sem);
+      return b.shader;
+   };
+
+   nir_shader *vs_base = build_vs();
+   agx_apple9_vertex_layout base_layout = {};
+   agx_shader_part base_out = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_vertex_inputs(vs_base, &base_layout,
+                                                &base_out, &reason))
+      << (reason ?: "");
+   ASSERT_TRUE(base_out.info.apple9_vary_relocs_valid);
+   EXPECT_FALSE(base_out.info.apple9_varyings.cull_distance_mask);
+   EXPECT_EQ(base_out.info.apple9_varyings.group[VARYING_SLOT_CULL_PRIMITIVE], 2u);
+
+   /* Patch VAR0 to flat without passing CULL_PRIMITIVE in linear_mask:
+    * CULL_PRIMITIVE must stay in group 2 (linear) and match fresh recompile. */
+   uint64_t flat = BITFIELD64_BIT(VARYING_SLOT_VAR0);
+   nir_shader *vs_ref = build_vs();
+   agx_apple9_vertex_layout ref_layout = {};
+   ref_layout.outputs_flat = flat;
+   agx_shader_part ref_out = {};
+   ASSERT_TRUE(agx_compile_apple9_vertex_inputs(vs_ref, &ref_layout, &ref_out,
+                                                &reason)) << (reason ?: "");
+
+   uint8_t *patched = (uint8_t *)malloc(base_out.info.binary_size);
+   ASSERT_NE(patched, nullptr);
+   agx_apple9_varying_layout patched_layout = {};
+   ASSERT_TRUE(agx_apple9_patch_vs_varyings(
+      (const uint8_t *)base_out.binary, base_out.info.binary_size,
+      &base_out.info, flat, 0, patched, &patched_layout));
+   EXPECT_EQ(patched_layout.group[VARYING_SLOT_VAR0], 1u);
+   EXPECT_EQ(patched_layout.group[VARYING_SLOT_CULL_PRIMITIVE], 2u);
+   EXPECT_EQ(memcmp(&patched_layout, &ref_out.info.apple9_varyings,
+                    sizeof(patched_layout)), 0);
+   ASSERT_EQ(base_out.info.binary_size, ref_out.info.binary_size);
+   EXPECT_EQ(memcmp(patched, ref_out.binary, ref_out.info.binary_size), 0);
+
+   free(patched);
+   free(base_out.binary);
+   free(ref_out.binary);
+   ralloc_free(vs_base);
+   ralloc_free(vs_ref);
+}
+
+TEST(Apple9Compiler, ExpandedFsEpilogsAllFeatures)
+{
+   const uint8_t tile_80c[6] = {0x87, 0x02, 0x54, 0x0c, 0x08, 0x00};
+   const uint8_t fence_20c[6] = {0x07, 0x02, 0x54, 0x0c, 0x02, 0x00};
+
+   /* 1. FRAG_RESULT_COLOR broadcast to 3 targets in epilog */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "epilog_frag_color");
+      nir_store_output(&b, nir_imm_vec4(&b, 0.2f, 0.4f, 0.6f, 1.0f),
+                       nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_COLOR,
+                                        .num_slots = 1});
+      agx_apple9_blend blend = {.use_epilog = 1, .dynamic_samples = 1};
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(main_out.info.apple9_fs_epilog.uses_epilog);
+      EXPECT_TRUE(main_out.info.apple9_fs_epilog.writes_frag_color);
+      EXPECT_EQ(main_out.info.apple9_fs_epilog.outputs_written, 1u);
+
+      agx_apple9_fs_epilog_key ekey = {};
+      ekey.iface = main_out.info.apple9_fs_epilog;
+      ekey.nr_targets = 3;
+      for (unsigned rt = 0; rt < 3; ++rt) {
+         ekey.blend[rt].rgb_src = PIPE_BLENDFACTOR_ONE;
+         ekey.blend[rt].rgb_dst = PIPE_BLENDFACTOR_ZERO;
+         ekey.blend[rt].alpha_src = PIPE_BLENDFACTOR_ONE;
+         ekey.blend[rt].alpha_dst = PIPE_BLENDFACTOR_ZERO;
+         ekey.blend[rt].format = PIPE_FORMAT_R8G8B8A8_UNORM;
+         ekey.blend[rt].colormask = 0xf;
+         ekey.blend[rt].samples = 1;
+         ekey.color_map[rt] = rt;
+      }
+      agx_shader_part ep_out = {};
+      ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                         &reason))
+         << (reason ?: "");
+      EXPECT_GT(ep_out.info.binary_size, 0u);
+      free(ep_out.binary);
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* 2. FRAG_RESULT_DEPTH + FRAG_RESULT_STENCIL + discard handed to epilog */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "epilog_depth_stencil");
+      nir_def *z = nir_load_frag_coord_z(&b);
+      nir_demote_if(&b, nir_flt_imm(&b, z, 0.1f));
+      nir_store_output(&b, nir_imm_vec4(&b, 1, 0, 0, 1), nir_imm_int(&b, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+      nir_store_output(&b, nir_fadd_imm(&b, z, 0.05f), nir_imm_int(&b, 0),
+                       .write_mask = 1, .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DEPTH,
+                                        .num_slots = 1});
+      nir_store_output(&b, nir_imm_int(&b, 7), nir_imm_int(&b, 0),
+                       .write_mask = 1, .src_type = nir_type_uint32,
+                       .io_semantics = {.location = FRAG_RESULT_STENCIL,
+                                        .num_slots = 1});
+      b.shader->info.fs.uses_discard = true;
+
+      agx_apple9_blend blend = {.use_epilog = 1, .dynamic_samples = 1};
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(main_out.info.apple9_fs_epilog.writes_depth);
+      EXPECT_TRUE(main_out.info.apple9_fs_epilog.writes_stencil);
+      EXPECT_TRUE(main_out.info.apple9_fs_epilog.main_defers_zs_test);
+      EXPECT_TRUE(main_out.info.apple9_fs_epilog.has_killed_mask);
+      EXPECT_EQ(main_out.info.depth_layout, FRAG_DEPTH_LAYOUT_UNCHANGED);
+
+      agx_apple9_fs_epilog_key ekey = {};
+      ekey.iface = main_out.info.apple9_fs_epilog;
+      ekey.nr_targets = 1;
+      ekey.blend[0].rgb_src = PIPE_BLENDFACTOR_ONE;
+      ekey.blend[0].rgb_dst = PIPE_BLENDFACTOR_ZERO;
+      ekey.blend[0].alpha_src = PIPE_BLENDFACTOR_ONE;
+      ekey.blend[0].alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      ekey.blend[0].format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      ekey.blend[0].colormask = 0xf;
+      ekey.blend[0].samples = 1;
+      ekey.blend[0].alpha_to_coverage = 1;
+      agx_shader_part ep_out = {};
+      ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                         &reason))
+         << (reason ?: "");
+      EXPECT_EQ(ep_out.info.depth_layout, FRAG_DEPTH_LAYOUT_ANY);
+      EXPECT_TRUE(ep_out.info.apple9_uses_discard);
+      free(ep_out.binary);
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* 3. early_fragment_tests + writes_memory + discard */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "epilog_early_z_mem");
+      b.shader->info.fs.early_fragment_tests = true;
+      b.shader->info.writes_memory = true;
+      b.shader->info.fs.uses_discard = true;
+      nir_def *coord = nir_load_pixel_coord(&b);
+      nir_demote_if(&b, nir_ieq_imm(&b, nir_channel(&b, coord, 0), 0));
+      nir_store_ssbo(&b, nir_imm_int(&b, 1), nir_imm_int(&b, 0),
+                     nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
+      nir_store_output(&b, nir_imm_vec4(&b, 0, 1, 0, 1), nir_imm_int(&b, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+      agx_apple9_blend blend = {.use_epilog = 1, .dynamic_samples = 1};
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(main_out.info.apple9_fs_epilog.early_fragment_tests);
+      EXPECT_FALSE(main_out.info.apple9_fs_epilog.main_defers_zs_test);
+      EXPECT_TRUE(main_out.info.apple9_fs_epilog.has_killed_mask);
+      EXPECT_TRUE(main_out.info.apple9_reads_z);
+
+      agx_apple9_fs_epilog_key ekey = {};
+      ekey.iface = main_out.info.apple9_fs_epilog;
+      ekey.nr_targets = 1;
+      ekey.blend[0].rgb_src = PIPE_BLENDFACTOR_ONE;
+      ekey.blend[0].rgb_dst = PIPE_BLENDFACTOR_ZERO;
+      ekey.blend[0].alpha_src = PIPE_BLENDFACTOR_ONE;
+      ekey.blend[0].alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      ekey.blend[0].format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      ekey.blend[0].colormask = 0xf;
+      ekey.blend[0].samples = 1;
+      agx_shader_part ep_out = {};
+      ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                         &reason))
+         << (reason ?: "");
+      EXPECT_EQ(ep_out.info.depth_layout, FRAG_DEPTH_LAYOUT_UNCHANGED);
+      free(ep_out.binary);
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* 4. pixel_interlock tile-lock handoff (main opens 0x80c, epilog closes 0x020c) */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "epilog_interlock");
+      b.shader->info.fs.pixel_interlock_ordered = true;
+      nir_begin_invocation_interlock(&b);
+      nir_store_ssbo(&b, nir_imm_int(&b, 42), nir_imm_int(&b, 0),
+                     nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
+      nir_end_invocation_interlock(&b);
+      agx_apple9_blend blend = {.use_epilog = 1, .dynamic_samples = 1};
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 0,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(main_out.info.apple9_pixel_interlock);
+      EXPECT_TRUE(main_out.info.apple9_fs_epilog.has_tile_lock);
+      EXPECT_TRUE(apple9_binary_contains(main_out, tile_80c, sizeof(tile_80c)));
+      EXPECT_FALSE(apple9_binary_contains(main_out, fence_20c, sizeof(fence_20c)));
+
+      agx_apple9_fs_epilog_key ekey = {};
+      ekey.iface = main_out.info.apple9_fs_epilog;
+      ekey.nr_targets = 0;
+      ekey.blend[0].samples = 1;
+      agx_shader_part ep_out = {};
+      ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                         &reason))
+         << (reason ?: "");
+      EXPECT_FALSE(apple9_binary_contains(ep_out, tile_80c, sizeof(tile_80c)));
+      EXPECT_TRUE(apple9_binary_contains(ep_out, fence_20c, sizeof(fence_20c)));
+      free(ep_out.binary);
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* 5. late_zs + z_cf_index in epilog for depth/stencil feedback loops */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "epilog_late_zs");
+      nir_store_output(&b, nir_imm_vec4(&b, 0.5f, 0.5f, 0.5f, 1.0f),
+                       nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+      agx_apple9_blend blend = {.use_epilog = 1, .dynamic_samples = 1};
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      EXPECT_FALSE(main_out.info.apple9_reads_z);
+
+      agx_apple9_fs_epilog_key ekey = {};
+      ekey.iface = main_out.info.apple9_fs_epilog;
+      ekey.nr_targets = 1;
+      ekey.blend[0].rgb_src = PIPE_BLENDFACTOR_ONE;
+      ekey.blend[0].rgb_dst = PIPE_BLENDFACTOR_ZERO;
+      ekey.blend[0].alpha_src = PIPE_BLENDFACTOR_ONE;
+      ekey.blend[0].alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      ekey.blend[0].format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      ekey.blend[0].colormask = 0xf;
+      ekey.blend[0].samples = 1;
+      ekey.late_zs = true;
+      ekey.z_cf_index = 9;
+      agx_shader_part ep_out = {};
+      ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                         &reason))
+         << (reason ?: "");
+      EXPECT_EQ(ep_out.info.depth_layout, FRAG_DEPTH_LAYOUT_ANY);
+      EXPECT_TRUE(ep_out.info.apple9_reads_z);
+      EXPECT_TRUE(ep_out.info.apple9_uses_discard);
+      free(ep_out.binary);
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(Apple9Compiler, DynamicMsaaSysvalsAndPerSampleEpilog)
+{
+   const uint8_t abi_ret[4] = {0x8f, 0x02, 0x54, 0x00};
+   const uint8_t tile_80c[6] = {0x87, 0x02, 0x54, 0x0c, 0x08, 0x00};
+   const uint8_t fence_20c[6] = {0x07, 0x02, 0x54, 0x0c, 0x02, 0x00};
+
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "epilog_per_sample");
+   b.shader->info.fs.uses_sample_shading = true;
+   nir_def *sid = nir_u2f32(&b, nir_load_sample_id(&b));
+   nir_def *spos = nir_load_sample_pos(&b);
+   nir_def *smask = nir_u2f32(&b, nir_load_sample_mask_in(&b));
+   nir_store_output(&b, nir_vec4(&b, sid, nir_channel(&b, spos, 0),
+                                 nir_channel(&b, spos, 1), smask),
+                    nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .src_type = nir_type_float32,
+                    .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                     .num_slots = 1});
+
+   agx_apple9_blend blend = {.use_epilog = 1, .dynamic_samples = 1};
+   agx_shader_part main_out = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                               &main_out, &reason))
+      << (reason ?: "");
+   EXPECT_TRUE(main_out.info.apple9_fs_epilog.per_sample);
+   EXPECT_TRUE(apple9_binary_contains(main_out, abi_ret, sizeof(abi_ret)));
+   EXPECT_FALSE(apple9_binary_contains(main_out, tile_80c, sizeof(tile_80c)));
+
+   agx_apple9_fs_epilog_key ekey = {};
+   ekey.iface = main_out.info.apple9_fs_epilog;
+   ekey.nr_targets = 1;
+   ekey.blend[0].rgb_src = PIPE_BLENDFACTOR_ONE;
+   ekey.blend[0].rgb_dst = PIPE_BLENDFACTOR_ZERO;
+   ekey.blend[0].alpha_src = PIPE_BLENDFACTOR_ONE;
+   ekey.blend[0].alpha_dst = PIPE_BLENDFACTOR_ZERO;
+   ekey.blend[0].format = PIPE_FORMAT_R8G8B8A8_UNORM;
+   ekey.blend[0].colormask = 0xf;
+   ekey.blend[0].samples = 4;
+   ekey.per_sample = true;
+   agx_shader_part ep_out = {};
+   ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out, &reason))
+      << (reason ?: "");
+   EXPECT_TRUE(apple9_binary_contains(ep_out, abi_ret, sizeof(abi_ret)));
+   EXPECT_FALSE(apple9_binary_contains(ep_out, tile_80c, sizeof(tile_80c)));
+   EXPECT_FALSE(apple9_binary_contains(ep_out, fence_20c, sizeof(fence_20c)));
+
+   free(ep_out.binary);
+   free(main_out.binary);
+   ralloc_free(b.shader);
+}
+
+TEST(Apple9Compiler, IndependentFsPrimitiveIdInVaryings)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "epilog_prim_id");
+   nir_def *bary = nir_load_barycentric_pixel(&b, 32,
+      .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *v0 = nir_load_interpolated_input(&b, 1, 32, bary,
+      nir_imm_int(&b, 0), .dest_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+   nir_def *pid = nir_load_input(&b, 1, 32, nir_imm_int(&b, 0),
+      .dest_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_ID, .num_slots = 1});
+   nir_store_output(&b, nir_vec4(&b, v0, nir_u2f32(&b, pid),
+                                 nir_imm_float(&b, 0), nir_imm_float(&b, 1)),
+                    nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .src_type = nir_type_float32,
+                    .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                     .num_slots = 1});
+
+   agx_apple9_blend blend = {.use_epilog = 1, .dynamic_samples = 1};
+   agx_shader_part out = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                               &out, &reason))
+      << (reason ?: "");
+   EXPECT_FALSE(out.info.apple9_reads_primitive_id);
+   EXPECT_EQ(out.info.apple9_varyings.mask[VARYING_SLOT_PRIMITIVE_ID], 1u);
+   int pid_idx = agx_apple9_varying_index(&out.info.apple9_varyings,
+                                          VARYING_SLOT_PRIMITIVE_ID, 0);
+   ASSERT_GE(pid_idx, 0);
+   EXPECT_TRUE(agx_apple9_interp_mask_test(out.info.apple9_flat_mask, pid_idx));
+   free(out.binary);
+   ralloc_free(b.shader);
+}
+
+TEST(Apple9Compiler, SwVsPrologAndBodyLinkedAbi)
+{
+   const uint8_t abi_ret[4] = {0x8f, 0x02, 0x54, 0x00};
+
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "sw_vs_prolog_body");
+   b.shader->info.workgroup_size[0] = 64;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   nir_def *a0 = nir_load_input(&b, 4, 32, nir_imm_int(&b, 0), .base = 0,
+      .dest_type = nir_type_float32,
+      .io_semantics = {.location = VERT_ATTRIB_GENERIC0, .num_slots = 1});
+   nir_def *a1 = nir_load_input(&b, 2, 32, nir_imm_int(&b, 0), .base = 1,
+      .dest_type = nir_type_uint32,
+      .io_semantics = {.location = VERT_ATTRIB_GENERIC1, .num_slots = 1});
+   nir_def *sum = nir_fadd(&b, nir_channel(&b, a0, 0),
+                           nir_u2f32(&b, nir_channel(&b, a1, 1)));
+   nir_def *root = nir_load_ubo(&b, 1, 64, nir_imm_int(&b, 0),
+                                nir_imm_int(&b, 64), .align_mul = 8, .range = 8);
+   nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_store_global(&b, sum, nir_iadd(&b, root, nir_u2u64(&b, nir_imul_imm(&b, gid, 4))),
+                    .write_mask = 1, .align_mul = 4);
+
+   agx_apple9_vs_prolog_iface iface = {};
+   ASSERT_TRUE(agx_nir_lower_apple9_sw_vs_inputs_to_prolog(b.shader, nullptr, &iface));
+   EXPECT_TRUE(iface.uses_prolog);
+   EXPECT_EQ(iface.attribs_read, 0x3u);
+   EXPECT_EQ(iface.attrib_mask[0], 0x1u);
+   EXPECT_EQ(iface.attrib_mask[1], 0x2u);
+   EXPECT_EQ(iface.integer_attribs, 0x2u);
+
+   const uint16_t vb_ubo = 1, dp_ubo = 2, vp_ubo = 0;
+   agx_shader_part body_out = {};
+   agx_apple9_compute_profile body_prof = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_sw_vs_body(b.shader, vb_ubo, dp_ubo, vp_ubo,
+                                             &body_out, &body_prof, &reason))
+      << (reason ?: "");
+   ASSERT_GE(body_prof.resource_binding_count, 3u);
+   EXPECT_EQ(body_prof.resource_binding[0], vb_ubo);
+   EXPECT_EQ(body_prof.resource_binding[1], dp_ubo);
+   EXPECT_EQ(body_prof.resource_binding[2], vp_ubo);
+
+   for (bool desc_tables : {false, true}) {
+      agx_apple9_sw_vs_prolog_key pkey = {};
+      pkey.base.iface = iface;
+      pkey.base.buffer_descriptor_ubo = vb_ubo;
+      pkey.base.draw_params_ubo = dp_ubo;
+      pkey.base.dynamic_stride = true;
+      pkey.base.format[0] = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      pkey.base.format[1] = PIPE_FORMAT_R32G32_UINT;
+      pkey.base.divisor[1] = 2;
+      pkey.base.buffer[0] = 0;
+      pkey.base.buffer[1] = 1;
+      pkey.vertex_params_ubo = vp_ubo;
+      pkey.vertex_params_offset_B = 48;
+      pkey.descriptor_tables = desc_tables;
+
+      agx_shader_part prolog_out = {};
+      agx_apple9_compute_profile prolog_prof = {};
+      ASSERT_TRUE(agx_compile_apple9_sw_vs_prolog_key(&pkey, &prolog_out,
+                                                      &prolog_prof, &reason))
+         << (reason ?: "");
+      EXPECT_EQ(prolog_prof.abi,
+                desc_tables ? AGX_APPLE9_COMPUTE_ABI_DESCRIPTOR_TABLES
+                            : AGX_APPLE9_COMPUTE_ABI_DIRECT_BUFFERS);
+      ASSERT_EQ(prolog_prof.resource_binding_count, 3u);
+      EXPECT_EQ(prolog_prof.resource_binding[0], vb_ubo);
+      EXPECT_EQ(prolog_prof.resource_binding[1], dp_ubo);
+      EXPECT_EQ(prolog_prof.resource_binding[2], vp_ubo);
+      EXPECT_TRUE(apple9_binary_contains(prolog_out, abi_ret, sizeof(abi_ret)));
+      free(prolog_out.binary);
+   }
+
+   free(body_out.binary);
+   ralloc_free(b.shader);
+}
+
+TEST(Apple9Compiler, NativeMeshDynamicClipZ)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_MESH, &agx_nir_options, "native_mesh_dynamic_clip_z");
+   b.shader->info.workgroup_size[0] = 3;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.mesh.max_vertices_out = 3;
+   b.shader->info.mesh.max_primitives_out = 1;
+   b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+
+   nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 3),
+                                      nir_imm_int(&b, 1), nir_imm_int(&b, 0));
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_store_per_vertex_output(&b, nir_vec4(&b, nir_u2f32(&b, lane),
+                                            nir_imm_float(&b, 0.0f),
+                                            nir_imm_float(&b, -0.5f),
+                                            nir_imm_float(&b, 1.0f)),
+                               lane, nir_imm_int(&b, 0),
+                               .write_mask = 0xf, .src_type = nir_type_float32,
+                               .io_semantics = {.location = VARYING_SLOT_POS,
+                                                .num_slots = 1});
+   nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
+   nir_store_per_primitive_output(&b, nir_imm_ivec3(&b, 0, 1, 2),
+                                  nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                                  .write_mask = 0x7, .src_type = nir_type_uint32,
+                                  .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                                                   .num_slots = 1});
+   nir_pop_if(&b, NULL);
+
+   agx_apple9_native_mesh_options opts = {
+      .dynamic_clip_z = true,
+      .clip_z_ubo = 0,
+      .clip_z_offset_B = 28,
+   };
+   agx_shader_part out = {};
+   agx_apple9_mesh_body_info info = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_native_mesh(b.shader, true, &opts, &out,
+                                              &info, &reason))
+      << (reason ?: "");
+   EXPECT_TRUE(out.info.apple9_ubo_mask & 1u);
+   EXPECT_GT(out.info.binary_size, 0u);
+   free(out.binary);
+   ralloc_free(b.shader);
 }

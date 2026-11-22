@@ -117,7 +117,35 @@ struct agx_apple9_render_stage {
    /* Fragment-owned interpolation tables for each provoking vertex. */
    uint32_t coefficients[3];
    uint16_t coefficient_count;
+   /* Optional linked FS prolog / epilog extra CF bindings:
+    * - prolog_cull_count > 0: bind cull-distance varying(s) from vs_varyings
+    *   at CF slot `prolog_cull_cf_base` (1 flat if prolog_cull_mask, else
+    *   prolog_cull_count linear scalars).
+    * - prolog_line_stipple: bind TEX6.xyz flat + TEX7.xy linear at
+    *   `prolog_stipple_cf_base + 0..4`.
+    * - epilog_z_cf_index > 0: bind FRAGCOORD_Z (0x12c) at `epilog_z_cf_index`
+    *   when fs_main did not read Z itself (late_zs epilog). */
+   uint8_t prolog_cull_count;
+   bool prolog_cull_mask;
+   uint8_t prolog_cull_cf_base;
+   bool prolog_line_stipple;
+   uint8_t prolog_stipple_cf_base;
+   uint8_t epilog_z_cf_index;
 };
+
+/* Whether a linked (vertex, fragment) pair requires hardware-generated
+ * primitive ID (PPP group+0x68 bit 12, VDM bit 6, CF 0x60). True either when
+ * fragment set legacy reads_primitive_id or when an independent fragment reads
+ * VARYING_SLOT_PRIMITIVE_ID and the producer does not export it. */
+static inline bool
+agx_apple9_pipeline_reads_hw_prim_id(
+   const struct agx_apple9_render_stage *vertex,
+   const struct agx_apple9_render_stage *fragment)
+{
+   return fragment->reads_primitive_id ||
+          ((fragment->varyings.mask[VARYING_SLOT_PRIMITIVE_ID] & 1) &&
+           !(vertex->varyings.mask[VARYING_SLOT_PRIMITIVE_ID] & 1));
+}
 
 struct agx_apple9_render_pipeline {
    /* Vertex fetch is lowered into the API vertex program. The stages belong
@@ -281,14 +309,39 @@ agx_apple9_draw_reuses_coefficients(const struct agx_apple9_uniform_draw *previo
  * within the render-context aperture; USC allocations use the shader aperture.
  * A false return leaves the draw unpublished, including on allocation failure.
  */
-#define AGX_APPLE9_CF_BINDINGS_SIZE   0x2a0
-#define AGX_APPLE9_CF_BINDINGS_STRIDE 0x2c0
+#define AGX_APPLE9_CF_BINDINGS_SIZE   0x2e0
+#define AGX_APPLE9_CF_BINDINGS_STRIDE 0x300
 #define AGX_APPLE9_CF_ALLOCATION_SIZE (3 * AGX_APPLE9_CF_BINDINGS_STRIDE)
 unsigned
 agx_apple9_coefficients_size(const struct agx_apple9_render_stage *fragment);
 void agx_apple9_init_coefficients(struct agx_device *dev,
                                   struct agx_apple9_render_stage *fragment,
                                   struct agx_ptr allocation);
+
+/* Build a 2-stage (`third == 0`: call first, tail-jump second) or 3-stage
+ * (`third != 0`: call first, call second, tail-jump third) linked entry stub
+ * into a 64-byte entry code window. Returns false on invalid addresses or
+ * out-of-range displacements. */
+bool agx_apple9_build_linked_entry(uint8_t out[64], uint64_t entry,
+                                   uint64_t first, uint64_t second,
+                                   uint64_t third);
+
+/* Maximum byte length of a per-sample trampoline built by
+ * agx_apple9_build_per_sample_trampoline (4 samples + prolog + tile + ZS). */
+#define AGX_APPLE9_PER_SAMPLE_TRAMPOLINE_MAX_BYTES 256
+
+/* Build an unrolled per-sample fragment trampoline (samples in {1, 2, 4}) at
+ * `code_va`. For each sample s = 0..samples-1, loads (1 << s) into
+ * AGX_APPLE9_SAMPLE_MASK_ABI_REG (r63), calls `main_addr`, reloads (1 << s)
+ * into r63, and calls `epilog_addr`. Runs optional `prolog_addr` once before
+ * the loop, opens `tile_access_mode` (0 = none, 0x600, or 0x700) + 0x80c when
+ * `emit_tile_fence` is set, and emits TILE_FENCE 1 (`emit_zs_release`) and
+ * TILE_FENCE 0x020c (`emit_tile_fence`) once after the final sample.
+ * Returns the exact emitted byte count, or 0 on error. */
+size_t agx_apple9_build_per_sample_trampoline(
+   uint8_t *out, size_t capacity, uint64_t code_va, uint8_t samples,
+   uint64_t prolog_addr, uint64_t main_addr, uint64_t epilog_addr,
+   uint16_t tile_access_mode, bool emit_zs_release, bool emit_tile_fence);
 
 #define AGX_APPLE9_PPP_STATIC_SIZE 0xc0
 void agx_apple9_build_ppp_static(const struct agx_apple9_render_pipeline *pipeline,

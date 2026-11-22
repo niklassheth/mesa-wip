@@ -100,6 +100,11 @@ bool agx_compile_apple9_fragment(nir_shader *nir,
 #define AGX_APPLE9_TEXTURE_INFO_STRIDE 32
 #define AGX_APPLE9_POINT_SIZE_OFFSET (AGX_APPLE9_TEXTURE_INFO_OFFSET + 32 * AGX_APPLE9_TEXTURE_INFO_STRIDE)
 #define AGX_APPLE9_FIRST_FAN_OFFSET (AGX_APPLE9_POINT_SIZE_OFFSET + 4)
+/* Dynamic MSAA sample count log2 (0, 1, or 2) and API sample mask (enabled
+ * sample bits, e.g. 0xf & ~disabled). Used when blend.dynamic_samples is set
+ * or by epilog fragment mains with early_fragment_tests / writes_memory. */
+#define AGX_APPLE9_SAMPLES_LOG2_OFFSET (AGX_APPLE9_POINT_SIZE_OFFSET + 8)
+#define AGX_APPLE9_API_SAMPLE_MASK_OFFSET (AGX_APPLE9_POINT_SIZE_OFFSET + 12)
 #define AGX_APPLE9_POLYGON_STIPPLE_OFFSET (AGX_APPLE9_POINT_SIZE_OFFSET + 16)
 /* Line stipple: the packed pattern/factor word, then the viewport scale and
  * offset of viewport 0 as vec3s (window = ndc * scale + offset). */
@@ -131,6 +136,9 @@ bool agx_compile_apple9_fragment(nir_shader *nir,
 #define AGX_APPLE9_COLOR_WRITE_ENABLE_OFFSET (AGX_APPLE9_FETCH_SAMPLER_INDEX_OFFSET + 4)
 /* Packed sample positions, in the PPP multisample control format. */
 #define AGX_APPLE9_SAMPLE_POSITIONS_OFFSET (AGX_APPLE9_FETCH_SAMPLER_INDEX_OFFSET + 8)
+/* Nonzero when depth clamping is active (gates early-depth clamp and late_zs
+ * epilog depth clamp). */
+#define AGX_APPLE9_DEPTH_CLAMP_ENABLE_OFFSET (AGX_APPLE9_FETCH_SAMPLER_INDEX_OFFSET + 12)
 /* Per-viewport window transform for vertex-stage line stipple, one vec4
  * (scale.xy, offset.xy) per viewport: window = ndc * scale + offset. */
 #define AGX_APPLE9_VIEWPORT_TABLE_OFFSET (AGX_APPLE9_FETCH_SAMPLER_INDEX_OFFSET + 16)
@@ -139,7 +147,11 @@ bool agx_compile_apple9_fragment(nir_shader *nir,
  * agx_apple9_polygon_point_params). */
 #define AGX_APPLE9_POLYGON_POINT_OFFSET \
    (AGX_APPLE9_VIEWPORT_TABLE_OFFSET + AGX_APPLE9_VIEWPORT_TABLE_COUNT * 16)
-#define AGX_APPLE9_RUNTIME_SYSVAL_SIZE (AGX_APPLE9_POLYGON_POINT_OFFSET + 32)
+/* Depth clamp range {float min, float max} and uint32_t force_never_in_shader,
+ * consumed by early-depth clamp and late_zs fragment epilogs. */
+#define AGX_APPLE9_DEPTH_CLAMP_RANGE_OFFSET (AGX_APPLE9_POLYGON_POINT_OFFSET + 32)
+#define AGX_APPLE9_FORCE_NEVER_OFFSET (AGX_APPLE9_DEPTH_CLAMP_RANGE_OFFSET + 8)
+#define AGX_APPLE9_RUNTIME_SYSVAL_SIZE (AGX_APPLE9_DEPTH_CLAMP_RANGE_OFFSET + 16)
 
 enum agx_apple9_polygon_point_flags {
    AGX_APPLE9_PP_CULL_FRONT = 1 << 0,
@@ -204,6 +216,9 @@ struct agx_apple9_blend {
    /* Rasterization sample count is unknown at compile time (epilog/GPL/ESO);
     * keep hardware centroid interpolation instead of folding to single-sample. */
    uint8_t dynamic_samples : 1;
+   /* Lower fragment main for per-sample execution driven by a trampoline that
+    * supplies the active sample bitmask in AGX_APPLE9_SAMPLE_MASK_ABI_REG. */
+   uint8_t per_sample : 1;
    uint8_t advanced_mode, advanced_overlap;
    uint8_t src_premultiplied, dst_premultiplied;
    /* Optional per-draw depth range for shader-triggered early tests. */
@@ -470,10 +485,42 @@ struct agx_apple9_fs_epilog_key {
    uint8_t nr_targets;
    uint8_t color_map[8];
    struct agx_apple9_blend blend[8];
+   /* Emit late depth export (clamped frag_coord.z) for depth/stencil feedback
+    * loops when the main shader did not write FRAG_RESULT_DEPTH. */
+   bool late_zs;
+   /* Coefficient index holding FRAGCOORD_Z for late_zs (0 selects default). */
+   uint8_t z_cf_index;
+   /* Compile as a callable per-sample epilog driven by a per-sample trampoline
+    * (reads active sample mask from AGX_APPLE9_SAMPLE_MASK_ABI_REG, omits tile
+    * acquire/release and defers ZS release to the trampoline). */
+   bool per_sample;
+   /* A linked cull/stipple prolog may demote fragments before fs_main; ensure
+    * surviving samples run ZS test once if fs_main did not already test ZS. */
+   bool prolog_defers_zs_test;
 };
 
 bool agx_compile_apple9_fragment_epilog_key(
    const struct agx_apple9_fs_epilog_key *key,
+   struct agx_shader_part *out, const char **reason);
+
+struct agx_apple9_cull_prolog_key {
+   bool mask;       /* true: 1 flat uint32 mask; false: `count` linear floats */
+   uint8_t count;   /* 1..8 (1 when mask is true) */
+   uint8_t cf_base; /* first coefficient index (>= 1) */
+   bool standalone; /* true: complete depth-only FS (tests surviving samples + halts) */
+};
+
+bool agx_compile_apple9_cull_prolog(
+   const struct agx_apple9_cull_prolog_key *key,
+   struct agx_shader_part *out, const char **reason);
+
+struct agx_apple9_stipple_prolog_key {
+   uint8_t cf_base; /* first CF index (>= 1): +0..2 TEX6 flat, +3..4 TEX7 linear */
+   bool standalone; /* true: complete depth-only FS (tests surviving samples + halts) */
+};
+
+bool agx_compile_apple9_stipple_prolog(
+   const struct agx_apple9_stipple_prolog_key *key,
    struct agx_shader_part *out, const char **reason);
 
 /* Per-target blend array contains MAX2(nr_targets, 1) entries, up to eight.
@@ -577,6 +624,36 @@ bool agx_compile_apple9_vertex_inputs(
 bool agx_compile_apple9_vertex_prolog_key(
    const struct agx_apple9_vertex_prolog_key *key,
    struct agx_shader_part *out, const char **reason);
+
+/* Software vertex-shader (compute) prolog key and helpers. The SW-VS body
+ * lowers load_input to ABI GPRs via agx_nir_lower_apple9_sw_vs_inputs_to_prolog
+ * and compiles via agx_compile_apple9_sw_vs_body (reserving the prolog's UBO
+ * slots); the prolog compiles via agx_compile_apple9_sw_vs_prolog_key and
+ * chains to the body through apple9_shader_entry(..., compute=true). */
+struct agx_apple9_sw_vs_prolog_key {
+   struct agx_apple9_vertex_prolog_key base;
+   /* UBO binding and byte offset of the 64-bit poly_vertex_params pointer
+    * (for indexed SW-VS pulls). */
+   uint16_t vertex_params_ubo;
+   uint32_t vertex_params_offset_B;
+   /* Compute ABI matching the linked SW-VS body (false = direct buffers,
+    * true = descriptor tables). */
+   bool descriptor_tables;
+};
+
+bool agx_nir_lower_apple9_sw_vs_inputs_to_prolog(
+   nir_shader *nir, const struct agx_apple9_vertex_layout *layout,
+   struct agx_apple9_vs_prolog_iface *iface);
+
+bool agx_compile_apple9_sw_vs_body(
+   nir_shader *nir, uint16_t buffer_descriptor_ubo, uint16_t draw_params_ubo,
+   uint16_t vertex_params_ubo, struct agx_shader_part *out,
+   struct agx_apple9_compute_profile *profile, const char **reason);
+
+bool agx_compile_apple9_sw_vs_prolog_key(
+   const struct agx_apple9_sw_vs_prolog_key *key,
+   struct agx_shader_part *out, struct agx_apple9_compute_profile *profile,
+   const char **reason);
 
 /* The same vertex fetch lowering is used by hardware VS and Poly compute VS. */
 bool agx_nir_lower_apple9_vertex_inputs(

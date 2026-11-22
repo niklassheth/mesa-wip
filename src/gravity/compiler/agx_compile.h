@@ -218,12 +218,28 @@ struct agx_apple9_vs_prolog_iface {
 };
 
 /* Interface between a linked Apple9 fragment main and its fragment epilog.
- * Each written FRAG_RESULT_DATA0..7 vec4 (and optional dual-source SRC1 vec4)
- * is passed in four consecutive 32-bit GPRs starting at
- * AGX_APPLE9_ABI_REG_BASE in ascending location order, followed by SRC1. */
+ * ABI GPRs start at AGX_APPLE9_ABI_REG_BASE (r8) in fixed deterministic order:
+ *  1. Each written FRAG_RESULT_DATA0..7 vec4 (or FRAG_RESULT_COLOR at slot 0):
+ *     4 consecutive 32-bit GPRs per set bit of `outputs_written`.
+ *  2. Optional dual-source SRC1 vec4 (`writes_src1`): 4 GPRs.
+ *  3. Optional FRAG_RESULT_DEPTH (`writes_depth`): 1 GPR (FP32).
+ *  4. Optional FRAG_RESULT_STENCIL (`writes_stencil`): 1 GPR (low 16 bits).
+ *  5. Optional accumulated killed-sample mask (`main_defers_zs_test` or
+ *     `early_fragment_tests && has_killed_mask`): 1 GPR (low 16 bits).
+ * Per-sample shading passes the active sample bitmask (1 << s) in fixed
+ * physical GPR AGX_APPLE9_SAMPLE_MASK_ABI_REG (r63). */
+#define AGX_APPLE9_SAMPLE_MASK_ABI_REG 63
+
 struct agx_apple9_fs_epilog_iface {
    uint8_t outputs_written;
    bool writes_src1;
+   bool writes_frag_color;
+   bool writes_depth;
+   bool writes_stencil;
+   bool has_tile_lock;
+   bool early_fragment_tests;
+   bool has_killed_mask;
+   bool per_sample;
    bool main_defers_zs_test;
    bool uses_epilog;
 };

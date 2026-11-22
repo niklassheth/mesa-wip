@@ -18,10 +18,14 @@ struct agx_device;
 struct agx_shader_body {
    struct agx_bo *bo;
    uint64_t addr;
-   /* Optional second target for linked prolog/epilog stages: when non-zero,
-    * the entry block calls `addr` (convention 0) then tail-jumps `tail_addr`. */
+   /* Optional second and third targets for linked prolog/main/epilog chains:
+    * - tail_addr != 0, mid_addr == 0: 2-stage: call `addr` (conv 0),
+    *   tail-jump `tail_addr`.
+    * - mid_addr != 0, tail_addr != 0: 3-stage: call `addr` (conv 0),
+    *   call `mid_addr` (conv 0), tail-jump `tail_addr`. */
+   uint64_t mid_addr;
    uint64_t tail_addr;
-   struct agx_shader_body *first_ref, *second_ref;
+   struct agx_shader_body *first_ref, *second_ref, *third_ref;
    int32_t refcnt;
    void (*destroy)(struct agx_device *dev, struct agx_shader_body *body);
 

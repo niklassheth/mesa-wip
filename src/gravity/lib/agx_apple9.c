@@ -546,9 +546,11 @@ apple9_shader_entry(struct agx_device *dev, void *allocator,
             memcpy(bytes + 0x40, apple9_compute_constant, 0x40);
          }
          bool built = body->tail_addr
-            ? apple9_build_linked_entry(bytes + AGX_APPLE9_ENTRY_CODE_OFFSET,
-                                        dev->shader_base + entry,
-                                        body->addr, body->tail_addr)
+            ? agx_apple9_build_linked_entry(
+                 bytes + AGX_APPLE9_ENTRY_CODE_OFFSET,
+                 dev->shader_base + entry, body->addr,
+                 body->mid_addr ? body->mid_addr : body->tail_addr,
+                 body->mid_addr ? body->tail_addr : 0)
             : apple9_build_body_entry(bytes + AGX_APPLE9_ENTRY_CODE_OFFSET,
                                       dev->shader_base + entry, body->addr);
          if (built) {
@@ -1141,9 +1143,10 @@ agx_apple9_pack_nearest_sampler(void *out)
 #define APPLE9_CF_BINDINGS 0x203d00u
 #define APPLE9_CF_BINDINGS_SIZE AGX_APPLE9_CF_BINDINGS_SIZE
 /* One binding per user scalar in the worst case, then 1/W, primitive ID,
- * Z, point coordinates, two barycentric pairs and the per-vertex inputs. */
+ * Z, point coordinates, two barycentric pairs, per-vertex inputs, optional
+ * epilog Z, and optional cull (up to 8) + line-stipple (5) prolog scalars. */
 static_assert(4 + 4 * (AGX_APPLE9_MAX_VARYING_COMPONENTS + 1 + 1 + 1 + 1 + 2 +
-                       AGX_APPLE9_MAX_PER_VERTEX) <= APPLE9_CF_BINDINGS_SIZE,
+                       AGX_APPLE9_MAX_PER_VERTEX + 1 + 8 + 5) <= APPLE9_CF_BINDINGS_SIZE,
               "coefficient table must fit its worst-case bindings");
 
 static unsigned
@@ -1174,13 +1177,13 @@ apple9_build_cf_bindings(uint8_t *table,
                               : AGX_SHADE_MODEL_FLAT_VERTEX_2;
    assert(components <= AGX_APPLE9_MAX_VARYING_COMPONENTS);
    memset(table, 0, APPLE9_CF_BINDINGS_SIZE);
+   const bool any_reads_z = reads_z || fragment->epilog_z_cf_index > 0;
    unsigned extra = 2 * util_bitcount(fragment->barycentric_mask) +
                     fragment->per_vertex_count;
    unsigned cf_slots = components + 1 + reads_z + 2 * reads_point_coord +
                        reads_primitive_id + extra;
    unsigned vs_slots =
-      (vs_varyings ? vs_varyings->count : components) + 1 + reads_z;
-   apple9_put_u32(table, vs_slots | (cf_slots << 8));
+      (vs_varyings ? vs_varyings->count : components) + 1 + any_reads_z;
    /* Coefficient zero is 1/W. Keep stable scalar indices across all modes. */
    apple9_put_u32(table + 4, 0x0c);
    unsigned binding = 1;
@@ -1200,6 +1203,15 @@ apple9_build_cf_bindings(uint8_t *table,
          int vs_idx = agx_apple9_varying_index(vs_varyings, fs_locs[start],
                                                fs_comps[start]);
          if (vs_idx < 0) {
+            if (fs_locs[start] == VARYING_SLOT_PRIMITIVE_ID &&
+                fs_comps[start] == 0) {
+               /* Producer does not export gl_PrimitiveID: bind hardware-generated
+                * rasterizer primitive ID (0x60) at this exact CF slot. */
+               apple9_put_u32(table + 4 + binding * 4,
+                              0x60 | ((start + 1) << 16));
+               ++start;
+               continue;
+            }
             /* Unwritten user varying: undefined in Vulkan. Bind source 0 (1/W)
              * linearly so the coefficient stays valid without reading past the
              * vertex shader's UVS export range. */
@@ -1220,7 +1232,7 @@ apple9_build_cf_bindings(uint8_t *table,
                break;
             ++count;
          }
-         unsigned src = (unsigned)vs_idx + 1 + reads_z;
+         unsigned src = (unsigned)vs_idx + 1 + any_reads_z;
          unsigned dst = start + 1;
          apple9_put_u32(table + 4 + binding * 4,
                         (count - 1) | (shade << 2) | (src << 8) | (dst << 16));
@@ -1240,7 +1252,7 @@ apple9_build_cf_bindings(uint8_t *table,
       }
       unsigned base = start + 1;
       apple9_put_u32(table + 4 + binding * 4,
-                     (count - 1) | (shade << 2) | ((base + reads_z) << 8) | (base << 16));
+                     (count - 1) | (shade << 2) | ((base + any_reads_z) << 8) | (base << 16));
       start += count;
    }
    if (reads_primitive_id) {
@@ -1280,13 +1292,72 @@ apple9_build_cf_bindings(uint8_t *table,
             ? agx_apple9_varying_index(vs_varyings, fs_locs[src_idx],
                                        fs_comps[src_idx])
             : -1;
-         source = mapped >= 0 ? (unsigned)mapped + 1 + reads_z : 0;
+         source = mapped >= 0 ? (unsigned)mapped + 1 + any_reads_z : 0;
       } else {
-         source = src_idx + 1 + reads_z;
+         source = src_idx + 1 + any_reads_z;
       }
       apple9_put_u32(table + 4 + binding++ * 4,
                      (6 << 2) | (source << 8) | (coefficient++ << 16));
    }
+   if (fragment->epilog_z_cf_index > 0 && !reads_z) {
+      apple9_put_u32(table + 4 + binding++ * 4,
+                     0x12c | ((unsigned)fragment->epilog_z_cf_index << 16));
+      cf_slots = MAX2(cf_slots, (unsigned)fragment->epilog_z_cf_index + 1);
+   }
+   if (fragment->prolog_cull_count > 0 && vs_varyings) {
+      assert(fragment->prolog_cull_cf_base > 0);
+      if (fragment->prolog_cull_mask) {
+         int vs_idx =
+            agx_apple9_varying_index(vs_varyings, VARYING_SLOT_CULL_PRIMITIVE, 0);
+         uint32_t word = vs_idx >= 0
+            ? (flat_shade << 2) | (((unsigned)vs_idx + 1 + any_reads_z) << 8) |
+                 ((unsigned)fragment->prolog_cull_cf_base << 16)
+            : 0x0cu | ((unsigned)fragment->prolog_cull_cf_base << 16);
+         apple9_put_u32(table + 4 + binding++ * 4, word);
+         cf_slots = MAX2(cf_slots, (unsigned)fragment->prolog_cull_cf_base + 1);
+      } else {
+         unsigned emitted = 0;
+         for (unsigned slot = 0; slot < 2 && emitted < fragment->prolog_cull_count; ++slot) {
+            unsigned loc = VARYING_SLOT_CULL_PRIMITIVE + slot;
+            u_foreach_bit(c, vs_varyings->mask[loc]) {
+               if (emitted >= fragment->prolog_cull_count)
+                  break;
+               int vs_idx = agx_apple9_varying_index(vs_varyings, loc, c);
+               unsigned dst = (unsigned)fragment->prolog_cull_cf_base + emitted++;
+               uint32_t word = vs_idx >= 0
+                  ? (3u << 2) | (((unsigned)vs_idx + 1 + any_reads_z) << 8) |
+                       (dst << 16)
+                  : 0x0cu | (dst << 16);
+               apple9_put_u32(table + 4 + binding++ * 4, word);
+            }
+         }
+         cf_slots = MAX2(cf_slots, (unsigned)fragment->prolog_cull_cf_base +
+                                      fragment->prolog_cull_count);
+      }
+   }
+   if (fragment->prolog_line_stipple && vs_varyings) {
+      assert(fragment->prolog_stipple_cf_base > 0);
+      for (unsigned c = 0; c < 3; ++c) {
+         int vs_idx = agx_apple9_varying_index(vs_varyings, VARYING_SLOT_TEX6, c);
+         unsigned dst = (unsigned)fragment->prolog_stipple_cf_base + c;
+         uint32_t word = vs_idx >= 0
+            ? (flat_shade << 2) | (((unsigned)vs_idx + 1 + any_reads_z) << 8) |
+                 (dst << 16)
+            : 0x0cu | (dst << 16);
+         apple9_put_u32(table + 4 + binding++ * 4, word);
+      }
+      for (unsigned c = 0; c < 2; ++c) {
+         int vs_idx = agx_apple9_varying_index(vs_varyings, VARYING_SLOT_TEX7, c);
+         unsigned dst = (unsigned)fragment->prolog_stipple_cf_base + 3 + c;
+         uint32_t word = vs_idx >= 0
+            ? (3u << 2) | (((unsigned)vs_idx + 1 + any_reads_z) << 8) |
+                 (dst << 16)
+            : 0x0cu | (dst << 16);
+         apple9_put_u32(table + 4 + binding++ * 4, word);
+      }
+      cf_slots = MAX2(cf_slots, (unsigned)fragment->prolog_stipple_cf_base + 5);
+   }
+   apple9_put_u32(table, vs_slots | (cf_slots << 8));
    assert(4 + 4 * binding <= APPLE9_CF_BINDINGS_SIZE);
    return binding;
 }
@@ -1366,28 +1437,147 @@ apple9_build_direct_bind_group(uint8_t *page, unsigned varying_components)
    apple9_put_u32(page + 0x18, varying_components / 8);
 }
 
-static bool
-apple9_build_linked_entry(uint8_t *out, uint64_t entry, uint64_t first,
-                          uint64_t second)
+bool
+agx_apple9_build_linked_entry(uint8_t out[64], uint64_t entry, uint64_t first,
+                              uint64_t second, uint64_t third)
 {
-   /* Call `first` (convention 0), restore the converged execution mask, then
-    * tail-jump into `second`. Fits in 34 bytes inside the 64-byte entry code
-    * window (AGX_APPLE9_ENTRY_BLOCK_SIZE - AGX_APPLE9_ENTRY_CODE_OFFSET). */
-   if ((entry | first | second) & 1)
-      return false;
-   int64_t call_disp = (int64_t)first - (int64_t)(entry + 4);
-   int64_t jmp_disp = (int64_t)second - (int64_t)(entry + 20);
-   if (call_disp < -(int64_t)UINT32_MAX || call_disp > UINT32_MAX ||
-       jmp_disp < -(int64_t)UINT32_MAX || jmp_disp > UINT32_MAX)
+   /* Call `first` (convention 0), restore the converged execution mask, then:
+    * - 2-stage (`third == 0`): tail-jump `second` (34 bytes).
+    * - 3-stage (`third != 0`): call `second` (conv 0), restore exec mask,
+    *   tail-jump `third` (50 bytes).
+    * Both fit inside the 64-byte entry code window
+    * (AGX_APPLE9_ENTRY_BLOCK_SIZE - AGX_APPLE9_ENTRY_CODE_OFFSET). */
+   if (!out || !first || !second || ((entry | first | second | third) & 1))
       return false;
    const uint8_t push[4] = {0x0f, 0x05, 0x54, 0x1a};
    memcpy(out, push, 4);
-   if (!agx_apple9_encode_call(out + 4, 0, call_disp) ||
-       !agx_apple9_encode_exec_pop(out + 14, 2) ||
-       !agx_apple9_encode_branch(out + 20, true, jmp_disp))
+   unsigned pos = 4;
+
+   int64_t call1_disp = (int64_t)first - (int64_t)(entry + pos);
+   if (call1_disp < -(int64_t)UINT32_MAX || call1_disp > UINT32_MAX ||
+       !agx_apple9_encode_call(out + pos, 0, call1_disp))
       return false;
-   apple9_put_u32(out + 30, 0x0e);
+   pos += 10;
+   if (!agx_apple9_encode_exec_pop(out + pos, 2))
+      return false;
+   pos += 6;
+
+   uint64_t tail = second;
+   if (third) {
+      int64_t call2_disp = (int64_t)second - (int64_t)(entry + pos);
+      if (call2_disp < -(int64_t)UINT32_MAX || call2_disp > UINT32_MAX ||
+          !agx_apple9_encode_call(out + pos, 0, call2_disp))
+         return false;
+      pos += 10;
+      if (!agx_apple9_encode_exec_pop(out + pos, 2))
+         return false;
+      pos += 6;
+      tail = third;
+   }
+
+   int64_t jmp_disp = (int64_t)tail - (int64_t)(entry + pos);
+   if (jmp_disp < -(int64_t)UINT32_MAX || jmp_disp > UINT32_MAX ||
+       !agx_apple9_encode_branch(out + pos, true, jmp_disp))
+      return false;
+   pos += 10;
+   apple9_put_u32(out + pos, 0x0e);
    return true;
+}
+
+static bool
+apple9_emit_tile_ctrl(uint8_t *out, size_t capacity, size_t *pos, bool access,
+                      uint16_t mode)
+{
+   if (*pos + 6 > capacity)
+      return false;
+   const uint8_t bytes[6] = {
+      access ? 0x87 : 0x07, 2, 0x54,
+      (uint8_t)(mode & 0xff), (uint8_t)((mode >> 8) & 0xff), 0,
+   };
+   memcpy(out + *pos, bytes, 6);
+   *pos += 6;
+   return true;
+}
+
+static bool
+apple9_emit_call_pop(uint8_t *out, size_t capacity, size_t *pos,
+                     uint64_t code_va, uint64_t target)
+{
+   if (*pos + 16 > capacity)
+      return false;
+   int64_t disp = (int64_t)target - (int64_t)(code_va + *pos);
+   if (disp < -(int64_t)UINT32_MAX || disp > UINT32_MAX ||
+       !agx_apple9_encode_call(out + *pos, 0, disp))
+      return false;
+   *pos += 10;
+   if (!agx_apple9_encode_exec_pop(out + *pos, 2))
+      return false;
+   *pos += 6;
+   return true;
+}
+
+size_t
+agx_apple9_build_per_sample_trampoline(
+   uint8_t *out, size_t capacity, uint64_t code_va, uint8_t samples,
+   uint64_t prolog_addr, uint64_t main_addr, uint64_t epilog_addr,
+   uint16_t tile_access_mode, bool emit_zs_release, bool emit_tile_fence)
+{
+   if (!out || !main_addr || !epilog_addr ||
+       (samples != 1 && samples != 2 && samples != 4) ||
+       ((code_va | prolog_addr | main_addr | epilog_addr) & 1) ||
+       (tile_access_mode != 0 && tile_access_mode != 0x600 &&
+        tile_access_mode != 0x700))
+      return 0;
+
+   size_t pos = 0;
+   if (pos + 4 > capacity)
+      return 0;
+   const uint8_t push[4] = {0x0f, 0x05, 0x54, 0x1a};
+   memcpy(out + pos, push, 4);
+   pos += 4;
+
+   if (prolog_addr &&
+       !apple9_emit_call_pop(out, capacity, &pos, code_va, prolog_addr))
+      return 0;
+
+   if (tile_access_mode &&
+       !apple9_emit_tile_ctrl(out, capacity, &pos, true, tile_access_mode))
+      return 0;
+   if (emit_tile_fence &&
+       !apple9_emit_tile_ctrl(out, capacity, &pos, true, 0x80c))
+      return 0;
+
+   for (unsigned s = 0; s < samples; ++s) {
+      if (pos + 8 > capacity ||
+          !agx_apple9_encode_literal32(out + pos,
+                                       AGX_APPLE9_SAMPLE_MASK_ABI_REG,
+                                       1u << s))
+         return 0;
+      pos += 8;
+      if (!apple9_emit_call_pop(out, capacity, &pos, code_va, main_addr))
+         return 0;
+      if (pos + 8 > capacity ||
+          !agx_apple9_encode_literal32(out + pos,
+                                       AGX_APPLE9_SAMPLE_MASK_ABI_REG,
+                                       1u << s))
+         return 0;
+      pos += 8;
+      if (!apple9_emit_call_pop(out, capacity, &pos, code_va, epilog_addr))
+         return 0;
+   }
+
+   if (emit_zs_release &&
+       !apple9_emit_tile_ctrl(out, capacity, &pos, false, 1))
+      return 0;
+   if (emit_tile_fence &&
+       !apple9_emit_tile_ctrl(out, capacity, &pos, false, 0x020c))
+      return 0;
+
+   if (pos + 4 > capacity)
+      return 0;
+   apple9_put_u32(out + pos, 0x0e);
+   pos += 4;
+   return pos;
 }
 
 static bool
@@ -1620,9 +1810,11 @@ agx_apple9_build_ppp_static(const struct agx_apple9_render_pipeline *pipeline,
    apple9_put_u32(ppp + 4, counts[0] | (counts[1] << 8) | (counts[2] << 16));
    uint8_t *group = ppp + 0x40;
    apple9_build_direct_bind_group(group, pipeline->vertex->varying_components);
-   if (pipeline->fragment->apple9_reads_z)
+   if (pipeline->fragment->apple9_reads_z ||
+       pipeline->fragment->epilog_z_cf_index)
       apple9_put_u32(group + 0x20, apple9_get_u32(group + 0x20) | (1u << 21));
-   if (pipeline->fragment->reads_primitive_id)
+   if (agx_apple9_pipeline_reads_hw_prim_id(pipeline->vertex,
+                                            pipeline->fragment))
       apple9_put_u32(group + 0x68, apple9_get_u32(group + 0x68) | (1u << 12));
    if (pipeline->vertex->writes_point_size) {
       apple9_put_u32(group + 0x20, apple9_get_u32(group + 0x20) | (1u << 18));
@@ -1704,8 +1896,11 @@ agx_apple9_prepare_draw_alloc(
       !memcmp(&pipeline->vertex->varyings, &pipeline->fragment->varyings,
               sizeof(pipeline->vertex->varyings));
    bool prebaked_cf_valid =
-      varyings_match || (pipeline->fragment->varying_components == 0 &&
-                         pipeline->fragment->per_vertex_count == 0);
+      !pipeline->fragment->prolog_cull_count &&
+      !pipeline->fragment->prolog_line_stipple &&
+      !pipeline->fragment->epilog_z_cf_index &&
+      (varyings_match || (pipeline->fragment->varying_components == 0 &&
+                          pipeline->fragment->per_vertex_count == 0));
    bool reuse_coefficients = agx_apple9_draw_reuses_coefficients(previous, draw);
    unsigned cf_count;
    if (prebaked_cf_valid &&
@@ -2024,7 +2219,10 @@ agx_apple9_emit_draw_state(uint8_t *out,
       pipeline->vertex_launch,
       pipeline->vertex_state_class,
       apple9_provoking_vertex(pipeline->primitive, pipeline->flatshade_first) |
-         (pipeline->fragment->reads_primitive_id ? (1u << 6) : 0),
+         (agx_apple9_pipeline_reads_hw_prim_id(pipeline->vertex,
+                                               pipeline->fragment)
+             ? (1u << 6)
+             : 0),
       0x00000000, /* VDM padding */
       0x00000500, /* first PPP state update header */
    };

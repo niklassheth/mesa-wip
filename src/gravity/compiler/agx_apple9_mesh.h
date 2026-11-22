@@ -216,6 +216,11 @@ struct agx_apple9_native_mesh_options {
     * invocations as serialized subgroups; the driver must qualify that launch. */
    unsigned physical_threads;
    bool clip_halfz;
+   /* Dynamic depth_clip_negative_one_to_one: load float clip_z_coeff
+    * (0.5 for [-w,w], 0.0 for [0,w]) from UBO `clip_z_ubo` at `clip_z_offset_B`. */
+   bool dynamic_clip_z;
+   uint16_t clip_z_ubo;
+   uint32_t clip_z_offset_B;
    bool attributes;
    /* Exact single-primitive lowering; no native primitive-record ABI. */
    bool primitive_broadcast;

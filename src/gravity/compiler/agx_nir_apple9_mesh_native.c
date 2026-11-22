@@ -862,35 +862,45 @@ agx_nir_lower_apple9_native_mesh(
    if (primitive_vertices)
       vertices = duplicate_primitive_vertices(&b, info, lane, vertices, primitives,
                                                physical_threads);
-   if (options && options->clip_halfz) {
+   if (options && (options->clip_halfz || options->dynamic_clip_z)) {
       /* Convert the completed homogeneous position, after all body writes and
        * output reads. Doing this at publication also handles scalar/partial
        * stores and different invocations writing Z and W. Keep W unchanged:
        * U consumes it for clipping and perspective division.
-       * This is the vertex path's c=1/2 depth conversion, not a state-word
-       * change. The body barrier above makes its final Z/W visible. */
+       * When dynamic_clip_z is set, load clip_z_coeff (0.5 for [-w,w], 0.0 for
+       * [0,w]) from the caller's draw UBO and skip conversion when zero.
+       * The body barrier above makes its final Z/W visible. */
+      nir_def *coeff = options->dynamic_clip_z
+         ? nir_load_ubo(&b, 1, 32, nir_imm_int(&b, options->clip_z_ubo),
+                        nir_imm_int(&b, options->clip_z_offset_B),
+                        .align_mul = 4, .range_base = options->clip_z_offset_B,
+                        .range = 4)
+         : nir_imm_float(&b, 0.5f);
+      if (options->dynamic_clip_z)
+         nir_push_if(&b, nir_fneu_imm(&b, coeff, 0.0f));
       for (unsigned first = 0; first < layout->max_vertices;
            first += physical_threads) {
-      nir_def *vertex = nir_iadd_imm(&b, lane, first);
-      nir_push_if(&b, nir_ult(&b, vertex, vertices));
-      nir_def *offset = nir_imul_imm(&b, vertex, 4);
-      nir_def *z_address = nir_iadd_imm(
-         &b, offset, layout->position_B + layout->vertex_pitch_B *
-                        layout->vertex_component[VARYING_SLOT_POS][2]);
-      nir_def *w_address = nir_iadd_imm(
-         &b, offset, layout->position_B + layout->vertex_pitch_B *
-                        layout->vertex_component[VARYING_SLOT_POS][3]);
-      nir_def *z = nir_load_local_apple9_agx(&b, z_address,
-                                            .base = key.output_root);
-      nir_def *w = nir_load_local_apple9_agx(&b, w_address,
-                                            .base = key.output_root);
-      nir_def *half = nir_imm_float(&b, 0.5);
-      nir_def *converted = nir_ffma_weak(
-         &b, nir_fneg(&b, z), half, nir_ffma_weak(&b, w, half, z));
-      nir_store_local_apple9_agx(&b, converted, z_address,
-                                  .base = key.output_root, .bit_size = 32);
-      nir_pop_if(&b, NULL);
+         nir_def *vertex = nir_iadd_imm(&b, lane, first);
+         nir_push_if(&b, nir_ult(&b, vertex, vertices));
+         nir_def *offset = nir_imul_imm(&b, vertex, 4);
+         nir_def *z_address = nir_iadd_imm(
+            &b, offset, layout->position_B + layout->vertex_pitch_B *
+                           layout->vertex_component[VARYING_SLOT_POS][2]);
+         nir_def *w_address = nir_iadd_imm(
+            &b, offset, layout->position_B + layout->vertex_pitch_B *
+                           layout->vertex_component[VARYING_SLOT_POS][3]);
+         nir_def *z = nir_load_local_apple9_agx(&b, z_address,
+                                                .base = key.output_root);
+         nir_def *w = nir_load_local_apple9_agx(&b, w_address,
+                                                .base = key.output_root);
+         nir_def *converted = nir_ffma_weak(
+            &b, nir_fneg(&b, z), coeff, nir_ffma_weak(&b, w, coeff, z));
+         nir_store_local_apple9_agx(&b, converted, z_address,
+                                    .base = key.output_root, .bit_size = 32);
+         nir_pop_if(&b, NULL);
       }
+      if (options->dynamic_clip_z)
+         nir_pop_if(&b, NULL);
       nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
                   .memory_scope = SCOPE_WORKGROUP,
                   .memory_semantics = NIR_MEMORY_ACQ_REL,
