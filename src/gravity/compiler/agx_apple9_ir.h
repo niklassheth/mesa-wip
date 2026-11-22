@@ -212,6 +212,11 @@ enum agx_apple9_fence_mode {
    AGX_APPLE9_FENCE_IMAGE_WRITE = 4,
    /* Invalidate the texture cache so subsequent texture loads observe memory. */
    AGX_APPLE9_FENCE_TEX_INVALIDATE = 5,
+   /* Fragment-stage PBE drain (07 14 64 50 06 00). */
+   AGX_APPLE9_FENCE_IMAGE_WRITE_FS = 6,
+   /* Workgroup-scope texture barrier drain (0x0e51) and invalidate (0x0ed1). */
+   AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP = 7,
+   AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP = 8,
 };
 
 enum agx_apple9_unpack_norm_mode {
@@ -424,6 +429,8 @@ struct agx_apple9_vir_instr {
     * order, replace the immediate texture and sampler indices. */
    bool texture_bindless;
    bool sampler_bindless;
+   /* Fragment-stage PBE image write selects the fa/da/ea/ca + 0x08 form. */
+   bool image_fragment;
    uint8_t texture_gather_component;
    /* Logical RGBA channels returned in ascending channel order, packed at
     * dest. Zero retains the default RGBA selection for VIR callers. */
@@ -807,6 +814,30 @@ bool agx_apple9_vir_emit_image_store(struct agx_apple9_vir_program *program,
                                    const uint32_t xy[2], const uint32_t rgba[4],
                                    uint32_t index, uint32_t layer, bool integer);
 
+/* Generalized bindless PBE image write:
+ * - dimension: 0 = 2D, 1 = Cube, 2 = 2D-array (layered), 3 = 3D
+ * - bits: 32 (4 RGBA data words) or 16 (2 packed RG/BA data words)
+ * - coords: {x, y} for 2D; {x, y, z/layer/face} for 3D / 2D-array / Cube
+ * - data: 4 words for 32-bit, 2 packed words for 16-bit
+ * - integer: false = float (f32/f16), true = integer (i32/u32/i16/u16)
+ * - fragment: true for fragment stage (fa/da/ea/ca + 0x08), false for CS/VS */
+bool agx_apple9_vir_emit_image_store_ex(struct agx_apple9_vir_program *program,
+                                      const uint32_t *coords,
+                                      const uint32_t *data, uint32_t index,
+                                      unsigned dimension, unsigned bits,
+                                      bool integer, bool fragment);
+
+/* Aligned threadgroup (shared) memory loads and stores. components may be
+ * 1 (32-bit, 4B-scaled index), 2 (64-bit, 8B-scaled index), or 4 (128-bit,
+ * 16B-scaled index). Loads allocate a components-wide adjacent SSA tuple
+ * with AUTO scoreboard slot; stores consume an adjacent data tuple. */
+uint32_t agx_apple9_vir_emit_shared_load(struct agx_apple9_vir_program *program,
+                                         uint32_t index, unsigned root,
+                                         unsigned components);
+bool agx_apple9_vir_emit_shared_store(struct agx_apple9_vir_program *program,
+                                      const uint32_t *data, unsigned components,
+                                      uint32_t index, unsigned root);
+
 bool agx_apple9_vir_emit_block_image_store(
    struct agx_apple9_vir_program *program, const uint32_t src[4],
    unsigned image, unsigned format, bool multisampled, bool array);
@@ -834,6 +865,20 @@ uint32_t agx_apple9_vir_emit_texture_volume(
    struct agx_apple9_vir_program *program, const uint32_t coords[3],
    uint32_t packed_lod, unsigned texture, unsigned sampler, unsigned dimension,
    bool bias, bool shadow);
+
+/* Volume / cube / array / shadow sample with native min_lod_clamp in word 3
+ * (packed Q6 min_lod or bias<<16 | min_lod):
+ * - 2D (0): !shadow bias=true (0x0804, +offset 0x02c1);
+ *           shadow bias=false (0x0820), bias=true (0x0824)
+ * - Cube (1): !shadow bias=false (0x0810), bias=true (0x0814)
+ * - 2D-array (2): !shadow bias=true (+offset 0x67db);
+ *                 shadow bias=false (0x64ad)
+ * - 3D (3): !shadow bias=false (0x2180), bias=true (0x2190)
+ * - Cube-array (4): !shadow bias=false (0x6553) */
+uint32_t agx_apple9_vir_emit_texture_volume_min_lod(
+   struct agx_apple9_vir_program *program, const uint32_t coords[3],
+   uint32_t packed_min_lod, unsigned texture, unsigned sampler,
+   unsigned dimension, bool bias, bool shadow);
 
 /* Coordinates followed by derivatives interleaved by texture axis. Extended
  * forms publish four coordinate words, then four (array/shadow/min LOD) or
@@ -907,6 +952,13 @@ bool agx_apple9_vir_emit_abi_return(struct agx_apple9_vir_program *program);
  * instructions. Spills use per-thread Dynamic-Caching scratch storage.
  */
 struct nir_shader;
+struct agx_apple9_allocation_cost {
+   uint64_t spills, instructions, bytes, dependency_gaps;
+   unsigned registers, peak_registers;
+   bool has_copies;
+};
+bool agx_apple9_allocation_cheaper(struct agx_apple9_allocation_cost a,
+                                   struct agx_apple9_allocation_cost b);
 bool agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
                                  struct nir_shader *nir, const char **reason);
 bool agx_apple9_allocate_publications(struct agx_apple9_vir_program *program,

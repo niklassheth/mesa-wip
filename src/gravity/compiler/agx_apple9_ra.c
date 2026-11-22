@@ -121,8 +121,8 @@ apple9_schedule_resources(const agx_instr *I, uint32_t *reads, uint32_t *writes)
    case AGX_APPLE9_VIR_BLOCK_IMAGE_STORE:
       /* Coordinates and data live in the publication file, outside GPR
        * SSA. Keep the store after their publication and before a later
-       * publication reuses the slots. Both store encodings join the write
-       * before returning, so the publication is only borrowed at issue. */
+       * publication reuses the slots. Async IMAGE_STORE borrows its tuple
+       * until scoreboard completion (tracked in apple9_schedule_physical). */
       *reads |= APPLE9_SCHED_MEMORY | APPLE9_SCHED_PUBLICATION;
       *writes |= APPLE9_SCHED_MEMORY;
       return;
@@ -202,6 +202,7 @@ apple9_source_width(const struct agx_apple9_vir_instr *ins, unsigned source)
         ins->op == AGX_APPLE9_VIR_MESH_SUBMIT_SCALAR) && source == 0)
       return 2;
    if ((ins->op == AGX_APPLE9_VIR_DEVICE_STORE ||
+        (ins->op == AGX_APPLE9_VIR_SHARED_STORE && !ins->memory_bits) ||
         ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
         ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC) && source == 0)
       return MAX2(ins->memory_components, 1);
@@ -246,6 +247,11 @@ apple9_source_constraint(const struct agx_apple9_vir_instr *ins, unsigned source
        source + ins->texture_bindless + ins->sampler_bindless >= ins->nr_srcs)
       return &apple9_table_index[ins->sampler_bindless &&
                                  source + 1 == ins->nr_srcs];
+   if (ins->op == AGX_APPLE9_VIR_SHARED_STORE && !ins->memory_bits) {
+      return agx_apple9_find_operand(ins->encoding,
+                                     source ? AGX_APPLE9_OPERAND_SRC1
+                                            : AGX_APPLE9_OPERAND_SRC0);
+   }
    if (ins->op == AGX_APPLE9_VIR_DEVICE_STORE ||
        ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
        ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC) {
@@ -649,6 +655,9 @@ apple9_shared_dataflow(struct apple9_shared_ra *ra, nir_shader *nir,
              (ins->texture_bindless || ins->sampler_bindless))
             common->reg_constraints[0].max =
                AGX_APPLE9_HALF_REGISTER_COUNT - 2;
+         if (common->nr_dests && ins->op == AGX_APPLE9_VIR_SHARED_LOAD &&
+             components > 1)
+            common->reg_constraints[0].max = 2 * (64 - components);
          /* A synchronous instruction reads its sources before publishing its
           * result, also when it releases them, and a memory load reads them
           * at issue, so a scalar result may be written over a source that
@@ -666,6 +675,9 @@ apple9_shared_dataflow(struct apple9_shared_ra *ra, nir_shader *nir,
             unsigned source = first_source[s];
             struct agx_reg_constraint c =
                apple9_register_constraint(apple9_source_constraint(ins, source));
+            if (ins->op == AGX_APPLE9_VIR_SHARED_STORE && !ins->memory_bits &&
+                source == 0 && ins->memory_components > 1)
+               c.max = 2 * (64 - ins->memory_components);
             unsigned fixed = p->fixed_phys[ins->src[source]];
             if (fixed != AGX_APPLE9_PHYS_INVALID && !ra->publication[ins->src[source]])
                c.min = c.max = fixed * 2;
@@ -1265,9 +1277,10 @@ apple9_resource_hazard(const struct agx_apple9_vir_instr *ins,
    /* Block-image stores and image-write parameter tuples publish on slot 1,
     * and image writes wait on slot 1 for their parameters. */
    return (ins->encoding == AGX_APPLE9_ENC_BLOCK_IMAGE_STORE ||
+           ins->encoding == AGX_APPLE9_ENC_BLOCK_IMAGE_STORE_EXTENDED ||
            ins->encoding == AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS ||
-           ins->encoding == AGX_APPLE9_ENC_IMAGE_WRITE ||
-           ins->encoding == AGX_APPLE9_ENC_IMAGE_WRITE_LAYERED) &&
+           ins->encoding == AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS_16 ||
+           ins->op == AGX_APPLE9_VIR_IMAGE_STORE) &&
           producer->producer_scoreboard_slot == AGX_APPLE9_SCOREBOARD_SLOT_1;
 }
 
@@ -1283,11 +1296,16 @@ apple9_lane_hazard(const struct agx_apple9_vir_instr *ins,
       unsigned reg = save ? ins->src[0] : ins->dest + c;
       if (apple9_producer_result(producer, reg))
          return true;
-      /* Includes texture parameter publications, which remain borrowed
-       * until the result handoff, and scratch SAVE's destructive input. */
+      /* Includes texture and image-store parameter publications, which remain
+       * borrowed until completion, and scratch SAVE's destructive input.
+       * Image-store bindless index GPRs (src[8..9], < PUB_BASE) are read at
+       * issue, like device-load address/index GPRs. */
       for (unsigned s = 0;
            !apple9_reads_sources_at_issue(producer) && s < producer->nr_srcs;
            ++s) {
+         if (producer->op == AGX_APPLE9_VIR_IMAGE_STORE &&
+             producer->src[s] < PUB_BASE)
+            continue;
          if (producer->src[s] == reg)
             return true;
       }
@@ -1556,7 +1574,10 @@ apple9_shares_slot(const struct agx_apple9_vir_instr *ins)
 {
    return !apple9_fixed_producer_slot(ins) &&
           (ins->op == AGX_APPLE9_VIR_DEVICE_LOAD ||
-           ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE);
+           ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE ||
+           ins->op == AGX_APPLE9_VIR_SHARED_LOAD ||
+           ins->op == AGX_APPLE9_VIR_PRIVATE_LOAD ||
+           ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC);
 }
 
 /* The first instruction in [start, end) that needs the producer's completion,
@@ -2283,16 +2304,10 @@ cleanup:
    return success;
 }
 
-struct apple9_allocation_cost {
-   uint64_t spills, instructions, bytes, dependency_gaps;
-   unsigned registers, peak_registers;
-   bool has_copies;
-};
-
-static struct apple9_allocation_cost
+static struct agx_apple9_allocation_cost
 apple9_allocation_cost(const struct agx_apple9_vir_program *p)
 {
-   struct apple9_allocation_cost cost = {
+   struct agx_apple9_allocation_cost cost = {
       .registers = p->max_phys_gpr + 1,
       .peak_registers = MAX2(p->max_phys_gpr + 1, p->peak_live_gprs),
    };
@@ -2327,15 +2342,25 @@ apple9_allocation_cost(const struct agx_apple9_vir_program *p)
    return cost;
 }
 
-static bool
-apple9_allocation_cheaper(struct apple9_allocation_cost a,
-                          struct apple9_allocation_cost b)
+bool
+agx_apple9_allocation_cheaper(struct agx_apple9_allocation_cost a,
+                              struct agx_apple9_allocation_cost b)
 {
-   if (a.spills != b.spills) return a.spills < b.spills;
-   if (a.instructions != b.instructions) return a.instructions < b.instructions;
-   if (a.bytes != b.bytes) return a.bytes < b.bytes;
-   if (a.registers != b.registers) return a.registers < b.registers;
-   return a.dependency_gaps < b.dependency_gaps;
+   if (a.spills != b.spills)
+      return a.spills < b.spills;
+   unsigned a_threads =
+      agx_occupancy_for_register_count(2 * MAX2(a.registers, 1)).max_threads;
+   unsigned b_threads =
+      agx_occupancy_for_register_count(2 * MAX2(b.registers, 1)).max_threads;
+   if (a_threads != b_threads)
+      return a_threads > b_threads;
+   if (a.dependency_gaps != b.dependency_gaps)
+      return a.dependency_gaps < b.dependency_gaps;
+   if (a.instructions != b.instructions)
+      return a.instructions < b.instructions;
+   if (a.bytes != b.bytes)
+      return a.bytes < b.bytes;
+   return a.registers < b.registers;
 }
 
 /* Estimate peak live 32-bit GPRs across the VIR program in O(N + V) so
@@ -2545,7 +2570,7 @@ agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
       return false;
    }
 
-   struct apple9_allocation_cost cost = apple9_allocation_cost(&best);
+   struct agx_apple9_allocation_cost cost = apple9_allocation_cost(&best);
    if (cost.spills) {
       if (!used_banks) {
          const char *unused_reason = NULL;
@@ -2554,9 +2579,9 @@ agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
          if (apple9_run_candidate(program, nir, true, false, 0, true,
                                   cost.spills, &alt_copy, &alternative,
                                   &unused_reason, &alt_remat)) {
-            struct apple9_allocation_cost alt_cost =
+            struct agx_apple9_allocation_cost alt_cost =
                apple9_allocation_cost(&alternative);
-            if (apple9_allocation_cheaper(alt_cost, cost)) {
+            if (agx_apple9_allocation_cheaper(alt_cost, cost)) {
                SWAP(best, alternative);
                cost = alt_cost;
                remat_used = alt_remat;
@@ -2573,9 +2598,9 @@ agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
          if (apple9_run_candidate(program, nir, true, false, 0, false,
                                   cost.spills, &alt_copy, &alternative,
                                   &unused_reason, NULL)) {
-            struct apple9_allocation_cost alt_cost =
+            struct agx_apple9_allocation_cost alt_cost =
                apple9_allocation_cost(&alternative);
-            if (apple9_allocation_cheaper(alt_cost, cost)) {
+            if (agx_apple9_allocation_cheaper(alt_cost, cost)) {
                SWAP(best, alternative);
                cost = alt_cost;
             }

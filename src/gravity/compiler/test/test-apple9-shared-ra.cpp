@@ -1039,3 +1039,315 @@ TEST(Apple9SharedRa, SubgroupMaxWaitsForInputAndPreservesSource)
    agx_apple9_vir_finish(&p);
    ralloc_free(nir.shader);
 }
+
+TEST(Apple9SharedRa, MultiSlotSharedPrivateAndSharedAtomicOverlapWithoutWaits)
+{
+   for (unsigned kind = 0; kind < 3; ++kind) {
+      SCOPED_TRACE(kind);
+      nir_builder nir = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "multislot_mem");
+      nir_block logical = {};
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      auto block = agx_apple9_block_create(&p);
+      block->nir = &logical;
+      agx_apple9_block_begin(&p, block);
+
+      uint32_t idx[6], vals[6];
+      uint32_t one = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+         AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 1);
+      for (unsigned i = 0; i < 6; ++i)
+         idx[i] = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+            AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, i);
+
+      for (unsigned i = 0; i < 6; ++i) {
+         if (kind == 0) {
+            vals[i] = agx_apple9_vir_emit_shared_load(&p, idx[i], 0, 1);
+         } else if (kind == 1) {
+            vals[i] = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_PRIVATE_LOAD,
+               AGX_APPLE9_ENC_PRIVATE_LOAD, &idx[i], 1, i);
+            p.private_size = 256;
+            p.instructions[p.instruction_count - 1]->producer_scoreboard_slot =
+               AGX_APPLE9_SCOREBOARD_SLOT_AUTO;
+         } else {
+            uint32_t srcs[] = {one, idx[i]};
+            vals[i] = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_SHARED_ATOMIC,
+               AGX_APPLE9_ENC_SHARED_ATOMIC, srcs, 2, 0);
+            auto *ins = p.instructions[p.instruction_count - 1];
+            ins->atomic_op = AGX_APPLE9_ATOMIC_ADD;
+            ins->memory_components = 1;
+            ins->producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_AUTO;
+         }
+         ASSERT_NE(vals[i], AGX_APPLE9_VREG_INVALID);
+      }
+
+      /* Consume all 6 results after issuing all 6 ops. */
+      uint32_t acc = vals[0];
+      for (unsigned i = 1; i < 6; ++i) {
+         uint32_t srcs[] = {acc, vals[i]};
+         acc = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IADD,
+            AGX_APPLE9_ENC_INT_ADD_EXTENDED, srcs, 2, 0);
+      }
+      ASSERT_TRUE(agx_apple9_vir_emit_device_store(&p, 0, idx[0], &acc, 1, 32));
+
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << reason;
+
+      unsigned slot_mask = 0, ops_seen = 0;
+      for (unsigned i = 0; i < p.instruction_count; ++i) {
+         const auto *I = p.instructions[i];
+         if ((kind == 0 && I->op == AGX_APPLE9_VIR_SHARED_LOAD) ||
+             (kind == 1 && I->op == AGX_APPLE9_VIR_PRIVATE_LOAD) ||
+             (kind == 2 && I->op == AGX_APPLE9_VIR_SHARED_ATOMIC)) {
+            ASSERT_GE(I->producer_scoreboard_slot, 1u);
+            ASSERT_LE(I->producer_scoreboard_slot, 6u);
+            slot_mask |= BITFIELD_BIT(I->producer_scoreboard_slot - 1);
+            ++ops_seen;
+         }
+         agx_apple9_packed_instruction packed;
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(I, p.phys, &packed, &reason))
+            << (reason ?: "");
+      }
+      EXPECT_EQ(ops_seen, 6u);
+      /* SHARED_LOAD and PRIVATE_LOAD have no memory hazards with each other and
+       * spread across multiple scoreboard slots; SHARED_ATOMIC writes shared
+       * memory so it exercises multi-slot packing cleanly too. */
+      if (kind < 2) {
+         EXPECT_GT(util_bitcount(slot_mask), 1u);
+      }
+      agx_apple9_vir_finish(&p);
+      ralloc_free(nir.shader);
+   }
+}
+
+TEST(Apple9SharedRa, AsyncImageStoresOverlapSixTuplesZeroJoinsAndDrainAtFence)
+{
+   for (unsigned count : {6u, 7u}) {
+      SCOPED_TRACE(count);
+      nir_builder nir = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "async_imgwrite_6x");
+      nir_block logical = {};
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      auto block = agx_apple9_block_create(&p);
+      block->nir = &logical;
+      agx_apple9_block_begin(&p, block);
+
+      uint32_t zero = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+         AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+      uint32_t one = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+         AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0x3f800000);
+      uint32_t rgba[] = {one, one, one, one};
+      for (unsigned i = 0; i < count; ++i) {
+         uint32_t x = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+            AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, i);
+         uint32_t xy[] = {x, zero};
+         ASSERT_TRUE(agx_apple9_vir_emit_image_store(&p, xy, rgba, zero,
+                                                     AGX_APPLE9_VREG_INVALID, false));
+      }
+      /* Fence drains all pending image writes before texture invalidate. */
+      ASSERT_TRUE(agx_apple9_vir_emit_side_effect(&p, AGX_APPLE9_VIR_DEVICE_FENCE,
+         AGX_APPLE9_ENC_DEVICE_FENCE, nullptr, 0, AGX_APPLE9_FENCE_IMAGE_WRITE));
+      ASSERT_TRUE(agx_apple9_vir_emit_side_effect(&p, AGX_APPLE9_VIR_DEVICE_FENCE,
+         AGX_APPLE9_ENC_DEVICE_FENCE, nullptr, 0, AGX_APPLE9_FENCE_TEX_INVALIDATE));
+
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << reason;
+
+      unsigned stores = 0, waits_before_fence = 0, waits_at_fence = 0;
+      unsigned tuple_mask = 0, slot_mask = 0;
+      bool saw_fence = false;
+      for (unsigned i = 0; i < p.instruction_count; ++i) {
+         const auto *I = p.instructions[i];
+         if (I->op == AGX_APPLE9_VIR_DEVICE_FENCE &&
+             I->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE)
+            saw_fence = true;
+         if (I->op == AGX_APPLE9_VIR_WAIT) {
+            if (!saw_fence && stores < count)
+               ++waits_before_fence;
+            else if (!saw_fence && stores == count)
+               ++waits_at_fence;
+         }
+         if (I->op == AGX_APPLE9_VIR_IMAGE_STORE) {
+            unsigned base = p.phys[I->src[0]];
+            ASSERT_EQ(base % 8, 0u);
+            ASSERT_LE(base, 40u);
+            tuple_mask |= BITFIELD_BIT(base / 8);
+            ASSERT_GE(I->producer_scoreboard_slot, 1u);
+            ASSERT_LE(I->producer_scoreboard_slot, 6u);
+            slot_mask |= BITFIELD_BIT(I->producer_scoreboard_slot - 1);
+            ++stores;
+         }
+         agx_apple9_packed_instruction packed;
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(I, p.phys, &packed, &reason))
+            << (reason ?: "");
+      }
+      EXPECT_EQ(stores, count);
+      EXPECT_EQ(tuple_mask, BITFIELD_MASK(6)); /* All 6 tuples p0..p40 used. */
+      EXPECT_EQ(slot_mask, BITFIELD_MASK(6));  /* All 6 slots 1..6 used. */
+      /* 6 back-to-back stores issue with ZERO waits between them; the 7th
+       * waits once when reusing p0..p7. All pending stores drain before 0x0650. */
+      EXPECT_EQ(waits_before_fence, count == 6 ? 0u : 1u);
+      EXPECT_EQ(waits_at_fence, 1u);
+      agx_apple9_vir_finish(&p);
+      ralloc_free(nir.shader);
+   }
+}
+
+TEST(Apple9SharedRa, VectorSharedLoadStoreAllocatesAndPacksUint2Uint4)
+{
+   for (unsigned comps : {2u, 4u}) {
+      SCOPED_TRACE(comps);
+      nir_builder nir = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "vec_shared_ra");
+      nir_block logical = {};
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      auto block = agx_apple9_block_create(&p);
+      block->nir = &logical;
+      agx_apple9_block_begin(&p, block);
+
+      uint32_t i0 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+         AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+      uint32_t i1 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+         AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 1);
+      uint32_t loaded = agx_apple9_vir_emit_shared_load(&p, i0, 2, comps);
+      ASSERT_NE(loaded, AGX_APPLE9_VREG_INVALID);
+
+      uint32_t out[4];
+      for (unsigned c = 0; c < comps; ++c) {
+         uint32_t k = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+            AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, c + 1);
+         uint32_t add[] = {loaded + c, k};
+         out[c] = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IADD,
+            AGX_APPLE9_ENC_INT_ADD_EXTENDED, add, 2, 0);
+      }
+      ASSERT_TRUE(agx_apple9_vir_emit_shared_store(&p, out, comps, i1, 2));
+
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << reason;
+
+      unsigned loads = 0, stores = 0;
+      for (unsigned i = 0; i < p.instruction_count; ++i) {
+         const auto *I = p.instructions[i];
+         if (I->op == AGX_APPLE9_VIR_SHARED_LOAD) {
+            EXPECT_EQ(I->dest_components, comps);
+            EXPECT_LE(p.phys[I->dest] + comps, 64u);
+            ++loads;
+         } else if (I->op == AGX_APPLE9_VIR_SHARED_STORE) {
+            EXPECT_EQ(I->memory_components, comps);
+            EXPECT_LE(p.phys[I->src[0]] + comps, 64u);
+            for (unsigned c = 1; c < comps; ++c)
+               EXPECT_EQ(p.phys[I->src[c]], p.phys[I->src[0]] + c);
+            ++stores;
+         }
+         agx_apple9_packed_instruction packed;
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(I, p.phys, &packed, &reason))
+            << (reason ?: "");
+      }
+      EXPECT_EQ(loads, 1u);
+      EXPECT_EQ(stores, 1u);
+      agx_apple9_vir_finish(&p);
+      ralloc_free(nir.shader);
+   }
+}
+
+TEST(Apple9SharedRa, AllocationCheaperBucketsRegistersByOccupancyTier)
+{
+   /* 50 and 51 GPRs (100 and 102 half-regs) sit in the same top occupancy tier
+    * (<= 104 half-regs, 1024 threads); 53 GPRs (106 half-regs) drops to 896. */
+   const unsigned base_gprs = 50;
+   const unsigned same_tier_gprs = 51;
+   const unsigned worse_tier_gprs = 53;
+
+   /* Latency-hiding schedule uses +1 GPR (same occupancy tier) and +2 bytes,
+    * but eliminates 16 dependency-gap stalls: MUST NOT be vetoed. */
+   agx_apple9_allocation_cost plain = {
+      .spills = 0, .instructions = 10, .bytes = 80, .dependency_gaps = 32,
+      .registers = base_gprs, .peak_registers = base_gprs,
+   };
+   agx_apple9_allocation_cost latency = {
+      .spills = 0, .instructions = 10, .bytes = 82, .dependency_gaps = 16,
+      .registers = same_tier_gprs, .peak_registers = same_tier_gprs,
+   };
+   EXPECT_TRUE(agx_apple9_allocation_cheaper(latency, plain));
+   EXPECT_FALSE(agx_apple9_allocation_cheaper(plain, latency));
+
+   /* Dropping to a lower occupancy tier IS vetoed even with fewer dep gaps. */
+   agx_apple9_allocation_cost low_occ = latency;
+   low_occ.registers = worse_tier_gprs;
+   low_occ.dependency_gaps = 0;
+   EXPECT_TRUE(agx_apple9_allocation_cheaper(plain, low_occ));
+   EXPECT_FALSE(agx_apple9_allocation_cheaper(low_occ, plain));
+
+   /* Spills remain strictly highest priority over occupancy and dep gaps. */
+   agx_apple9_allocation_cost spilling = plain;
+   spilling.spills = 1;
+   spilling.dependency_gaps = 0;
+   EXPECT_TRUE(agx_apple9_allocation_cheaper(low_occ, spilling));
+   EXPECT_FALSE(agx_apple9_allocation_cheaper(spilling, low_occ));
+
+   /* Equal spills, occupancy tier, and dep gaps tie-break by instrs -> bytes -> regs. */
+   agx_apple9_allocation_cost fewer_bytes = plain;
+   fewer_bytes.bytes = plain.bytes - 2;
+   fewer_bytes.registers = same_tier_gprs;
+   EXPECT_TRUE(agx_apple9_allocation_cheaper(fewer_bytes, plain));
+   EXPECT_FALSE(agx_apple9_allocation_cheaper(plain, fewer_bytes));
+}
+
+TEST(Apple9SharedRa, NativeImageStoreExAndVolumeMinLodAllocateAndPack)
+{
+   nir_builder nir = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "native_img_and_minlod");
+   nir_block logical = {};
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+   p.fragment_shader = true;
+   auto block = agx_apple9_block_create(&p);
+   block->nir = &logical;
+   agx_apple9_block_begin(&p, block);
+
+   uint32_t zero = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+      AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+   uint32_t one = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+      AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0x3f800000);
+   uint32_t coords3[] = {zero, zero, zero};
+   uint32_t rgba[] = {one, one, one, one};
+   uint32_t packed16[] = {one, one};
+
+   /* 3D f32 fragment, Cube u32 compute, 2D f16 fragment, plus FS fence pair. */
+   ASSERT_TRUE(agx_apple9_vir_emit_image_store_ex(
+      &p, coords3, rgba, zero, 3, 32, false, true));
+   ASSERT_TRUE(agx_apple9_vir_emit_image_store_ex(
+      &p, coords3, rgba, zero, 1, 32, true, false));
+   ASSERT_TRUE(agx_apple9_vir_emit_image_store_ex(
+      &p, coords3, packed16, zero, 0, 16, false, true));
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(&p, AGX_APPLE9_VIR_DEVICE_FENCE,
+      AGX_APPLE9_ENC_DEVICE_FENCE, nullptr, 0, AGX_APPLE9_FENCE_IMAGE_WRITE_FS));
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(&p, AGX_APPLE9_VIR_DEVICE_FENCE,
+      AGX_APPLE9_ENC_DEVICE_FENCE, nullptr, 0, AGX_APPLE9_FENCE_TEX_INVALIDATE));
+
+   /* 3D min_lod sample after the fence. */
+   uint32_t samp = agx_apple9_vir_emit_texture_volume_min_lod(
+      &p, coords3, zero, 0, 0, 3, false, false);
+   ASSERT_NE(samp, AGX_APPLE9_VREG_INVALID);
+   uint32_t out_rgba[] = {samp, samp + 1, samp + 2, samp + 3};
+   ASSERT_TRUE(agx_apple9_vir_emit_device_store(&p, 0, zero, out_rgba, 4, 32));
+
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << reason;
+
+   unsigned img_stores = 0, samples = 0;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      const auto *I = p.instructions[i];
+      img_stores += I->op == AGX_APPLE9_VIR_IMAGE_STORE;
+      samples += I->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE;
+      agx_apple9_packed_instruction packed;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(I, p.phys, &packed, &reason))
+         << (reason ?: "");
+   }
+   EXPECT_EQ(img_stores, 3u);
+   EXPECT_EQ(samples, 1u);
+   agx_apple9_vir_finish(&p);
+   ralloc_free(nir.shader);
+}
