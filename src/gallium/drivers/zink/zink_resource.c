@@ -1903,9 +1903,9 @@ resource_create(struct pipe_screen *pscreen,
       templ2.bind |= PIPE_BIND_SHADER_IMAGE;
 
 #ifdef HAVE_LIBDRM
+   struct winsys_handle ro_handle;
+   bool close_ro_handle = false;
    if (!whandle && screen->ro && (templ2.bind & PIPE_BIND_SCANOUT)) {
-      struct winsys_handle handle;
-
       assert(screen->info.have_EXT_image_drm_format_modifier);
 
       /* Only LINEAR is considered the appropriate modifier for scaning out
@@ -1924,17 +1924,22 @@ resource_create(struct pipe_screen *pscreen,
          goto fail;
 
       res->ro_scanout =
-         renderonly_scanout_for_resource(&templ2, screen->ro, &handle);
+         renderonly_scanout_for_resource(&templ2, screen->ro, &ro_handle);
 
       if (!res->ro_scanout)
          goto fail;
-      assert(handle.type == WINSYS_HANDLE_TYPE_FD);
-      assert(handle.modifier == DRM_FORMAT_MOD_LINEAR);
-      whandle = &handle;
+      assert(ro_handle.type == WINSYS_HANDLE_TYPE_FD);
+      assert(ro_handle.modifier == DRM_FORMAT_MOD_LINEAR);
+      whandle = &ro_handle;
+      close_ro_handle = true;
    }
 #endif
 
    res->obj = resource_object_create(screen, &templ2, whandle, &linear, res->modifiers, res->modifiers_count, loader_private, user_mem);
+#ifdef HAVE_LIBDRM
+   if (close_ro_handle)
+      close(ro_handle.handle);
+#endif
    if (!res->obj)
       goto fail;
 
