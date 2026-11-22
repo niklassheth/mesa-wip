@@ -39,6 +39,7 @@
 #include "pipe/p_screen.h"
 #include "pipe-loader/pipe_loader.h"
 #include "renderonly/renderonly.h"
+#include "util/os_file.h"
 #include "util/u_memory.h"
 
 #include "loader.h"
@@ -73,7 +74,11 @@ struct pipe_screen *kmsro_drm_screen_create(int kms_fd,
          goto out;
 
       ro->kms_fd = kms_fd;
-      ro->gpu_fd = dup(gpu_fds[i]);
+      ro->gpu_fd = os_dupfd_cloexec(gpu_fds[i]);
+      if (ro->gpu_fd < 0) {
+         FREE(ro);
+         goto out;
+      }
 
       render_dev_name = loader_get_kernel_driver_name(ro->gpu_fd);
       if (!render_dev_name) {
@@ -148,6 +153,8 @@ struct pipe_screen *kmsro_drm_screen_create(int kms_fd,
           */
          ro->create_for_resource = renderonly_create_kms_dumb_buffer_for_resource;
          screen = zink_drm_create_screen_renderonly(ro->gpu_fd, ro, config);
+         if (!screen)
+            ro->destroy(ro);
       }
 #endif
 

@@ -37,6 +37,9 @@ endif
 loader_c_args = [
   '-DUSE_DRICONF',
 ]
+if with_gallium_zink
+  loader_c_args += '-DGALLIUM_ZINK'
+endif
 libloader = static_library(
   'loader',
   ['loader_dri_helper.c', 'loader.c', sha1_h],

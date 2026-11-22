@@ -4064,11 +4064,6 @@ zink_drm_create_screen(int fd, const struct pipe_screen_config *config, struct r
       return NULL;
 
    ret->drm_fd = os_dupfd_cloexec(fd);
-#ifdef HAVE_LIBDRM
-   ret->ro = ro;
-#else
-   assert(!ro);
-#endif
 
    if (!ret->info.have_KHR_external_memory_fd) {
       debug_printf("ZINK: KHR_external_memory_fd required!\n");
@@ -4083,6 +4078,12 @@ zink_drm_create_screen(int fd, const struct pipe_screen_config *config, struct r
       debug_printf("ZINK: EXT_image_drm_format_modifier required for renderonly GPUs!\n");
       goto fail;
    }
+
+#ifdef HAVE_LIBDRM
+   ret->ro = ro;
+#else
+   assert(!ro);
+#endif
 
    return &ret->base;
 

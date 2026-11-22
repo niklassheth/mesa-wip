@@ -216,7 +216,6 @@ asahi_use_zink(int fd)
 #ifndef HAVE_LIBDRM
    return false;
 #else
-   bool prefer_zink = false;
    bool require_zink = false;
 
    struct drm_asahi_params_global params = { 0 };
@@ -231,11 +230,21 @@ asahi_use_zink(int fd)
       /* Apple9 (G16 / M4) and later GPUs have no native Gallium driver
        * and run OpenGL via Zink on top of the Gravity Vulkan driver.
        */
-      prefer_zink = true;
       require_zink = true;
    }
 
-   prefer_zink = debug_get_bool_option("ASAHI_USE_ZINK", prefer_zink);
+#ifndef GALLIUM_ZINK
+   if (require_zink) {
+      static bool warned = false;
+      if (!warned) {
+         log_(_LOADER_WARNING,
+              "Apple9 (G16) and later GPUs require Gallium Zink, which was not built.\n");
+         warned = true;
+      }
+   }
+   return false;
+#else
+   bool prefer_zink = debug_get_bool_option("ASAHI_USE_ZINK", require_zink);
 
    bool use_zink = prefer_zink;
    if (require_zink) {
@@ -250,6 +259,7 @@ asahi_use_zink(int fd)
    }
 
    return use_zink;
+#endif
 #endif
 }
 

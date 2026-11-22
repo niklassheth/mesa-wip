@@ -48,6 +48,11 @@
 #include "util/os_file.h"
 #include "frontend/winsys_handle.h"
 
+#ifdef HAVE_LIBDRM
+#include <fcntl.h>
+#include <xf86drm.h>
+#endif
+
 #if !defined(__APPLE__)
 #define ZINK_USE_DMABUF
 #endif
@@ -1216,6 +1221,11 @@ allocate_bo(struct zink_screen *screen, const struct pipe_resource *templ,
           heap = ZINK_HEAP_DEVICE_LOCAL;
    };
 
+#if defined(ZINK_USE_DMABUF) && !defined(_WIN32)
+   if (!obj->bo && alloc_info->whandle)
+      close(imfi.fd);
+#endif
+
    return obj->bo ? roc_success : roc_fail_and_cleanup_object;
 }
 
@@ -1942,6 +1952,10 @@ resource_create(struct pipe_screen *pscreen,
 #endif
    if (!res->obj)
       goto fail;
+#ifdef HAVE_LIBDRM
+   if (res->ro_scanout)
+      res->obj->immutable_handle = true;
+#endif
 
    res->queue = VK_QUEUE_FAMILY_IGNORED;
    res->internal_format = templ->format;
@@ -2088,40 +2102,100 @@ add_resource_bind(struct zink_context *ctx, struct zink_resource *res, unsigned 
    assert((res->base.b.bind & bind) == 0);
    res->base.b.bind |= bind;
    struct zink_resource_object *old_obj = res->obj;
+   struct winsys_handle *whandle = NULL;
+#ifdef HAVE_LIBDRM
+   struct winsys_handle ro_handle;
+   int ro_fd = -1;
+   if (res->ro_scanout) {
+      /* Preserve the KMSRO scanout backing by re-importing its dma-buf instead
+       * of detaching res->obj onto an unrelated allocation.
+       */
+      if ((bind & ZINK_BIND_MUTABLE) || old_obj->plane_count > 1 ||
+          old_obj->offset != 0 || !screen->ro || screen->ro->kms_fd < 0 ||
+          drmPrimeHandleToFD(screen->ro->kms_fd, res->ro_scanout->handle,
+                             DRM_CLOEXEC | DRM_RDWR, &ro_fd) < 0) {
+         res->base.b.bind &= ~bind;
+         return false;
+      }
+      memset(&ro_handle, 0, sizeof(ro_handle));
+      ro_handle.type = WINSYS_HANDLE_TYPE_FD;
+      ro_handle.handle = ro_fd;
+      ro_handle.stride = res->ro_scanout->stride;
+      ro_handle.modifier = old_obj->modifier != DRM_FORMAT_MOD_INVALID ?
+                           old_obj->modifier : DRM_FORMAT_MOD_LINEAR;
+      whandle = &ro_handle;
+   }
+#endif
    ASSERTED uint64_t mod = DRM_FORMAT_MOD_INVALID;
+   bool added_modifiers = false;
    if (bind & ZINK_BIND_DMABUF && !res->modifiers_count && !res->obj->is_buffer && screen->info.have_EXT_image_drm_format_modifier) {
       res->modifiers_count = 1;
       res->modifiers = malloc(res->modifiers_count * sizeof(uint64_t));
       if (!res->modifiers) {
          mesa_loge("ZINK: failed to allocate res->modifiers!");
+#ifdef HAVE_LIBDRM
+         if (ro_fd >= 0)
+            close(ro_fd);
+#endif
+         res->modifiers_count = 0;
+         res->base.b.bind &= ~bind;
          return false;
       }
 
       mod = res->modifiers[0] = DRM_FORMAT_MOD_LINEAR;
+      added_modifiers = true;
    }
-   struct zink_resource_object *new_obj = resource_object_create(screen, &res->base.b, NULL, &res->linear, res->modifiers, res->modifiers_count, NULL, NULL);
+   struct zink_resource_object *new_obj = resource_object_create(screen, &res->base.b, whandle, &res->linear, res->modifiers, res->modifiers_count, NULL, NULL);
+#ifdef HAVE_LIBDRM
+   if (ro_fd >= 0)
+      close(ro_fd);
+#endif
    if (!new_obj) {
       debug_printf("new backing resource alloc failed!\n");
+      if (added_modifiers) {
+         free(res->modifiers);
+         res->modifiers = NULL;
+         res->modifiers_count = 0;
+      }
       res->base.b.bind &= ~bind;
       return false;
    }
    assert(mod == DRM_FORMAT_MOD_INVALID || new_obj->modifier == DRM_FORMAT_MOD_LINEAR);
+   new_obj->immutable_handle = old_obj->immutable_handle;
    struct zink_resource staging = *res;
    staging.obj = old_obj;
    staging.all_binds = 0;
-   res->layout = VK_IMAGE_LAYOUT_UNDEFINED;
-   res->obj = new_obj;
-   res->queue = VK_QUEUE_FAMILY_IGNORED;
-   bool valid_contents = (res->obj->is_buffer && (res->valid_buffer_range.end || res->base.valid_buffer_range.end)) ||
-                         (!res->obj->is_buffer && res->valid);
-   if (valid_contents) {
-      for (unsigned i = 0; i <= res->base.b.last_level; i++) {
-         struct pipe_box box;
-         u_box_3d(0, 0, 0,
-                  u_minify(res->base.b.width0, i),
-                  u_minify(res->base.b.height0, i), res->base.b.array_size, &box);
-         box.depth = util_num_layers(&res->base.b, i);
-         ctx->base.resource_copy_region(&ctx->base, &res->base.b, i, 0, 0, 0, &staging.base.b, i, &box);
+   bool valid_contents = (old_obj->is_buffer && (res->valid_buffer_range.end || res->base.valid_buffer_range.end)) ||
+                         (!old_obj->is_buffer && res->valid);
+   if (whandle) {
+      /* new_obj aliases the same ro_scanout backing memory as old_obj, so make
+       * any unflushed writes through old_obj visible instead of self-copying.
+       */
+      if (valid_contents && zink_resource_has_usage(res) &&
+          !zink_resource_usage_check_completion_fast(screen, res, ZINK_RESOURCE_ACCESS_RW)) {
+         zink_batch_no_rp(ctx);
+         screen->image_barrier(ctx, res, VK_IMAGE_LAYOUT_GENERAL,
+                               VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+         zink_batch_reference_resource(ctx, res);
+      }
+      res->obj = new_obj;
+      res->layout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+      if (res->queue != VK_QUEUE_FAMILY_FOREIGN_EXT)
+         res->queue = VK_QUEUE_FAMILY_IGNORED;
+   } else {
+      res->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+      res->obj = new_obj;
+      res->queue = VK_QUEUE_FAMILY_IGNORED;
+      if (valid_contents) {
+         for (unsigned i = 0; i <= res->base.b.last_level; i++) {
+            struct pipe_box box;
+            u_box_3d(0, 0, 0,
+                     u_minify(res->base.b.width0, i),
+                     u_minify(res->base.b.height0, i), res->base.b.array_size, &box);
+            box.depth = util_num_layers(&res->base.b, i);
+            ctx->base.resource_copy_region(&ctx->base, &res->base.b, i, 0, 0, 0, &staging.base.b, i, &box);
+         }
       }
    }
    res->rebind_count++;
