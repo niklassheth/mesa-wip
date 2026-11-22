@@ -88,7 +88,6 @@ struct hk_meta_save {
    struct vk_sample_locations_state _dynamic_sl;
    struct vk_dynamic_graphics_state dynamic;
    struct hk_api_shader *shaders[MESA_SHADER_MESH + 1];
-   struct hk_api_shader *apple9_api[HK_APPLE9_GFX_STAGES];
    struct hk_addr_range vb0;
    struct hk_descriptor_set *desc0;
    /* Set 0's address and size, for descriptor-buffer bindings, which have
@@ -117,8 +116,6 @@ hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
 
       static_assert(sizeof(cmd->state.gfx.shaders) == sizeof(save->shaders));
       memcpy(save->shaders, cmd->state.gfx.shaders, sizeof(save->shaders));
-      memcpy(save->apple9_api, cmd->state.gfx.apple9_api,
-             sizeof(save->apple9_api));
 
       /* Pause queries */
       save->occlusion = cmd->state.gfx.occlusion.paused;
@@ -222,8 +219,6 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       for (uint32_t stage = 0; stage < ARRAY_SIZE(save->shaders); stage++) {
          hk_cmd_bind_graphics_shader(cmd, stage, save->shaders[stage]);
       }
-      memcpy(cmd->state.gfx.apple9_api, save->apple9_api,
-             sizeof(save->apple9_api));
 
       hk_cmd_bind_vertex_buffer(cmd, 0, save->vb0);
 

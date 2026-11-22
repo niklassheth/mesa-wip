@@ -326,18 +326,33 @@ bool agx_apple9_build_linked_entry(uint8_t out[64], uint64_t entry,
                                    uint64_t first, uint64_t second,
                                    uint64_t third);
 
+/* Byte capacity for a 4-stage linked body stub (call first, call second,
+ * call third, tail-jump fourth = 66 bytes, rounded up for alignment). */
+#define AGX_APPLE9_LINKED_STUB_4_MAX_BYTES 80
+size_t agx_apple9_build_linked_stub_4(uint8_t *out, size_t capacity,
+                                      uint64_t code_va, uint64_t first,
+                                      uint64_t second, uint64_t third,
+                                      uint64_t fourth);
+
 /* Maximum byte length of a per-sample trampoline built by
- * agx_apple9_build_per_sample_trampoline (4 samples + prolog + tile + ZS). */
+ * agx_apple9_build_per_sample_trampoline[_prologs] (4 samples + up to 2
+ * prologs + tile + ZS = 256 bytes). */
 #define AGX_APPLE9_PER_SAMPLE_TRAMPOLINE_MAX_BYTES 256
 
 /* Build an unrolled per-sample fragment trampoline (samples in {1, 2, 4}) at
  * `code_va`. For each sample s = 0..samples-1, loads (1 << s) into
  * AGX_APPLE9_SAMPLE_MASK_ABI_REG (r63), calls `main_addr`, reloads (1 << s)
- * into r63, and calls `epilog_addr`. Runs optional `prolog_addr` once before
- * the loop, opens `tile_access_mode` (0 = none, 0x600, or 0x700) + 0x80c when
+ * into r63, and calls `epilog_addr`. Runs optional `prolog_addr` (and
+ * `prolog2_addr` in the `_prologs` variant) once before the loop, opens
+ * `tile_access_mode` (0 = none, 0x600, or 0x700) + 0x80c when
  * `emit_tile_fence` is set, and emits TILE_FENCE 1 (`emit_zs_release`) and
  * TILE_FENCE 0x020c (`emit_tile_fence`) once after the final sample.
  * Returns the exact emitted byte count, or 0 on error. */
+size_t agx_apple9_build_per_sample_trampoline_prologs(
+   uint8_t *out, size_t capacity, uint64_t code_va, uint8_t samples,
+   uint64_t prolog1_addr, uint64_t prolog2_addr, uint64_t main_addr,
+   uint64_t epilog_addr, uint16_t tile_access_mode, bool emit_zs_release,
+   bool emit_tile_fence);
 size_t agx_apple9_build_per_sample_trampoline(
    uint8_t *out, size_t capacity, uint64_t code_va, uint8_t samples,
    uint64_t prolog_addr, uint64_t main_addr, uint64_t epilog_addr,

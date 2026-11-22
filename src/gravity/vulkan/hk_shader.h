@@ -411,8 +411,6 @@ hk_num_variants(mesa_shader_stage stage)
  * is never among them. */
 #define HK_APPLE9_GFX_STAGES (MESA_SHADER_MESH + 1)
 
-struct hk_apple9_deferred;
-
 enum hk_pre_raster_reads {
    /* Sampled, storage or input-attachment images: may alias attachments. */
    HK_READS_IMAGES = BITFIELD_BIT(0),
@@ -460,34 +458,22 @@ struct hk_api_shader {
     * This is upload metadata and does not change the compiled program. */
    uint64_t push_constant_mask;
 
-   /* Apple9 graphics shaders whose key depends on state that is dynamic or
-    * unknown at compile time keep their NIR and are compiled at draw time,
-    * together with the other bound stages. Their variants are unused.
-    */
-   struct hk_apple9_deferred *apple9_deferred;
+   /* Static depth/stencil attachment feedback loop bit from pipeline creation
+    * (VK_PIPELINE_CREATE_2_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT).
+    * Checked at draw time by hk_apple9_draw_late_zs to trigger epilog late_zs. */
+   bool zs_self_dep;
 
-   /* Optional fallback NIR retained on independently-compiled GPL/ESO stages
-    * so rare cross-stage draw states (cull distances, per-vertex barycentrics,
-    * line stipple, polygon mode POINT, dynamic depth/stencil feedback loops)
-    * can still resolve a linked pair without failing. NULL for monolithic
-    * pipelines and never touched on ordinary draws. */
-   struct hk_apple9_deferred *apple9_fallback;
-
-   /* Eager pipelines own an emulated realization and this optional native
-    * leaf. Deferred variants compile only the requested path: a native
-    * result is itself a leaf, with no emulated realization attached. */
+   /* Pipelines own an emulated realization and this optional native leaf. */
    struct hk_api_shader *apple9_native;
 
    /* Native mesh/FS realizations have the same content-derived compile ID.
     * Store the ID in cache blobs so independently reloaded stages can still
-    * prove that their producer/consumer interfaces were compiled together.
-    * Leaves have no deferred source or further alternative. */
+    * prove that their producer/consumer interfaces were compiled together. */
    bool apple9_native_leaf;
    blake3_hash apple9_native_pair_id;
 
-   /* Shader capability, established before deferred state-dependent linking.
-    * Draw state can still require the emulated realization. A deferred native
-    * rejection clears this atomically while recording threads may read it. */
+   /* Shader capability for native routing. Draw state can still require the
+    * emulated realization. */
    bool apple9_native_candidate;
    /* Whole-primitive culling that requires degenerate triangles to be empty,
     * including CullPrimitiveEXT and per-vertex CullDistance. */
@@ -496,13 +482,11 @@ struct hk_api_shader {
    /* A native TES uses the program-info union for mesh metadata. Retain
     * the API tessellation mode independently for the existing producer. */
    struct hk_tess_info apple9_native_tess;
-   /* Production admission of the API producer. Also persisted on deferred
-    * candidates and every leaf in a linked native realization. Zero denotes
-    * ordinary fallback or an explicitly selected research realization. */
+   /* Production admission of the API producer. Zero denotes ordinary fallback
+    * or an explicitly selected research realization. */
    uint8_t apple9_native_stage_mask;
 
-   /* True once compiled variants are populated (false on deferred or test-stub
-    * shells). */
+   /* True once compiled variants are populated (false on test-stub shells). */
    bool compiled;
 
    /* Immutable after compilation/cache reload; avoids walking variants at
@@ -548,24 +532,11 @@ hk_native_producer_object(struct hk_api_shader *shader)
 }
 
 struct vk_graphics_pipeline_state;
-
-VkResult hk_apple9_resolve_graphics(
-   struct hk_device *dev, struct hk_api_shader *const api[HK_APPLE9_GFX_STAGES],
-   const struct vk_graphics_pipeline_state *state,
-   struct hk_api_shader *out[HK_APPLE9_GFX_STAGES], bool prefer_native,
-   bool fs_statistics);
-
-void hk_apple9_precompile_init(struct hk_device *dev);
-void hk_apple9_precompile_finish(struct hk_device *dev);
-
-bool hk_apple9_deferred_sample_shading(const struct hk_api_shader *fs);
-bool hk_apple9_deferred_zs_self_dep(const struct hk_api_shader *fs);
-bool hk_apple9_fallback_dynamic_topology(const struct hk_api_shader *vs);
 struct vk_depth_stencil_state;
+
 bool hk_apple9_zs_writes(const struct vk_depth_stencil_state *ds,
                          VkImageAspectFlags aspects);
 
-void hk_apple9_variants_finish(struct hk_device *dev);
 void hk_apple9_bodies_finish(struct hk_device *dev);
 
 bool hk_apple9_lower_sparse_residency(nir_shader *nir);

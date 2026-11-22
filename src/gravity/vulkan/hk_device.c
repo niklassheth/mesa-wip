@@ -499,7 +499,6 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    }
 
    simple_mtx_init(&dev->heap_lock, mtx_plain);
-   simple_mtx_init(&dev->apple9_variants.lock, mtx_plain);
    simple_mtx_init(&dev->apple9_bodies.lock, mtx_plain);
    list_inithead(&dev->apple9_bodies.slabs);
    dev->dev.apple9_pin_entry = hk_apple9_pin_entry;
@@ -528,8 +527,6 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_null_fs;
 
-   hk_apple9_precompile_init(dev);
-
    *pDevice = hk_device_to_handle(dev);
 
    simple_mtx_init(&dev->events.lock, mtx_plain);
@@ -552,7 +549,6 @@ fail_mem_cache:
    hk_apple9_sw_vs_prologs_finish(dev);
    hk_apple9_vs_prologs_finish(dev);
    hk_apple9_fs_epilogs_finish(dev);
-   hk_apple9_variants_finish(dev);
    hk_apple9_bodies_finish(dev);
    hk_apple9_tile_helpers_finish(dev);
    assert(list_is_empty(&dev->apple9_bodies.slabs));
@@ -564,7 +560,6 @@ fail_mem_cache:
    simple_mtx_destroy(&dev->apple9_linked_entries.lock);
    simple_mtx_destroy(&dev->apple9_fs_epilogs.lock);
    simple_mtx_destroy(&dev->apple9_vs_prologs.lock);
-   simple_mtx_destroy(&dev->apple9_variants.lock);
    simple_mtx_destroy(&dev->apple9_bodies.lock);
    simple_mtx_destroy(&dev->apple9_tile_helpers.lock);
 fail_queues:
@@ -603,7 +598,6 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (!dev)
       return;
 
-   hk_apple9_precompile_finish(dev);
    hk_device_finish_meta(dev);
    hk_apple9_per_sample_trampolines_finish(dev);
    hk_apple9_linked_entries_finish(dev);
@@ -613,7 +607,6 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    hk_apple9_sw_vs_prologs_finish(dev);
    hk_apple9_vs_prologs_finish(dev);
    hk_apple9_fs_epilogs_finish(dev);
-   hk_apple9_variants_finish(dev);
    hk_apple9_bodies_finish(dev);
    hk_apple9_tile_helpers_finish(dev);
    hk_destroy_internal_shaders(dev, &dev->kernels, false);
@@ -643,7 +636,6 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    simple_mtx_destroy(&dev->apple9_linked_entries.lock);
    simple_mtx_destroy(&dev->apple9_fs_epilogs.lock);
    simple_mtx_destroy(&dev->apple9_vs_prologs.lock);
-   simple_mtx_destroy(&dev->apple9_variants.lock);
    assert(list_is_empty(&dev->apple9_bodies.slabs));
    simple_mtx_destroy(&dev->apple9_bodies.lock);
    simple_mtx_destroy(&dev->apple9_tile_helpers.lock);

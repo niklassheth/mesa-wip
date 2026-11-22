@@ -87,7 +87,6 @@ record(struct hk_device *dev, const char *name, unsigned count,
       blob_finish(&blob);
       hk_api_shader_destroy(&dev->vk, out[i], NULL);
    }
-   hk_apple9_variants_finish(dev);
    hk_apple9_bodies_finish(dev);
    test_reset_usc_heap(dev);
    CHECK(live_bos == 0);
@@ -163,7 +162,6 @@ int main(int argc, char **argv)
    dev->dev.shader_base=0x1200000000ull;
    dev->vk.alloc=*vk_default_allocator();dev->vk.physical=&pdev->vk;
    hk_device_init_usc_heap(dev);
-   simple_mtx_init(&dev->apple9_variants.lock,mtx_plain);
    simple_mtx_init(&dev->apple9_bodies.lock,mtx_plain);
    simple_mtx_init(&pdev->debug_compile_lock,mtx_plain);
    for (unsigned t=16;t<=32;t*=2) {
@@ -196,7 +194,6 @@ int main(int argc, char **argv)
    record(dev,"VS-FS",2,ordinary);
    simple_mtx_destroy(&pdev->debug_compile_lock);
    simple_mtx_destroy(&dev->apple9_bodies.lock);
-   simple_mtx_destroy(&dev->apple9_variants.lock);
    test_reset_usc_heap(dev);hk_device_finish_usc_heap(dev);
    free(dev);free(pdev);glsl_type_singleton_decref();fclose(ledger);
    printf("cases=%u shader_objects=%u native_objects=%u GPU_execution=0\n",cases,objects,natives);

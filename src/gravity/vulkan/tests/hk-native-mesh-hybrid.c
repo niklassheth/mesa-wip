@@ -205,7 +205,6 @@ roundtrip(struct hk_device *dev, struct hk_api_shader *src)
 static void
 check_programs(struct hk_api_shader *mesh, struct hk_api_shader *fs, bool native)
 {
-   CHECK(!mesh->apple9_deferred && !fs->apple9_deferred);
    if (!mesh->apple9_native_leaf) {
       CHECK(!fs->apple9_native_leaf);
       CHECK(mesh->variants[HK_MESH_VARIANT_MAIN].info.apple9_native_stage ==
@@ -246,7 +245,7 @@ check_programs(struct hk_api_shader *mesh, struct hk_api_shader *fs, bool native
 }
 
 static unsigned
-compile(struct hk_device *dev, bool deferred, bool native, unsigned failure)
+compile(struct hk_device *dev, bool native, unsigned failure)
 {
    struct vk_shader_compile_info infos[] = {
       {.stage = MESA_SHADER_MESH,
@@ -271,64 +270,27 @@ compile(struct hk_device *dev, bool deferred, bool native, unsigned failure)
    allocations = 0;
    native_compiles = emulated_compiles = fragment_compiles = 0;
    fail_allocation = failure;
-   VkResult result = deferred
-      ? hk_apple9_defer_graphics(dev, 2, infos, NULL, NULL, out)
-      : hk_apple9_compile_graphics(dev, 2, infos, NULL, &key, NULL, NULL, out);
+   VkResult result =
+      hk_apple9_compile_graphics(dev, 2, infos, NULL, &key, NULL, NULL, out);
    if (failure) {
       CHECK(result == VK_ERROR_OUT_OF_DEVICE_MEMORY);
       CHECK(!out[0] && !out[1]);
    } else {
       if (result != VK_SUCCESS)
-         fprintf(stderr, "compile deferred=%u native=%u result=%d\n", deferred, native, result);
+         fprintf(stderr, "compile native=%u result=%d\n", native, result);
       CHECK(result == VK_SUCCESS);
       struct hk_api_shader *mesh = container_of(out[0], struct hk_api_shader, vk);
       struct hk_api_shader *fs = container_of(out[1], struct hk_api_shader, vk);
-      if (deferred) {
-         CHECK(allocations == 0);
-         CHECK(mesh->apple9_native_candidate == native);
-         CHECK(mesh->apple9_deferred && !mesh->apple9_native);
-      } else {
-         check_programs(mesh, fs, native);
-         CHECK(native_compiles == native && emulated_compiles == 1);
-         CHECK(fragment_compiles == 1 + native);
-      }
+      check_programs(mesh, fs, native);
+      CHECK(native_compiles == native && emulated_compiles == 1);
+      CHECK(fragment_compiles == 1 + native);
       struct hk_api_shader *mcopy = roundtrip(dev, mesh), *fcopy = roundtrip(dev, fs);
-      if (deferred) {
-         CHECK(mcopy->apple9_native_candidate == native);
-         CHECK(allocations == 0);
-         struct hk_api_shader *api[HK_APPLE9_GFX_STAGES] = {
-            [MESA_SHADER_MESH] = mcopy, [MESA_SHADER_FRAGMENT] = fcopy,
-         }, *resolved[HK_APPLE9_GFX_STAGES] = {0};
-         CHECK(hk_apple9_resolve_graphics(dev, api, &state, resolved, true, false) ==
-               VK_SUCCESS);
-         check_programs(resolved[MESA_SHADER_MESH], resolved[MESA_SHADER_FRAGMENT], native);
-         CHECK(native_compiles == native && emulated_compiles == !native);
-         CHECK(fragment_compiles == 1);
-         struct hk_api_shader *first = resolved[MESA_SHADER_MESH];
-         unsigned before = allocations;
-         CHECK(hk_apple9_resolve_graphics(dev, api, &state, resolved, true, false) ==
-               VK_SUCCESS);
-         CHECK(resolved[MESA_SHADER_MESH] == first && allocations == before);
-         CHECK(fragment_compiles == 1);
-         CHECK(hk_apple9_resolve_graphics(dev, api, &state, resolved, false, false) ==
-               VK_SUCCESS);
-         check_programs(resolved[MESA_SHADER_MESH],
-                        resolved[MESA_SHADER_FRAGMENT], false);
-         CHECK(native_compiles == native && emulated_compiles == 1);
-         CHECK(fragment_compiles == 1 + native);
-         before = allocations;
-         CHECK(hk_apple9_resolve_graphics(dev, api, &state, resolved, true, false) ==
-               VK_SUCCESS);
-         CHECK(resolved[MESA_SHADER_MESH] == first && allocations == before);
-      } else {
-         check_programs(mcopy, fcopy, native);
-      }
+      check_programs(mcopy, fcopy, native);
       hk_api_shader_destroy(&dev->vk, &mcopy->vk, NULL);
       hk_api_shader_destroy(&dev->vk, &fcopy->vk, NULL);
       hk_api_shader_destroy(&dev->vk, out[0], NULL);
       hk_api_shader_destroy(&dev->vk, out[1], NULL);
    }
-   hk_apple9_variants_finish(dev);
    hk_apple9_bodies_finish(dev);
    test_reset_usc_heap(dev);
    CHECK(live_bos == 0);
@@ -373,47 +335,6 @@ compile_native_only(struct hk_device *dev, bool reject, unsigned failure)
    test_reset_usc_heap(dev);
    CHECK(live_bos == 0);
    return allocations;
-}
-
-static void
-deferred_rejection(struct hk_device *dev)
-{
-   struct vk_shader_compile_info infos[] = {
-      {.stage = MESA_SHADER_MESH, .nir = source(false, 3, 1),
-       .robustness = &vk_robustness_disabled},
-      {.stage = MESA_SHADER_FRAGMENT, .nir = source(true, 0, 0),
-       .robustness = &vk_robustness_disabled},
-   };
-   struct vk_shader *out[2] = {0};
-   fail_allocation = 0;
-   allocations = native_compiles = emulated_compiles = fragment_compiles = 0;
-   CHECK(hk_apple9_defer_graphics(dev, 2, infos, NULL, NULL, out) == VK_SUCCESS);
-   struct hk_api_shader *api[HK_APPLE9_GFX_STAGES] = {
-      [MESA_SHADER_MESH] = container_of(out[0], struct hk_api_shader, vk),
-      [MESA_SHADER_FRAGMENT] = container_of(out[1], struct hk_api_shader, vk),
-   }, *resolved[HK_APPLE9_GFX_STAGES] = {0};
-   CHECK(api[MESA_SHADER_MESH]->apple9_native_candidate);
-   reject_native = true;
-   CHECK(hk_apple9_resolve_graphics(dev, api, NULL, resolved, true, false) == VK_SUCCESS);
-   reject_native = false;
-   CHECK(!api[MESA_SHADER_MESH]->apple9_native_candidate);
-   check_programs(resolved[MESA_SHADER_MESH], resolved[MESA_SHADER_FRAGMENT], false);
-   struct hk_api_shader *first = resolved[MESA_SHADER_MESH];
-   unsigned before = allocations;
-   for (unsigned i = 0; i < 4; ++i) {
-      CHECK(hk_apple9_resolve_graphics(dev, api, NULL, resolved, i & 1, false) == VK_SUCCESS);
-      CHECK(resolved[MESA_SHADER_MESH] == first && allocations == before);
-      CHECK(native_compiles == 1 && emulated_compiles == 1 && fragment_compiles == 1);
-   }
-   struct hk_api_shader *copy = roundtrip(dev, api[MESA_SHADER_MESH]);
-   CHECK(!copy->apple9_native_candidate);
-   hk_api_shader_destroy(&dev->vk, &copy->vk, NULL);
-   hk_api_shader_destroy(&dev->vk, out[0], NULL);
-   hk_api_shader_destroy(&dev->vk, out[1], NULL);
-   hk_apple9_variants_finish(dev);
-   hk_apple9_bodies_finish(dev);
-   test_reset_usc_heap(dev);
-   CHECK(live_bos == 0);
 }
 
 /* Use real VS->GS input loads so the native path must retain the software VS
@@ -469,7 +390,7 @@ check_gs_programs(struct hk_api_shader **api, bool native, unsigned vertices)
    struct hk_api_shader *ng = hk_api_shader_native(api[MESA_SHADER_GEOMETRY]);
    for (unsigned i = 0; i < ARRAY_SIZE(stages); ++i) {
       struct hk_api_shader *s = api[stages[i]];
-      CHECK(s && s->vk.stage == stages[i] && !s->apple9_deferred);
+      CHECK(s && s->vk.stage == stages[i]);
       CHECK(s->constant_data_addr);
       struct hk_api_shader *n = hk_api_shader_native(s);
       CHECK(!!n == native);
@@ -506,11 +427,11 @@ check_gs_programs(struct hk_api_shader **api, bool native, unsigned vertices)
    }
 }
 
-/* Exercise eager ownership, deferred native/fallback/native reuse, backend
- * rejection and every BO allocation failure, including the software VS. */
+/* Exercise eager ownership, backend rejection and every BO allocation
+ * failure, including the software VS. */
 static unsigned
-compile_gs(struct hk_device *dev, unsigned vertices, bool deferred,
-           bool reject, unsigned failure)
+compile_gs(struct hk_device *dev, unsigned vertices, bool reject,
+           unsigned failure)
 {
    const mesa_shader_stage stages[] = {
       MESA_SHADER_VERTEX, MESA_SHADER_GEOMETRY, MESA_SHADER_FRAGMENT};
@@ -518,7 +439,6 @@ compile_gs(struct hk_device *dev, unsigned vertices, bool deferred,
    struct vk_shader *out[3] = {0};
    struct hk_api_shader *api[HK_APPLE9_GFX_STAGES] = {0};
    struct hk_api_shader *copies[HK_APPLE9_GFX_STAGES] = {0};
-   struct hk_api_shader *resolved[HK_APPLE9_GFX_STAGES] = {0};
    for (unsigned i = 0; i < 3; ++i) {
       infos[i].stage = stages[i];
       infos[i].nir = gs_source(stages[i], vertices);
@@ -528,13 +448,12 @@ compile_gs(struct hk_device *dev, unsigned vertices, bool deferred,
    allocations = native_compiles = emulated_compiles = fragment_compiles = 0;
    fail_allocation = failure;
    reject_native = reject;
-   VkResult result = deferred
-      ? hk_apple9_defer_graphics(dev, 3, infos, NULL, NULL, out)
-      : hk_apple9_compile_graphics(dev, 3, infos, NULL, NULL, NULL, NULL, out);
+   VkResult result =
+      hk_apple9_compile_graphics(dev, 3, infos, NULL, NULL, NULL, NULL, out);
    unsigned compiled_allocations = allocations;
    bool native = (hk_apple9_native_gs_enabled() ||
        (hk_apple9_native_stage_policy(hk_device_physical(dev)) & HK_APPLE9_NATIVE_GS_BIT)) && vertices <= 4 && !reject;
-   if (!deferred && failure) {
+   if (failure) {
       CHECK(result == VK_ERROR_OUT_OF_DEVICE_MEMORY);
       CHECK(!out[0] && !out[1] && !out[2]);
    } else {
@@ -543,39 +462,14 @@ compile_gs(struct hk_device *dev, unsigned vertices, bool deferred,
          api[stages[i]] = container_of(out[i], struct hk_api_shader, vk);
          copies[stages[i]] = roundtrip(dev, api[stages[i]]);
       }
-      if (deferred) {
-         CHECK(allocations == 0);
-         result = hk_apple9_resolve_graphics(dev, copies, NULL, resolved, true, false);
-         compiled_allocations = allocations;
-         if (failure) {
-            CHECK(result == VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         } else {
-            CHECK(result == VK_SUCCESS);
-            check_gs_programs(resolved, native, vertices);
-            CHECK(native_compiles == ((hk_apple9_native_gs_enabled() ||
-       (hk_apple9_native_stage_policy(hk_device_physical(dev)) & HK_APPLE9_NATIVE_GS_BIT)) && vertices <= 4));
-            unsigned before = allocations, compiles = native_compiles;
-            struct hk_api_shader *first = resolved[MESA_SHADER_GEOMETRY];
-            CHECK(hk_apple9_resolve_graphics(dev, copies, NULL, resolved, true, false) == VK_SUCCESS);
-            CHECK(allocations == before && resolved[MESA_SHADER_GEOMETRY] == first);
-            CHECK(hk_apple9_resolve_graphics(dev, copies, NULL, resolved, false, false) == VK_SUCCESS);
-            check_gs_programs(resolved, false, vertices);
-            before = allocations;
-            CHECK(hk_apple9_resolve_graphics(dev, copies, NULL, resolved, true, false) == VK_SUCCESS);
-            CHECK(allocations == before && resolved[MESA_SHADER_GEOMETRY] == first);
-            CHECK(native_compiles == compiles);
-         }
-      } else {
-         check_gs_programs(api, native, vertices);
-         check_gs_programs(copies, native, vertices);
-      }
+      check_gs_programs(api, native, vertices);
+      check_gs_programs(copies, native, vertices);
       for (unsigned i = 0; i < 3; ++i) {
          hk_api_shader_destroy(&dev->vk, out[i], NULL);
          hk_api_shader_destroy(&dev->vk, &copies[stages[i]]->vk, NULL);
       }
    }
    reject_native = false;
-   hk_apple9_variants_finish(dev);
    hk_apple9_bodies_finish(dev);
    test_reset_usc_heap(dev);
    CHECK(live_bos == 0);
@@ -645,7 +539,7 @@ check_tess_programs(struct hk_api_shader **api, bool native, unsigned vertices)
    struct hk_api_shader *ng = hk_api_shader_native(api[MESA_SHADER_TESS_EVAL]);
    for (unsigned i = 0; i < ARRAY_SIZE(stages); ++i) {
       struct hk_api_shader *s = api[stages[i]];
-      CHECK(s && s->vk.stage == stages[i] && !s->apple9_deferred);
+      CHECK(s && s->vk.stage == stages[i]);
       CHECK(s->constant_data_addr);
       struct hk_api_shader *n = hk_api_shader_native(s);
       CHECK(!!n == native);
@@ -688,11 +582,11 @@ check_tess_programs(struct hk_api_shader **api, bool native, unsigned vertices)
    }
 }
 
-/* Exercise eager ownership, deferred native/fallback/native reuse, backend
- * rejection and every BO allocation failure, including the software VS. */
+/* Exercise eager ownership, backend rejection and every BO allocation
+ * failure, including the software VS. */
 static unsigned
-compile_tess(struct hk_device *dev, unsigned vertices, bool deferred,
-             bool reject, unsigned failure)
+compile_tess(struct hk_device *dev, unsigned vertices, bool reject,
+             unsigned failure)
 {
    const mesa_shader_stage stages[] = {
       MESA_SHADER_VERTEX, MESA_SHADER_TESS_CTRL, MESA_SHADER_TESS_EVAL,
@@ -701,7 +595,6 @@ compile_tess(struct hk_device *dev, unsigned vertices, bool deferred,
    struct vk_shader *out[4] = {0};
    struct hk_api_shader *api[HK_APPLE9_GFX_STAGES] = {0};
    struct hk_api_shader *copies[HK_APPLE9_GFX_STAGES] = {0};
-   struct hk_api_shader *resolved[HK_APPLE9_GFX_STAGES] = {0};
    for (unsigned i = 0; i < 4; ++i) {
       infos[i].stage = stages[i];
       infos[i].nir = tess_source(stages[i], vertices);
@@ -715,13 +608,11 @@ compile_tess(struct hk_device *dev, unsigned vertices, bool deferred,
    fail_allocation = failure;
    reject_native = reject;
    VkResult result =
-      deferred ? hk_apple9_defer_graphics(dev, 4, infos, NULL, NULL, out)
-               : hk_apple9_compile_graphics(dev, 4, infos, NULL, NULL, NULL,
-                                            NULL, out);
+      hk_apple9_compile_graphics(dev, 4, infos, NULL, NULL, NULL, NULL, out);
    unsigned compiled_allocations = allocations;
    bool native = (hk_apple9_native_tess_enabled() ||
        (hk_apple9_native_stage_policy(hk_device_physical(dev)) & HK_APPLE9_NATIVE_TES_BIT)) && vertices <= 32 && !reject;
-   if (!deferred && failure) {
+   if (failure) {
       CHECK(result == VK_ERROR_OUT_OF_DEVICE_MEMORY);
       CHECK(!out[0] && !out[1] && !out[2] && !out[3]);
    } else {
@@ -730,46 +621,14 @@ compile_tess(struct hk_device *dev, unsigned vertices, bool deferred,
          api[stages[i]] = container_of(out[i], struct hk_api_shader, vk);
          copies[stages[i]] = roundtrip(dev, api[stages[i]]);
       }
-      if (deferred) {
-         CHECK(allocations == 0);
-         result = hk_apple9_resolve_graphics(dev, copies, NULL, resolved, true,
-                                             false);
-         compiled_allocations = allocations;
-         if (failure) {
-            CHECK(result == VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         } else {
-            CHECK(result == VK_SUCCESS);
-            check_tess_programs(resolved, native, vertices);
-            CHECK(native_compiles ==
-                  ((hk_apple9_native_tess_enabled() ||
-       (hk_apple9_native_stage_policy(hk_device_physical(dev)) & HK_APPLE9_NATIVE_TES_BIT)) && vertices <= 32));
-            unsigned before = allocations, compiles = native_compiles;
-            struct hk_api_shader *first = resolved[MESA_SHADER_TESS_EVAL];
-            CHECK(hk_apple9_resolve_graphics(dev, copies, NULL, resolved, true,
-                                             false) == VK_SUCCESS);
-            CHECK(allocations == before &&
-                  resolved[MESA_SHADER_TESS_EVAL] == first);
-            CHECK(hk_apple9_resolve_graphics(dev, copies, NULL, resolved, false,
-                                             false) == VK_SUCCESS);
-            check_tess_programs(resolved, false, vertices);
-            before = allocations;
-            CHECK(hk_apple9_resolve_graphics(dev, copies, NULL, resolved, true,
-                                             false) == VK_SUCCESS);
-            CHECK(allocations == before &&
-                  resolved[MESA_SHADER_TESS_EVAL] == first);
-            CHECK(native_compiles == compiles);
-         }
-      } else {
-         check_tess_programs(api, native, vertices);
-         check_tess_programs(copies, native, vertices);
-      }
+      check_tess_programs(api, native, vertices);
+      check_tess_programs(copies, native, vertices);
       for (unsigned i = 0; i < 4; ++i) {
          hk_api_shader_destroy(&dev->vk, out[i], NULL);
          hk_api_shader_destroy(&dev->vk, &copies[stages[i]]->vk, NULL);
       }
    }
    reject_native = false;
-   hk_apple9_variants_finish(dev);
    hk_apple9_bodies_finish(dev);
    test_reset_usc_heap(dev);
    CHECK(live_bos == 0);
@@ -836,48 +695,33 @@ main(void)
    dev->vk.alloc = *vk_default_allocator();
    dev->vk.physical = &pdev->vk;
    hk_device_init_usc_heap(dev);
-   simple_mtx_init(&dev->apple9_variants.lock, mtx_plain);
    simple_mtx_init(&dev->apple9_bodies.lock, mtx_plain);
    list_inithead(&dev->apple9_bodies.slabs);
    simple_mtx_init(&pdev->debug_compile_lock, mtx_plain);
-   for (unsigned v = 1; v <= 32; v = v == 1 ? 3 : v == 3 ? 32 : 33) {
-      compile_tess(dev, v, false, false, 0);
-      compile_tess(dev, v, true, false, 0);
-   }
+   for (unsigned v = 1; v <= 32; v = v == 1 ? 3 : v == 3 ? 32 : 33)
+      compile_tess(dev, v, false, 0);
    if (hk_apple9_native_tess_enabled()) {
-      compile_tess(dev, 3, false, true, 0);
-      compile_tess(dev, 3, true, true, 0);
-      for (unsigned deferred = 0; deferred < 2; ++deferred) {
-         unsigned count = compile_tess(dev, 3, deferred, false, 0);
-         for (unsigned i = 1; i <= count; ++i)
-            compile_tess(dev, 3, deferred, false, i);
-      }
+      compile_tess(dev, 3, true, 0);
+      unsigned count = compile_tess(dev, 3, false, 0);
+      for (unsigned i = 1; i <= count; ++i)
+         compile_tess(dev, 3, false, i);
       goto done;
    }
-   for (unsigned v = 3; v <= 5; ++v) {
-      compile_gs(dev, v, false, false, 0);
-      compile_gs(dev, v, true, false, 0);
-   }
+   for (unsigned v = 3; v <= 5; ++v)
+      compile_gs(dev, v, false, 0);
    if (hk_apple9_native_gs_enabled()) {
-      compile_gs(dev, 4, false, true, 0);
-      compile_gs(dev, 4, true, true, 0);
-      for (unsigned deferred = 0; deferred < 2; ++deferred) {
-         unsigned count = compile_gs(dev, 4, deferred, false, 0);
-         for (unsigned i = 1; i <= count; ++i)
-            compile_gs(dev, 4, deferred, false, i);
-      }
+      compile_gs(dev, 4, true, 0);
+      unsigned count = compile_gs(dev, 4, false, 0);
+      for (unsigned i = 1; i <= count; ++i)
+         compile_gs(dev, 4, false, i);
       goto done;
    }
-   unsigned count = compile(dev, false, true, 0);
-   compile(dev, false, false, 0);
-   compile(dev, true, true, 0);
-   compile(dev, true, false, 0);
-   deferred_rejection(dev);
+   unsigned count = compile(dev, true, 0);
+   compile(dev, false, 0);
    for (unsigned i = 1; i <= count; ++i)
-      compile(dev, false, true, i);
+      compile(dev, true, i);
    primitive_copies = true;
-   compile(dev, false, true, 0);
-   compile(dev, true, true, 0);
+   compile(dev, true, 0);
    primitive_copies = false;
    count = compile_native_only(dev, false, 0);
    for (unsigned i = 1; i <= count; ++i)
@@ -888,13 +732,11 @@ main(void)
 done:
    simple_mtx_destroy(&pdev->debug_compile_lock);
    simple_mtx_destroy(&dev->apple9_bodies.lock);
-   simple_mtx_destroy(&dev->apple9_variants.lock);
    test_reset_usc_heap(dev);
    hk_device_finish_usc_heap(dev);
    free(dev);
    free(pdev);
    glsl_type_singleton_decref();
-   puts(
-      "hybrid pairs, single-path deferred compiles/cache reuse, helper guards, constants and OOM pass");
+   puts("hybrid pairs, helper guards, constants and OOM pass");
    return 0;
 }

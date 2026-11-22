@@ -67,7 +67,6 @@ gravity_vk_files = files(
   'hk_shader_compile.c',
   'hk_shader_nir.c',
   'hk_shader_priv.h',
-  'hk_shader_variant.c',
   'hk_sync.c',
   'hk_sync.h',
   'hk_wsi.c',
@@ -172,24 +171,16 @@ if with_tests
                  '-Wl,--wrap=poll', '-Wl,--wrap=ioctl', '-Wl,--wrap=close',
                  '-Wl,--wrap=realloc', '-Wl,--wrap=calloc']),
     suite : ['gravity'])
-  foreach t : ['hk-index-aperture', 'hk-index-memory', 'hk-variant-retry', 'hk-variant-cache', 'hk-texture-upload-failure', 'hk-line-stipple-limit']
+  foreach t : ['hk-index-aperture', 'hk-index-memory', 'hk-texture-upload-failure', 'hk-line-stipple-limit']
     gravity_shader_test = executable('gravity-' + t, 'tests/' + t + '.c',
       include_directories : [inc_gallium, inc_gallium_aux, inc_include,
                              inc_src, inc_gravity],
       dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
       link_args : {'hk-index-aperture': ['-Wl,--wrap=hk_dispatch_precomp'],
                    'hk-index-memory': ['-Wl,--wrap=agx_va_alloc', '-Wl,--wrap=agx_bo_bind', '-Wl,--wrap=agx_va_free'],
-                   'hk-variant-cache': ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_reference', '-Wl,--wrap=agx_bo_unreference', '-Wl,--wrap=nir_deserialize', '-Wl,--wrap=__vk_errorf'],
-                   'hk-variant-retry': ['-Wl,--wrap=nir_deserialize', '-Wl,--wrap=__vk_errorf'],
                    'hk-texture-upload-failure': ['-Wl,--wrap=hk_pool_upload'],
                    'hk-line-stipple-limit': []}[t])
-    if t == 'hk-variant-cache'
-      test('gravity-' + t, prog_python,
-        args : [files('tests/hk-variant-cache.py'), gravity_shader_test],
-        suite : ['gravity'])
-    else
-      test('gravity-' + t, gravity_shader_test, suite : ['gravity'])
-    endif
+    test('gravity-' + t, gravity_shader_test, suite : ['gravity'])
   endforeach
   test(
     'gravity-hk-heap-oom',

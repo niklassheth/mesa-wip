@@ -122,8 +122,7 @@ static const char *const hk_codegen_env[] = {
  * compiled, or command recording/submission. They do not change shader code.
  * Keep them available for runtime investigations without splitting caches. */
 static const char *const hk_ignored_env[] = {
-   "HK_APPLE9_VARIANT_CACHE_VERIFY", "HK_APPLE9_DUMP_FRAGMENT_DIR",
-   "HK_APPLE9_EAGER_VARIANTS",       "HK_APPLE9_SPARSE_SCRATCH",
+   "HK_APPLE9_DUMP_FRAGMENT_DIR",    "HK_APPLE9_SPARSE_SCRATCH",
    "HK_APPLE9_TESS_BATCH",           "HK_APPLE9_TESS_SCAN_BLOCK",
    "HK_APPLE9_MERGE_RENDERS",        "HK_APPLE9_MERGE_RESUME",
    "HK_APPLE9_MERGE_HOIST_BARRIERS", "HK_APPLE9_MERGE_MOVE_COMPUTE",
@@ -434,13 +433,7 @@ hk_hash_graphics_state(struct vk_physical_device *device,
    if (state) {
       struct hk_apple9_graphics_key key;
       hk_apple9_graphics_key_device(&key, state, pdev);
-      if (hk_apple9_fs_needs_epilog(state, features))
-         key.fs_use_epilog = true;
       _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
-
-      /* Deferred shaders differ from precompiled ones for the same key. */
-      uint32_t deferral = hk_apple9_deferral_hash_bits(state, features, stages);
-      _mesa_blake3_update(&blake3_ctx, &deferral, sizeof(deferral));
    }
 
    if (state &&
@@ -494,19 +487,6 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
    if (obj->apple9_native) {
       assert(!obj->apple9_native->apple9_native);
       hk_api_shader_destroy(vk_dev, &obj->apple9_native->vk, pAllocator);
-   }
-
-   if (obj->apple9_deferred) {
-      hk_apple9_forget_deferred(dev, obj);
-      hk_apple9_destroy_deferred(dev, obj->apple9_deferred);
-      vk_shader_free(&dev->vk, pAllocator, &obj->vk);
-      return;
-   }
-
-   if (obj->apple9_fallback) {
-      hk_apple9_forget_deferred(dev, obj);
-      hk_apple9_destroy_deferred(dev, obj->apple9_fallback);
-      obj->apple9_fallback = NULL;
    }
 
    hk_foreach_variant(obj, shader) {
@@ -572,48 +552,8 @@ hk_compile_shaders_timed(struct vk_device *vk_dev, uint32_t shader_count,
    }
 
    if (shader_count && infos[0].stage != MESA_SHADER_COMPUTE) {
-      enum hk_apple9_deferral deferral =
-         hk_apple9_needs_deferral(shader_count, infos, state, features);
-      if (deferral != HK_APPLE9_COMPILE_NOW) {
-         VkResult result = hk_apple9_defer_graphics(dev, shader_count, infos,
-                                                    state, pAllocator,
-                                                    shaders_out);
-         /* With complete state, the variant draws select is known: resolve
-          * it now, as RADV and ANV compile at creation, so that draws do not
-          * stall the recording thread. */
-         if (result == VK_SUCCESS && deferral == HK_APPLE9_DEFER_COMPLETE &&
-             !hk_apple9_eager_variants_disabled())
-            hk_apple9_eager_variant(dev, shader_count, shaders_out, state,
-                                    true);
-         return result;
-      }
-      struct hk_apple9_deferred *fallbacks[HK_APPLE9_GFX_STAGES] = {NULL};
-      const bool need_fallback =
-         (shader_count == 1 &&
-          (infos[0].stage == MESA_SHADER_VERTEX ||
-           infos[0].stage == MESA_SHADER_FRAGMENT)) ||
-         (state &&
-          (BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE) ||
-           BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE)));
-      if (need_fallback) {
-         for (uint32_t i = 0; i < shader_count; ++i) {
-            if (infos[i].stage == MESA_SHADER_VERTEX ||
-                infos[i].stage == MESA_SHADER_FRAGMENT)
-               fallbacks[i] = hk_apple9_build_deferred(&infos[i], state);
-         }
-      }
-      VkResult result = hk_apple9_compile_graphics(
-         dev, shader_count, infos, state, NULL, NULL, pAllocator, shaders_out);
-      for (uint32_t i = 0; i < shader_count; ++i) {
-         if (result == VK_SUCCESS && fallbacks[i]) {
-            struct hk_api_shader *obj =
-               container_of(shaders_out[i], struct hk_api_shader, vk);
-            obj->apple9_fallback = fallbacks[i];
-         } else if (fallbacks[i]) {
-            hk_apple9_destroy_deferred(dev, fallbacks[i]);
-         }
-      }
-      return result;
+      return hk_apple9_compile_graphics(dev, shader_count, infos, state, NULL,
+                                        NULL, pAllocator, shaders_out);
    }
 
    for (uint32_t i = 0; i < shader_count; i++) {
@@ -700,7 +640,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 }
 
 /* Version the container independently of the hardware programs it owns. */
-#define HK_SHADER_CONTAINER_VERSION 0x484b000bu
+#define HK_SHADER_CONTAINER_VERSION 0x484b000cu
 
 static VkResult
 hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *blob,
@@ -761,54 +701,6 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
    }
 
-   if (blob_read_uint8(blob)) {
-      if (obj->apple9_native_leaf ||
-          (mask && stage != MESA_SHADER_GEOMETRY && stage != MESA_SHADER_TESS_EVAL)) {
-         hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
-         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
-      }
-      struct hk_apple9_deferred *d = calloc(1, sizeof(*d));
-      if (!d) {
-         vk_shader_free(&dev->vk, pAllocator, &obj->vk);
-         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
-      }
-      d->next_stage_mask = blob_read_uint32(blob);
-      d->set_layout_count = blob_read_uint32(blob);
-      d->sample_shading = blob_read_uint8(blob);
-      d->zs_self_dep = blob_read_uint8(blob);
-      d->vertex_unbounded = blob_read_uint8(blob);
-      d->undefined_colors = blob_read_uint8(blob);
-      d->cull_distance = blob_read_uint8(blob);
-      d->vs_can_prolog = blob_read_uint8(blob);
-      d->fs_uses_per_vertex = blob_read_uint8(blob);
-      d->fs_can_epilog = blob_read_uint8(blob);
-      d->fs_uses_sample_rate = blob_read_uint8(blob);
-      d->fs_reads_viewport = blob_read_uint8(blob);
-      d->fs_reads_prim_id = blob_read_uint8(blob);
-      d->vs_dynamic_topology = blob_read_uint8(blob);
-      obj->writes_memory = blob_read_uint8(blob);
-      obj->pre_raster_reads = blob_read_uint8(blob);
-      obj->reads_draw_id = blob_read_uint8(blob);
-      blob_copy_bytes(blob, &obj->push_constant_mask,
-                      sizeof(obj->push_constant_mask));
-      const uint32_t nir_size = blob_read_uint32(blob);
-      const void *nir = blob_read_bytes(blob, nir_size);
-      d->nir = blob->overrun ? NULL : hk_apple9_nir_create(nir, nir_size);
-      if (!d->nir) {
-         free(d);
-         vk_shader_free(&dev->vk, pAllocator, &obj->vk);
-         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
-      }
-      obj->apple9_deferred = d;
-      simple_mtx_init(&d->variant_lock, mtx_plain);
-      if (!hk_apple9_deserialize_variants(dev, obj, blob)) {
-         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
-         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
-      }
-      *shader_out = &obj->vk;
-      return VK_SUCCESS;
-   }
-
    hk_foreach_variant(obj, shader) {
       VkResult result = hk_deserialize_shader(dev, blob, shader);
 
@@ -823,6 +715,7 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
                       sizeof(obj->apple9_native_tess));
    obj->pre_raster_reads = blob_read_uint8(blob);
    obj->reads_draw_id = blob_read_uint8(blob);
+   obj->zs_self_dep = blob_read_uint8(blob);
    blob_copy_bytes(blob, &obj->push_constant_mask,
                    sizeof(obj->push_constant_mask));
    bool has_native = blob_read_uint8(blob);
@@ -841,49 +734,12 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
          return result;
       }
       obj->apple9_native = container_of(native, struct hk_api_shader, vk);
-      if (native->stage != stage || obj->apple9_native->apple9_deferred ||
+      if (native->stage != stage ||
           !obj->apple9_native->apple9_native_leaf ||
           obj->apple9_native->apple9_native_stage_mask != mask) {
          hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       }
-   }
-
-   bool has_fallback = blob_read_uint8(blob);
-   if (blob->overrun) {
-      hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
-      return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
-   }
-   if (has_fallback) {
-      struct hk_apple9_deferred *fb = calloc(1, sizeof(*fb));
-      if (!fb) {
-         hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
-         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
-      }
-      fb->next_stage_mask = blob_read_uint32(blob);
-      fb->set_layout_count = blob_read_uint32(blob);
-      fb->sample_shading = blob_read_uint8(blob);
-      fb->zs_self_dep = blob_read_uint8(blob);
-      fb->vertex_unbounded = blob_read_uint8(blob);
-      fb->undefined_colors = blob_read_uint8(blob);
-      fb->cull_distance = blob_read_uint8(blob);
-      fb->vs_can_prolog = blob_read_uint8(blob);
-      fb->fs_uses_per_vertex = blob_read_uint8(blob);
-      fb->fs_can_epilog = blob_read_uint8(blob);
-      fb->fs_uses_sample_rate = blob_read_uint8(blob);
-      fb->fs_reads_viewport = blob_read_uint8(blob);
-      fb->fs_reads_prim_id = blob_read_uint8(blob);
-      fb->vs_dynamic_topology = blob_read_uint8(blob);
-      const uint32_t nir_size = blob_read_uint32(blob);
-      const void *nir = blob_read_bytes(blob, nir_size);
-      fb->nir = blob->overrun ? NULL : hk_apple9_nir_create(nir, nir_size);
-      if (!fb->nir) {
-         free(fb);
-         hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
-         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
-      }
-      simple_mtx_init(&fb->variant_lock, mtx_plain);
-      obj->apple9_fallback = fb;
    }
 
    hk_api_shader_init_constant_data(obj);
@@ -930,33 +786,6 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
    blob_write_bytes(blob, obj->apple9_native_pair_id,
                     sizeof(obj->apple9_native_pair_id));
 
-   struct hk_apple9_deferred *d = obj->apple9_deferred;
-   blob_write_uint8(blob, d != NULL);
-   if (d) {
-      blob_write_uint32(blob, d->next_stage_mask);
-      blob_write_uint32(blob, d->set_layout_count);
-      blob_write_uint8(blob, d->sample_shading);
-      blob_write_uint8(blob, d->zs_self_dep);
-      blob_write_uint8(blob, d->vertex_unbounded);
-      blob_write_uint8(blob, d->undefined_colors);
-      blob_write_uint8(blob, d->cull_distance);
-      blob_write_uint8(blob, d->vs_can_prolog);
-      blob_write_uint8(blob, d->fs_uses_per_vertex);
-      blob_write_uint8(blob, d->fs_can_epilog);
-      blob_write_uint8(blob, d->fs_uses_sample_rate);
-      blob_write_uint8(blob, d->fs_reads_viewport);
-      blob_write_uint8(blob, d->fs_reads_prim_id);
-      blob_write_uint8(blob, d->vs_dynamic_topology);
-      blob_write_uint8(blob, obj->writes_memory);
-      blob_write_uint8(blob, obj->pre_raster_reads);
-      blob_write_uint8(blob, obj->reads_draw_id);
-      blob_write_bytes(blob, &obj->push_constant_mask,
-                       sizeof(obj->push_constant_mask));
-      blob_write_uint32(blob, d->nir->size);
-      blob_write_bytes(blob, d->nir->data, d->nir->size);
-      return hk_apple9_serialize_variants(d, blob);
-   }
-
    hk_foreach_variant(obj, shader) {
       hk_shader_serialize(vk_dev, shader, blob);
    }
@@ -970,37 +799,16 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
                        sizeof(obj->apple9_native_tess));
    blob_write_uint8(blob, obj->pre_raster_reads);
    blob_write_uint8(blob, obj->reads_draw_id);
+   blob_write_uint8(blob, obj->zs_self_dep);
    blob_write_bytes(blob, &obj->push_constant_mask,
                     sizeof(obj->push_constant_mask));
 
    blob_write_uint8(blob, obj->apple9_native != NULL);
    if (obj->apple9_native) {
       assert(!obj->apple9_native->apple9_native &&
-             !obj->apple9_native->apple9_deferred &&
              obj->apple9_native->apple9_native_leaf &&
              !obj->apple9_native_leaf);
       hk_api_shader_serialize(vk_dev, &obj->apple9_native->vk, blob);
-   }
-
-   struct hk_apple9_deferred *fb = obj->apple9_fallback;
-   blob_write_uint8(blob, fb != NULL);
-   if (fb) {
-      blob_write_uint32(blob, fb->next_stage_mask);
-      blob_write_uint32(blob, fb->set_layout_count);
-      blob_write_uint8(blob, fb->sample_shading);
-      blob_write_uint8(blob, fb->zs_self_dep);
-      blob_write_uint8(blob, fb->vertex_unbounded);
-      blob_write_uint8(blob, fb->undefined_colors);
-      blob_write_uint8(blob, fb->cull_distance);
-      blob_write_uint8(blob, fb->vs_can_prolog);
-      blob_write_uint8(blob, fb->fs_uses_per_vertex);
-      blob_write_uint8(blob, fb->fs_can_epilog);
-      blob_write_uint8(blob, fb->fs_uses_sample_rate);
-      blob_write_uint8(blob, fb->fs_reads_viewport);
-      blob_write_uint8(blob, fb->fs_reads_prim_id);
-      blob_write_uint8(blob, fb->vs_dynamic_topology);
-      blob_write_uint32(blob, fb->nir->size);
-      blob_write_bytes(blob, fb->nir->data, fb->nir->size);
    }
 
    return !blob->out_of_memory;

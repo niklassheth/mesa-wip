@@ -1141,8 +1141,6 @@ hk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
       if (stages[i] == MESA_SHADER_COMPUTE || stages[i] == MESA_SHADER_KERNEL) {
          hk_cmd_bind_compute_shader(cmd, shader);
       } else {
-         if (stages[i] < HK_APPLE9_GFX_STAGES)
-            cmd->state.gfx.apple9_api[stages[i]] = shaders[i] ? shader : NULL;
          hk_cmd_bind_graphics_shader(cmd, stages[i], shaders[i] ? shader : NULL);
       }
    }

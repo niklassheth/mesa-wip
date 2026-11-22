@@ -107,21 +107,6 @@ struct hk_device {
    /* Apple9: the null fragment program for a full API sample mask. */
    struct hk_api_shader *null_fs_trivial;
 
-   /* Apple9 draw-time variants of deferred graphics shaders, keyed by the
-    * bound shader objects and the resolved graphics key. */
-   struct {
-      simple_mtx_t lock;
-      struct hash_table *ht;
-   } apple9_variants;
-
-   /* Apple9 variants compiled into the pipeline cache in the background when
-    * a pipeline with complete state is created, see hk_apple9_precompile_init. */
-   struct {
-      struct util_queue queue;
-      bool ready;
-      uint32_t abort;
-   } apple9_precompile;
-
    /* Apple9 shader code slices shared by byte-identical bodies, see
     * hk_upload_shader. */
    struct {

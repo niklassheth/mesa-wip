@@ -50,8 +50,7 @@ a = read(AGX_APPLE9_DEBUG='asm')[1]
 b = read(AGX_APPLE9_STATS='1')[1]
 assert read(AGX_APPLE9_DEBUG='asm', AGX_APPLE9_STATS='0') == (base, a | b)
 # Runtime-only controls and dump paths share the same compiler key.
-for name in ('HK_APPLE9_VARIANT_CACHE_VERIFY', 'HK_APPLE9_DUMP_FRAGMENT_DIR',
-             'HK_APPLE9_EAGER_VARIANTS', 'HK_APPLE9_SPARSE_SCRATCH',
+for name in ('HK_APPLE9_DUMP_FRAGMENT_DIR', 'HK_APPLE9_SPARSE_SCRATCH',
              'HK_APPLE9_TESS_BATCH', 'HK_APPLE9_TESS_SCAN_BLOCK',
              'HK_APPLE9_MERGE_RENDERS', 'HK_APPLE9_MERGE_RESUME',
              'HK_APPLE9_MERGE_HOIST_BARRIERS', 'HK_APPLE9_MERGE_MOVE_COMPUTE',

@@ -655,7 +655,7 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
        dyn->ia.primitive_topology ==
           VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY);
    bool stipple_gs =
-      fs_stipple && dyn->rs.line.stipple.enable &&
+      dyn->rs.line.stipple.enable &&
       u_reduced_prim(in_prim) == MESA_PRIM_LINES;
 
    /* Polygon mode POINT on triangles draws real points from a software

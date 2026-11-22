@@ -1777,6 +1777,190 @@ hk_apple9_compile_task(struct hk_device *dev, nir_shader *nir,
 
 /* fs_interp optionally gives the {flat, linear} input masks of the fragment
  * shader consuming a separately compiled last pre-rasterization stage. */
+/* Whether a draw with this depth/stencil state can write the depth or
+ * stencil aspects present. A depth/stencil feedback loop needs late tests
+ * only then: an early test that writes nothing leaves the attachment the
+ * fragment shader reads unchanged (turnip applies the same condition). */
+bool
+hk_apple9_zs_writes(const struct vk_depth_stencil_state *ds,
+                    VkImageAspectFlags aspects)
+{
+   if (!ds)
+      return true;
+   struct vk_depth_stencil_state opt = *ds;
+   opt.stencil.write_enable = true;
+   vk_optimize_depth_stencil_state(&opt, aspects, true);
+   return opt.depth.write_enable || opt.stencil.write_enable;
+}
+
+void
+hk_apple9_graphics_key(struct hk_apple9_graphics_key *key,
+                       const struct vk_graphics_pipeline_state *state)
+{
+   memset(key, 0, sizeof(*key));
+   key->vertex.draw_params_ubo = HK_APPLE9_DRAW_PARAMS_BINDING;
+   key->vertex.buffer_descriptor_ubo = HK_APPLE9_VERTEX_BUFFERS_BINDING;
+   /* Strides are always read from the bound buffer table, which supports
+    * VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE without recompilation. */
+   key->vertex.dynamic_stride = true;
+   /* Vulkan enables every clip distance the shader writes. */
+   key->vertex.clip_distance_enable = 0xff;
+   /* All non-internal fragment shaders link with a draw-time epilog. */
+   key->fs_use_epilog = true;
+   key->blend[0].samples = 1;
+   for (unsigned rt = 0; rt < ARRAY_SIZE(key->color_map); ++rt)
+      key->color_map[rt] = rt;
+   if (!state) {
+      /* Independent shader-object compile (ESO): decouple vertex input,
+       * clip-space depth range, and fragment output/blending. */
+      key->vertex.use_prolog = true;
+      key->clip_negative_one_to_one_dynamic = true;
+      key->blend[0].dynamic_samples = true;
+      key->blend[0].sample_mask_single_sample = true;
+      key->blend[0].dynamic_sample_positions = true;
+      key->blend[0].clamp_early_depth = true;
+      key->blend[0].early_depth_clamp_offset_B =
+         hk_root_descriptor_offset(draw.depth_clamp);
+      return;
+   }
+   if (state->cal) {
+      for (unsigned rt = 0; rt < ARRAY_SIZE(key->color_map); ++rt)
+         key->color_map[rt] = state->cal->color_map[rt];
+   }
+   if (!state->vp ||
+       (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ||
+       BITSET_TEST(state->dynamic,
+                   MESA_VK_DYNAMIC_VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE)) {
+      key->clip_negative_one_to_one_dynamic = true;
+      key->clip_negative_one_to_one = false;
+   } else {
+      key->clip_negative_one_to_one =
+         state->vp->depth_clip_negative_one_to_one;
+   }
+   if (state->rp) {
+      for (unsigned rt = 0; rt < MIN2(state->rp->color_attachment_count, 8); ++rt) {
+         if (state->rp->color_attachment_formats[rt] == VK_FORMAT_UNDEFINED)
+            key->undefined_colors |= BITFIELD_BIT(rt);
+      }
+   }
+   key->sample_shading = state->ms && state->ms->sample_shading_enable;
+   key->zs_self_dep = !!(state->pipeline_flags &
+                         VK_PIPELINE_CREATE_2_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
+   key->line_stipple =
+      state->rs && state->rs->line.stipple.enable &&
+      !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE);
+   key->polygon_points =
+      state->rs && state->rs->polygon_mode == VK_POLYGON_MODE_POINT &&
+      !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE);
+   if (state->ia) {
+      enum mesa_prim prim =
+         u_reduced_prim(vk_topology_to_mesa(state->ia->primitive_topology));
+      key->polygon_points &= prim != MESA_PRIM_POINTS && prim != MESA_PRIM_LINES;
+   }
+
+   if (state->ia &&
+       !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY)) {
+      key->vertex.rasterize_points =
+         state->ia->primitive_topology == MESA_PRIM_POINTS;
+      key->vertex.ignore_point_size = !key->vertex.rasterize_points;
+   }
+   if (!state->vi || BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_VI)) {
+      key->vertex.use_prolog = true;
+   } else {
+      for (unsigned a = 0; a < 16; ++a) {
+         if (!(state->vi->attributes_valid & BITFIELD_BIT(a)))
+            continue;
+         const struct vk_vertex_attribute_state *attr =
+            &state->vi->attributes[a];
+         const struct vk_vertex_binding_state *binding =
+            &state->vi->bindings[attr->binding];
+         key->vertex.format[a] = vk_format_to_pipe_format(attr->format);
+         key->vertex.offset[a] = attr->offset;
+         key->vertex.buffer[a] = attr->binding;
+         /* A zero instance divisor repeats the first instance's element. */
+         key->vertex.divisor[a] =
+            binding->input_rate != VK_VERTEX_INPUT_RATE_INSTANCE ? 0
+            : binding->divisor ? binding->divisor
+                               : AGX_APPLE9_VERTEX_DIVISOR_ZERO;
+      }
+   }
+   key->targets = state->rp ? state->rp->color_attachment_count : 0;
+   for (unsigned rt = 0; rt < MAX2(MIN2(key->targets, 8), 1); ++rt) {
+      struct agx_apple9_blend *blend = &key->blend[rt];
+      blend->format = rt < key->targets
+         ? vk_format_to_pipe_format(state->rp->color_attachment_formats[rt])
+         : PIPE_FORMAT_NONE;
+      blend->color_attachment_unused = blend->format == PIPE_FORMAT_NONE;
+      blend->sample_mask_single_sample = true;
+      blend->dynamic_sample_positions = true;
+      blend->clamp_early_depth =
+         !state->rs || state->rs->depth_clamp_enable ||
+         BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLAMP_ENABLE);
+      blend->early_depth_clamp_ubo = 0;
+      blend->early_depth_clamp_offset_B =
+         hk_root_descriptor_offset(draw.depth_clamp);
+      blend->samples =
+         (state->ms &&
+          !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES) &&
+          state->ms->rasterization_samples)
+            ? state->ms->rasterization_samples : 1;
+      if (rt == 0 &&
+          (!state->ms ||
+           BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES)))
+         blend->dynamic_samples = true;
+      blend->rgb_src = blend->alpha_src = PIPE_BLENDFACTOR_ONE;
+      blend->rgb_dst = blend->alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      blend->rgb_func = blend->alpha_func = PIPE_BLEND_ADD;
+      if (state->ms) {
+         blend->disabled_samples = ~state->ms->sample_mask;
+         blend->alpha_to_coverage = state->ms->alpha_to_coverage_enable;
+         blend->alpha_to_one = state->ms->alpha_to_one_enable;
+      }
+      if (state->cb && rt < state->cb->attachment_count) {
+         const struct vk_color_blend_attachment_state *cb =
+            &state->cb->attachments[rt];
+         blend->dynamic_enable = BITSET_TEST(
+            state->dynamic, MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES);
+         blend->colormask = (blend->dynamic_enable ||
+                             (state->cb->color_write_enables & BITFIELD_BIT(rt)))
+                               ? cb->write_mask
+                               : 0;
+         blend->logicop_enable = state->cb->logic_op_enable;
+         blend->logicop_func = vk_logic_op_to_pipe(state->cb->logic_op);
+         if (cb->blend_enable && cb->color_blend_op >= VK_BLEND_OP_ZERO_EXT) {
+            /* Advanced equations are blended in the shader from the tile. */
+            blend->advanced_mode =
+               vk_advanced_blend_op_to_pipe(cb->color_blend_op);
+            blend->advanced_overlap =
+               vk_blend_overlap_to_pipe(cb->blend_overlap);
+            blend->src_premultiplied = cb->src_premultiplied;
+            blend->dst_premultiplied = cb->dst_premultiplied;
+         } else if (cb->blend_enable) {
+            blend->rgb_src =
+               vk_blend_factor_to_pipe(cb->src_color_blend_factor);
+            blend->rgb_dst =
+               vk_blend_factor_to_pipe(cb->dst_color_blend_factor);
+            blend->alpha_src =
+               vk_blend_factor_to_pipe(cb->src_alpha_blend_factor);
+            blend->alpha_dst =
+               vk_blend_factor_to_pipe(cb->dst_alpha_blend_factor);
+            blend->rgb_func = vk_blend_op_to_pipe(cb->color_blend_op);
+            blend->alpha_func = vk_blend_op_to_pipe(cb->alpha_blend_op);
+         }
+      }
+   }
+}
+
+void
+hk_apple9_graphics_key_device(struct hk_apple9_graphics_key *key,
+                              const struct vk_graphics_pipeline_state *state,
+                              const struct hk_physical_device *pdev)
+{
+   hk_apple9_graphics_key(key, state);
+   key->native_index = hk_apple9_native_index_enabled(pdev);
+   key->native_stages = hk_apple9_native_stage_policy(pdev);
+}
+
 VkResult
 hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                            struct vk_shader_compile_info *infos,
@@ -1791,11 +1975,8 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
    struct hk_apple9_graphics_key key;
    if (key_in)
       key = *key_in;
-   else {
+   else
       hk_apple9_graphics_key_device(&key, state, hk_device_physical(dev));
-      if (state && hk_apple9_fs_needs_epilog(state, &dev->vk.enabled_features))
-         key.fs_use_epilog = true;
-   }
    struct agx_apple9_varying_layout varyings = {0};
    const char *reason = NULL;
    simple_mtx_t *lock = agx_get_compiler_debug()
@@ -2115,10 +2296,12 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                nir->xfb_info || hk_per_vertex_copies_used(&per_vertex) ||
                stipple_stage == MESA_SHADER_VERTEX ||
                polygon_stage == MESA_SHADER_VERTEX ||
-               !state ||
+               key.line_stipple || key.polygon_points ||
+               !state || !has_fragment ||
                (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ||
                BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE) ||
-               BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE);
+               BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE) ||
+               dev->vk.enabled_features.primitivesGeneratedQuery;
             struct hk_shader *sw = &obj->variants[HK_VS_VARIANT_SW];
             nir_shader *sw_nir = NULL;
             if (sw_needed || nir->info.cull_distance_array_size) {
@@ -2203,10 +2386,12 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             bool tes_sw_needed =
                polygon_stage == MESA_SHADER_TESS_EVAL ||
                stipple_stage == MESA_SHADER_TESS_EVAL ||
-               copies_from_gs || !state ||
+               key.line_stipple || key.polygon_points ||
+               copies_from_gs || !state || !has_fragment ||
                (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ||
                BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE) ||
-               BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE);
+               BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE) ||
+               dev->vk.enabled_features.primitivesGeneratedQuery;
             result = hk_apple9_compile_tes(
                dev, nir, &key.vertex, obj,
                infos[i].next_stage_mask |
@@ -2286,6 +2471,10 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             varyings = obj->variants[HK_MESH_VARIANT_RAST].b.info.apple9_varyings;
             continue;
          } else {
+            obj->zs_self_dep =
+               state &&
+               (state->pipeline_flags &
+                VK_PIPELINE_CREATE_2_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
             shader->info.fs.interp.linear = key.vertex.outputs_linear;
             shader->info.fs.interp.flat = key.vertex.outputs_flat;
             shader->info.fs.line_stipple_start = stipple.start;
@@ -2545,8 +2734,6 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
       key = *key_in;
    } else {
       hk_apple9_graphics_key_device(&key, state, hk_device_physical(dev));
-      if (state && hk_apple9_fs_needs_epilog(state, &dev->vk.enabled_features))
-         key.fs_use_epilog = true;
       for (unsigned i = 0; i < count; ++i) {
          if (infos[i].stage == MESA_SHADER_VERTEX)
             key.vertex.unbounded = hk_apple9_vertex_unbounded(&infos[i]);

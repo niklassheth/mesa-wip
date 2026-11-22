@@ -1517,14 +1517,45 @@ apple9_emit_call_pop(uint8_t *out, size_t capacity, size_t *pos,
 }
 
 size_t
-agx_apple9_build_per_sample_trampoline(
+agx_apple9_build_linked_stub_4(uint8_t *out, size_t capacity, uint64_t code_va,
+                               uint64_t first, uint64_t second, uint64_t third,
+                               uint64_t fourth)
+{
+   if (!out || !first || !second || !third || !fourth ||
+       ((code_va | first | second | third | fourth) & 1) || capacity < 66)
+      return 0;
+
+   size_t pos = 0;
+   const uint8_t push[4] = {0x0f, 0x05, 0x54, 0x1a};
+   memcpy(out + pos, push, 4);
+   pos += 4;
+
+   if (!apple9_emit_call_pop(out, capacity, &pos, code_va, first) ||
+       !apple9_emit_call_pop(out, capacity, &pos, code_va, second) ||
+       !apple9_emit_call_pop(out, capacity, &pos, code_va, third))
+      return 0;
+
+   int64_t jmp_disp = (int64_t)fourth - (int64_t)(code_va + pos);
+   if (pos + 14 > capacity ||
+       jmp_disp < -(int64_t)UINT32_MAX || jmp_disp > UINT32_MAX ||
+       !agx_apple9_encode_branch(out + pos, true, jmp_disp))
+      return 0;
+   pos += 10;
+   apple9_put_u32(out + pos, 0x0e);
+   pos += 4;
+   return pos;
+}
+
+size_t
+agx_apple9_build_per_sample_trampoline_prologs(
    uint8_t *out, size_t capacity, uint64_t code_va, uint8_t samples,
-   uint64_t prolog_addr, uint64_t main_addr, uint64_t epilog_addr,
-   uint16_t tile_access_mode, bool emit_zs_release, bool emit_tile_fence)
+   uint64_t prolog1_addr, uint64_t prolog2_addr, uint64_t main_addr,
+   uint64_t epilog_addr, uint16_t tile_access_mode, bool emit_zs_release,
+   bool emit_tile_fence)
 {
    if (!out || !main_addr || !epilog_addr ||
        (samples != 1 && samples != 2 && samples != 4) ||
-       ((code_va | prolog_addr | main_addr | epilog_addr) & 1) ||
+       ((code_va | prolog1_addr | prolog2_addr | main_addr | epilog_addr) & 1) ||
        (tile_access_mode != 0 && tile_access_mode != 0x600 &&
         tile_access_mode != 0x700))
       return 0;
@@ -1536,8 +1567,11 @@ agx_apple9_build_per_sample_trampoline(
    memcpy(out + pos, push, 4);
    pos += 4;
 
-   if (prolog_addr &&
-       !apple9_emit_call_pop(out, capacity, &pos, code_va, prolog_addr))
+   if (prolog1_addr &&
+       !apple9_emit_call_pop(out, capacity, &pos, code_va, prolog1_addr))
+      return 0;
+   if (prolog2_addr &&
+       !apple9_emit_call_pop(out, capacity, &pos, code_va, prolog2_addr))
       return 0;
 
    if (tile_access_mode &&
@@ -1578,6 +1612,17 @@ agx_apple9_build_per_sample_trampoline(
    apple9_put_u32(out + pos, 0x0e);
    pos += 4;
    return pos;
+}
+
+size_t
+agx_apple9_build_per_sample_trampoline(
+   uint8_t *out, size_t capacity, uint64_t code_va, uint8_t samples,
+   uint64_t prolog_addr, uint64_t main_addr, uint64_t epilog_addr,
+   uint16_t tile_access_mode, bool emit_zs_release, bool emit_tile_fence)
+{
+   return agx_apple9_build_per_sample_trampoline_prologs(
+      out, capacity, code_va, samples, prolog_addr, 0, main_addr, epilog_addr,
+      tile_access_mode, emit_zs_release, emit_tile_fence);
 }
 
 static bool

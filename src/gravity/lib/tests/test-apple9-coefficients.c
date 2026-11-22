@@ -256,6 +256,20 @@ main(void)
       /* Odd addresses must be rejected */
       CHECK(!agx_apple9_build_linked_entry(stub, entry + 1, prolog, main_va, epilog));
       CHECK(!agx_apple9_build_linked_entry(stub, entry, prolog, main_va, epilog + 1));
+
+      /* 4-stage linked body stub (cull + stipple + main + epilog = 66 bytes) */
+      uint8_t stub4[AGX_APPLE9_LINKED_STUB_4_MAX_BYTES];
+      uint64_t prolog2 = dev->shader_base + 0x11800;
+      size_t sz4 = agx_apple9_build_linked_stub_4(
+         stub4, sizeof(stub4), entry, prolog, prolog2, main_va, epilog);
+      CHECK(sz4 == 66);
+      CHECK(stub4[0] == 0x0f && stub4[1] == 0x05 && stub4[2] == 0x54 && stub4[3] == 0x1a);
+      CHECK(stub4[4] == 0x8f && stub4[20] == 0x8f && stub4[36] == 0x8f);
+      CHECK(stub4[52] == 0x0f && stub4[62] == 0x0e);
+      CHECK(agx_apple9_build_linked_stub_4(
+               stub4, 64, entry, prolog, prolog2, main_va, epilog) == 0);
+      CHECK(agx_apple9_build_linked_stub_4(
+               stub4, sizeof(stub4), entry, prolog, 0, main_va, epilog) == 0);
    }
 
    /* Per-sample trampoline builder (1x, 2x, 4x, with and without prolog/fences) */
@@ -263,6 +277,7 @@ main(void)
       uint8_t tramp[AGX_APPLE9_PER_SAMPLE_TRAMPOLINE_MAX_BYTES];
       uint64_t base = dev->shader_base + 0x10000;
       uint64_t prolog = dev->shader_base + 0x11000;
+      uint64_t prolog2 = dev->shader_base + 0x11800;
       uint64_t main_va = dev->shader_base + 0x12000;
       uint64_t epilog = dev->shader_base + 0x13000;
 
@@ -276,6 +291,13 @@ main(void)
       CHECK(tramp[sz4 - 16] == 0x07 && tramp[sz4 - 13] == 0x01 && tramp[sz4 - 12] == 0x00);
       CHECK(tramp[sz4 - 10] == 0x07 && tramp[sz4 - 7] == 0x0c && tramp[sz4 - 6] == 0x02);
       CHECK(tramp[sz4 - 4] == 0x0e && tramp[sz4 - 1] == 0x00);
+
+      size_t sz4_2p = agx_apple9_build_per_sample_trampoline_prologs(
+         tramp, sizeof(tramp), base, 4, prolog, prolog2, main_va, epilog,
+         0x600, true, true);
+      /* +16 bytes for second prolog = 256 (exact fit in MAX_BYTES) */
+      CHECK(sz4_2p == 256);
+      CHECK(tramp[sz4_2p - 4] == 0x0e && tramp[sz4_2p - 1] == 0x00);
 
       size_t sz2 = agx_apple9_build_per_sample_trampoline(
          tramp, sizeof(tramp), base, 2, 0, main_va, epilog, 0, false, false);

@@ -1532,10 +1532,6 @@ hk_ia_update(struct hk_cmd_buffer *cmd, struct agx_draw draw,
    }
 }
 
-/* Replace deferred Apple9 shaders with the variant for the current dynamic
- * state and attachments. The synthesized pipeline state carries exactly the
- * inputs of the Apple9 graphics key.
- */
 /* Late depth/stencil tests for a feedback loop, enabled dynamically or by
  * the fragment shader's pipeline, only when the draw can write depth or
  * stencil (hk_apple9_zs_writes). Zink reports a loop whenever a depth texture
@@ -1548,170 +1544,12 @@ hk_apple9_draw_late_zs(const struct vk_dynamic_graphics_state *dyn,
 {
    const bool dynamic = dyn->feedback_loops &
       (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
-   const bool created = hk_apple9_deferred_zs_self_dep(fs);
+   const bool created = fs && fs->zs_self_dep;
    if (!dynamic && !created)
       return false;
    return hk_apple9_zs_writes(&dyn->ds,
       (render->depth_att.iview ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
       (render->stencil_att.iview ? VK_IMAGE_ASPECT_STENCIL_BIT : 0));
-}
-
-static bool
-hk_apple9_resolve_shaders(struct hk_cmd_buffer *cmd, bool prefer_native)
-{
-   struct hk_graphics_state *gfx = &cmd->state.gfx;
-   /* Shader resolution consumes some dirty bits which also affect native
-    * draw state. Invalidate that cache before resolution clears them. */
-   if (vk_dynamic_graphics_state_any_dirty(&cmd->vk.dynamic_graphics_state))
-      cmd->apple9_draw_state.valid = false;
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
-   const struct hk_rendering_state *render = &gfx->render;
-   const bool late_zs = hk_apple9_draw_late_zs(dyn, render,
-      gfx->apple9_api[MESA_SHADER_FRAGMENT]);
-
-   bool deferred = false;
-   for (unsigned s = 0; s < HK_APPLE9_GFX_STAGES; ++s) {
-      deferred |= gfx->apple9_api[s] && gfx->apple9_api[s]->apple9_deferred;
-   }
-   bool exotic = false;
-   if (!deferred) {
-      const bool vs_fb = gfx->apple9_api[MESA_SHADER_VERTEX] &&
-                         gfx->apple9_api[MESA_SHADER_VERTEX]->apple9_fallback;
-      const bool fs_fb = gfx->apple9_api[MESA_SHADER_FRAGMENT] &&
-                         gfx->apple9_api[MESA_SHADER_FRAGMENT]->apple9_fallback;
-      if (vs_fb || fs_fb) {
-         const bool polygon_points =
-            dyn->rs.polygon_mode == VK_POLYGON_MODE_POINT &&
-            u_reduced_prim(vk_topology_to_mesa(dyn->ia.primitive_topology)) ==
-               MESA_PRIM_TRIANGLES;
-         const bool point_list =
-            dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST &&
-            hk_apple9_fallback_dynamic_topology(
-               gfx->apple9_api[MESA_SHADER_VERTEX]);
-         exotic = dyn->rs.line.stipple.enable || polygon_points ||
-                  point_list || (late_zs && fs_fb);
-      }
-   }
-   if (!deferred && !exotic) {
-      if (gfx->apple9_resolved.valid) {
-         for (unsigned s = 0; s < HK_APPLE9_GFX_STAGES; ++s) {
-            if (gfx->apple9_api[s] || s == MESA_SHADER_FRAGMENT)
-               hk_cmd_bind_graphics_shader(cmd, s, gfx->apple9_api[s]);
-         }
-         gfx->apple9_resolved.valid = false;
-      }
-      return true;
-   }
-
-   /* Dynamic state read by the graphics key. Draw-state reuse was already
-    * invalidated above, so resolution can consume these bits. */
-   static const enum mesa_vk_dynamic_graphics_state inputs[] = {
-      MESA_VK_DYNAMIC_VI,
-      MESA_VK_DYNAMIC_VI_BINDINGS_VALID,
-      MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY,
-      MESA_VK_DYNAMIC_VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE,
-      MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP,
-      MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES,
-      MESA_VK_DYNAMIC_MS_SAMPLE_MASK,
-      MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE,
-      MESA_VK_DYNAMIC_MS_ALPHA_TO_ONE_ENABLE,
-      MESA_VK_DYNAMIC_CB_LOGIC_OP_ENABLE,
-      MESA_VK_DYNAMIC_CB_LOGIC_OP,
-      MESA_VK_DYNAMIC_CB_ATTACHMENT_COUNT,
-      MESA_VK_DYNAMIC_CB_BLEND_ENABLES,
-      MESA_VK_DYNAMIC_CB_BLEND_EQUATIONS,
-      MESA_VK_DYNAMIC_CB_WRITE_MASKS,
-      MESA_VK_DYNAMIC_CB_BLEND_ADVANCED,
-      MESA_VK_DYNAMIC_ATTACHMENT_FEEDBACK_LOOP_ENABLE,
-      MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE,
-      MESA_VK_DYNAMIC_RS_POLYGON_MODE,
-      MESA_VK_DYNAMIC_RS_DEPTH_CLAMP_ENABLE,
-   };
-   /* Fragment shaders count invocations only while such a query is active;
-    * other draws use variants without the counter. */
-   const bool fs_statistics = gfx->descriptors.root.draw.pipeline_stats_flags &
-      VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
-   bool changed = !gfx->apple9_resolved.valid ||
-                  gfx->apple9_resolved.prefer_native != prefer_native ||
-                  gfx->apple9_resolved.fs_statistics != fs_statistics ||
-                  gfx->apple9_resolved.late_zs != late_zs ||
-                  gfx->apple9_resolved.render_gen != gfx->render_gen ||
-                  memcmp(gfx->apple9_resolved.api, gfx->apple9_api,
-                         sizeof(gfx->apple9_api));
-   for (unsigned i = 0; i < ARRAY_SIZE(inputs); ++i)
-      changed |= BITSET_TEST(dyn->dirty, inputs[i]);
-   if (!changed) {
-      for (unsigned s = 0; s < HK_APPLE9_GFX_STAGES; ++s) {
-         if (gfx->apple9_api[s] || s == MESA_SHADER_FRAGMENT)
-            hk_cmd_bind_graphics_shader(cmd, s, gfx->apple9_resolved.out[s]);
-      }
-      return true;
-   }
-
-   struct vk_multisample_state ms = {
-      .rasterization_samples =
-         dyn->ms.rasterization_samples
-            ? dyn->ms.rasterization_samples
-            : MAX2(render->tilebuffer.nr_samples, 1),
-      .sample_mask = dyn->ms.sample_mask,
-      .alpha_to_coverage_enable = dyn->ms.alpha_to_coverage_enable,
-      .alpha_to_one_enable = dyn->ms.alpha_to_one_enable,
-      .sample_shading_enable = hk_apple9_deferred_sample_shading(
-         gfx->apple9_api[MESA_SHADER_FRAGMENT]),
-   };
-   struct vk_render_pass_state rp = {
-      .color_attachment_count = render->color_att_count,
-   };
-   for (unsigned i = 0; i < render->color_att_count; ++i)
-      rp.color_attachment_formats[i] = render->color_att[i].vk_format;
-   /* Shader objects set blend state per attachment without a count. */
-   struct vk_color_blend_state cb = dyn->cb;
-   cb.attachment_count = MAX2(cb.attachment_count, render->color_att_count);
-
-   struct vk_graphics_pipeline_state state = {
-      .vi = dyn->vi,
-      /* Mesh pipelines have no input assembly; their topology is unset. */
-      .ia = gfx->apple9_api[MESA_SHADER_MESH] ? NULL : &dyn->ia,
-      .vp = &dyn->vp,
-      .rs = &dyn->rs,
-      .ms = &ms,
-      .cb = &cb,
-      .rp = &rp,
-      .cal = &dyn->cal,
-      .pipeline_flags =
-         late_zs ? VK_PIPELINE_CREATE_2_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT
-                 : 0,
-   };
-   /* Color write enables are read at draw time from the sysval. */
-   BITSET_SET(state.dynamic, MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES);
-
-   struct hk_api_shader *out[HK_APPLE9_GFX_STAGES];
-   uint64_t t_slow = hk_cpu_sub_begin();
-   VkResult result = hk_apple9_resolve_graphics(dev, gfx->apple9_api, &state,
-                                                out, prefer_native,
-                                                fs_statistics);
-   hk_cpu_sub_end(t_slow, HK_CPU_SUB_RESOLVE_SLOW);
-   if (result != VK_SUCCESS) {
-      vk_command_buffer_set_error(&cmd->vk, result);
-      return false;
-   }
-   /* Without an API fragment shader, a variant may supply the empty program
-    * which applies cull distances; otherwise the device's is used. */
-   for (unsigned s = 0; s < HK_APPLE9_GFX_STAGES; ++s) {
-      if (gfx->apple9_api[s] || s == MESA_SHADER_FRAGMENT)
-         hk_cmd_bind_graphics_shader(cmd, s, out[s]);
-   }
-   gfx->apple9_resolved.valid = true;
-   gfx->apple9_resolved.prefer_native = prefer_native;
-   gfx->apple9_resolved.fs_statistics = fs_statistics;
-   gfx->apple9_resolved.late_zs = late_zs;
-   gfx->apple9_resolved.render_gen = gfx->render_gen;
-   memcpy(gfx->apple9_resolved.api, gfx->apple9_api, sizeof(gfx->apple9_api));
-   memcpy(gfx->apple9_resolved.out, out, sizeof(out));
-   for (unsigned i = 0; i < ARRAY_SIZE(inputs); ++i)
-      BITSET_CLEAR(dyn->dirty, inputs[i]);
-   return true;
 }
 
 static struct agx_draw hk_apple9_predicate_draw(struct hk_cmd_buffer *cmd,
@@ -2061,23 +1899,17 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
    if (!defer_prepare &&
        !hk_apple9_prepare_draw(cmd, agx_is_indirect(draw_.b) || draw_.indexed, false))
       return;
-   uint64_t t_resolve = hk_cpu_sub_begin();
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
    mesa_shader_stage producer = gfx->shaders[MESA_SHADER_GEOMETRY]
                                    ? MESA_SHADER_GEOMETRY
                                    : MESA_SHADER_TESS_EVAL;
-   const struct hk_api_shader *source =
-      gfx->apple9_api[producer] ?: gfx->shaders[producer];
+   const struct hk_api_shader *source = gfx->shaders[producer];
    bool prefer_native =
       source && !source->is_passthrough &&
       p_atomic_read(&source->apple9_native_candidate) &&
       (producer == MESA_SHADER_GEOMETRY
           ? hk_apple9_native_gs_state_eligible(cmd, draw_)
           : hk_apple9_native_tess_state_eligible(cmd, draw_));
-   bool resolved = hk_apple9_resolve_shaders(cmd, prefer_native);
-   hk_cpu_sub_end(t_resolve, HK_CPU_SUB_RESOLVE);
-   if (!resolved)
-      return;
    if (cmd->feedback_raw.size) {
       for (unsigned stage = 0; stage <= MESA_SHADER_MESH; stage++) {
          if (cmd->state.gfx.shaders[stage] &&
@@ -2089,11 +1921,6 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
    }
    bool native_gs = hk_apple9_use_native_gs(cmd, draw_);
    bool native_tess = hk_apple9_use_native_tess(cmd, draw_);
-   if (!native_gs && !native_tess && gfx->shaders[producer] &&
-       gfx->shaders[producer]->apple9_native_leaf) {
-      if (!hk_apple9_resolve_shaders(cmd, false))
-         return;
-   }
    if (producer == MESA_SHADER_GEOMETRY && source &&
        debug_get_option_gs_route_log()) {
       fprintf(stderr, "HK_GS_SELECT candidate=%u prefer=%u state=%u leaf=%u vs_leaf=%u vs_writes=%u\n",
@@ -2371,14 +2198,7 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    if (direct && (!direct[0] || !direct[1] || !direct[2]))
       return;
 
-   const struct hk_api_shader *source =
-      gfx->apple9_api[MESA_SHADER_MESH] ?: gfx->shaders[MESA_SHADER_MESH];
-   bool prefer_native =
-      source && p_atomic_read(&source->apple9_native_candidate) &&
-      hk_apple9_native_mesh_state_eligible(
-         cmd, direct, count_addr, source->apple9_native_cull_primitive);
-   if (vk_command_buffer_has_error(&cmd->vk) ||
-       !hk_apple9_resolve_shaders(cmd, prefer_native))
+   if (vk_command_buffer_has_error(&cmd->vk))
       return;
 
    struct hk_api_shader *mesh = gfx->shaders[MESA_SHADER_MESH];
@@ -2387,18 +2207,6 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       return;
 
    bool native = hk_apple9_use_native_mesh(cmd, direct, count_addr);
-   if (!native && (mesh->apple9_native_leaf ||
-                   (gfx->shaders[MESA_SHADER_FRAGMENT] &&
-                    gfx->shaders[MESA_SHADER_FRAGMENT]->apple9_native_leaf))) {
-      /* A native-only deferred result cannot serve an emulated draw. This
-       * also makes a mismatched cached pair fall back before any work is
-       * emitted, instead of failing the render-interface link at recording. */
-      if (!hk_apple9_resolve_shaders(cmd, false))
-         return;
-      mesh = gfx->shaders[MESA_SHADER_MESH];
-      task = gfx->shaders[MESA_SHADER_TASK];
-      assert(mesh && !mesh->apple9_native_leaf);
-   }
    cmd->apple9_draw_primitives =
       native ? (uint64_t)direct[0] * direct[1] * direct[2] *
                   (task ? hk_only_variant(hk_api_shader_native(task))

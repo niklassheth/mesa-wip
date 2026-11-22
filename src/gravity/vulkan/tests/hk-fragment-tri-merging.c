@@ -166,7 +166,6 @@ main(void)
    dev->vk.alloc = *vk_default_allocator();
    dev->vk.physical = &pdev->vk;
    hk_device_init_usc_heap(dev);
-   simple_mtx_init(&dev->apple9_variants.lock, mtx_plain);
    simple_mtx_init(&dev->apple9_bodies.lock, mtx_plain);
    list_inithead(&dev->apple9_bodies.slabs);
    simple_mtx_init(&pdev->debug_compile_lock, mtx_plain);
@@ -180,7 +179,6 @@ main(void)
 
    simple_mtx_destroy(&pdev->debug_compile_lock);
    simple_mtx_destroy(&dev->apple9_bodies.lock);
-   simple_mtx_destroy(&dev->apple9_variants.lock);
    test_reset_usc_heap(dev);
    hk_device_finish_usc_heap(dev);
    free(dev);
