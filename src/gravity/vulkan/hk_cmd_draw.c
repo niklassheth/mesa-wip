@@ -778,6 +778,11 @@ hk_apple9_dispatch_prerast(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    if (!cs)
       return;
 
+   if (s->b.info.apple9_vs_prolog.uses_prolog) {
+      hk_apple9_dispatch_sw_vs_prolog(cmd, cs, s, grid, bindings);
+      return;
+   }
+
    hk_apple9_dispatch(cmd, cs, s->apple9_body, &s->info.apple9, grid,
                       cmd->state.gfx.root, s, bindings);
 }
@@ -1536,7 +1541,7 @@ hk_ia_update(struct hk_cmd_buffer *cmd, struct agx_draw draw,
  * stencil (hk_apple9_zs_writes). Zink reports a loop whenever a depth texture
  * stays bound while it is the attachment; late export costs the early
  * rejection of hidden fragments. */
-static bool
+bool
 hk_apple9_draw_late_zs(const struct vk_dynamic_graphics_state *dyn,
                        const struct hk_rendering_state *render,
                        const struct hk_api_shader *fs)
@@ -2461,9 +2466,12 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    }
    struct hk_shader *task_main = task ? hk_only_variant(task) : NULL;
    const struct hk_mesh_info *info = &main->info.mesh;
+   struct hk_shader *mesh_rast = hk_apple9_select_mesh_rast(cmd, mesh);
+   const bool rast_polygon_points =
+      mesh_rast ? mesh_rast->info.mesh.polygon_points : info->polygon_points;
    unsigned vertices = MAX2(info->max_primitives, 1) *
-                       (info->polygon_points ? HK_PP_MAX_VERTICES
-                                             : mesa_vertices_per_prim(info->prim));
+                       (rast_polygon_points ? HK_PP_MAX_VERTICES
+                                            : mesa_vertices_per_prim(info->prim));
    struct hk_apple9_prerast_bindings bindings = {0};
 
    /* Draws without a task shader and with a known grid are set up here.

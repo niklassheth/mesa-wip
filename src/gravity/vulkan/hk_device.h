@@ -168,6 +168,24 @@ struct hk_device {
       struct list_head lru;
       unsigned count;
    } apple9_vs_vary_variants;
+   struct {
+      simple_mtx_t lock;
+      struct hash_table *ht;
+   } apple9_cull_prologs;
+   struct {
+      simple_mtx_t lock;
+      struct hash_table *ht;
+   } apple9_stipple_prologs;
+   struct {
+      simple_mtx_t lock;
+      struct hash_table *ht;
+   } apple9_sw_vs_prologs;
+   struct {
+      simple_mtx_t lock;
+      struct hash_table *ht;
+      struct list_head lru;
+      unsigned count;
+   } apple9_per_sample_trampolines;
 
    /* Indirected for common secondary emulation */
    struct vk_device_dispatch_table cmd_dispatch;

@@ -510,6 +510,11 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    list_inithead(&dev->apple9_linked_entries.lru);
    simple_mtx_init(&dev->apple9_vs_vary_variants.lock, mtx_plain);
    list_inithead(&dev->apple9_vs_vary_variants.lru);
+   simple_mtx_init(&dev->apple9_cull_prologs.lock, mtx_plain);
+   simple_mtx_init(&dev->apple9_stipple_prologs.lock, mtx_plain);
+   simple_mtx_init(&dev->apple9_sw_vs_prologs.lock, mtx_plain);
+   simple_mtx_init(&dev->apple9_per_sample_trampolines.lock, mtx_plain);
+   list_inithead(&dev->apple9_per_sample_trampolines.lru);
    result = hk_device_init_meta(dev);
    if (result != VK_SUCCESS)
       goto fail_mem_cache;
@@ -539,14 +544,22 @@ fail_meta:
 fail_mem_cache:
    vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
    hk_cmd_bo_cache_finish(dev);
+   hk_apple9_per_sample_trampolines_finish(dev);
    hk_apple9_linked_entries_finish(dev);
    hk_apple9_vs_vary_variants_finish(dev);
+   hk_apple9_cull_prologs_finish(dev);
+   hk_apple9_stipple_prologs_finish(dev);
+   hk_apple9_sw_vs_prologs_finish(dev);
    hk_apple9_vs_prologs_finish(dev);
    hk_apple9_fs_epilogs_finish(dev);
    hk_apple9_variants_finish(dev);
    hk_apple9_bodies_finish(dev);
    hk_apple9_tile_helpers_finish(dev);
    assert(list_is_empty(&dev->apple9_bodies.slabs));
+   simple_mtx_destroy(&dev->apple9_per_sample_trampolines.lock);
+   simple_mtx_destroy(&dev->apple9_sw_vs_prologs.lock);
+   simple_mtx_destroy(&dev->apple9_stipple_prologs.lock);
+   simple_mtx_destroy(&dev->apple9_cull_prologs.lock);
    simple_mtx_destroy(&dev->apple9_vs_vary_variants.lock);
    simple_mtx_destroy(&dev->apple9_linked_entries.lock);
    simple_mtx_destroy(&dev->apple9_fs_epilogs.lock);
@@ -592,8 +605,12 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    hk_apple9_precompile_finish(dev);
    hk_device_finish_meta(dev);
+   hk_apple9_per_sample_trampolines_finish(dev);
    hk_apple9_linked_entries_finish(dev);
    hk_apple9_vs_vary_variants_finish(dev);
+   hk_apple9_cull_prologs_finish(dev);
+   hk_apple9_stipple_prologs_finish(dev);
+   hk_apple9_sw_vs_prologs_finish(dev);
    hk_apple9_vs_prologs_finish(dev);
    hk_apple9_fs_epilogs_finish(dev);
    hk_apple9_variants_finish(dev);
@@ -618,6 +635,10 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    }
    if (dev->null_fs_trivial)
       hk_api_shader_destroy(&dev->vk, &dev->null_fs_trivial->vk, pAllocator);
+   simple_mtx_destroy(&dev->apple9_per_sample_trampolines.lock);
+   simple_mtx_destroy(&dev->apple9_sw_vs_prologs.lock);
+   simple_mtx_destroy(&dev->apple9_stipple_prologs.lock);
+   simple_mtx_destroy(&dev->apple9_cull_prologs.lock);
    simple_mtx_destroy(&dev->apple9_vs_vary_variants.lock);
    simple_mtx_destroy(&dev->apple9_linked_entries.lock);
    simple_mtx_destroy(&dev->apple9_fs_epilogs.lock);

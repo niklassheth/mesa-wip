@@ -424,6 +424,11 @@ struct hk_graphics_state {
    uint32_t apple9_sysvals_positions;
    bool apple9_sysvals_first_fan;
    uint32_t apple9_sysvals_line_stipple;
+   uint32_t apple9_sysvals_samples_log2;
+   uint32_t apple9_sysvals_api_sample_mask;
+   uint32_t apple9_sysvals_depth_clamp_enable;
+   float apple9_sysvals_depth_clamp_range[2];
+   uint32_t apple9_sysvals_force_never;
    struct agx_apple9_polygon_point_params apple9_sysvals_polygon_points;
    float apple9_sysvals_viewports[HK_MAX_VIEWPORTS][4];
 
@@ -1537,10 +1542,24 @@ struct agx_robustness hk_prolog_robustness(struct hk_device *dev);
 void hk_apple9_tile_helpers_finish(struct hk_device *dev);
 void hk_apple9_vs_prologs_finish(struct hk_device *dev);
 void hk_apple9_fs_epilogs_finish(struct hk_device *dev);
+void hk_apple9_cull_prologs_finish(struct hk_device *dev);
+void hk_apple9_stipple_prologs_finish(struct hk_device *dev);
+void hk_apple9_sw_vs_prologs_finish(struct hk_device *dev);
+void hk_apple9_per_sample_trampolines_finish(struct hk_device *dev);
 void hk_apple9_linked_entries_finish(struct hk_device *dev);
 void hk_apple9_vs_vary_variants_finish(struct hk_device *dev);
 struct agx_shader_body *hk_apple9_body_upload(struct hk_device *dev,
                                               const struct hk_shader *shader);
+struct agx_shader_body *hk_apple9_body_alloc_raw(struct hk_device *dev,
+                                                 size_t size, void **map_out);
+void hk_apple9_dispatch_sw_vs_prolog(
+   struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct hk_shader *s,
+   struct agx_grid grid, const struct hk_apple9_prerast_bindings *bindings);
+struct hk_shader *hk_apple9_select_mesh_rast(struct hk_cmd_buffer *cmd,
+                                             struct hk_api_shader *mesh);
+bool hk_apple9_draw_late_zs(const struct vk_dynamic_graphics_state *dyn,
+                            const struct hk_rendering_state *render,
+                            const struct hk_api_shader *fs);
 struct hk_bg_eot hk_apple9_build_bg_eot(
    struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
    bool store, bool partial, bool incomplete);

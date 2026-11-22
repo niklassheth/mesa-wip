@@ -304,6 +304,31 @@ hk_apple9_body_upload(struct hk_device *dev, const struct hk_shader *shader)
    return &body->base;
 }
 
+struct agx_shader_body *
+hk_apple9_body_alloc_raw(struct hk_device *dev, size_t size, void **map_out)
+{
+   if (!size || size > SIZE_MAX - (HK_APPLE9_BODY_ALIGNMENT - 1))
+      return NULL;
+   struct hk_apple9_body *body = calloc(1, sizeof(*body));
+   if (!body)
+      return NULL;
+   body->size = size;
+   if (!hk_apple9_body_alloc(dev, body)) {
+      free(body);
+      return NULL;
+   }
+   void *map = agx_bo_map(body->base.bo);
+   if (!map) {
+      agx_shader_body_unreference(&dev->dev, &body->base);
+      return NULL;
+   }
+   uint64_t offset = body->base.addr - body->base.bo->va->addr;
+   map = (char *)map + offset;
+   memset(map, 0, body->alloc_size);
+   *map_out = map;
+   return &body->base;
+}
+
 void
 hk_apple9_bodies_finish(struct hk_device *dev)
 {
@@ -727,7 +752,14 @@ hk_apple9_compile_sw_vs(struct hk_device *dev, nir_shader *nir,
                         const struct agx_apple9_vertex_layout *layout,
                         struct hk_shader *shader, const char **reason)
 {
-   if (!agx_nir_lower_apple9_vertex_inputs(nir, layout, true)) {
+   struct agx_apple9_vs_prolog_iface vs_prolog = {0};
+   if (layout->use_prolog) {
+      if (!agx_nir_lower_apple9_sw_vs_inputs_to_prolog(nir, layout,
+                                                       &vs_prolog)) {
+         *reason = "unsupported software vertex prolog input";
+         return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
+      }
+   } else if (!agx_nir_lower_apple9_vertex_inputs(nir, layout, true)) {
       *reason = "unsupported software vertex input";
       return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
    }
@@ -737,6 +769,47 @@ hk_apple9_compile_sw_vs(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass,
             hk_apple9_lower_sw_vertex_zero_base, nir_metadata_control_flow,
             NULL);
+   if (vs_prolog.uses_prolog) {
+      nir->info.stage = MESA_SHADER_COMPUTE;
+      memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+      nir->info.workgroup_size_variable = false;
+      nir->info.workgroup_size[0] = 64;
+      nir->info.workgroup_size[1] = nir->info.workgroup_size[2] = 1;
+      nir->xfb_info = NULL;
+      hk_apple9_lower_prerast_sysvals(nir, MESA_SHADER_COMPUTE);
+      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(_, nir, nir_opt_dead_cf);
+      NIR_PASS(_, nir, nir_opt_dce);
+
+      hk_assert_final_push_mask(nir, shader);
+      bool empty = true;
+      nir_foreach_block(block, nir_shader_get_entrypoint(nir))
+         empty &= exec_list_is_empty(&block->instr_list);
+      if (empty) {
+         shader->b.info.stats.instrs = 1;
+         shader->b.info.outputs = outputs;
+         return VK_SUCCESS;
+      }
+
+      if (!agx_compile_apple9_sw_vs_body(
+             nir, layout->buffer_descriptor_ubo, layout->draw_params_ubo,
+             0 /* vertex_params_ubo = root UBO 0 */,
+             &shader->b, &shader->info.apple9, reason)) {
+         if (*reason == agx_apple9_compute_without_effects) {
+            memset(&shader->b, 0, sizeof(shader->b));
+            memset(&shader->info.apple9, 0, sizeof(shader->info.apple9));
+            shader->b.info.stats.instrs = 1;
+            shader->b.info.outputs = outputs;
+            *reason = NULL;
+            return VK_SUCCESS;
+         }
+         return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
+      }
+      shader->b.info.apple9_vs_prolog = vs_prolog;
+      shader->info.apple9_vertex_unbounded = layout->unbounded;
+      shader->b.info.outputs = outputs;
+      return hk_apple9_finish_shader(dev, shader, nir);
+   }
    VkResult result = hk_apple9_compile_prerast(dev, nir, shader, 64, reason);
    shader->b.info.outputs = outputs;
    return result;
@@ -1385,7 +1458,11 @@ hk_apple9_native_mesh_options(nir_shader *nir,
    return (struct agx_apple9_native_mesh_options){
       .physical_threads = rounds ? AGX_APPLE9_NATIVE_SERIAL_THREADS
                                  : hk_apple9_native_mesh_threads(nir->info.workgroup_size),
-      .clip_halfz = key->clip_negative_one_to_one,
+      .clip_halfz = !key->clip_negative_one_to_one_dynamic &&
+                    key->clip_negative_one_to_one,
+      .dynamic_clip_z = key->clip_negative_one_to_one_dynamic,
+      .clip_z_ubo = 0,
+      .clip_z_offset_B = hk_root_descriptor_offset(draw.clip_z_coeff),
       .attributes = (rounds || !packed) && hk_apple9_native_mesh_attributes_enabled(),
       .primitive_broadcast = !rounds && !packed && hk_apple9_native_mesh_primitive_lowering_enabled(),
       .primitive_vertices = rounds && hk_apple9_native_mesh_primitive_lowering_enabled(),
@@ -2037,7 +2114,11 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                  VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)) ||
                nir->xfb_info || hk_per_vertex_copies_used(&per_vertex) ||
                stipple_stage == MESA_SHADER_VERTEX ||
-               polygon_stage == MESA_SHADER_VERTEX;
+               polygon_stage == MESA_SHADER_VERTEX ||
+               !state ||
+               (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ||
+               BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE) ||
+               BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE);
             struct hk_shader *sw = &obj->variants[HK_VS_VARIANT_SW];
             nir_shader *sw_nir = NULL;
             if (sw_needed || nir->info.cull_distance_array_size) {
@@ -2061,8 +2142,6 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             if (!per_vertex.count && hk_per_vertex_copies_used(&per_vertex))
                hk_apple9_write_vertex_weights(nir, &per_vertex);
             struct agx_apple9_vertex_layout vs_layout = key.vertex;
-            if (sw_needed)
-               vs_layout.use_prolog = false;
             /* Dynamic topology (or ESO/GPL without IA state): always run
              * point-size lowering and synthesize default 1.0 when unwritten
              * if output slots fit. */
@@ -2227,13 +2306,14 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
              * merging unless the shader itself requires disabling it. */
             bool tri_merging = true;
             if (!nir->info.internal) {
-               if (key.zs_self_dep)
+               if (key.zs_self_dep && !key.fs_use_epilog)
                   hk_apple9_late_zs(nir);
                nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
                tri_merging = !nir->info.uses_wide_subgroup_intrinsics &&
                              !nir->info.fs.needs_coarse_quad_helper_invocations &&
                              !nir->info.writes_memory &&
                              !key.sample_shading &&
+                             !nir->info.fs.uses_sample_shading &&
                              !hk_apple9_interpolates_off_center(nir);
                if (dev->vk.enabled_features.pipelineStatisticsQuery)
                   hk_apple9_lower_fs_statistics(nir);
@@ -2254,9 +2334,11 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                         nir_metadata_control_flow, NULL);
             }
             NIR_PASS(_, nir, hk_apple9_lower_api_vertex_order);
-            if (key.fs_use_epilog && !nir->info.internal &&
-                hk_apple9_fs_can_epilog_nir(nir)) {
+            if (key.fs_use_epilog && !nir->info.internal) {
                key.blend[0].use_epilog = true;
+               key.blend[0].dynamic_samples = true;
+               key.blend[0].per_sample =
+                  key.sample_shading || nir->info.fs.uses_sample_shading;
                shader->info.apple9_undefined_colors = key.undefined_colors;
             } else {
                hk_apple9_remap_fs_outputs(nir, key.color_map);
@@ -2627,10 +2709,13 @@ hk_apple9_null_fs_nir(bool sample_mask)
     * coverage, no root reads, as Metal's empty fragment program. */
    if (!sample_mask)
       return b.shader;
-   const unsigned mask_offset = hk_root_descriptor_offset(draw.api_sample_mask);
-   nir_def *mask = nir_load_ubo(&b, 1, 16, nir_imm_int(&b, 0),
-      nir_imm_int(&b, mask_offset), .align_mul = 2,
-      .range_base = mask_offset, .range = 2);
+   /* Read the per-draw API sample mask from AGX_APPLE9_GRAPHICS_SYSVAL_BINDING
+    * (slot 0) so null_fs shares slot 0 cleanly with linked stipple prologs. */
+   nir_def *mask = nir_u2u16(&b, nir_load_ubo(&b, 1, 32,
+      nir_imm_int(&b, AGX_APPLE9_GRAPHICS_SYSVAL_BINDING),
+      nir_imm_int(&b, AGX_APPLE9_API_SAMPLE_MASK_OFFSET),
+      .align_mul = 4, .range_base = AGX_APPLE9_API_SAMPLE_MASK_OFFSET,
+      .range = 4));
    nir_demote_samples(&b, nir_inot(&b, mask));
    return b.shader;
 }

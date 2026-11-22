@@ -309,6 +309,17 @@ hk_apple9_upload_textures(struct hk_cmd_buffer *cmd,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    uint32_t line_stipple = hk_apple9_line_stipple_word(dyn, lines);
+   unsigned samples = dyn->ms.rasterization_samples
+      ? dyn->ms.rasterization_samples
+      : MAX2(gfx->render.tilebuffer.nr_samples, 1);
+   uint32_t samples_log2 = util_logbase2(samples);
+   uint32_t api_sample_mask = dyn->ms.sample_mask & BITFIELD_MASK(samples);
+   uint32_t depth_clamp_enable = dyn->rs.depth_clamp_enable ? 1 : 0;
+   float depth_clamp_range[2] = {
+      gfx->descriptors.root.draw.depth_clamp[0],
+      gfx->descriptors.root.draw.depth_clamp[1],
+   };
+   uint32_t force_never = gfx->descriptors.root.draw.force_never_in_shader ? 1 : 0;
    float viewports[AGX_APPLE9_VIEWPORT_TABLE_COUNT][4];
    hk_apple9_viewport_table(dyn, viewports);
    struct agx_apple9_polygon_point_params polygon_points;
@@ -322,6 +333,12 @@ hk_apple9_upload_textures(struct hk_cmd_buffer *cmd,
        gfx->apple9_sysvals_positions == gfx->apple9_sample_positions &&
        gfx->apple9_sysvals_first_fan == first_fan &&
        gfx->apple9_sysvals_line_stipple == line_stipple &&
+       gfx->apple9_sysvals_samples_log2 == samples_log2 &&
+       gfx->apple9_sysvals_api_sample_mask == api_sample_mask &&
+       gfx->apple9_sysvals_depth_clamp_enable == depth_clamp_enable &&
+       !memcmp(gfx->apple9_sysvals_depth_clamp_range, depth_clamp_range,
+               sizeof(depth_clamp_range)) &&
+       gfx->apple9_sysvals_force_never == force_never &&
        !memcmp(gfx->apple9_sysvals_viewports, viewports, sizeof(viewports))) {
       *sysvals = gfx->apple9_sysvals;
       goto clean;
@@ -334,14 +351,24 @@ hk_apple9_upload_textures(struct hk_cmd_buffer *cmd,
           &enables, sizeof(enables));
    memcpy((uint8_t *)info + AGX_APPLE9_SAMPLE_POSITIONS_OFFSET,
           &gfx->apple9_sample_positions, sizeof(uint32_t));
+   memcpy((uint8_t *)info + AGX_APPLE9_DEPTH_CLAMP_ENABLE_OFFSET,
+          &depth_clamp_enable, sizeof(depth_clamp_enable));
    uint32_t fan = first_fan;
    memcpy((uint8_t *)info + AGX_APPLE9_FIRST_FAN_OFFSET, &fan, sizeof(fan));
+   memcpy((uint8_t *)info + AGX_APPLE9_SAMPLES_LOG2_OFFSET, &samples_log2,
+          sizeof(samples_log2));
+   memcpy((uint8_t *)info + AGX_APPLE9_API_SAMPLE_MASK_OFFSET, &api_sample_mask,
+          sizeof(api_sample_mask));
    memcpy((uint8_t *)info + AGX_APPLE9_LINE_STIPPLE_OFFSET, &line_stipple,
           sizeof(line_stipple));
    memcpy((uint8_t *)info + AGX_APPLE9_VIEWPORT_TABLE_OFFSET, viewports,
           sizeof(viewports));
    memcpy((uint8_t *)info + AGX_APPLE9_POLYGON_POINT_OFFSET, &polygon_points,
           sizeof(polygon_points));
+   memcpy((uint8_t *)info + AGX_APPLE9_DEPTH_CLAMP_RANGE_OFFSET,
+          depth_clamp_range, sizeof(depth_clamp_range));
+   memcpy((uint8_t *)info + AGX_APPLE9_FORCE_NEVER_OFFSET, &force_never,
+          sizeof(force_never));
    *sysvals = hk_pool_upload(cmd, info, sizeof(info), 64);
    if (!*sysvals)
       return false;
@@ -354,6 +381,12 @@ hk_apple9_upload_textures(struct hk_cmd_buffer *cmd,
    gfx->apple9_sysvals_positions = gfx->apple9_sample_positions;
    gfx->apple9_sysvals_first_fan = first_fan;
    gfx->apple9_sysvals_line_stipple = line_stipple;
+   gfx->apple9_sysvals_samples_log2 = samples_log2;
+   gfx->apple9_sysvals_api_sample_mask = api_sample_mask;
+   gfx->apple9_sysvals_depth_clamp_enable = depth_clamp_enable;
+   memcpy(gfx->apple9_sysvals_depth_clamp_range, depth_clamp_range,
+          sizeof(depth_clamp_range));
+   gfx->apple9_sysvals_force_never = force_never;
    memcpy(gfx->apple9_sysvals_viewports, viewports, sizeof(viewports));
    gfx->apple9_sysvals_polygon_points = polygon_points;
 clean:
@@ -467,11 +500,13 @@ hk_apple9_dispatch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (agx_is_indirect(grid))
       geometry.group_counts = grid.ptr;
 
+   uint64_t preamble_base =
+      shader && shader->apple9_body ? shader->apple9_body->addr : body->addr;
    uint64_t launch;
    if (!root || !agx_apple9_prepare_compute_dispatch_alloc_tmpl(
           &dev->dev, cmd, hk_apple9_alloc, body, p, resources,
           p->resource_binding_count, textures, samplers, &geometry,
-          p->preamble_size ? body->addr + p->preamble_offset : 0,
+          p->preamble_size ? preamble_base + p->preamble_offset : 0,
           shader && shader->apple9_body == body ? shader->apple9_launch : NULL, &launch)) {
       fprintf(stderr, "Apple9 dispatch failed (5)\n");
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
