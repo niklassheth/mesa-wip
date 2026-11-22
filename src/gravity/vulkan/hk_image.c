@@ -106,25 +106,23 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
       features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
    }
 
-   if (agx_is_apple9(&pdev->dev)) {
-      /* Image atomics address device memory, which has FP32 addition. */
-      if (p_format == PIPE_FORMAT_R32_FLOAT && tiling == VK_IMAGE_TILING_OPTIMAL)
-         features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
-      /* As in the native GL path, shared-exponent color export is not yet
-       * implemented. Sampling, storage and transfer access remain available.
-       */
-      if (p_format == PIPE_FORMAT_R9G9B9E5_FLOAT)
-         features &= ~(VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
-                       VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT |
-                       VK_FORMAT_FEATURE_2_BLIT_DST_BIT);
-      /* Storage descriptors carry the format for loads and stores, so
-       * access without a shader format needs no extra support. */
-      if (!hk_apple9_storage_format_supported(vk_format))
-         features &= ~(VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
-                       VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |
-                       VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
-                       VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT);
-   }
+   /* Image atomics address device memory, which has FP32 addition. */
+   if (p_format == PIPE_FORMAT_R32_FLOAT && tiling == VK_IMAGE_TILING_OPTIMAL)
+      features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
+   /* As in the native GL path, shared-exponent color export is not yet
+    * implemented. Sampling, storage and transfer access remain available.
+    */
+   if (p_format == PIPE_FORMAT_R9G9B9E5_FLOAT)
+      features &= ~(VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
+                    VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT |
+                    VK_FORMAT_FEATURE_2_BLIT_DST_BIT);
+   /* Storage descriptors carry the format for loads and stores, so
+    * access without a shader format needs no extra support. */
+   if (!hk_apple9_storage_format_supported(vk_format))
+      features &= ~(VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+                    VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |
+                    VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                    VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT);
 
    if (features != 0) {
       features |= VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT;
@@ -283,7 +281,7 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
 
    /* Shared-exponent encodings do not round-trip through texture reads.
     * Apple9's raw transfer path preserves their bits without compression. */
-   if (agx_is_apple9(dev) && p_format == PIPE_FORMAT_R9G9B9E5_FLOAT)
+   if (p_format == PIPE_FORMAT_R9G9B9E5_FLOAT)
       return false;
 
    /* Check for format compatibility if mutability is enabled. */
@@ -506,10 +504,9 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    }
 
-   const uint32_t max_dim = agx_is_apple9(&pdev->dev) &&
-                                   pImageFormatInfo->type == VK_IMAGE_TYPE_3D
-                              ? AGX_APPLE9_MAX_3D_TEXTURE_DIMENSION
-                              : 16384;
+   const uint32_t max_dim = pImageFormatInfo->type == VK_IMAGE_TYPE_3D
+                               ? AGX_APPLE9_MAX_3D_TEXTURE_DIMENSION
+                               : 16384;
    VkExtent3D maxExtent;
    uint32_t maxArraySize;
    switch (pImageFormatInfo->type) {

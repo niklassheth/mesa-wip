@@ -13,9 +13,7 @@
 #include "agx_abi.h"
 #include "agx_bo.h"
 #include "agx_device.h"
-#include "agx_linker.h"
 #include "agx_tilebuffer.h"
-#include "agx_usc.h"
 #include "hk_buffer.h"
 #include "hk_cmd_pool.h"
 #include "hk_descriptor_set.h"
@@ -29,7 +27,6 @@
 #include "hk_shader.h"
 
 #include "libagx_dgc.h"
-#include "pool.h"
 #include "shader_enums.h"
 #include "vk_pipeline_layout.h"
 #include "vk_synchronization.h"
@@ -948,8 +945,7 @@ hk_cmd_sync_barrier(struct hk_cmd_buffer *cmd,
        */
       struct hk_device *dev = hk_cmd_buffer_device(cmd);
       hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
-      if (agx_is_apple9(&dev->dev) &&
-          !(dst_stages & HK_SYNC_DISPATCH_INDIRECT))
+      if (!(dst_stages & HK_SYNC_DISPATCH_INDIRECT))
          hk_cdm_compute_barrier(dev, cs);
       else
          hk_cdm_cache_flush(dev, cs);
@@ -1582,7 +1578,6 @@ void
 hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    struct hk_rendering_state *render = &cmd->state.gfx.render;
-   uint8_t *map = cs->current;
 
    cs->tib = render->tilebuffer;
    cs->feedback_color = render->feedback;
@@ -1625,49 +1620,9 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    cs->cr.eot.main = render->cr.eot.partial;
    cs->cr.zls_control = render->cr.zls_control_partial;
 
-   if (agx_is_apple9(&hk_cmd_buffer_device(cmd)->dev)) {
-      cs->scissor = UTIL_DYNARRAY_INIT;
-      cs->depth_bias = UTIL_DYNARRAY_INIT;
-      cs->ppp_multisamplectl = hk_default_sample_positions(cs->tib.nr_samples);
-      hk_cmd_buffer_dirty_all(cmd);
-      return;
-   }
-
-   /* Barrier to enforce GPU-CPU coherency, in case this batch is back to back
-    * with another that caused stale data to be cached and the CPU wrote to it
-    * in the meantime.
-    */
-   agx_push(map, VDM_BARRIER, cfg) {
-      cfg.usc_cache_inval = true;
-   }
-
-   struct AGX_PPP_HEADER present = {
-      .w_clamp = true,
-      .occlusion_query_2 = true,
-      .output_unknown = true,
-      .varying_word_2 = true,
-      .viewport_count = 1, /* irrelevant */
-   };
-
-   size_t size = agx_ppp_update_size(&present);
-   struct agx_ptr T = hk_pool_alloc(cmd, size, AGX_PPP_HEADER_ALIGN);
-   if (!T.cpu)
-      return;
-
-   struct agx_ppp_update ppp = agx_new_ppp_update(T, size, &present);
-
-   /* clang-format off */
-   agx_ppp_push(&ppp, W_CLAMP, cfg) cfg.w_clamp = 1e-10;
-   agx_ppp_push(&ppp, FRAGMENT_OCCLUSION_QUERY_2, cfg);
-   agx_ppp_push(&ppp, OUTPUT_UNKNOWN, cfg);
-   agx_ppp_push(&ppp, VARYING_2, cfg);
-   /* clang-format on */
-
-   agx_ppp_fini(&map, &ppp);
-   cs->current = map;
-
    cs->scissor = UTIL_DYNARRAY_INIT;
    cs->depth_bias = UTIL_DYNARRAY_INIT;
+   cs->ppp_multisamplectl = hk_default_sample_positions(cs->tib.nr_samples);
 
    /* All graphics state must be reemited in each control stream */
    hk_cmd_buffer_dirty_all(cmd);
@@ -1706,7 +1661,7 @@ hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    /* Native VDM continuation pointers are relative to the render context. */
    uint64_t target = T.gpu;
-   if (vdm && agx_is_apple9(&hk_cmd_buffer_device(cmd)->dev)) {
+   if (vdm) {
       assert(target >= AGX_APPLE9_RENDER_CONTEXT_BASE &&
              target - AGX_APPLE9_RENDER_CONTEXT_BASE <= UINT32_MAX);
       target -= AGX_APPLE9_RENDER_CONTEXT_BASE;

@@ -25,8 +25,7 @@ hk_get_buffer_alignment(const struct hk_physical_device *pdev,
 
    /* Native VDM index pointers are relative to the USC aperture. Mapping a
     * buffer there requires page-aligned memory bindings, not a CPU copy. */
-   if (agx_is_apple9(&pdev->dev) &&
-       (usage_flags & VK_BUFFER_USAGE_2_INDEX_BUFFER_BIT))
+   if (usage_flags & VK_BUFFER_USAGE_2_INDEX_BUFFER_BIT)
       alignment = 16384;
 
    if (usage_flags & VK_BUFFER_USAGE_2_UNIFORM_BUFFER_BIT_KHR)
@@ -177,7 +176,7 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
     */
    const bool sparse =
       buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT;
-   buffer->apple9_index_va = agx_is_apple9(&dev->dev) && !sparse &&
+   buffer->apple9_index_va = !sparse &&
       (buffer->vk.usage & VK_BUFFER_USAGE_2_INDEX_BUFFER_BIT);
    if (buffer->vk.size > 0 &&
        (buffer->vk.create_flags &
@@ -202,11 +201,10 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
 
       enum agx_va_flags flags = buffer->apple9_index_va ? AGX_VA_USC : 0;
       /* Shaders address descriptor records in the USC aperture. */
-      if (agx_is_apple9(&dev->dev) &&
-          (buffer->vk.usage &
-           (VK_BUFFER_USAGE_2_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
-            VK_BUFFER_USAGE_2_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
-            VK_BUFFER_USAGE_2_PUSH_DESCRIPTORS_DESCRIPTOR_BUFFER_BIT_EXT)))
+      if (buffer->vk.usage &
+          (VK_BUFFER_USAGE_2_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
+           VK_BUFFER_USAGE_2_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+           VK_BUFFER_USAGE_2_PUSH_DESCRIPTORS_DESCRIPTOR_BUFFER_BIT_EXT))
          flags |= AGX_VA_USC;
       if (bda_capture_replay)
          flags |= AGX_VA_REPLAY | (bda_fixed_addr != 0 ? AGX_VA_FIXED : 0);
@@ -257,8 +255,7 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       /* Apple9 texel fetches report no residency, so shaders read it from
        * a table of the buffer's pages, all unbound initially.
        */
-      if (agx_is_apple9(&dev->dev) &&
-          (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT)) {
+      if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT) {
          size_t pages = DIV_ROUND_UP(vma_size_B, AIL_PAGESIZE);
          buffer->apple9_residency =
             agx_bo_create(&dev->dev, pages, 0, 0, "Apple9 buffer residency");

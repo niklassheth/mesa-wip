@@ -14,13 +14,13 @@
 
 #include "util/list.h"
 #include "agx_abi.h"
+#include "agx_bo.h"
 #include "agx_helpers.h"
 #include "agx_linker.h"
 #include "agx_pack.h"
 #include "agx_tilebuffer.h"
 #include "agx_uvs.h"
 #include "libagx_dgc.h"
-#include "pool.h"
 #include "shader_enums.h"
 
 #include "hk_private.h"
@@ -1056,9 +1056,8 @@ static inline struct agx_ptr
 hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment,
                  bool compute)
 {
-   return !compute && agx_is_apple9(&hk_cmd_buffer_device(cmd)->dev)
-             ? hk_pool_context_alloc(cmd, size, alignment)
-             : hk_pool_alloc(cmd, size, alignment);
+   return !compute ? hk_pool_context_alloc(cmd, size, alignment)
+                   : hk_pool_alloc(cmd, size, alignment);
 }
 
 void hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs);

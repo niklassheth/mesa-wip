@@ -85,7 +85,6 @@ check(unsigned gen, const char *before, const char *after, bool qualified, bool 
    uint64_t flags = hk_physical_device_compiler_flags(pdev);
    CHECK(!pdev->dev.bo_cache.started);
    agx_bo_cache_finish(&pdev->dev);
-   agxdecode_destroy_context(pdev->dev.agxdecode);
    util_sparse_array_finish(&pdev->dev.bo_map);
    pthread_mutex_destroy(&pdev->dev.bo_map_lock);
    simple_mtx_destroy(&pdev->dev.vma_lock);

@@ -134,7 +134,7 @@ main(void)
     * Only G17P needs it; G13G and G16 start streams without one.
     */
    const enum agx_chip chips[] = {
-      AGX_CHIP_G13G, AGX_CHIP_G16G, AGX_CHIP_G16C, AGX_CHIP_G17P,
+      AGX_CHIP_G16G, AGX_CHIP_G16C, AGX_CHIP_G17P,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(chips); ++i) {
       cmd = calloc(1, sizeof(*cmd));

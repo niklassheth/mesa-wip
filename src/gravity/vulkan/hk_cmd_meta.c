@@ -497,8 +497,6 @@ struct vk_meta_image_copy_key {
    enum pipe_format src_format, dst_format;
    unsigned block_size;
    unsigned nr_samples;
-   bool block_based;
-   bool storage_read;
 };
 
 static nir_def *
@@ -521,81 +519,37 @@ linearize_coords(nir_builder *b, nir_def *coord,
    return nir_udiv_imm(b, v, key->block_size);
 }
 
-static bool
-is_format_native(enum pipe_format format)
-{
-   switch (format) {
-   case PIPE_FORMAT_R8_UINT:
-   case PIPE_FORMAT_R8G8_UINT:
-   case PIPE_FORMAT_R32_UINT:
-   case PIPE_FORMAT_R32G32_UINT:
-   case PIPE_FORMAT_R16G16_UINT:
-   case PIPE_FORMAT_R16_UNORM:
-      /* TODO: debug me .. why do these fail */
-      return false;
-   case PIPE_FORMAT_R11G11B10_FLOAT:
-   case PIPE_FORMAT_R9G9B9E5_FLOAT:
-   case PIPE_FORMAT_R16G16B16A16_UINT:
-   case PIPE_FORMAT_R32G32B32A32_UINT:
-   case PIPE_FORMAT_R8G8B8A8_UINT:
-   case PIPE_FORMAT_R10G10B10A2_UNORM:
-      return true;
-   case PIPE_FORMAT_R5G6B5_UNORM:
-   case PIPE_FORMAT_R4G4B4A4_UNORM:
-   case PIPE_FORMAT_A1R5G5B5_UNORM:
-   case PIPE_FORMAT_B5G5R5A1_UNORM:
-      return false;
-   default:
-      UNREACHABLE("expected canonical");
-   }
-}
-
 static nir_def *
 load_store_formatted(nir_builder *b, nir_def *base, nir_def *index,
-                     nir_def *value, enum pipe_format format, bool software)
+                     nir_def *value, enum pipe_format format)
 {
    if (util_format_is_depth_or_stencil(format))
       format = canonical_format_pipe(format);
 
-   if (!software && is_format_native(format)) {
-      enum pipe_format isa = ail_pixel_format[format].renderable;
-      unsigned isa_size = util_format_get_blocksize(isa);
-      unsigned isa_components = util_format_get_blocksize(format) / isa_size;
-      unsigned shift = util_logbase2(isa_components);
+   unsigned blocksize_B = util_format_get_blocksize(format);
+   nir_def *addr =
+      nir_iadd(b, base, nir_imul_imm(b, nir_u2u64(b, index), blocksize_B));
 
-      if (value) {
-         nir_store_agx(b, value, base, index, .format = isa, .base = shift);
+   if (value) {
+      nir_def *raw = nir_format_pack_rgba(b, format, value);
+
+      if (blocksize_B <= 4) {
+         assert(raw->num_components == 1);
+         raw = nir_u2uN(b, raw, blocksize_B * 8);
       } else {
-         return nir_load_agx(b, 4, 32, base, index, .format = isa,
-                             .base = shift);
+         assert(raw->bit_size == 32);
+         raw = nir_trim_vector(b, raw, blocksize_B / 4);
       }
+
+      nir_store_global(b, raw, addr, .align_mul = blocksize_B);
+      return NULL;
    } else {
-      unsigned blocksize_B = util_format_get_blocksize(format);
-      nir_def *addr =
-         nir_iadd(b, base, nir_imul_imm(b, nir_u2u64(b, index), blocksize_B));
+      nir_def *raw = nir_load_global(b, DIV_ROUND_UP(blocksize_B, 4),
+                                     MIN2(32, blocksize_B * 8), addr,
+                                     .align_mul = blocksize_B);
 
-      if (value) {
-         nir_def *raw = nir_format_pack_rgba(b, format, value);
-
-         if (blocksize_B <= 4) {
-            assert(raw->num_components == 1);
-            raw = nir_u2uN(b, raw, blocksize_B * 8);
-         } else {
-            assert(raw->bit_size == 32);
-            raw = nir_trim_vector(b, raw, blocksize_B / 4);
-         }
-
-         nir_store_global(b, raw, addr, .align_mul = blocksize_B);
-      } else {
-         nir_def *raw = nir_load_global(b, DIV_ROUND_UP(blocksize_B, 4),
-                                        MIN2(32, blocksize_B * 8), addr,
-                                        .align_mul = blocksize_B);
-
-         return nir_format_unpack_rgba(b, raw, format);
-      }
+      return nir_format_unpack_rgba(b, raw, format);
    }
-
-   return NULL;
 }
 
 static nir_shader *
@@ -618,29 +572,25 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key)
    enum glsl_sampler_dim dim_dst = dst_is_buf ? GLSL_SAMPLER_DIM_BUF : dim_2d;
 
    const struct glsl_type *texture_type =
-      key->storage_read ? glsl_image_type(dim_src, !src_is_buf, GLSL_TYPE_UINT)
-                        : glsl_sampler_type(dim_src, false, !src_is_buf, GLSL_TYPE_UINT);
+      glsl_image_type(dim_src, !src_is_buf, GLSL_TYPE_UINT);
 
    const struct glsl_type *image_type =
       glsl_image_type(dim_dst, !dst_is_buf, GLSL_TYPE_UINT);
 
    nir_variable *texture =
-      nir_variable_create(b->shader, key->storage_read ? nir_var_image : nir_var_uniform,
-                           texture_type, "source");
+      nir_variable_create(b->shader, nir_var_image, texture_type, "source");
    nir_variable *image =
       nir_variable_create(b->shader, nir_var_image, image_type, "dest");
 
    image->data.descriptor_set = 0;
    image->data.binding = BINDING_OUTPUT;
    image->data.access = ACCESS_NON_READABLE;
+   image->data.image.format = key->dst_format;
 
    texture->data.descriptor_set = 0;
    texture->data.binding = BINDING_INPUT;
-   if (key->storage_read) {
-      texture->data.image.format = key->src_format;
-      texture->data.access = ACCESS_NON_WRITEABLE;
-      image->data.image.format = key->dst_format;
-   }
+   texture->data.image.format = key->src_format;
+   texture->data.access = ACCESS_NON_WRITEABLE;
 
    /* Grab the offset vectors */
    nir_def *src_offset_el = nir_load_push_constant(
@@ -657,48 +607,16 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key)
    /* We're done setting up variables, do the copy */
    nir_def *coord = nir_load_global_invocation_id(b, 32);
 
-   /* The destination format is already canonical, convert to an ISA format */
-   enum pipe_format isa_format = PIPE_FORMAT_NONE;
-   if (key->block_based) {
-      enum pipe_format pipe = canonical_format_pipe(key->dst_format);
-      isa_format = ail_pixel_format[pipe].renderable;
-      assert(isa_format != PIPE_FORMAT_NONE);
-   }
-
-   nir_def *local_offset = nir_imm_int(b, 0);
-   nir_def *lid = nir_trim_vector(b, nir_load_local_invocation_id(b), 2);
-   lid = nir_u2u16(b, lid);
-
    nir_def *src_coord = src_is_buf ? coord : nir_iadd(b, coord, src_offset_el);
    nir_def *dst_coord = dst_is_buf ? coord : nir_iadd(b, coord, dst_offset_el);
 
    nir_def *image_deref = &nir_build_deref_var(b, image)->def;
 
    nir_def *coord_2d_el = nir_trim_vector(b, coord, 2);
-   nir_def *in_bounds;
-   if (key->block_based) {
-      nir_def *offset_in_block_el =
-         nir_umod_imm(b, nir_trim_vector(b, dst_offset_el, 2), TILE_WIDTH);
-
-      dst_coord =
-         nir_vector_insert_imm(b, nir_isub(b, dst_coord, offset_in_block_el),
-                               nir_channel(b, dst_coord, 2), 2);
-
-      src_coord =
-         nir_vector_insert_imm(b, nir_isub(b, src_coord, offset_in_block_el),
-                               nir_channel(b, src_coord, 2), 2);
-
-      in_bounds = nir_uge(b, coord_2d_el, offset_in_block_el);
-      in_bounds = nir_iand(
-         b, in_bounds,
-         nir_ult(b, coord_2d_el, nir_iadd(b, offset_in_block_el, grid_2d_el)));
-   } else {
-      in_bounds = nir_ult(b, coord_2d_el, grid_2d_el);
-   }
+   nir_def *in_bounds = nir_ult(b, coord_2d_el, grid_2d_el);
 
    /* Special case handle buffer indexing */
    if (dst_is_buf) {
-      assert(!key->block_based);
       dst_coord = linearize_coords(b, dst_coord, key);
    } else if (src_is_buf) {
       src_coord = linearize_coords(b, src_coord, key);
@@ -706,28 +624,21 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key)
 
    for (unsigned s = 0; s < key->nr_samples; ++s) {
       nir_def *ms_index = nir_imm_int(b, s);
-      nir_def *value1 = NULL, *value2 = NULL;
 
       nir_push_if(b, nir_ball(b, in_bounds));
       {
-         /* Copy formatted texel from texture to storage image */
          nir_deref_instr *deref = nir_build_deref_var(b, texture);
+         nir_def *value1;
 
          if (src_is_buf) {
             value1 = load_store_formatted(b, get_push(b, buffer), src_coord,
-                                          NULL, key->dst_format, key->storage_read);
+                                          NULL, key->dst_format);
          } else {
-            if (key->storage_read) {
-               value1 = nir_image_deref_load(b, 4, 32, &deref->def,
-                  nir_pad_vec4(b, src_coord), ms_index, nir_imm_int(b, 0),
-                  .image_dim = dim_src, .image_array = !src_is_buf,
-                  .format = key->src_format, .access = ACCESS_NON_WRITEABLE,
-                  .dest_type = nir_type_uint32);
-            } else {
-               value1 = nir_txf(b, src_coord, .texture_deref = deref,
-                                .ms_index = msaa ? ms_index : NULL);
-               nir_def_as_tex(value1)->backend_flags = AGX_TEXTURE_FLAG_NO_CLAMP;
-            }
+            value1 = nir_image_deref_load(
+               b, 4, 32, &deref->def, nir_pad_vec4(b, src_coord), ms_index,
+               nir_imm_int(b, 0), .image_dim = dim_src,
+               .image_array = !src_is_buf, .format = key->src_format,
+               .access = ACCESS_NON_WRITEABLE, .dest_type = nir_type_uint32);
 
             /* Munge according to the implicit conversions so we get a bit copy */
             if (key->src_format != key->dst_format) {
@@ -740,59 +651,19 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key)
 
          if (dst_is_buf) {
             load_store_formatted(b, get_push(b, buffer), dst_coord, value1,
-                                 key->dst_format, key->storage_read);
-         } else if (!key->block_based) {
+                                 key->dst_format);
+         } else {
             nir_image_deref_store(b, image_deref, nir_pad_vec4(b, dst_coord),
                                   ms_index, value1, nir_imm_int(b, 0),
                                   .image_dim = dim_dst,
                                   .image_array = !dst_is_buf,
-                                  .format = key->storage_read ? key->dst_format : PIPE_FORMAT_NONE);
+                                  .format = key->dst_format);
          }
       }
-      nir_push_else(b, NULL);
-      if (key->block_based) {
-         /* Copy back the existing destination content */
-         value2 = nir_image_deref_load(b, 4, 32, image_deref,
-                                       nir_pad_vec4(b, dst_coord), ms_index,
-                                       nir_imm_int(b, 0), .image_dim = dim_dst,
-                                       .image_array = !dst_is_buf);
-      }
       nir_pop_if(b, NULL);
-
-      if (key->block_based) {
-         /* Must define the phi first so we validate. */
-         nir_def *phi = nir_if_phi(b, value1, value2);
-         nir_def *mask = nir_imm_intN_t(b, 1 << s, 16);
-
-         nir_store_local_pixel_agx(b, phi, mask, lid, .base = 0,
-                                   .write_mask = 0xf, .format = isa_format,
-                                   .explicit_coord = true);
-      }
-   }
-
-   if (key->block_based) {
-      assert(!dst_is_buf);
-
-      nir_barrier(b, .execution_scope = SCOPE_WORKGROUP);
-
-      nir_push_if(b, nir_ball(b, nir_ieq_imm(b, lid, 0)));
-      {
-         nir_image_deref_store_block_agx(
-            b, image_deref, local_offset, dst_coord, .format = isa_format,
-            .image_dim = dim_2d, .image_array = true, .explicit_coord = true);
-      }
-      nir_pop_if(b, NULL);
-      b->shader->info.cs.image_block_size_per_thread_agx =
-         util_format_get_blocksize(key->dst_format);
    }
 
    return b->shader;
-}
-
-static bool
-hk_meta_apple9(struct vk_device *device)
-{
-   return agx_is_apple9(&container_of(device, struct hk_device, vk)->dev);
 }
 
 static VkResult
@@ -823,8 +694,7 @@ get_image_copy_descriptor_set_layout(struct vk_device *device,
       },
       {
          .binding = BINDING_INPUT,
-         .descriptorType = hk_meta_apple9(device) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                                   : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
          .descriptorCount = 1,
          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
       },
@@ -848,24 +718,20 @@ get_image_copy_pipeline_layout(struct vk_device *device,
                                VkPipelineLayout *layout_out,
                                enum copy_type type)
 {
-   key->storage_read = hk_meta_apple9(device);
-   if (key->storage_read) {
-      key->block_based = false;
-      /* Software image addressing only needs the texel byte size. Copy raw
-       * integer bits to preserve noncanonical shared-exponent encodings and
-       * floating-point NaN payloads through all transfer directions. */
-      enum pipe_format raw;
-      switch (key->block_size) {
-      case 1: raw = PIPE_FORMAT_R8_UINT; break;
-      case 2: raw = PIPE_FORMAT_R16_UINT; break;
-      case 4: raw = PIPE_FORMAT_R32_UINT; break;
-      case 8: raw = PIPE_FORMAT_R32G32_UINT; break;
-      case 16: raw = PIPE_FORMAT_R32G32B32A32_UINT; break;
-      default: raw = PIPE_FORMAT_NONE; break;
-      }
-      if (raw != PIPE_FORMAT_NONE)
-         key->src_format = key->dst_format = raw;
+   /* Software image addressing only needs the texel byte size. Copy raw
+    * integer bits to preserve noncanonical shared-exponent encodings and
+    * floating-point NaN payloads through all transfer directions. */
+   enum pipe_format raw;
+   switch (key->block_size) {
+   case 1: raw = PIPE_FORMAT_R8_UINT; break;
+   case 2: raw = PIPE_FORMAT_R16_UINT; break;
+   case 4: raw = PIPE_FORMAT_R32_UINT; break;
+   case 8: raw = PIPE_FORMAT_R32G32_UINT; break;
+   case 16: raw = PIPE_FORMAT_R32G32B32A32_UINT; break;
+   default: raw = PIPE_FORMAT_NONE; break;
    }
+   if (raw != PIPE_FORMAT_NONE)
+      key->src_format = key->dst_format = raw;
 
    const char *keys[] = {
       [IMG2BUF] = "vk-meta-copy-image-to-buffer-pipeline-layout",
@@ -1013,8 +879,7 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
          VkImageView src_view;
          const VkImageViewUsageCreateInfo src_view_usage = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-            .usage = hk_meta_apple9(device) ? VK_IMAGE_USAGE_STORAGE_BIT
-                                             : VK_IMAGE_USAGE_SAMPLED_BIT,
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT,
          };
          const VkImageViewCreateInfo src_view_info = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -1052,8 +917,7 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet = 0,
             .dstBinding = BINDING_INPUT,
-            .descriptorType = hk_meta_apple9(device) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                                      : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             .descriptorCount = 1,
             .pImageInfo = &src_info,
          };
@@ -1188,10 +1052,6 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
             .src_format = hk_format_to_pipe_format(canonical),
             .dst_format = canonical_format_pipe(
                hk_format_to_pipe_format(aspect_format(image->format, aspect))),
-
-            /* TODO: MSAA path */
-            .block_based =
-               (image->image_type != VK_IMAGE_TYPE_1D) && image->samples == 1,
          };
 
          VkPipelineLayout pipeline_layout;
@@ -1350,10 +1210,6 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
                .src_format = hk_format_to_pipe_format(canonical),
                .dst_format = canonical_format_pipe(hk_format_to_pipe_format(
                   aspect_format(dst_image->format, dst_aspect_mask))),
-
-               /* TODO: MSAA path */
-               .block_based = (dst_image->image_type != VK_IMAGE_TYPE_1D) &&
-                              dst_image->samples == 1,
             };
 
             assert(key.nr_samples == src_image->samples);
@@ -1371,8 +1227,7 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
             VkImageView src_view;
             const VkImageViewUsageCreateInfo src_view_usage = {
                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-               .usage = hk_meta_apple9(device) ? VK_IMAGE_USAGE_STORAGE_BIT
-                                             : VK_IMAGE_USAGE_SAMPLED_BIT,
+               .usage = VK_IMAGE_USAGE_STORAGE_BIT,
             };
             const VkImageViewCreateInfo src_view_info = {
                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -1457,8 +1312,7 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                .dstSet = 0,
                .dstBinding = BINDING_INPUT,
-               .descriptorType = hk_meta_apple9(device) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                                      : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+               .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                .descriptorCount = 1,
                .pImageInfo = &src_info,
             };
@@ -1504,11 +1358,8 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
  * integer views of the same byte size for bit-preserving copies.
  */
 static VkFormat
-hk_meta_copy_plane_format(struct hk_image *img, unsigned plane, VkFormat format)
+hk_meta_copy_plane_format(struct hk_image *img, unsigned plane)
 {
-   if (!hk_meta_apple9(img->vk.base.device))
-      return format;
-
    const struct ail_layout *layout = &img->planes[plane].layout;
    if (!layout->compressed) {
       switch (util_format_get_blocksize(layout->format)) {
@@ -1533,11 +1384,10 @@ hk_meta_copy_get_image_properties(struct hk_image *img)
       vk_format_get_ycbcr_info(img->vk.format);
    if (ycbcr_info) {
       for (unsigned p = 0; p < img->plane_count; ++p) {
-         props.plane[p].view_format =
-            hk_meta_copy_plane_format(img, p, ycbcr_info->planes[p].format);
+         props.plane[p].view_format = hk_meta_copy_plane_format(img, p);
       }
    } else if (!vk_format_is_depth_or_stencil(img->vk.format)) {
-      props.color.view_format = hk_meta_copy_plane_format(img, 0, img->vk.format);
+      props.color.view_format = hk_meta_copy_plane_format(img, 0);
    } else {
       switch (img->vk.format) {
       case VK_FORMAT_S8_UINT:
@@ -1676,9 +1526,7 @@ hk_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info)
 static bool
 hk_copy_requires_gfx(struct hk_image *img)
 {
-   struct hk_device *dev = container_of(img->vk.base.device, struct hk_device, vk);
-   return (img->vk.samples > 1 || agx_is_apple9(&dev->dev)) &&
-          img->planes[0].layout.compressed;
+   return img->planes[0].layout.compressed;
 }
 
 static bool
@@ -1732,9 +1580,8 @@ hk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
 
    struct hk_meta_save save;
    hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
-   if (agx_is_apple9(&dev->dev) &&
-       (src_image->planes[0].layout.compressed ||
-        src_image->planes[0].sparse_map != NULL)) {
+   if (src_image->planes[0].layout.compressed ||
+       src_image->planes[0].sparse_map != NULL) {
       struct vk_meta_copy_image_properties props =
          hk_meta_copy_get_image_properties(src_image);
       vk_meta_copy_image_to_buffer(&cmd->vk, &dev->meta,
@@ -1756,9 +1603,8 @@ hk_CmdCopyImage2(VkCommandBuffer commandBuffer,
    hk_cmd_use_implicit_sync(cmd, src_image->implicit_sync_res);
    hk_cmd_use_implicit_sync(cmd, dst_image->implicit_sync_res);
    bool gfx = hk_copy_requires_gfx(dst_image);
-   bool sampled_copy = agx_is_apple9(&dev->dev) &&
-                       (src_image->planes[0].layout.compressed ||
-                        src_image->planes[0].sparse_map != NULL);
+   bool sampled_copy = src_image->planes[0].layout.compressed ||
+                       src_image->planes[0].sparse_map != NULL;
    VkPipelineBindPoint bind_point = hk_bind_point(gfx);
 
    struct hk_meta_save save;

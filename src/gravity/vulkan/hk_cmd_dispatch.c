@@ -10,11 +10,8 @@
 #include "vulkan/vulkan_core.h"
 #include "agx_helpers.h"
 #include "agx_apple9.h"
-#include "hk_descriptor_set.h"
 #include "pipe/p_defines.h"
-#include "agx_linker.h"
 #include "agx_pack.h"
-#include "agx_scratch.h"
 #include "agx_tilebuffer.h"
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
@@ -26,7 +23,6 @@
 #include "libagx_dgc.h"
 #include "libagx_shaders.h"
 #include "libcl/tessellator_fold.h"
-#include "pool.h"
 
 void
 hk_cmd_buffer_begin_compute(struct hk_cmd_buffer *cmd,

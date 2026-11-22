@@ -55,8 +55,6 @@ main(void)
    CHECK(!hk_feedback_can_compress(&dev, VK_IMAGE_TYPE_2D, VK_FORMAT_D16_UNORM, 1));
    CHECK(!hk_feedback_can_compress(&dev, VK_IMAGE_TYPE_2D,
                                    VK_FORMAT_D16_UNORM_S8_UINT, 1));
-   dev.chip = AGX_CHIP_G14G;
-   CHECK(!hk_feedback_can_compress(&dev, VK_IMAGE_TYPE_2D, formats[0], 1));
 
    struct hk_cmd_buffer cmd = {0}, other = {0};
    struct hk_image a = {0}, b = {0};

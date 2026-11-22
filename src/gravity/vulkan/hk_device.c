@@ -14,7 +14,6 @@
 #include "agx_bg_eot.h"
 #include "agx_apple9.h"
 #include "agx_helpers.h"
-#include "agx_scratch.h"
 #include "hk_cmd_buffer.h"
 #include "hk_descriptor_table.h"
 #include "hk_entrypoints.h"
@@ -67,24 +66,13 @@ static const struct debug_named_value hk_perf_options[] = {
 static VkResult
 hk_upload_rodata(struct hk_device *dev)
 {
-   dev->rodata.bo =
-      agx_bo_create(&dev->dev, AGX_SAMPLER_LENGTH, 0, 0, "Read only data");
+   dev->rodata.bo = agx_bo_create(&dev->dev, 2 * sizeof(struct poly_heap), 0, 0,
+                                  "Read only data");
 
    if (!dev->rodata.bo)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-   uint8_t *map = agx_bo_map(dev->rodata.bo);
    uint32_t offs = 0;
-
-   offs = align(offs, 8);
-   agx_pack(&dev->dev.txf_sampler, USC_SAMPLER, cfg) {
-      cfg.start = 0;
-      cfg.count = 1;
-      cfg.buffer = dev->rodata.bo->va->addr + offs;
-   }
-
-   agx_pack_txf_sampler((struct agx_sampler_packed *)(map + offs));
-   offs += AGX_SAMPLER_LENGTH;
 
    /* The heap descriptor isn't strictly readonly data, but we only have a
     * single instance of it device-wide and -- after initializing at heap
@@ -94,7 +82,6 @@ hk_upload_rodata(struct hk_device *dev)
     *
     * So, we allocate it here for convenience.
     */
-   offs = align(offs, sizeof(uint64_t));
    dev->rodata.heap = dev->rodata.bo->va->addr + offs;
    offs += sizeof(struct poly_heap);
    dev->rodata.mesh_heap = dev->rodata.bo->va->addr + offs;
@@ -406,11 +393,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    dev->perftest = debug_get_flags_option("HK_PERFTEST", hk_perf_options, 0);
 
-   /* Apple9 does not advertise custom border colours. */
-   if (instance->drirc.misc.disable_border_emulation ||
-       agx_is_apple9(&dev->dev)) {
-      dev->perftest |= HK_PERF_NOBORDER;
-   }
+   /* Apple9 uses native custom border colours without software emulation. */
+   dev->perftest |= HK_PERF_NOBORDER;
 
    if (HK_PERF(dev, NOROBUST)) {
       dev->vk.enabled_features.robustBufferAccess = false;
@@ -438,8 +422,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    hk_device_init_usc_heap(dev);
 
-   if (agx_is_apple9(&dev->dev))
-      agx_apple9_initialize_entries(&dev->dev);
+   agx_apple9_initialize_entries(&dev->dev);
 
    vk_device_set_drm_fd(&dev->vk, dev->dev.fd);
    dev->vk.command_buffer_ops = &hk_cmd_buffer_ops;
@@ -458,31 +441,29 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_dev;
 
-   if (agx_is_apple9(&dev->dev)) {
-      dev->apple9_fetch_sampler =
-         agx_bo_create(&dev->dev, 64 + AGX_APPLE9_SAMPLER_TABLE_STRIDE, 0,
-                       AGX_BO_LOW_VA, "Apple9 immutable samplers");
-      if (!dev->apple9_fetch_sampler) {
-         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-         goto fail_samplers;
-      }
-      uint8_t *samplers = agx_bo_map(dev->apple9_fetch_sampler);
-      memset(samplers, 0, 64 + AGX_APPLE9_SAMPLER_TABLE_STRIDE);
-      agx_apple9_pack_fetch_sampler(samplers);
-      agx_apple9_pack_sampler(samplers + 64, false, false, 1, 0, 14,
-                              PIPE_TEX_WRAP_CLAMP_TO_EDGE,
-                              PIPE_TEX_WRAP_CLAMP_TO_EDGE, 1);
-      dev->apple9_reload_sampler = dev->apple9_fetch_sampler->va->addr + 64;
-
-      dev->apple9_compute_sysvals =
-         agx_bo_create(&dev->dev, AGX_APPLE9_RUNTIME_SYSVAL_SIZE, 0, 0,
-                       "Apple9 compute sysvals");
-      if (!dev->apple9_compute_sysvals) {
-         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-         goto fail_samplers;
-      }
-      hk_apple9_compute_sysvals(dev, agx_bo_map(dev->apple9_compute_sysvals));
+   dev->apple9_fetch_sampler =
+      agx_bo_create(&dev->dev, 64 + AGX_APPLE9_SAMPLER_TABLE_STRIDE, 0,
+                    AGX_BO_LOW_VA, "Apple9 immutable samplers");
+   if (!dev->apple9_fetch_sampler) {
+      result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      goto fail_samplers;
    }
+   uint8_t *samplers = agx_bo_map(dev->apple9_fetch_sampler);
+   memset(samplers, 0, 64 + AGX_APPLE9_SAMPLER_TABLE_STRIDE);
+   agx_apple9_pack_fetch_sampler(samplers);
+   agx_apple9_pack_sampler(samplers + 64, false, false, 1, 0, 14,
+                           PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+                           PIPE_TEX_WRAP_CLAMP_TO_EDGE, 1);
+   dev->apple9_reload_sampler = dev->apple9_fetch_sampler->va->addr + 64;
+
+   dev->apple9_compute_sysvals =
+      agx_bo_create(&dev->dev, AGX_APPLE9_RUNTIME_SYSVAL_SIZE, 0, 0,
+                    "Apple9 compute sysvals");
+   if (!dev->apple9_compute_sysvals) {
+      result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      goto fail_samplers;
+   }
+   hk_apple9_compute_sysvals(dev, agx_bo_map(dev->apple9_compute_sysvals));
 
    result = hk_upload_rodata(dev);
    if (result != VK_SUCCESS)

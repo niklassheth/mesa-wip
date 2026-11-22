@@ -15,9 +15,7 @@
 #include "util/u_dynarray.h"
 #include "agx_bg_eot.h"
 #include "agx_pack.h"
-#include "agx_scratch.h"
 #include "hk_cmd_pool.h"
-#include "decode.h"
 #include "vk_cmd_queue.h"
 #include "vk_dispatch_table.h"
 
@@ -71,7 +69,6 @@ struct hk_sampler_heap {
 struct hk_device {
    struct vk_device vk;
    struct agx_device dev;
-   struct agxdecode_ctx *decode_ctx;
 
    struct hk_sampler_heap samplers;
 
@@ -249,7 +246,7 @@ void hk_sampler_heap_remove(struct hk_device *dev, struct hk_rc_sampler *rc);
 static inline bool
 hk_sparse_unbound_unmapped(const struct agx_device *dev)
 {
-   return agx_is_apple9(dev) && agx_has_soft_fault((struct agx_device *)dev) &&
+   return agx_has_soft_fault((struct agx_device *)dev) &&
           !debug_get_option_cached_hk_apple9_sparse_scratch();
 }
 /* Debug only: HK_CPU_TIMING, see hk_cpu_timing.c */

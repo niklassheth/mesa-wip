@@ -83,7 +83,7 @@ hk_init_dri_options(struct hk_instance *instance)
 {
    hk_parse_dri_options(&instance->drirc,
                         &(driConfigFileParseParams) {
-                           .driverName = "hk",
+                           .driverName = "gravity",
                            .applicationName = instance->vk.app_info.app_name,
                            .applicationVersion = instance->vk.app_info.app_version,
                            .engineName = instance->vk.app_info.engine_name,

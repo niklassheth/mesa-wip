@@ -180,7 +180,7 @@ hk_pack_texel_buffer(struct hk_device *dev, enum pipe_format format,
    assert(tail_offset_el * util_format_get_blocksize(format) == tail_offset_B &&
           "must be texel aligned");
 
-   const bool apple9 = agx_is_apple9(&dev->dev);
+   (void)dev;
    struct AGX_TEXTURE texture = {AGX_TEXTURE_header};
    texture.dimension = AGX_TEXTURE_DIMENSION_2D;
    texture.layout = AGX_LAYOUT_LINEAR;
@@ -205,15 +205,13 @@ hk_pack_texel_buffer(struct hk_device *dev, enum pipe_format format,
    texture.depth = 1;
    texture.stride = (texture.width * util_format_get_blocksize(format)) - 16;
 
-   if (apple9) {
-      bool packed = agx_apple9_pack_texture(apple9_texture, &texture);
-      assert(packed);
-      (void)packed;
-      /* The common prefix is software query state on G16. Storage accesses
-       * use the full address in apple9 metadata, not a legacy PBE pointer.
-       */
-      texture.address = 0;
-   }
+   bool packed = agx_apple9_pack_texture(apple9_texture, &texture);
+   assert(packed);
+   (void)packed;
+   /* The common prefix is software query state on G16. Storage accesses
+    * use the full address in apple9 metadata, not a legacy PBE pointer.
+    */
+   texture.address = 0;
    agx_pack(tex, TEXTURE, cfg) {
       cfg = texture;
    }
@@ -238,7 +236,7 @@ hk_pack_texel_buffer(struct hk_device *dev, enum pipe_format format,
             cfg.swizzle_a = i;
       }
 
-      cfg.buffer = apple9 ? 0 : rw_base;
+      cfg.buffer = 0;
       cfg.buffer_offset_sw = tail_offset_el;
 
       cfg.width = AGX_TEXTURE_BUFFER_WIDTH;
@@ -249,12 +247,10 @@ hk_pack_texel_buffer(struct hk_device *dev, enum pipe_format format,
       cfg.levels = 1;
    };
 
-   if (apple9) {
-      m->base = rw_addr;
-      m->elements = elements;
-      hk_apple9_texel_layout(format, m);
-      m->residency = residency;
-   }
+   m->base = rw_addr;
+   m->elements = elements;
+   hk_apple9_texel_layout(format, m);
+   m->residency = residency;
 
    /* Native storage writes see the buffer as a linear 2D image 16384 texels
     * wide from the 16-byte aligned base, element e + tail at
@@ -263,7 +259,7 @@ hk_pack_texel_buffer(struct hk_device *dev, enum pipe_format format,
     * the buffer are never written. The native_ok word carries the tail in
     * the PBE index field; residency buffers are not write-valid, so checked
     * stores keep them on the converter. */
-   if (apple9 && apple9_pbe) {
+   if (apple9_pbe) {
       unsigned bs = util_format_get_blocksize(format);
       uint64_t rows = DIV_ROUND_UP((uint64_t)elements + tail_offset_el,
                                    AGX_TEXTURE_BUFFER_WIDTH);
@@ -304,9 +300,7 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
    hk_pack_texel_buffer(device, hk_format_to_pipe_format(view->vk.format),
                         hk_buffer_address_ro(buffer, view->vk.offset),
                         hk_buffer_address_rw(buffer, view->vk.offset),
-                        view->vk.elements,
-                        agx_is_apple9(&device->dev)
-                           ? hk_buffer_apple9_residency(buffer) : 0,
+                        view->vk.elements, hk_buffer_apple9_residency(buffer),
                         &view->tex, &view->pbe, &view->apple9,
                         view->apple9_texture, view->apple9_pbe,
                         &view->apple9_store);

@@ -10,7 +10,7 @@ vertex_stores(const char *device, const char *engine)
 {
    struct hk_drirc drirc;
    driConfigFileParseParams params = {};
-   params.driverName = "hk";
+   params.driverName = "gravity";
    params.deviceName = device;
    params.engineName = engine;
    hk_parse_dri_options(&drirc, &params);
@@ -64,7 +64,7 @@ TEST(HkDrirc, NativeIndexKillSwitch)
       setenv(option, value, 1);
       struct hk_drirc drirc;
       driConfigFileParseParams params = {};
-      params.driverName = "hk";
+      params.driverName = "gravity";
       params.deviceName = "G16";
       hk_parse_dri_options(&drirc, &params);
       EXPECT_EQ(drirc.misc.disable_native_index, value[0] == 't');
@@ -74,7 +74,7 @@ TEST(HkDrirc, NativeIndexKillSwitch)
    unsetenv(option);
    struct hk_drirc drirc;
    driConfigFileParseParams params = {};
-   params.driverName = "hk";
+   params.driverName = "gravity";
    params.deviceName = "G16";
    hk_parse_dri_options(&drirc, &params);
    EXPECT_FALSE(drirc.misc.disable_native_index);
@@ -89,7 +89,7 @@ TEST(HkDrirc, NativeStageKillSwitch)
       setenv(option, value, 1);
       struct hk_drirc drirc;
       driConfigFileParseParams params = {};
-      params.driverName = "hk";
+      params.driverName = "gravity";
       params.deviceName = "G16";
       hk_parse_dri_options(&drirc, &params);
       EXPECT_EQ(drirc.misc.disable_native_stages, value[0] == 't');
@@ -99,7 +99,7 @@ TEST(HkDrirc, NativeStageKillSwitch)
    unsetenv(option);
    struct hk_drirc drirc;
    driConfigFileParseParams params = {};
-   params.driverName = "hk";
+   params.driverName = "gravity";
    params.deviceName = "G16";
    hk_parse_dri_options(&drirc, &params);
    EXPECT_FALSE(drirc.misc.disable_native_stages);
@@ -115,7 +115,7 @@ TEST(HkDrirc, DefaultsLoadedForEveryApplication)
       for (const char *engine : engines) {
          struct hk_drirc drirc;
          driConfigFileParseParams params = {};
-         params.driverName = "hk";
+         params.driverName = "gravity";
          params.deviceName = device;
          params.engineName = engine;
          hk_parse_dri_options(&drirc, &params);

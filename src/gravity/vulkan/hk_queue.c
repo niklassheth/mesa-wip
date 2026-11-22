@@ -24,7 +24,6 @@
 #include "agx_bo.h"
 #include "agx_device.h"
 #include "agx_pack.h"
-#include "decode.h"
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
 #include "hk_image.h"
@@ -1225,13 +1224,6 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       join->vdm_barrier = 0;
    if (nr_cdm == slice_cdm && join->cdm_barrier == DRM_ASAHI_BARRIER_NONE)
       join->cdm_barrier = 0;
-
-   if (dev->dev.debug & AGX_DBG_TRACE) {
-      agxdecode_drm_cmdbuf(dev->dev.agxdecode, &dev->dev.params, &payload,
-                           true);
-
-      agxdecode_next_frame();
-   }
 
    struct drm_asahi_submit submit_ioctl = {
       .flags = 0,
