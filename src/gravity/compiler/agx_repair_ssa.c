@@ -11,7 +11,6 @@
  * https://link.springer.com/content/pdf/10.1007/978-3-642-37051-9_6.pdf
  */
 
-#include "gravity/debug.h"
 #include "util/u_debug.h"
 #include "util/hash_table.h"
 #include "util/ralloc.h"
@@ -45,7 +44,6 @@ struct repair_ctx {
    struct repair_block *blocks;
 
    struct hash_table_u64 *homes;
-   bool audit;
 };
 
 static inline struct repair_block *
@@ -62,9 +60,6 @@ record_write(struct repair_ctx *ctx, agx_block *block, unsigned node,
    if (ctx->homes && val.memory)
       _mesa_hash_table_u64_insert(ctx->homes, val.value,
                                   (void *)(uintptr_t)(node + 1));
-   if (ctx->audit)
-      fprintf(stderr, "RA_AUDIT_HOME node=%u ssa=%u mem=%u block=%u\n",
-              node, val.value, val.memory, block->index);
    struct hash_table_u64 *defs = repair_block(ctx, block)->defs;
    _mesa_hash_table_u64_insert(defs, node,
                                ralloc_memdup(defs, &val, sizeof(val)));
@@ -322,7 +317,6 @@ agx_repair_ssa(agx_context *ctx)
    }
 
    unsigned n = ctx->alloc;
-   const bool audit = agx_apple9_debug_enabled(AGX_A9_DBG_RA_AUDIT);
    struct hash_table_u64 *homes = debug_get_option_agx_spill_coalesce()
       ? _mesa_hash_table_u64_create(blocks) : NULL;
 
@@ -350,7 +344,6 @@ agx_repair_ssa(agx_context *ctx)
          .n = n,
          .blocks = blocks,
          .homes = homes,
-         .audit = audit,
       };
 
       agx_foreach_instr_in_block(block, I) {
@@ -426,7 +419,6 @@ agx_repair_ssa(agx_context *ctx)
                .n = n,
                .blocks = blocks,
                .homes = homes,
-               .audit = audit,
             };
 
             agx_replace_src(phi, s,
@@ -451,13 +443,5 @@ agx_repair_ssa(agx_context *ctx)
       }
    }
    ralloc_free(blocks);
-   if (audit) {
-      unsigned next = 0;
-      agx_foreach_instr_global(ctx, I) {
-         agx_foreach_ssa_dest(I, d)
-            fprintf(stderr, "RA_AUDIT_REINDEX old=%u new=%u\n",
-                    I->dest[d].value, next++);
-      }
-   }
    agx_reindex_ssa(ctx);
 }

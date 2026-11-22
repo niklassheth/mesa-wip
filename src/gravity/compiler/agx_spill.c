@@ -348,13 +348,7 @@ reconstruct_index(struct spill_ctx *ctx, unsigned node)
 static bool
 can_remat(agx_instr *I)
 {
-   switch (I->op) {
-   case AGX_OPCODE_MOV_IMM:
-   case AGX_OPCODE_GET_SR:
-      return true;
-   default:
-      return false;
-   }
+   return I->op == AGX_OPCODE_MOV_IMM;
 }
 
 /* Rebuild short scalar expressions whose complete input graph consists of
@@ -467,8 +461,6 @@ remat_to(agx_builder *b, agx_index dst, struct spill_ctx *ctx, unsigned node)
    switch (I->op) {
    case AGX_OPCODE_MOV_IMM:
       return agx_mov_imm_to(b, dst, I->imm);
-   case AGX_OPCODE_GET_SR:
-      return agx_get_sr_to(b, dst, I->sr);
    case AGX_OPCODE_APPLE9_PURE: {
       agx_instr *copy = agx_alloc_instr(b, I->op, 1, I->nr_srcs);
       copy->dest[0] = dst;

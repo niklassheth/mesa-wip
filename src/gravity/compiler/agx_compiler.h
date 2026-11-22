@@ -139,13 +139,6 @@ agx_immediate(uint32_t imm)
    };
 }
 
-static inline agx_index
-agx_immediate_f(float f)
-{
-   assert(agx_minifloat_exact(f));
-   return agx_immediate(agx_minifloat_encode(f));
-}
-
 /* in half-words, specify r0h as 1, r1 as 2... */
 static inline agx_index
 agx_register(uint32_t imm, enum agx_size size)
@@ -217,36 +210,6 @@ agx_null()
    return (agx_index){.type = AGX_INDEX_NULL};
 }
 
-static inline agx_index
-agx_zero()
-{
-   return agx_immediate(0);
-}
-
-/* IEEE 754 additive identity -0.0, stored as an 8-bit AGX minifloat: mantissa
- * = exponent = 0, sign bit set */
-
-static inline agx_index
-agx_negzero()
-{
-   return agx_immediate(0x80);
-}
-
-static inline agx_index
-agx_abs(agx_index idx)
-{
-   idx.abs = true;
-   idx.neg = false;
-   return idx;
-}
-
-static inline agx_index
-agx_neg(agx_index idx)
-{
-   idx.neg ^= true;
-   return idx;
-}
-
 /* Replaces an index, preserving any modifiers */
 
 static inline agx_index
@@ -288,61 +251,6 @@ ra_class_for_index(agx_index idx)
    return idx.memory ? RA_MEM : RA_GPR;
 }
 
-enum agx_icond {
-   AGX_ICOND_UEQ = 0,
-   AGX_ICOND_ULT = 1,
-   AGX_ICOND_UGT = 2,
-   /* unknown */
-   AGX_ICOND_SEQ = 4,
-   AGX_ICOND_SLT = 5,
-   AGX_ICOND_SGT = 6,
-   /* unknown */
-};
-
-enum agx_fcond {
-   AGX_FCOND_EQ = 0,
-   AGX_FCOND_LT = 1,
-   AGX_FCOND_GT = 2,
-   AGX_FCOND_LTN = 3,
-   /* unknown */
-   AGX_FCOND_GE = 5,
-   AGX_FCOND_LE = 6,
-   AGX_FCOND_GTN = 7,
-};
-
-enum agx_round {
-   AGX_ROUND_RTZ = 0,
-   AGX_ROUND_RTE = 1,
-};
-
-enum agx_convert {
-   AGX_CONVERT_U8_TO_F = 0,
-   AGX_CONVERT_S8_TO_F = 1,
-   AGX_CONVERT_F_TO_U16 = 4,
-   AGX_CONVERT_F_TO_S16 = 5,
-   AGX_CONVERT_U16_TO_F = 6,
-   AGX_CONVERT_S16_TO_F = 7,
-   AGX_CONVERT_F_TO_U32 = 8,
-   AGX_CONVERT_F_TO_S32 = 9,
-   AGX_CONVERT_U32_TO_F = 10,
-   AGX_CONVERT_S32_TO_F = 11
-};
-
-enum agx_lod_mode {
-   AGX_LOD_MODE_AUTO_LOD = 0,
-   AGX_LOD_MODE_AUTO_LOD_BIAS_UNIFORM = 1,
-   AGX_LOD_MODE_LOD_MIN_UNIFORM = 2,
-   AGX_LOD_MODE_AUTO_LOD_BIAS = 5,
-   AGX_LOD_MODE_LOD_GRAD = 4,
-   AGX_LOD_MODE_LOD_MIN = 6,
-   AGX_LOD_MODE_AUTO_LOD_BIAS_MIN_UNIFORM = 9,
-   AGX_LOD_MODE_LOD_GRAD_MIN = 12,
-   AGX_LOD_MODE_AUTO_LOD_BIAS_MIN = 13,
-};
-
-/* Forward declare for branch target */
-struct agx_block;
-
 /* Instruction-local register constraints, in 16-bit units. Bounds apply to
  * the first register of an operand; vectors must also fit in the register
  * file. A fixed source inside the reserved region is a short pre-instruction
@@ -356,7 +264,6 @@ struct agx_reg_constraint {
    bool reuse_killed;
 };
 
-/* Keep synced with hash_instr */
 typedef struct {
    /* Must be first */
    struct list_head link;
@@ -375,79 +282,24 @@ typedef struct {
    uint8_t nr_dests;
    uint8_t nr_srcs;
 
-   /* TODO: More efficient */
-   union {
-      enum agx_icond icond;
-      enum agx_fcond fcond;
-   };
-
    union {
       uint64_t imm;
-      uint32_t writeout;
-      uint32_t truth_table;
-      uint32_t component;
-      uint32_t channels;
-      uint32_t bfi_mask;
-      uint16_t pixel_offset;
-      uint16_t zs;
-      int16_t stack_size;
-      enum agx_sr sr;
-      enum agx_round round;
-      enum agx_atomic_opc atomic_opc;
-      enum agx_lod_mode lod_mode;
-      enum agx_simd_op simd_op;
-      struct agx_block *target;
-
-      /* As a special case to workaround ordering issues when translating phis,
-       * if nr_srcs == 0 and the opcode is PHI, points to the NIR phi.
-       */
-      nir_phi_instr *phi;
 
       /* Target-selected instruction carried through shared allocation. */
       struct agx_apple9_vir_instr *apple9;
    };
 
-   /* For local access */
+   /* Format for stack_load / stack_store */
    enum agx_format format;
 
-   /* Number of nested control flow layers to jump by. TODO: Optimize */
-   uint32_t nest;
+   /* Temporary marker for newly-created phis during SSA repair */
+   bool shadow : 1;
 
-   /* Invert icond/fcond */
-   bool invert_cond : 1;
-
-   /* TODO: Handle tex ops more efficient */
-   enum agx_dim dim       : 4;
-   bool offset            : 1;
-   bool shadow            : 1;
-   bool query_lod         : 1;
-   bool sparse            : 1;
-   enum agx_gather gather : 3;
-
-   /* TODO: Handle tilebuffer ops more efficient */
-   bool explicit_coords : 1;
-
-   /* TODO: Handle iter ops more efficient */
-   enum agx_interpolation interpolation : 2;
-
-   /* TODO: Handle loads more efficiently */
-   bool coherent : 1;
-
-   /* Final st_vary op */
-   bool last : 1;
-
-   /* Shift for a bitwise or memory op (conflicts with format for memory ops) */
+   /* Shift for iadd (unit tests) */
    unsigned shift : 4;
 
-   /* Scoreboard index, 0 or 1. Leave as 0 for instructions that do not require
-    * scoreboarding (everything but memory load/store and texturing). */
-   unsigned scoreboard : 1;
-
-   /* Output modifiers */
-   bool saturate : 1;
+   /* Channel mask for stack_load / stack_store */
    unsigned mask : 4;
-
-   unsigned padding : 8;
 } agx_instr;
 
 static inline void
@@ -473,15 +325,9 @@ typedef struct agx_block {
    struct util_dynarray predecessors;
    bool unconditional_jumps;
 
-   /* Could there be masked execution? */
-   bool divergent;
-
    /* Liveness analysis results */
    struct u_sparse_bitset live_in;
    struct u_sparse_bitset live_out;
-
-   BITSET_DECLARE(reg_live_in, AGX_NUM_REGS);
-   BITSET_DECLARE(reg_live_out, AGX_NUM_REGS);
 
    /* Live-out SSA names and their assigned registers, sorted by SSA name.
     * A non-NULL array also marks blocks already visited by register assignment.
@@ -496,12 +342,6 @@ typedef struct agx_block {
     * source order.
     */
    bool loop_header;
-
-   /* Offset of the block in the emitted binary */
-   off_t offset, last_offset;
-
-   /** Available for passes to use for metadata */
-   uint8_t pass_flags;
 } agx_block;
 
 /* Target allocation limits, in the IR's 16-bit register units. Zero selects
@@ -561,11 +401,9 @@ typedef struct agx_context {
    unsigned schedule_rejected_increase;
    nir_shader *nir;
    mesa_shader_stage stage;
-   bool is_preamble;
    unsigned scratch_size_B;
 
    struct list_head blocks; /* list of agx_block */
-   struct agx_shader_info *out;
    struct agx_shader_key *key;
 
    /* Maximum block index */
@@ -579,58 +417,15 @@ typedef struct agx_context {
    unsigned *spill_home;
    unsigned spill_home_count;
 
-   /* Does the shader statically use scratch memory? */
-   bool any_scratch;
-
-   /* Mask of pixel fences we've definitely already waited for. */
-   uint16_t already_pixel_waited;
-
-   /* Has r0l been zeroed yet due to control flow? */
-   bool any_cf;
-
-   /* Do we need r0h zero throughout the program to handle quad-divergent
-    * shuffle?
-    */
-   bool any_quad_divergent_shuffle;
-
-   /* Number of nested control flow structures within the innermost loop. Since
-    * NIR is just loop and if-else, this is the number of nested if-else
-    * statements in the loop */
-   unsigned loop_nesting;
-
-   /* Total nesting across all loops, to determine if we need push_exec */
-   unsigned total_nesting;
-
-   /* During instruction selection, for inserting control flow */
-   agx_block *current_block;
-   agx_block *break_block;
-   agx_block *after_block;
-   agx_block **indexed_nir_blocks;
-
-   /* During instruction selection, map from vector agx_index to its scalar
-    * components, populated by a split. */
-   struct hash_table_u64 *allocated_vec;
-
-   /* During instruction selection, preloaded values or NULL if it hasn't been
-    * preloaded.
-    */
-   agx_index preloaded[AGX_NUM_REGS];
-
    /* Beginning of our stack allocation used for spilling, below that is
     * NIR-level scratch.
     */
    unsigned spill_base_B;
 
-   /* Beginning of stack allocation used for parallel copy lowering */
+   /* Whether spill parallel-copy temporaries have been reserved */
    bool has_spill_pcopy_reserved;
-   unsigned spill_pcopy_base;
 
-   /* Stats for shader-db */
-   unsigned loop_count;
    unsigned max_reg;
-
-   /* Promoted constants. These will be appended to the binary at the end. */
-   uint16_t rodata[512];
 } agx_context;
 
 static inline void
@@ -675,32 +470,6 @@ agx_size_for_bits(unsigned bits)
    }
 }
 
-static inline agx_index
-agx_def_index(nir_def *ssa)
-{
-   return agx_get_vec_index(ssa->index, agx_size_for_bits(ssa->bit_size),
-                            ssa->num_components);
-}
-
-static inline agx_index
-agx_src_index(nir_src *src)
-{
-   return agx_def_index(src->ssa);
-}
-
-static inline agx_index
-agx_vec_for_def(agx_context *ctx, nir_def *def)
-{
-   return agx_vec_temp(ctx, agx_size_for_bits(def->bit_size),
-                       def->num_components);
-}
-
-static inline agx_index
-agx_vec_for_intr(agx_context *ctx, nir_intrinsic_instr *instr)
-{
-   return agx_vec_for_def(ctx, &instr->def);
-}
-
 static inline unsigned
 agx_num_predecessors(agx_block *block)
 {
@@ -720,14 +489,6 @@ agx_start_block(agx_context *ctx)
    agx_block *first = list_first_entry(&ctx->blocks, agx_block, link);
    assert(agx_num_predecessors(first) == 0);
    return first;
-}
-
-static inline agx_block *
-agx_end_block(agx_context *ctx)
-{
-   agx_block *last = list_last_entry(&ctx->blocks, agx_block, link);
-   assert(agx_num_successors(last) == 0);
-   return last;
 }
 
 void agx_block_add_successor(agx_block *block, agx_block *successor);
@@ -829,22 +590,16 @@ void agx_block_add_successor(agx_block *block, agx_block *successor);
    agx_foreach_dest(ins, v)                                                    \
       if (ins->dest[v].type == AGX_INDEX_REGISTER)
 
-/* Phis only come at the start (after else instructions) so we stop as soon as
- * we hit a non-phi
- */
+/* Phis only come at the start of a block so we stop as soon as we hit a non-phi */
 #define agx_foreach_phi_in_block(block, v)                                     \
    agx_foreach_instr_in_block(block, v)                                        \
-      if (v->op == AGX_OPCODE_ELSE_ICMP || v->op == AGX_OPCODE_ELSE_FCMP)      \
-         continue;                                                             \
-      else if (v->op != AGX_OPCODE_PHI)                                        \
+      if (v->op != AGX_OPCODE_PHI)                                             \
          break;                                                                \
       else
 
 #define agx_foreach_phi_in_block_safe(block, v)                                \
    agx_foreach_instr_in_block_safe(block, v)                                   \
-      if (v->op == AGX_OPCODE_ELSE_ICMP || v->op == AGX_OPCODE_ELSE_FCMP)      \
-         continue;                                                             \
-      else if (v->op != AGX_OPCODE_PHI)                                        \
+      if (v->op != AGX_OPCODE_PHI)                                             \
          break;                                                                \
       else
 
@@ -866,12 +621,6 @@ agx_predecessor_index(agx_block *succ, agx_block *pred)
    UNREACHABLE("Invalid predecessor");
 }
 
-static inline agx_block *
-agx_prev_block(agx_block *ins)
-{
-   return list_last_entry(&(ins->link), agx_block, link);
-}
-
 static inline agx_instr *
 agx_prev_op(agx_instr *ins)
 {
@@ -885,27 +634,6 @@ agx_first_instr(agx_block *block)
       return NULL;
    else
       return list_first_entry(&block->instructions, agx_instr, link);
-}
-
-static inline agx_instr *
-agx_last_instr(agx_block *block)
-{
-   if (list_is_empty(&block->instructions))
-      return NULL;
-   else
-      return list_last_entry(&block->instructions, agx_instr, link);
-}
-
-static inline agx_instr *
-agx_next_op(agx_instr *ins)
-{
-   return list_first_entry(&(ins->link), agx_instr, link);
-}
-
-static inline agx_block *
-agx_next_block(agx_block *block)
-{
-   return list_first_entry(&(block->link), agx_block, link);
 }
 
 static inline agx_block *
@@ -940,18 +668,6 @@ typedef struct {
       agx_instr *instr;
    };
 } agx_cursor;
-
-static inline bool
-agx_cursors_equal(agx_cursor a, agx_cursor b)
-{
-   if (a.option != b.option)
-      return false;
-
-   if (a.option == agx_cursor_after_block)
-      return a.block == b.block;
-   else
-      return a.instr == b.instr;
-}
 
 static inline agx_cursor
 agx_after_block(agx_block *block)
@@ -1001,22 +717,7 @@ agx_before_block(agx_block *block)
 static inline bool
 instr_after_logical_end(const agx_instr *I)
 {
-   switch (I->op) {
-   case AGX_OPCODE_APPLE9_CF:
-   case AGX_OPCODE_JMP_EXEC_ANY:
-   case AGX_OPCODE_JMP_EXEC_NONE:
-   case AGX_OPCODE_POP_EXEC:
-   case AGX_OPCODE_BREAK:
-   case AGX_OPCODE_IF_ICMP:
-   case AGX_OPCODE_WHILE_ICMP:
-   case AGX_OPCODE_IF_FCMP:
-   case AGX_OPCODE_WHILE_FCMP:
-   case AGX_OPCODE_STOP:
-   case AGX_OPCODE_EXPORT:
-      return true;
-   default:
-      return false;
-   }
+   return I->op == AGX_OPCODE_APPLE9_CF || I->op == AGX_OPCODE_EXPORT;
 }
 
 /*
@@ -1131,17 +832,6 @@ agx_validate_ra(UNUSED agx_context *ctx)
 
 enum agx_size agx_split_width(const agx_instr *I);
 bool agx_allows_16bit_immediate(agx_instr *I);
-unsigned agx_negate_src_index(agx_instr *I);
-
-static inline bool
-agx_is_float_src(const agx_instr *I, unsigned s)
-{
-   struct agx_opcode_info info = agx_opcodes_info[I->op];
-   bool fcmp = (I->op == AGX_OPCODE_FCMPSEL || I->op == AGX_OPCODE_FCMP);
-
-   /* fcmp takes first 2 as floats but returns an integer */
-   return info.is_float || (s < 2 && fcmp);
-}
 
 struct agx_copy {
    /* Base register destination of the copy */

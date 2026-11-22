@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "util/lut.h"
 #include "util/u_math.h"
 #include "agx_builder.h"
 #include "agx_compiler.h"
@@ -121,22 +120,12 @@ agx_print_index(agx_index index, bool is_float, FILE *fp)
       fprintf(fp, ".neg");
 }
 
-static const char *lut2_to_function[16] = {
-   "zero", "nor",  "andn2", "not2", "andn1", "not1", "xor", "nand",
-   "and",  "xnor", "mov1",  "orn2", "mov2",  "orn1", "or",  "one",
-};
-
 void
 agx_print_instr(const agx_instr *I, FILE *fp)
 {
    assert(I->op < AGX_NUM_OPCODES);
    struct agx_opcode_info info = agx_opcodes_info[I->op];
    bool print_comma = false;
-
-   if (I->op == AGX_OPCODE_BITOP) {
-      info.name = lut2_to_function[I->truth_table];
-      info.immediates &= ~AGX_IMMEDIATE_TRUTH_TABLE;
-   }
 
    fprintf(fp, "   ");
 
@@ -154,15 +143,7 @@ agx_print_instr(const agx_instr *I, FILE *fp)
       print_comma = false;
    }
 
-   fprintf(fp, "%s", info.name);
-
-   if (I->saturate)
-      fprintf(fp, ".sat");
-
-   if (I->last)
-      fprintf(fp, ".last");
-
-   fprintf(fp, " ");
+   fprintf(fp, "%s ", info.name);
 
    agx_foreach_src(I, s) {
       if (print_comma)
@@ -170,10 +151,7 @@ agx_print_instr(const agx_instr *I, FILE *fp)
       else
          print_comma = true;
 
-      agx_print_index(I->src[s],
-                      agx_opcodes_info[I->op].is_float &&
-                         !(s >= 2 && I->op == AGX_OPCODE_FCMPSEL),
-                      fp);
+      agx_print_index(I->src[s], info.is_float, fp);
    }
 
    if (I->mask) {
@@ -185,8 +163,7 @@ agx_print_instr(const agx_instr *I, FILE *fp)
       }
    }
 
-   /* TODO: Do better for enums, truth tables, etc */
-   if (info.immediates) {
+   if (info.immediates & AGX_IMMEDIATE_IMM) {
       if (print_comma)
          fprintf(fp, ", ");
       else
@@ -196,42 +173,6 @@ agx_print_instr(const agx_instr *I, FILE *fp)
       if (I->imm && util_is_probably_float(I->imm)) {
          fprintf(fp, " /* %f */", uif(I->imm));
       }
-   }
-
-   if (info.immediates & AGX_IMMEDIATE_DIM) {
-      if (print_comma)
-         fprintf(fp, ", ");
-      else
-         print_comma = true;
-
-      fputs(agx_dim_as_str(I->dim), fp);
-   }
-
-   if (info.immediates & AGX_IMMEDIATE_SCOREBOARD) {
-      if (print_comma)
-         fprintf(fp, ", ");
-      else
-         print_comma = true;
-
-      fprintf(fp, "slot %u", I->scoreboard);
-   }
-
-   if (info.immediates & AGX_IMMEDIATE_NEST) {
-      if (print_comma)
-         fprintf(fp, ", ");
-      else
-         print_comma = true;
-
-      fprintf(fp, "n=%u", I->nest);
-   }
-
-   if ((info.immediates & AGX_IMMEDIATE_INVERT_COND) && I->invert_cond) {
-      if (print_comma)
-         fprintf(fp, ", ");
-      else
-         print_comma = true;
-
-      fprintf(fp, "inv");
    }
 
    fprintf(fp, "\n");

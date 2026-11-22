@@ -44,8 +44,6 @@ agx_validate_block_form(agx_block *block)
    agx_foreach_instr_in_block(block, I) {
       switch (I->op) {
       case AGX_OPCODE_PRELOAD:
-      case AGX_OPCODE_ELSE_ICMP:
-      case AGX_OPCODE_ELSE_FCMP:
          agx_validate_assert(state == AGX_BLOCK_STATE_CF_ELSE);
          break;
 
@@ -160,82 +158,17 @@ agx_write_registers(const agx_instr *I, unsigned d)
       /* Tautological */
       return agx_index_size_16(I->dest[d]);
 
-   case AGX_OPCODE_ITER:
-   case AGX_OPCODE_ITERPROJ:
-      assert(1 <= I->channels && I->channels <= 4);
-      return I->channels * size;
-
-   case AGX_OPCODE_IMAGE_LOAD:
-   case AGX_OPCODE_TEXTURE_LOAD:
-   case AGX_OPCODE_TEXTURE_SAMPLE:
-      /* Even when masked out, these clobber 4 registers.
-       *
-       * TODO: Figure out the sparse interaction.
-       */
-      return (I->sparse ? 8 : 4) * size;
-
-   case AGX_OPCODE_DEVICE_LOAD:
-   case AGX_OPCODE_LOCAL_LOAD:
    case AGX_OPCODE_STACK_LOAD:
-   case AGX_OPCODE_LD_TILE:
       /* Can write 16-bit or 32-bit. Anything logically 64-bit is already
        * expanded to 32-bit in the mask.
        */
       return util_bitcount(I->mask) * MIN2(size, 2);
 
-   case AGX_OPCODE_LDCF:
-      return 6;
    case AGX_OPCODE_COLLECT:
       return I->nr_srcs * agx_size_align_16(I->src[0].size);
    default:
       return size;
    }
-}
-
-struct dim_info {
-   unsigned comps;
-   bool array;
-};
-
-static struct dim_info
-agx_dim_info(enum agx_dim dim)
-{
-   switch (dim) {
-   case AGX_DIM_1D:
-      return (struct dim_info){1, false};
-   case AGX_DIM_1D_ARRAY:
-      return (struct dim_info){1, true};
-   case AGX_DIM_2D:
-      return (struct dim_info){2, false};
-   case AGX_DIM_2D_ARRAY:
-      return (struct dim_info){2, true};
-   case AGX_DIM_2D_MS:
-      return (struct dim_info){3, false};
-   case AGX_DIM_3D:
-      return (struct dim_info){3, false};
-   case AGX_DIM_CUBE:
-      return (struct dim_info){3, false};
-   case AGX_DIM_CUBE_ARRAY:
-      return (struct dim_info){3, true};
-   case AGX_DIM_2D_MS_ARRAY:
-      return (struct dim_info){2, true};
-   default:
-      UNREACHABLE("invalid dim");
-   }
-}
-
-/*
- * Return number of registers required for coordinates for a texture/image
- * instruction. We handle layer + sample index as 32-bit even when only the
- * lower 16-bits are present. LOD queries do not take a layer.
- */
-static unsigned
-agx_coordinate_registers(const agx_instr *I, enum agx_size size)
-{
-   struct dim_info dim = agx_dim_info(I->dim);
-   bool has_array = !I->query_lod;
-
-   return agx_size_align_16(size) * (dim.comps + (has_array && dim.array));
 }
 
 static unsigned
@@ -262,99 +195,10 @@ agx_read_registers(const agx_instr *I, unsigned s)
    case AGX_OPCODE_SPLIT:
       return I->nr_dests * agx_size_align_16(agx_split_width(I));
 
-   case AGX_OPCODE_UNIFORM_STORE:
-      if (s == 0)
-         return util_bitcount(I->mask) * size;
-      else
-         return size;
-
-   case AGX_OPCODE_DEVICE_STORE:
-   case AGX_OPCODE_LOCAL_STORE:
    case AGX_OPCODE_STACK_STORE:
-   case AGX_OPCODE_ST_TILE:
       /* See agx_write_registers */
       if (s == 0)
          return util_bitcount(I->mask) * MIN2(size, 2);
-      else if (s == 2 && I->explicit_coords)
-         return 2;
-      else
-         return size;
-
-   case AGX_OPCODE_ZS_EMIT:
-      if (s == 1) {
-         /* Depth (bit 0) is fp32, stencil (bit 1) is u16 in the hw but we pad
-          * up to u32 for simplicity
-          */
-         bool z = !!(I->zs & 1);
-         bool s = !!(I->zs & 2);
-         assert(z || s);
-
-         return (z && s) ? 4 : z ? 2 : 1;
-      } else {
-         return 1;
-      }
-
-   case AGX_OPCODE_IMAGE_WRITE:
-      if (s == 0)
-         return 4 * size /* data */;
-      else if (s == 1)
-         return agx_coordinate_registers(I, I->src[1].size);
-      else
-         return size;
-
-   case AGX_OPCODE_IMAGE_LOAD:
-   case AGX_OPCODE_TEXTURE_LOAD:
-   case AGX_OPCODE_TEXTURE_SAMPLE:
-      if (s == 0) {
-         return agx_coordinate_registers(I, I->src[0].size);
-      } else if (s == 1) {
-         /* LOD */
-         if (I->lod_mode == AGX_LOD_MODE_LOD_GRAD ||
-             I->lod_mode == AGX_LOD_MODE_LOD_GRAD_MIN) {
-
-            /* Technically only 16-bit but we model as 32-bit to keep the IR
-             * simple, since the gradient is otherwise 32-bit.
-             */
-            unsigned min = I->lod_mode == AGX_LOD_MODE_LOD_GRAD_MIN ? 2 : 0;
-
-            switch (I->dim) {
-            case AGX_DIM_1D:
-            case AGX_DIM_1D_ARRAY:
-               return (2 * 2 * 1) + min;
-            case AGX_DIM_2D:
-            case AGX_DIM_2D_ARRAY:
-            case AGX_DIM_2D_MS_ARRAY:
-            case AGX_DIM_2D_MS:
-               return (2 * 2 * 2) + min;
-            case AGX_DIM_CUBE:
-            case AGX_DIM_CUBE_ARRAY:
-            case AGX_DIM_3D:
-               return (2 * 2 * 3) + min;
-            }
-
-            UNREACHABLE("Invalid texture dimension");
-         } else if (I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS_MIN) {
-            return 2;
-         } else {
-            return 1;
-         }
-      } else if (s == 5) {
-         /* Compare/offset */
-         return 2 * ((!!I->shadow) + (!!I->offset));
-      } else {
-         return size;
-      }
-
-   case AGX_OPCODE_BLOCK_IMAGE_STORE:
-      if (s == 3 && I->explicit_coords)
-         return agx_coordinate_registers(I, I->src[3].size);
-      else
-         return size;
-
-   case AGX_OPCODE_ATOMIC:
-   case AGX_OPCODE_LOCAL_ATOMIC:
-      if (s == 0 && I->atomic_opc == AGX_ATOMIC_OPC_CMPXCHG)
-         return size * 2;
       else
          return size;
 
@@ -454,36 +298,6 @@ agx_validate_predecessors(agx_block *block)
    return true;
 }
 
-static bool
-agx_validate_sr(const agx_instr *I)
-{
-   bool none = (I->op == AGX_OPCODE_GET_SR);
-   bool coverage = (I->op == AGX_OPCODE_GET_SR_COVERAGE);
-   bool barrier = (I->op == AGX_OPCODE_GET_SR_BARRIER);
-
-   /* Filter get_sr instructions */
-   if (!(none || coverage || barrier))
-      return true;
-
-   switch (I->sr) {
-   case AGX_SR_ACTIVE_THREAD_INDEX_IN_QUAD:
-   case AGX_SR_ACTIVE_THREAD_INDEX_IN_SUBGROUP:
-   case AGX_SR_TOTAL_ACTIVE_THREADS_IN_QUAD:
-   case AGX_SR_TOTAL_ACTIVE_THREADS_IN_SUBGROUP:
-   case AGX_SR_COVERAGE_MASK:
-   case AGX_SR_IS_ACTIVE_THREAD:
-      return coverage;
-
-   case AGX_SR_HELPER_OP:
-   case AGX_SR_HELPER_ARG_L:
-   case AGX_SR_HELPER_ARG_H:
-      return barrier;
-
-   default:
-      return none;
-   }
-}
-
 void
 agx_validate(agx_context *ctx, const char *after)
 {
@@ -549,12 +363,6 @@ agx_validate(agx_context *ctx, const char *after)
       if (!agx_validate_sources(I)) {
          fprintf(stderr, "Invalid sources form after %s\n", after);
          agx_print_instr(I, stderr);
-         fail = true;
-      }
-
-      if (!agx_validate_sr(I)) {
-         fprintf(stderr, "Invalid SR after %s\n", after);
-         agx_print_instr(I, stdout);
          fail = true;
       }
    }

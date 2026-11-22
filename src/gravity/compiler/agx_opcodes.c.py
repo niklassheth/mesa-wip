@@ -5,14 +5,6 @@ template = """/*
 
 #include "agx_opcodes.h"
 
-<%
-def make_encoding(encoding):
-   if encoding is None:
-      return "{ 0 }"
-
-   return "{{ {}, {}, {} }}".format(hex(encoding.exact), encoding.length_short, int(encoding.extensible))
-%>
-
 const struct agx_opcode_info agx_opcodes_info[AGX_NUM_OPCODES] = {
 % for opcode in opcodes:
 <%
@@ -23,7 +15,6 @@ const struct agx_opcode_info agx_opcodes_info[AGX_NUM_OPCODES] = {
 %>
    [AGX_OPCODE_${opcode.upper()}] = {
       "${opcode}", ${op.srcs}, ${op.dests}, ${" | ".join(imms)},
-      ${make_encoding(op.encoding)},
       AGX_SCHEDULE_CLASS_${op.schedule_class.upper()},
       ${int(op.is_float)},
       ${int(op.can_eliminate)},

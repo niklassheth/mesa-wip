@@ -127,8 +127,6 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx,
       assert(dep != AGX_SCHEDULE_CLASS_INVALID && "invalid instruction seen");
 
       bool barrier = dep == AGX_SCHEDULE_CLASS_BARRIER;
-      bool discards =
-         I->op == AGX_OPCODE_SAMPLE_MASK || I->op == AGX_OPCODE_ZS_EMIT;
 
       if (dep == AGX_SCHEDULE_CLASS_STORE)
          add_dep(node, memory_load);
@@ -141,10 +139,6 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx,
 
       if (dep == AGX_SCHEDULE_CLASS_COVERAGE || barrier)
          serialize(node, &coverage);
-
-      /* Make sure side effects happen before a discard */
-      if (discards)
-         add_dep(node, memory_store);
 
       if (dep == AGX_SCHEDULE_CLASS_PRELOAD)
          serialize(node, &preload);
@@ -222,29 +216,6 @@ choose_instr(struct sched_ctx *s)
    list_for_each_entry(struct sched_node, n, &s->dag->heads, dag.link) {
       if (s->ctx->schedule_delay && n->ready > s->position)
          continue;
-      /* Heuristic: hoist sample_mask/zs_emit. This allows depth/stencil tests
-       * to run earlier, and potentially to discard the entire quad invocation
-       * earlier, reducing how much redundant fragment shader we run.
-       *
-       * Since we schedule backwards, we make that happen by only choosing
-       * sample_mask when all other instructions have been exhausted.
-       */
-      if (n->instr->op == AGX_OPCODE_SAMPLE_MASK ||
-          n->instr->op == AGX_OPCODE_ZS_EMIT) {
-
-         if (!best) {
-            best = n;
-            assert(min_delta == INT32_MAX);
-         }
-
-         continue;
-      }
-
-      /* Heuristic: sink wait_pix to increase parallelism. Since wait_pix does
-       * not read or write registers, this has no effect on pressure.
-       */
-      if (n->instr->op == AGX_OPCODE_WAIT_PIX)
-         return n;
 
       int32_t delta = calculate_pressure_delta(n->instr, &s->live);
       unsigned dependency = 0;
