@@ -1023,8 +1023,13 @@ hk_apple9_compile_tes(struct hk_device *dev, nir_shader *nir,
    sw->info.cull_distance_array_size = nir->info.cull_distance_array_size;
 
    /* The software variant feeds a geometry stage: the application's, or a
-    * passthrough for transform feedback or a cull mask. */
-   nir_shader *clone = nir_shader_clone(NULL, nir);
+    * passthrough for transform feedback, cull distances, or dynamic raster
+    * features. Only clone NIR when the software variant can be compiled. */
+   nir_shader *clone =
+      ((next & VK_SHADER_STAGE_GEOMETRY_BIT) || nir->xfb_info ||
+       nir->info.cull_distance_array_size)
+         ? nir_shader_clone(NULL, nir)
+         : NULL;
 
    bool point_mode = nir->info.tess.point_mode;
    unsigned psiz_reserve =
@@ -1053,7 +1058,9 @@ hk_apple9_compile_tes(struct hk_device *dev, nir_shader *nir,
    hw->info.cull_mask = sw->info.cull_mask = cull_mask;
 
    VkResult result = VK_SUCCESS;
-   if ((next & VK_SHADER_STAGE_GEOMETRY_BIT) || clone->xfb_info || cull_mask) {
+   if ((next & VK_SHADER_STAGE_GEOMETRY_BIT) ||
+       (clone && clone->xfb_info) || cull_mask) {
+      assert(clone);
       if (clone->xfb_info) {
          memcpy(&sw->info.xfb_info, clone->xfb_info,
                 nir_xfb_info_size(clone->xfb_info->output_count));
@@ -2304,22 +2311,56 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                }
             }
             /* Transform feedback, flat copies of per-vertex inputs, line
-             * stipple, and polygon points are layered on a passthrough
-             * geometry shader, which consumes the software vertex shader
-             * with zero VS output modification for stipple/polygon points.
-             */
+             * stipple, polygon points, and primitives-generated queries are
+             * layered on a passthrough geometry shader, which consumes
+             * HK_VS_VARIANT_SW. For GPL pre-rasterization libraries (where
+             * !has_fragment), only compile HK_VS_VARIANT_SW when the library
+             * or enabled device features can actually reach GS/TCS or a
+             * passthrough GS — avoiding wasted SW-VS compiles on normal GPL
+             * titles (CS2/DXVK). */
+            bool is_library =
+               state &&
+               (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR);
+            bool has_stipple_feature =
+               dev->vk.enabled_features.stippledRectangularLines ||
+               dev->vk.enabled_features.stippledBresenhamLines ||
+               dev->vk.enabled_features.stippledSmoothLines;
+            bool static_point_mode =
+               state && state->rs &&
+               state->rs->polygon_mode == VK_POLYGON_MODE_POINT &&
+               (!state->ia ||
+                BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY) ||
+                u_reduced_prim(vk_topology_to_mesa(state->ia->primitive_topology)) ==
+                   MESA_PRIM_TRIANGLES);
+            bool may_stipple =
+               key.line_stipple ||
+               (state && BITSET_TEST(state->dynamic,
+                                     MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE)) ||
+               ((!state || !state->rs) && has_stipple_feature);
+            bool may_polygon_point_gs =
+               key.polygon_points || static_point_mode ||
+               (state && BITSET_TEST(state->dynamic,
+                                     MESA_VK_DYNAMIC_RS_POLYGON_MODE)) ||
+               ((!state || !state->rs) &&
+                dev->vk.enabled_features.fillModeNonSolid);
+            bool may_link_barycentric =
+               (!state || is_library) && !has_fragment &&
+               dev->vk.enabled_features.fragmentShaderBarycentric;
+            bool unknown_next_stage =
+               !infos[i].next_stage_mask &&
+               (dev->vk.enabled_features.geometryShader ||
+                dev->vk.enabled_features.tessellationShader ||
+                dev->vk.enabled_features.transformFeedback);
             bool sw_needed =
                (infos[i].next_stage_mask &
                 (VK_SHADER_STAGE_GEOMETRY_BIT |
                  VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)) ||
+               unknown_next_stage ||
                nir->xfb_info || hk_per_vertex_copies_used(&per_vertex) ||
                stipple_stage == MESA_SHADER_VERTEX ||
                polygon_stage == MESA_SHADER_VERTEX ||
-               key.line_stipple || key.polygon_points ||
-               !state || !has_fragment ||
-               (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ||
-               BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE) ||
-               BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE) ||
+               !state || may_stipple || may_polygon_point_gs ||
+               may_link_barycentric ||
                dev->vk.enabled_features.primitivesGeneratedQuery;
             struct hk_shader *sw = &obj->variants[HK_VS_VARIANT_SW];
             nir_shader *sw_nir = NULL;
@@ -2402,14 +2443,40 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                varyings = hk_native_producer_main(obj)->b.info.apple9_varyings;
                continue;
             }
+            bool is_library =
+               state &&
+               (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR);
+            bool has_stipple_feature =
+               dev->vk.enabled_features.stippledRectangularLines ||
+               dev->vk.enabled_features.stippledBresenhamLines ||
+               dev->vk.enabled_features.stippledSmoothLines;
+            bool static_point_mode =
+               state && state->rs &&
+               state->rs->polygon_mode == VK_POLYGON_MODE_POINT;
+            bool may_stipple =
+               key.line_stipple ||
+               (state && BITSET_TEST(state->dynamic,
+                                     MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE)) ||
+               ((!state || !state->rs) && has_stipple_feature);
+            bool may_polygon_point_gs =
+               key.polygon_points || static_point_mode ||
+               (state && BITSET_TEST(state->dynamic,
+                                     MESA_VK_DYNAMIC_RS_POLYGON_MODE)) ||
+               ((!state || !state->rs) &&
+                dev->vk.enabled_features.fillModeNonSolid);
+            bool may_link_barycentric =
+               (!state || is_library) && !has_fragment &&
+               dev->vk.enabled_features.fragmentShaderBarycentric;
+            bool unknown_next_stage =
+               !infos[i].next_stage_mask &&
+               (dev->vk.enabled_features.geometryShader ||
+                dev->vk.enabled_features.transformFeedback);
             bool tes_sw_needed =
                polygon_stage == MESA_SHADER_TESS_EVAL ||
                stipple_stage == MESA_SHADER_TESS_EVAL ||
-               key.line_stipple || key.polygon_points ||
-               copies_from_gs || !state || !has_fragment ||
-               (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ||
-               BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE) ||
-               BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE) ||
+               copies_from_gs || !state || unknown_next_stage ||
+               may_stipple || may_polygon_point_gs ||
+               may_link_barycentric ||
                dev->vk.enabled_features.primitivesGeneratedQuery;
             result = hk_apple9_compile_tes(
                dev, nir, &key.vertex, obj,

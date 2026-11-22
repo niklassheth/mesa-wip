@@ -637,13 +637,16 @@ hk_apple9_init_view_descriptors(struct hk_image_view *view)
    storage->extent[3] = image->vk.samples;
 
    /* A block-texel alias rebases to a single level. Its native 3D
-    * descriptor cannot express the original image's Z stride, but
-    * software storage reads use the explicit PBE stride correctly.
+    * descriptor cannot express the original image's Z stride, and a padded
+    * 2D alias widens ro_storage.width past storage->extent[0] for AIL tile
+    * alignment; keep both on software storage reads so bounds and stride stay
+    * exact under branchless hardware OOB clipping.
     */
    const bool alias_3d = view->vk.view_type == VK_IMAGE_VIEW_TYPE_3D &&
                          vk_format_is_compressed(view->vk.image->format) &&
                          !vk_format_is_compressed(view->vk.format);
-   if (!alias_3d &&
+   const bool padded_alias = view->planes[0].alias_width_el != 0;
+   if (!alias_3d && !padded_alias &&
        agx_apple9_translate_texture(storage->texture, &view->planes[0].ro_storage)) {
       storage->native_ok |= HK_APPLE9_STORAGE_READ_VALID;
       if (image->planes[image_plane].sparse_map != NULL)

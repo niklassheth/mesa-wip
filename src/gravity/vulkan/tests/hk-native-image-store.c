@@ -3,14 +3,17 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include "compiler/nir/nir_builder.h"
 #include "hk_descriptor_set.h"
 #include "hk_descriptor_buffer.h"
+#include "hk_entrypoints.h"
 #include "hk_image.h"
 #include "hk_image_view.h"
+#include "hk_physical_device.h"
 #include "hk_shader.h"
-#include "compiler/nir/nir_builder.h"
 #include "gravity/layout/layout.h"
 #include "gravity/lib/agx_helpers.h"
+#include "vk_alloc.h"
 #include "vk_format.h"
 #include "util/u_math.h"
 
@@ -80,9 +83,109 @@ test_image_storage(void)
    return 0;
 }
 
+static int
+test_storage_read_valid_flags(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_physical_device pdev = {0};
+   CHECK(dev);
+   dev->vk.base.type = VK_OBJECT_TYPE_DEVICE;
+   dev->vk.physical = &pdev.vk;
+   dev->vk.alloc = *vk_default_allocator();
+   dev->dev.chip = pdev.dev.chip = AGX_CHIP_G16G;
+
+   /* Normal 2D and 2D-MS storage views advertise HK_APPLE9_STORAGE_READ_VALID
+    * so branchless HW TEXTURE_LOAD / TEXTURE_LOAD_MS serves their reads. */
+   for (unsigned samples = 1; samples <= 4; samples *= 4) {
+      const VkImageCreateInfo ci = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+         .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+         .extent = {64, 64, 1}, .mipLevels = 1, .arrayLayers = 1,
+         .samples = (VkSampleCountFlagBits)samples,
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+      };
+      struct hk_image image = {0};
+      vk_image_init(&dev->vk, &image.vk, &ci);
+      image.plane_count = 1;
+      image.planes[0].addr = UINT64_C(0x2000000000);
+      image.planes[0].layout = (struct ail_layout){
+         .width_px = 64, .height_px = 64, .depth_px = 1, .levels = 1,
+         .sample_count_sa = samples, .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+         .tiling = AIL_TILING_GPU, .writeable_image = true,
+      };
+      ail_make_miptree(&image.planes[0].layout);
+      VkImageViewCreateInfo vi = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .image = hk_image_to_handle(&image), .viewType = VK_IMAGE_VIEW_TYPE_2D,
+         .format = VK_FORMAT_R8G8B8A8_UNORM,
+         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+      };
+      VkImageView handle;
+      CHECK(hk_CreateImageView(hk_device_to_handle(dev), &vi, NULL, &handle) == VK_SUCCESS);
+      struct hk_image_view *v = hk_image_view_from_handle(handle);
+      CHECK(v->planes[0].alias_width_el == 0);
+      CHECK((v->apple9_storage.native_ok & HK_APPLE9_STORAGE_READ_VALID) != 0);
+      CHECK(((v->apple9_storage.native_ok & HK_APPLE9_STORAGE_WRITE_VALID) != 0) ==
+            (samples == 1));
+      hk_DestroyImageView(hk_device_to_handle(dev), handle, NULL);
+      vk_image_finish(&image.vk);
+   }
+
+   /* Padded 2D block-texel aliases widen ro_storage.width past extent[0] and
+    * must clear HK_APPLE9_STORAGE_READ_VALID so OOB logical reads keep exact
+    * software bounds checking. */
+   const VkImageCreateInfo bc_ci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+               VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
+               VK_IMAGE_CREATE_EXTENDED_USAGE_BIT,
+      .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_ASTC_8x8_UNORM_BLOCK,
+      .extent = {768, 512, 1}, .mipLevels = 10, .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+   };
+   struct hk_image bc_img = {0};
+   vk_image_init(&dev->vk, &bc_img.vk, &bc_ci);
+   bc_img.plane_count = 1;
+   bc_img.planes[0].addr = UINT64_C(0x2000000000);
+   bc_img.planes[0].layout = (struct ail_layout){
+      .width_px = 768, .height_px = 512, .depth_px = 1, .levels = 10,
+      .sample_count_sa = 1, .format = PIPE_FORMAT_ASTC_8x8,
+      .tiling = AIL_TILING_GPU, .writeable_image = true,
+   };
+   ail_make_miptree(&bc_img.planes[0].layout);
+   unsigned padded_levels = 0;
+   for (unsigned l = 0; l < bc_img.planes[0].layout.levels; ++l) {
+      VkImageViewCreateInfo vi = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .image = hk_image_to_handle(&bc_img), .viewType = VK_IMAGE_VIEW_TYPE_2D,
+         .format = VK_FORMAT_R32G32B32A32_UINT,
+         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, l, 1, 0, 1},
+      };
+      VkImageView handle;
+      CHECK(hk_CreateImageView(hk_device_to_handle(dev), &vi, NULL, &handle) == VK_SUCCESS);
+      struct hk_image_view *v = hk_image_view_from_handle(handle);
+      if (v->planes[0].alias_width_el != 0) {
+         CHECK(!(v->apple9_storage.native_ok & HK_APPLE9_STORAGE_READ_VALID));
+         ++padded_levels;
+      } else {
+         CHECK((v->apple9_storage.native_ok & HK_APPLE9_STORAGE_READ_VALID) != 0);
+      }
+      CHECK((v->apple9_storage.native_ok & HK_APPLE9_STORAGE_WRITE_VALID) != 0);
+      hk_DestroyImageView(hk_device_to_handle(dev), handle, NULL);
+   }
+   CHECK(padded_levels > 0);
+   vk_image_finish(&bc_img.vk);
+   free(dev);
+   puts("native storage: READ_VALID honors 2D/MS and clears padded block-texel aliases");
+   return 0;
+}
+
 int main(void)
 {
    CHECK(test_image_storage() == 0);
+   CHECK(test_storage_read_valid_flags() == 0);
    glsl_type_singleton_init_or_ref();
    /* Every Apple9 storage format has a native entry. */
    for (unsigned f = 0; f < PIPE_FORMAT_COUNT; ++f) {
