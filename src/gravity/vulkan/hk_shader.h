@@ -466,6 +466,10 @@ struct hk_api_shader {
    /* Pipelines own an emulated realization and this optional native leaf. */
    struct hk_api_shader *apple9_native;
 
+   /* Optional software polygon-mode POINT realization for an application
+    * geometry shader compiled with dynamic polygon mode / ESO / GPL. */
+   struct hk_api_shader *apple9_gs_polygon_points;
+
    /* Native mesh/FS realizations have the same content-derived compile ID.
     * Store the ID in cache blobs so independently reloaded stages can still
     * prove that their producer/consumer interfaces were compiled together. */

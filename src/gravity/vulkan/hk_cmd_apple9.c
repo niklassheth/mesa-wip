@@ -2099,7 +2099,8 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    /* A geometry shader has already run as compute; its rasterization
     * variant is the hardware vertex program for its output primitives.
     */
-   struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
+   struct hk_api_shader *gs =
+      hk_apple9_select_gs(cmd, gfx->shaders[MESA_SHADER_GEOMETRY]);
    /* A non-zero rasterization stream discards unless a multistream geometry
     * shader selects that stream.
     */

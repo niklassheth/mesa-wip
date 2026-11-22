@@ -10709,6 +10709,10 @@ apple9_collect_varyings(nir_shader *nir,
                         const char **reason)
 {
    bool fragment = nir->info.stage == MESA_SHADER_FRAGMENT;
+   const bool prim_id_varying =
+      keep_prim_id_varying &&
+      (!producer || producer->mask[VARYING_SLOT_PRIMITIVE_ID] ||
+       producer->count < AGX_APPLE9_MAX_VARYING_COMPONENTS);
    nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
@@ -10739,10 +10743,11 @@ apple9_collect_varyings(nir_shader *nir,
          location += nir_src_as_uint(intr->src[offset]);
          unsigned component = nir_intrinsic_component(intr);
          /* Without a geometry output, the rasterizer generates this scalar.
-          * Independent epilog FS keeps PRIMITIVE_ID in the varying layout so
-          * the CF crossbar can bind either a producer flat varying or HW 0x60. */
+          * Epilog FS keeps PRIMITIVE_ID in the varying layout (when room
+          * remains) so the CF crossbar can bind either a producer flat varying
+          * or HW 0x60. */
          if (fragment && location == VARYING_SLOT_PRIMITIVE_ID &&
-             !keep_prim_id_varying &&
+             !prim_id_varying &&
              (!producer || !producer->mask[VARYING_SLOT_PRIMITIVE_ID]) && component == 0 &&
              intr->intrinsic == nir_intrinsic_load_input && intr->num_components == 1)
             continue;
@@ -10760,15 +10765,26 @@ apple9_collect_varyings(nir_shader *nir,
          layout->mask[location] |= mask << component;
       }
    }
+   const bool add_prim_id =
+      fragment && producer && prim_id_varying &&
+      (layout->mask[VARYING_SLOT_PRIMITIVE_ID] &
+       ~producer->mask[VARYING_SLOT_PRIMITIVE_ID]);
    for (unsigned i = 0; i < ARRAY_SIZE(layout->mask); ++i) {
-      if (producer && (layout->mask[i] & ~producer->mask[i])) {
+      if (producer && (layout->mask[i] & ~producer->mask[i]) &&
+          !(i == VARYING_SLOT_PRIMITIVE_ID && add_prim_id)) {
          *reason = "Apple9 fragment input is not written by the vertex stage";
          return false;
       }
       layout->count += util_bitcount(layout->mask[i]);
    }
-   if (producer)
+   if (producer) {
       *layout = *producer;
+      if (add_prim_id) {
+         layout->mask[VARYING_SLOT_PRIMITIVE_ID] = 1;
+         layout->group[VARYING_SLOT_PRIMITIVE_ID] = 1;
+         layout->count += 1;
+      }
+   }
    unsigned count = 0;
    for (unsigned i = 0; i < ARRAY_SIZE(layout->mask); ++i) {
       if ((layout->mask[i] & ~0xf) ||

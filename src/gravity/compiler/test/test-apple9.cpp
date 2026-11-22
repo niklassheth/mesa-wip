@@ -15998,3 +15998,46 @@ TEST(Apple9Compiler, NativeMeshDynamicClipZ)
    free(out.binary);
    ralloc_free(b.shader);
 }
+
+TEST(Apple9Compiler, EpilogFragmentLinkedProducerPrimId)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "epilog_fs_linked_prim_id");
+   nir_def *bary = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *v0 = nir_load_interpolated_input(
+      &b, 1, 32, bary, nir_imm_int(&b, 0), .dest_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+   nir_def *pid = nir_load_input(
+      &b, 1, 32, nir_imm_int(&b, 0), .dest_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_ID, .num_slots = 1});
+   nir_store_output(&b, nir_vec4(&b, v0, nir_u2f32(&b, pid),
+                                 nir_imm_float(&b, 0), nir_imm_float(&b, 1)),
+                    nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .src_type = nir_type_float32,
+                    .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                     .num_slots = 1});
+
+   /* Producer (e.g. VS or Mesh without gl_PrimitiveID) writes VAR0 only. */
+   agx_apple9_varying_layout producer = {};
+   producer.mask[VARYING_SLOT_VAR0] = 1;
+   producer.group[VARYING_SLOT_VAR0] = 0;
+   producer.count = 1;
+
+   agx_apple9_blend blend = {.use_epilog = 1, .dynamic_samples = 1};
+   agx_shader_part out = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, &producer, &blend, 1,
+                                               &out, &reason))
+      << (reason ?: "");
+   EXPECT_FALSE(out.info.apple9_reads_primitive_id);
+   EXPECT_EQ(out.info.apple9_varyings.mask[VARYING_SLOT_PRIMITIVE_ID], 1u);
+   EXPECT_EQ(out.info.apple9_varyings.group[VARYING_SLOT_PRIMITIVE_ID], 1u);
+   EXPECT_EQ(out.info.apple9_varyings.count, 2u);
+   int pid_idx = agx_apple9_varying_index(&out.info.apple9_varyings,
+                                          VARYING_SLOT_PRIMITIVE_ID, 0);
+   ASSERT_GE(pid_idx, 0);
+   EXPECT_TRUE(agx_apple9_interp_mask_test(out.info.apple9_flat_mask, pid_idx));
+   free(out.binary);
+   ralloc_free(b.shader);
+}

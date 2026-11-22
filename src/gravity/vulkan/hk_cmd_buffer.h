@@ -968,6 +968,17 @@ hk_cmd_buffer_pool(struct hk_cmd_buffer *cmd)
    return (struct hk_cmd_pool *)cmd->vk.pool;
 }
 
+static inline struct hk_api_shader *
+hk_apple9_select_gs(const struct hk_cmd_buffer *cmd,
+                    struct hk_api_shader *gs)
+{
+   if (gs && gs->apple9_gs_polygon_points &&
+       cmd->vk.dynamic_graphics_state.rs.polygon_mode == VK_POLYGON_MODE_POINT &&
+       !gs->variants[HK_GS_VARIANT_MAIN].info.gs.xfb)
+      return gs->apple9_gs_polygon_points;
+   return gs;
+}
+
 /*
  * The hardware vertex shader is supplied by the last geometry stage. The
  * geometry pipeline is vertex->tess->geometry so we search backwards.

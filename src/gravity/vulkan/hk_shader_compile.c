@@ -2018,6 +2018,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE) ||
       state->rs->polygon_mode == VK_POLYGON_MODE_POINT;
    unsigned polygon_face_slot = 0;
+   bool gs_dynamic_polygon_points = false;
    mesa_shader_stage polygon_stage = MESA_SHADER_NONE;
    mesa_shader_stage stipple_stage = MESA_SHADER_NONE;
    {
@@ -2130,6 +2131,24 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                warned = true;
             }
          }
+      }
+      if (!polygon_points && may_polygon_points &&
+          stage_nir[MESA_SHADER_GEOMETRY] &&
+          !stage_nir[MESA_SHADER_GEOMETRY]->info.internal &&
+          !stage_nir[MESA_SHADER_GEOMETRY]->xfb_info &&
+          hk_apple9_gs_polygon_points_ok(stage_nir[MESA_SHADER_GEOMETRY])) {
+         nir_shader *gs_nir = stage_nir[MESA_SHADER_GEOMETRY];
+         uint64_t reserved =
+            stipple.start
+               ? (BITFIELD64_BIT(stipple.start) | BITFIELD64_BIT(stipple.axis))
+               : 0;
+         unsigned budget_face_slot = 0;
+         gs_dynamic_polygon_points =
+            fs_nir
+               ? hk_apple9_polygon_point_budget(gs_nir, fs_nir, reserved,
+                                                &budget_face_slot)
+               : hk_apple9_slot_fits(
+                    gs_nir, 2 + !(gs_nir->info.outputs_written & VARYING_BIT_PSIZ));
       }
    }
 
@@ -2422,6 +2441,14 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             }
             if (stipple_stage == MESA_SHADER_GEOMETRY)
                hk_apple9_write_gs_line_stipple(nir, stipple);
+            nir_shader *pp_nir = NULL;
+            if (gs_dynamic_polygon_points) {
+               pp_nir = nir_shader_clone(NULL, nir);
+               if (!pp_nir) {
+                  result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+                  goto done;
+               }
+            }
             if (polygon_stage == MESA_SHADER_GEOMETRY) {
                struct hk_pp_info info = {
                   .clip = nir->info.clip_distance_array_size,
@@ -2434,8 +2461,56 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             }
             result = hk_apple9_compile_gs(dev, nir, &key.vertex,
                                           !key.gs_cull_planes, obj, &reason);
-            if (result != VK_SUCCESS)
+            if (result != VK_SUCCESS) {
+               ralloc_free(pp_nir);
                goto done;
+            }
+            if (pp_nir) {
+               struct hk_api_shader *pp_obj =
+                  vk_shader_zalloc(&dev->vk, &hk_shader_ops, stage, alloc, size);
+               if (!pp_obj) {
+                  ralloc_free(pp_nir);
+                  result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+                  goto done;
+               }
+               hk_foreach_variant(pp_obj, variant) {
+                  variant->info.stage = stage;
+                  variant->b.info.stats.instrs = 1;
+#ifndef NDEBUG
+                  variant->debug_owner = pp_obj;
+#endif
+               }
+               pp_obj->writes_memory = obj->writes_memory;
+               pp_obj->pre_raster_reads = obj->pre_raster_reads;
+               pp_obj->reads_draw_id = obj->reads_draw_id;
+               pp_obj->push_constant_mask = obj->push_constant_mask;
+               pp_obj->variants[0].info.set_count = shader->info.set_count;
+               struct hk_pp_info info = {
+                  .clip = pp_nir->info.clip_distance_array_size,
+                  .cull = pp_nir->info.cull_distance_array_size,
+                  .flat = key.vertex.outputs_flat,
+                  .face_slot = VARYING_SLOT_FOGC,
+               };
+               hk_apple9_lower_gs_polygon_points(
+                  pp_nir, info,
+                  hk_device_physical(dev)->vk.properties.polygonModePointSize);
+               const char *pp_reason = NULL;
+               VkResult pp_res = hk_apple9_compile_gs(
+                  dev, pp_nir, &key.vertex, !key.gs_cull_planes, pp_obj,
+                  &pp_reason);
+               ralloc_free(pp_nir);
+               if (pp_res == VK_SUCCESS) {
+                  hk_api_shader_init_constant_data(pp_obj);
+                  obj->apple9_gs_polygon_points = pp_obj;
+               } else {
+                  hk_api_shader_destroy(&dev->vk, &pp_obj->vk, alloc);
+                  if (pp_res == VK_ERROR_OUT_OF_HOST_MEMORY ||
+                      pp_res == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+                     result = pp_res;
+                     goto done;
+                  }
+               }
+            }
             varyings = shader->b.info.apple9_varyings;
             continue;
          } else if (stage == MESA_SHADER_TASK) {

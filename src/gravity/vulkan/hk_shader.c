@@ -489,6 +489,12 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
       hk_api_shader_destroy(vk_dev, &obj->apple9_native->vk, pAllocator);
    }
 
+   if (obj->apple9_gs_polygon_points) {
+      assert(!obj->apple9_gs_polygon_points->apple9_gs_polygon_points);
+      hk_api_shader_destroy(vk_dev, &obj->apple9_gs_polygon_points->vk,
+                            pAllocator);
+   }
+
    hk_foreach_variant(obj, shader) {
       hk_shader_destroy(dev, shader);
    }
@@ -640,7 +646,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 }
 
 /* Version the container independently of the hardware programs it owns. */
-#define HK_SHADER_CONTAINER_VERSION 0x484b000cu
+#define HK_SHADER_CONTAINER_VERSION 0x484b000du
 
 static VkResult
 hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *blob,
@@ -742,6 +748,28 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
       }
    }
 
+   bool has_gs_pp = blob_read_uint8(blob);
+   if (blob->overrun ||
+       (has_gs_pp && (!allow_native || stage != MESA_SHADER_GEOMETRY))) {
+      hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
+      return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+   }
+   if (has_gs_pp) {
+      struct vk_shader *gs_pp = NULL;
+      VkResult result = hk_deserialize_api_shader_inner(
+         vk_dev, blob, binary_version, pAllocator, &gs_pp, false);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
+         return result;
+      }
+      obj->apple9_gs_polygon_points =
+         container_of(gs_pp, struct hk_api_shader, vk);
+      if (gs_pp->stage != MESA_SHADER_GEOMETRY) {
+         hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      }
+   }
+
    hk_api_shader_init_constant_data(obj);
    *shader_out = &obj->vk;
    return VK_SUCCESS;
@@ -809,6 +837,13 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
              obj->apple9_native->apple9_native_leaf &&
              !obj->apple9_native_leaf);
       hk_api_shader_serialize(vk_dev, &obj->apple9_native->vk, blob);
+   }
+
+   blob_write_uint8(blob, obj->apple9_gs_polygon_points != NULL);
+   if (obj->apple9_gs_polygon_points) {
+      assert(obj->vk.stage == MESA_SHADER_GEOMETRY &&
+             !obj->apple9_gs_polygon_points->apple9_gs_polygon_points);
+      hk_api_shader_serialize(vk_dev, &obj->apple9_gs_polygon_points->vk, blob);
    }
 
    return !blob->out_of_memory;

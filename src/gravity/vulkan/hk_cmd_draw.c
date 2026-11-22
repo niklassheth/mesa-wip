@@ -433,7 +433,8 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
 {
    struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
+   struct hk_api_shader *gs =
+      hk_apple9_select_gs(cmd, gfx->shaders[MESA_SHADER_GEOMETRY]);
    struct hk_shader *fs = hk_only_variant(gfx->shaders[MESA_SHADER_FRAGMENT]);
    struct hk_shader *count = hk_count_gs_variant(gs);
 
@@ -941,6 +942,8 @@ hk_apple9_launch_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw,
       return draw;
    desc->root.draw.tess_params = tess_args.gpu;
    hk_upload_tess_params_for_tcs(cmd, tess_args.cpu, draw, tcs);
+   desc->root.draw.clip_z_coeff =
+      dyn->vp.depth_clip_negative_one_to_one ? 0.5f : 0.0f;
    desc->root_dirty = true;
    hk_cmd_buffer_flush_push_descriptors(cmd, desc);
    gfx->root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
@@ -1127,7 +1130,8 @@ hk_apple9_launch_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_descriptor_state *desc = &gfx->descriptors;
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
-   struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
+   struct hk_api_shader *gs =
+      hk_apple9_select_gs(cmd, gfx->shaders[MESA_SHADER_GEOMETRY]);
    struct hk_shader *vs = hk_bound_sw_vs_before_gs(gfx);
    struct hk_shader *main = hk_main_gs_variant(gs);
    struct hk_shader *count = hk_count_gs_variant(gs);
@@ -1146,6 +1150,8 @@ hk_apple9_launch_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    desc->root.draw.provoking =
       dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT ? 2
                                                                            : 0;
+   desc->root.draw.clip_z_coeff =
+      dyn->vp.depth_clip_negative_one_to_one ? 0.5f : 0.0f;
    desc->root_dirty = true;
    hk_cmd_buffer_flush_push_descriptors(cmd, desc);
    gfx->root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
