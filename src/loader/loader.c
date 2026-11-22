@@ -54,6 +54,7 @@
 #include "util/u_debug.h"
 #include "git_sha1.h"
 
+#include "drm-uapi/asahi_drm.h"
 #include "drm-uapi/nouveau_drm.h"
 
 #define MAX_DRM_DEVICES 64
@@ -205,6 +206,50 @@ nouveau_zink_predicate(int fd, const char *driver)
    if (!use_zink && !strcmp(driver, "nouveau"))
       return true;
    return false;
+#endif
+}
+
+/* Choose Zink or native Asahi Gallium for the asahi kernel driver. */
+static bool
+asahi_use_zink(int fd)
+{
+#ifndef HAVE_LIBDRM
+   return false;
+#else
+   bool prefer_zink = false;
+   bool require_zink = false;
+
+   struct drm_asahi_params_global params = { 0 };
+   struct drm_asahi_get_params get_params = {
+      .param_group = 0,
+      .pointer = (uint64_t)(uintptr_t)&params,
+      .size = sizeof(params),
+   };
+
+   int ret = drmIoctl(fd, DRM_IOCTL_ASAHI_GET_PARAMS, &get_params);
+   if (ret == 0 && params.gpu_generation >= 16) {
+      /* Apple9 (G16 / M4) and later GPUs have no native Gallium driver
+       * and run OpenGL via Zink on top of the Gravity Vulkan driver.
+       */
+      prefer_zink = true;
+      require_zink = true;
+   }
+
+   prefer_zink = debug_get_bool_option("ASAHI_USE_ZINK", prefer_zink);
+
+   bool use_zink = prefer_zink;
+   if (require_zink) {
+      static bool warned = false;
+      if (!prefer_zink && !warned) {
+         log_(_LOADER_WARNING,
+              "ASAHI_USE_ZINK is ignored for Apple9 (G16) and later GPUs.\n");
+         warned = true;
+      }
+
+      use_zink = true;
+   }
+
+   return use_zink;
 #endif
 }
 
@@ -825,8 +870,13 @@ loader_get_driver_for_fd(int fd)
 #endif
 
    driver = loader_get_pci_driver(fd);
-   if (!driver)
+   if (!driver) {
       driver = loader_get_kernel_driver_name(fd);
+      if (driver && strcmp(driver, "asahi") == 0 && asahi_use_zink(fd)) {
+         free(driver);
+         driver = strdup("zink");
+      }
+   }
 
    return driver;
 }

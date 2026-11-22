@@ -368,7 +368,7 @@ pipe_loader_get_compatible_render_capable_device_fds(int kms_only_fd, unsigned i
    bool is_platform_device;
    struct pipe_loader_device *dev;
    const char * const drivers[] = {
-#if defined GALLIUM_ASAHI
+#if defined(GALLIUM_ASAHI) || defined(GALLIUM_ZINK)
       "asahi",
 #endif
 #if defined GALLIUM_ETNAVIV

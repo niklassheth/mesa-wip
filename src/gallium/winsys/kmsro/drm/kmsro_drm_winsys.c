@@ -88,8 +88,16 @@ struct pipe_screen *kmsro_drm_screen_create(int kms_fd,
 
       if (strcmp(render_dev_name, "asahi") == 0) {
 #if defined(GALLIUM_ASAHI)
-         ro->create_for_resource = renderonly_create_gpu_import_for_resource;
-         screen = asahi_drm_screen_create_renderonly(ro->gpu_fd, ro, config);
+         bool use_zink = false;
+#if defined(GALLIUM_ZINK)
+         char *driver_name = loader_get_driver_for_fd(ro->gpu_fd);
+         use_zink = driver_name && strcmp(driver_name, "zink") == 0;
+         free(driver_name);
+#endif
+         if (!use_zink) {
+            ro->create_for_resource = renderonly_create_gpu_import_for_resource;
+            screen = asahi_drm_screen_create_renderonly(ro->gpu_fd, ro, config);
+         }
 #endif
       }
       else if (strcmp(render_dev_name, "etnaviv") == 0) {
@@ -133,6 +141,11 @@ struct pipe_screen *kmsro_drm_screen_create(int kms_fd,
 
 #if defined(GALLIUM_ZINK)
       if (!screen) {
+         /* Zink allocates renderonly scanout resources from the KMS device
+          * before creating the VkImage and imports the exported dma-buf FD
+          * with DRM_FORMAT_MOD_LINEAR. On Apple DCP, dumb buffers satisfy
+          * DCP's 64-byte pitch, 16 KiB size, and scanout memory requirements.
+          */
          ro->create_for_resource = renderonly_create_kms_dumb_buffer_for_resource;
          screen = zink_drm_create_screen_renderonly(ro->gpu_fd, ro, config);
       }
