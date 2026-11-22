@@ -6,19 +6,13 @@
  */
 #include <assert.h>
 #include "agx_abi.h"
-#include "agx_bg_eot.h"
 #include "agx_bo.h"
 #include "agx_compile.h"
-#include "agx_compiler.h"
 #include "agx_device.h"
 #include "agx_helpers.h"
 #include "agx_linker.h"
-#include "agx_nir_lower_vbo.h"
-#include "agx_ppp.h"
 #include "gravity/lib/agx_apple9.h"
 #include "agx_tilebuffer.h"
-#include "agx_usc.h"
-#include "agx_uvs.h"
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
 #include "hk_apple9_polygon_points.h"
@@ -54,7 +48,6 @@
 #include "nir_intrinsics.h"
 #include "nir_lower_blend.h"
 #include "nir_xfb_info.h"
-#include "pool.h"
 #include "shader_enums.h"
 #include "vk_blend.h"
 #include "vk_enum_to_str.h"
@@ -420,7 +413,7 @@ hk_render_merge_enabled(struct hk_cmd_buffer *cmd)
    if (enabled < 0)
       enabled = debug_get_bool_option("HK_APPLE9_MERGE_RENDERS", true);
 
-   return enabled && agx_is_apple9(&hk_cmd_buffer_device(cmd)->dev) &&
+   return enabled &&
           cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY && !cmd->in_meta;
 }
 
@@ -559,7 +552,6 @@ hk_render_suspend_keeps_open(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    return enabled && cs && !render->feedback && !render->raw_color_mask &&
           !render->raw_zs &&
           (render->flags & VK_RENDERING_SUSPENDING_BIT) &&
-          agx_is_apple9(&hk_cmd_buffer_device(cmd)->dev) &&
           cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY && !cmd->in_meta &&
           !cmd->sync_fallback && !cmd->current_cs.pre_gfx &&
           !cmd->current_cs.post_gfx && !cmd->tess_batch.draws;
@@ -816,8 +808,7 @@ hk_CmdSetAttachmentFeedbackLoopEnableEXT(VkCommandBuffer commandBuffer,
    }
    if (cmd->rendering && aspectMask)
       cmd->state.gfx.render.feedback = true;
-   if (agx_is_apple9(&hk_cmd_buffer_device(cmd)->dev))
-      hk_feedback_prepare_draw(cmd);
+   hk_feedback_prepare_draw(cmd);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -969,18 +960,16 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    render->tilebuffer = agx_build_tilebuffer_layout(
       formats, render->color_att_count, render->tilebuffer.nr_samples, true);
 
-   if (agx_is_apple9(&hk_cmd_buffer_device(cmd)->dev)) {
-      unsigned bytes = 0;
-      for (unsigned rt = 0; rt < render->color_att_count; ++rt) {
-         render->tilebuffer._offset_B[rt] = bytes;
-         bytes += 4 * agx_apple9_color_words(formats[rt]);
-         render->tilebuffer.spilled[rt] = false;
-      }
-      render->tilebuffer.sample_size_B = ALIGN_POT(
-         agx_apple9_tile_sample_bytes(bytes, render->tilebuffer.nr_samples), 8);
-      render->tilebuffer.tile_size = render->tilebuffer.nr_samples == 4
-                                       ? 32 * 16 : 32 * 32;
+   unsigned bytes = 0;
+   for (unsigned rt = 0; rt < render->color_att_count; ++rt) {
+      render->tilebuffer._offset_B[rt] = bytes;
+      bytes += 4 * agx_apple9_color_words(formats[rt]);
+      render->tilebuffer.spilled[rt] = false;
    }
+   render->tilebuffer.sample_size_B = ALIGN_POT(
+      agx_apple9_tile_sample_bytes(bytes, render->tilebuffer.nr_samples), 8);
+   render->tilebuffer.tile_size = render->tilebuffer.nr_samples == 4
+                                    ? 32 * 16 : 32 * 32;
 
    if (cmd->feedback_decompress) {
       /* A self-blit must retire each whole compression block before another
@@ -1143,9 +1132,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                        attach_z, attach_s, incomplete_render_area, true, false,
                        NULL);
 
-   const bool drop_stores =
-      agx_is_apple9(&hk_cmd_buffer_device(cmd)->dev) &&
-      !(render->flags & VK_RENDERING_SUSPENDING_BIT);
+   const bool drop_stores = !(render->flags & VK_RENDERING_SUSPENDING_BIT);
    /* The first render pass of a chain decides its loads. */
    if (!resume && !merge) {
       render->chain_load[0] =
@@ -1572,10 +1559,9 @@ hk_init_heap(const void *data)
     * and its backing grows instead, see hk_heap_prepare_submit. The USC
     * aperture is shared, so settle for a smaller range when it is crowded.
     */
-   enum agx_va_flags flags = agx_is_apple9(&dev->dev) ? AGX_VA_USC : 0;
    for (uint64_t va_B = HK_HEAP_VA_MAX_B;
         !dev->heap_va && va_B >= HK_HEAP_GEOMETRY_MIN_B; va_B /= 2) {
-      dev->heap_va = agx_va_alloc(&dev->dev, va_B, 65536, flags, 0);
+      dev->heap_va = agx_va_alloc(&dev->dev, va_B, 65536, AGX_VA_USC, 0);
    }
    if (!dev->heap_va)
       return;
@@ -1839,10 +1825,7 @@ hk_gs_in_prim(struct hk_cmd_buffer *cmd)
 static struct agx_ptr
 hk_geom_index_alloc(struct hk_cmd_buffer *cmd, uint32_t size)
 {
-   if (agx_is_apple9(&hk_cmd_buffer_device(cmd)->dev))
-      return hk_pool_usc_alloc(cmd, size, 4);
-   else
-      return hk_pool_alloc(cmd, size, 4);
+   return hk_pool_usc_alloc(cmd, size, 4);
 }
 
 static uint64_t
@@ -2384,7 +2367,7 @@ hk_build_meta_shader_locked(struct hk_device *dev, struct hk_internal_key *key,
       if (hk_apple9_compile_internal_gs(dev, b.shader, suffix.fs_interp,
                                         suffix.cull_mask, &s) != VK_SUCCESS)
          return NULL;
-   } else if (hk_compile_shader(dev, &info, NULL, NULL, NULL, &s) !=
+   } else if (hk_apple9_compile_compute(dev, &info, NULL, NULL, &s) !=
               VK_SUCCESS) {
       return NULL;
    }
@@ -3126,30 +3109,6 @@ hk_default_sample_positions(unsigned nr_samples)
    }
 }
 
-void
-agx_fill_velem_keys(const struct vk_vertex_input_state *vi,
-                    uint64_t attribs_read, struct agx_velem_key *keys)
-{
-   u_foreach_bit(a, vi->attributes_valid) {
-      struct vk_vertex_attribute_state attr = vi->attributes[a];
-
-      assert(vi->bindings_valid & BITFIELD_BIT(attr.binding));
-      struct vk_vertex_binding_state binding = vi->bindings[attr.binding];
-
-      /* nir_assign_io_var_locations compacts vertex inputs, eliminating
-       * unused inputs. We need to do the same here to match the locations.
-       */
-      unsigned slot = util_bitcount64(attribs_read & BITFIELD_MASK(a));
-
-      keys[slot] = (struct agx_velem_key){
-         .format = hk_format_to_pipe_format(attr.format),
-         .stride = binding.stride,
-         .divisor = binding.divisor,
-         .instanced = binding.input_rate == VK_VERTEX_INPUT_RATE_INSTANCE,
-      };
-   }
-}
-
 /* Direct draws through software vertex shading size the vertex output buffer
  * on the CPU (hk_upload_vertex_params). Its 32-bit size wraps for very large
  * draws, e.g. a vertex count of UINT32_MAX, and the vertex shader would then
@@ -3199,7 +3158,7 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
       dyn->ia.primitive_topology ==
          VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
    bool stipple_gs =
-      agx_is_apple9(&hk_cmd_buffer_device(cmd)->dev) && fs_stipple &&
+      fs_stipple &&
       !gfx->shaders[MESA_SHADER_TESS_EVAL] &&
       fs_stipple->info.fs.line_stipple_start && dyn->rs.line.stipple.enable &&
       (stipple_strip ||
@@ -3209,7 +3168,7 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    /* Polygon mode POINT on triangles draws real points from a software
     * polygon stage, see hk_apple9_polygon_point_gs. */
    bool polygon_points =
-      agx_is_apple9(&hk_cmd_buffer_device(cmd)->dev) && fs_stipple &&
+      fs_stipple &&
       fs_stipple->info.fs.polygon_points &&
       dyn->rs.polygon_mode == VK_POLYGON_MODE_POINT &&
       u_reduced_prim(hk_gs_in_prim(cmd)) == MESA_PRIM_TRIANGLES;
@@ -3249,7 +3208,7 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
 
    /* ...or to give the fragment shader flat copies of per-vertex inputs */
    struct hk_api_shader *fs_api_copies = gfx->shaders[MESA_SHADER_FRAGMENT];
-   if (agx_is_apple9(&hk_cmd_buffer_device(cmd)->dev) && fs_api_copies) {
+   if (fs_api_copies) {
       const struct hk_shader *fs_copies = hk_only_variant(fs_api_copies);
       /* The vertex shader writes the barycentric weights of non-indexed
        * triangle lists when there are no per-vertex inputs. */
@@ -3311,53 +3270,49 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    perf_debug(cmd, "Binding passthrough GS for%s\n", xfb_outputs ? " XFB" : "");
 
-   if (agx_is_apple9(&dev->dev)) {
-      struct hk_api_shader *fs_api = gfx->shaders[MESA_SHADER_FRAGMENT];
-      struct hk_shader *fs = fs_api ? hk_only_variant(fs_api) : NULL;
-      struct hk_apple9_passthrough_suffix suffix = {
-         .fs_interp = {
-            fs ? fs->info.fs.interp.flat : 0,
-            fs ? fs->info.fs.interp.linear : 0,
-         },
-         .per_vertex_copies = fs ? fs->info.fs.per_vertex_copies : 0,
-         .line_stipple_start = stipple_gs ? fs->info.fs.line_stipple_start : 0,
-         .line_stipple_strip = stipple_gs && stipple_strip,
-         .polygon_points = polygon_points,
-         .polygon_face_slot = polygon_points ? fs->info.fs.polygon_face_slot : 0,
-         .polygon_point_size = polygon_points &&
-            hk_cmd_buffer_device(cmd)->vk.physical->properties.polygonModePointSize,
-         .cull_mask = cull_mask,
-      };
-      if (fs) {
-         memcpy(suffix.per_vertex_location, fs->info.fs.per_vertex_location,
-                sizeof(suffix.per_vertex_location));
-         memcpy(suffix.per_vertex_copy_base, fs->info.fs.per_vertex_copy_base,
-                sizeof(suffix.per_vertex_copy_base));
-         memcpy(suffix.per_vertex_bary, fs->info.fs.per_vertex_bary,
-                sizeof(suffix.per_vertex_bary));
-      }
-      /* Without a fragment shader, the rasterized layout is unconstrained.
-       * Always retain components captured by transform feedback even when an
-       * independently-compiled fragment shader does not read them. */
-      if (fs && fs != hk_only_variant(dev->null_fs)) {
-         memcpy(suffix.components, fs->b.info.apple9_varyings.mask,
-                sizeof(suffix.components));
-         for (unsigned i = 0; i < xfb_outputs; ++i) {
-            const nir_xfb_output_info *o = &key->xfb_info.outputs[i];
-            if (o->location < ARRAY_SIZE(suffix.components))
-               suffix.components[o->location] |= o->component_mask;
-         }
-      } else {
-         memset(suffix.components, 0xff, sizeof(suffix.components));
-      }
-      uint8_t *full = alloca(key_size + sizeof(suffix));
-      memcpy(full, key, key_size);
-      memcpy(full + key_size, &suffix, sizeof(suffix));
-      gs = hk_meta_shader(dev, hk_apple9_passthrough_gs, full,
-                          key_size + sizeof(suffix));
-   } else {
-      gs = hk_meta_shader(dev, poly_nir_passthrough_gs, key, key_size);
+   struct hk_api_shader *fs_api = gfx->shaders[MESA_SHADER_FRAGMENT];
+   struct hk_shader *fs = fs_api ? hk_only_variant(fs_api) : NULL;
+   struct hk_apple9_passthrough_suffix suffix = {
+      .fs_interp = {
+         fs ? fs->info.fs.interp.flat : 0,
+         fs ? fs->info.fs.interp.linear : 0,
+      },
+      .per_vertex_copies = fs ? fs->info.fs.per_vertex_copies : 0,
+      .line_stipple_start = stipple_gs ? fs->info.fs.line_stipple_start : 0,
+      .line_stipple_strip = stipple_gs && stipple_strip,
+      .polygon_points = polygon_points,
+      .polygon_face_slot = polygon_points ? fs->info.fs.polygon_face_slot : 0,
+      .polygon_point_size = polygon_points &&
+         hk_cmd_buffer_device(cmd)->vk.physical->properties.polygonModePointSize,
+      .cull_mask = cull_mask,
+   };
+   if (fs) {
+      memcpy(suffix.per_vertex_location, fs->info.fs.per_vertex_location,
+             sizeof(suffix.per_vertex_location));
+      memcpy(suffix.per_vertex_copy_base, fs->info.fs.per_vertex_copy_base,
+             sizeof(suffix.per_vertex_copy_base));
+      memcpy(suffix.per_vertex_bary, fs->info.fs.per_vertex_bary,
+             sizeof(suffix.per_vertex_bary));
    }
+   /* Without a fragment shader, the rasterized layout is unconstrained.
+    * Always retain components captured by transform feedback even when an
+    * independently-compiled fragment shader does not read them. */
+   if (fs && fs != hk_only_variant(dev->null_fs)) {
+      memcpy(suffix.components, fs->b.info.apple9_varyings.mask,
+             sizeof(suffix.components));
+      for (unsigned i = 0; i < xfb_outputs; ++i) {
+         const nir_xfb_output_info *o = &key->xfb_info.outputs[i];
+         if (o->location < ARRAY_SIZE(suffix.components))
+            suffix.components[o->location] |= o->component_mask;
+      }
+   } else {
+      memset(suffix.components, 0xff, sizeof(suffix.components));
+   }
+   uint8_t *full = alloca(key_size + sizeof(suffix));
+   memcpy(full, key, key_size);
+   memcpy(full + key_size, &suffix, sizeof(suffix));
+   gs = hk_meta_shader(dev, hk_apple9_passthrough_gs, full,
+                       key_size + sizeof(suffix));
    gs->is_passthrough = true;
    hk_cmd_bind_graphics_shader(cmd, MESA_SHADER_GEOMETRY, gs);
 }

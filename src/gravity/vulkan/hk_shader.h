@@ -12,11 +12,6 @@
 #include "gravity/lib/agx_apple9.h"
 #include "poly/nir/poly_nir.h"
 #include "util/macros.h"
-#include "agx_linker.h"
-#include "agx_nir_lower_vbo.h"
-#include "agx_pack.h"
-#include "agx_usc.h"
-#include "agx_uvs.h"
 #include "hk_descriptor_memory.h"
 
 #include "hk_device.h"
@@ -231,15 +226,7 @@ struct hk_shader_info {
    struct agx_apple9_compute_profile apple9;
    union {
       struct {
-         uint32_t attribs_read;
-         BITSET_DECLARE(attrib_components_read, AGX_MAX_ATTRIBS * 4);
-         bool use_prolog;
-         uint8_t _pad[7];
-      } vs;
-
-      struct {
          struct agx_interp_info interp;
-         struct agx_fs_epilog_link_info epilog_key;
 
          bool reads_sample_mask;
          bool post_depth_coverage;
@@ -284,8 +271,6 @@ struct hk_shader_info {
       uint8_t _pad[32];
    };
 
-   struct agx_unlinked_uvs_layout uvs;
-
    /* Transform feedback buffer strides */
    uint8_t xfb_stride[MAX_XFB_BUFFERS];
 
@@ -313,8 +298,6 @@ struct hk_shader {
    struct agx_shader_part b;
 
    struct hk_shader_info info;
-   struct agx_fragment_face_2_packed frag_face;
-   struct agx_counts_packed counts;
 
    const void *code_ptr;
    uint32_t code_size;
@@ -322,7 +305,7 @@ struct hk_shader {
    const void *data_ptr;
    uint32_t data_size;
 
-   /* BO for older GPUs; borrowed from apple9_body on G16. */
+   /* Borrowed from apple9_body. */
    struct agx_bo *bo;
    struct agx_shader_body *apple9_body;
 
@@ -720,12 +703,11 @@ hk_nir_lower_descriptors(nir_shader *nir,
                          struct vk_descriptor_set_layout *const *set_layouts,
                          bool root_uniform);
 
-VkResult hk_compile_shader(struct hk_device *dev,
-                           struct vk_shader_compile_info *info,
-                           const struct vk_graphics_pipeline_state *state,
-                           const struct vk_features *features,
-                           const VkAllocationCallbacks *pAllocator,
-                           struct hk_api_shader **shader_out);
+VkResult hk_apple9_compile_compute(struct hk_device *dev,
+                                   struct vk_shader_compile_info *info,
+                                   const struct vk_features *vk_features,
+                                   const VkAllocationCallbacks *pAllocator,
+                                   struct hk_api_shader **shader_out);
 
 void hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev,
                                 nir_shader *nir);

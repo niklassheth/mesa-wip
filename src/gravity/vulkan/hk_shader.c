@@ -22,7 +22,6 @@
 #include "gravity/compiler/agx_apple9_mesh.h"
 #include "agx_device.h"
 #include "agx_helpers.h"
-#include "agx_nir_lower_vbo.h"
 #include "glsl_types.h"
 #include "hk_instance.h"
 #include "libagx.h"
@@ -68,7 +67,6 @@
 #include "gravity/lib/agx_abi.h"
 #include "gravity/lib/agx_linker.h"
 #include "gravity/lib/agx_tilebuffer.h"
-#include "gravity/lib/agx_uvs.h"
 #include "compiler/spirv/nir_spirv.h"
 
 #include "util/u_atomic.h"
@@ -92,32 +90,6 @@ DEBUG_GET_ONCE_BOOL_OPTION(apple9_variant_cache_verify,
 static _Thread_local bool hk_apple9_eager_compile;
 /* Resolve a variant into the pipeline cache only, see hk_apple9_eager_variant. */
 static _Thread_local bool hk_apple9_precompile;
-
-struct hk_fs_key {
-   bool zs_self_dep;
-
-   /** True if sample shading is forced on via an API knob such as
-    * VkPipelineMultisampleStateCreateInfo::minSampleShading
-    */
-   bool force_sample_shading;
-
-   uint8_t pad[2];
-};
-static_assert(sizeof(struct hk_fs_key) == 4, "packed");
-
-struct hk_vs_key {
-   struct agx_velem_key attribs[32];
-   bool skip_prolog;
-   bool static_strides;
-   bool kill_psiz;
-   bool pad[1];
-};
-static_assert(sizeof(struct hk_vs_key) == 260, "packed");
-
-union hk_key {
-   struct hk_vs_key vs;
-   struct hk_fs_key fs;
-};
 
 static void
 shared_var_info(const struct glsl_type *type, unsigned *size, unsigned *align)
@@ -418,10 +390,7 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_large_constants, NULL, 32);
 
-   struct hk_physical_device *pdev =
-      container_of(vk_pdev, struct hk_physical_device, vk);
-   if (agx_is_apple9(&pdev->dev))
-      NIR_PASS(_, nir, agx_nir_lower_apple9_math);
+   NIR_PASS(_, nir, agx_nir_lower_apple9_math);
    agx_preprocess_nir(nir);
 
    /* Constant-offset reads can fold away after extraction. Do not upload
@@ -460,69 +429,6 @@ hk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
       .has_base_workgroup_id = nir->info.stage == MESA_SHADER_COMPUTE,
    };
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv_options);
-}
-
-static void
-hk_populate_vs_key(struct hk_vs_key *key,
-                   const struct vk_graphics_pipeline_state *state)
-{
-   memset(key, 0, sizeof(*key));
-
-   if (state && state->ia &&
-       !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY)) {
-
-      key->kill_psiz = state->ia->primitive_topology != MESA_PRIM_POINTS;
-   }
-
-   if (state && state->vi && !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_VI) &&
-       !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_VI_BINDINGS_VALID)) {
-
-      agx_fill_velem_keys(state->vi, ~0 /* compacted on use */, key->attribs);
-      key->skip_prolog = true;
-      key->static_strides =
-         !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_VI_BINDING_STRIDES);
-
-      if (!key->static_strides) {
-         for (unsigned i = 0; i < ARRAY_SIZE(key->attribs); ++i) {
-            key->attribs[i].stride = 0;
-         }
-      }
-   }
-}
-
-static void
-hk_populate_fs_key(struct hk_fs_key *key,
-                   const struct vk_graphics_pipeline_state *state)
-{
-   memset(key, 0, sizeof(*key));
-
-   if (state == NULL)
-      return;
-
-   if (state->pipeline_flags &
-       VK_PIPELINE_CREATE_2_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)
-      key->zs_self_dep = true;
-
-   /* We force per-sample interpolation whenever sampleShadingEnable is set
-    * regardless of minSampleShading or rasterizationSamples.
-    *
-    * When sampleShadingEnable is set, few guarantees are made about the
-    * location of interpolation of the inputs.  The only real guarantees are
-    * that the inputs are interpolated within the pixel and that you get at
-    * least `rasterizationSamples * minSampleShading` unique positions.
-    * Importantly, it does not require that when `rasterizationSamples *
-    * minSampleShading <= 1.0` that those positions are at the fragment
-    * center.  Therefore, it's valid to just always do per-sample all the time.
-    *
-    * The one caveat here is that we have to be careful about gl_SampleMaskIn.
-    * When `hk_fs_key::force_sample_shading = true` we also turn any reads of
-    * gl_SampleMaskIn into `1 << gl_SampleID` because the hardware sample mask
-    * is actually per-fragment, not per-pass.  We handle this by smashing
-    * minSampleShading to 1.0 whenever gl_SampleMaskIn is read.
-    */
-   const struct vk_multisample_state *ms = state->ms;
-   if (ms != NULL && ms->sample_shading_enable)
-      key->force_sample_shading = true;
 }
 
 enum hk_feature_key {
@@ -1636,7 +1542,7 @@ hk_hash_graphics_state(struct vk_physical_device *device,
    struct mesa_blake3 blake3_ctx;
    _mesa_blake3_init(&blake3_ctx);
    struct hk_physical_device *pdev = container_of(device, struct hk_physical_device, vk);
-   if (agx_is_apple9(&pdev->dev) && state) {
+   if (state) {
       struct hk_apple9_graphics_key key;
       hk_apple9_graphics_key_device(&key, state, pdev);
       if (hk_apple9_fs_needs_epilog(state, features))
@@ -1656,15 +1562,6 @@ hk_hash_graphics_state(struct vk_physical_device *device,
       }
       _mesa_blake3_update(&blake3_ctx, &deferral, sizeof(deferral));
    }
-   if (state && (stages & VK_SHADER_STAGE_VERTEX_BIT)) {
-      struct hk_vs_key key;
-      hk_populate_vs_key(&key, state);
-      _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
-   } else if (state && (stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
-      struct hk_fs_key key;
-      hk_populate_fs_key(&key, state);
-      _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
-   }
 
    if (state &&
        (stages & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT))) {
@@ -1672,8 +1569,7 @@ hk_hash_graphics_state(struct vk_physical_device *device,
       _mesa_blake3_update(&blake3_ctx, &is_multiview, sizeof(is_multiview));
    }
 
-   if (agx_is_apple9(&pdev->dev) &&
-       (stages & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) &&
+   if ((stages & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) &&
        hk_apple9_native_mesh_available(pdev))
       hk_hash_apple9_native_mesh_abi(&blake3_ctx);
 
@@ -1683,18 +1579,13 @@ hk_hash_graphics_state(struct vk_physical_device *device,
    _mesa_blake3_final(&blake3_ctx, blake3_out);
 }
 
-/* Apple9 has no bounds_agx; it selects with a generic comparison. */
+/* Apple9 selects out-of-bounds zeroes with a generic comparison. */
 static nir_def *
-bounds_check(nir_builder *b, nir_def *data, nir_def *offs, nir_def *bound,
-             bool apple9)
+bounds_check(nir_builder *b, nir_def *data, nir_def *offs, nir_def *bound)
 {
-   if (!apple9 && data->bit_size == 32 && data->num_components == 1) {
-      return nir_bounds_agx(b, data, offs, bound);
-   } else {
-      /* TODO: Optimize */
-      return nir_bcsel(b, nir_uge(b, bound, offs), data,
-                       nir_imm_zero(b, data->num_components, data->bit_size));
-   }
+   /* TODO: Optimize */
+   return nir_bcsel(b, nir_uge(b, bound, offs), data,
+                    nir_imm_zero(b, data->num_components, data->bit_size));
 }
 
 static bool
@@ -2048,7 +1939,6 @@ hk_apple9_vectorize_cb(unsigned align_mul, unsigned align_offset,
 
 struct hk_bounded_lowering {
    bool soft_fault;
-   bool apple9;
    /* Merged vector loads are checked per component (bounds_checked_modes). */
    bool per_component;
 };
@@ -2119,8 +2009,7 @@ lower_load_global_constant_offset_instr(nir_builder *b,
          nir_def *end = nir_scalar_is_const(offs)
             ? nir_imm_int(b, nir_scalar_as_uint(offs) + (c + 1) * byte_size)
             : nir_iadd_imm(b, offset, (c + 1) * byte_size);
-         comps[c] = bounds_check(b, nir_channel(b, val, c), end, bound,
-                                 opts->apple9);
+         comps[c] = bounds_check(b, nir_channel(b, val, c), end, bound);
       }
       val = nir_vec(b, comps, intrin->def.num_components);
    } else if (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded) {
@@ -2134,11 +2023,10 @@ lower_load_global_constant_offset_instr(nir_builder *b,
           * the offset down would let loads past a short range through
           * (robustness2 uniform_buffer len_4..len_60).
           */
-         val = bounds_check(b, val, nir_imm_int(b, offs_imm), bound,
-                            opts->apple9);
+         val = bounds_check(b, val, nir_imm_int(b, offs_imm), bound);
       } else {
          offset = nir_iadd_imm(b, offset, load_size);
-         val = bounds_check(b, val, offset, bound, opts->apple9);
+         val = bounds_check(b, val, offset, bound);
       }
    }
 
@@ -2153,7 +2041,6 @@ hk_lower_bounded_global_loads(nir_shader *nir, bool soft_fault, bool apple9)
 {
    struct hk_bounded_lowering bounded = {
       .soft_fault = soft_fault,
-      .apple9 = apple9,
       .per_component = apple9,
    };
    return nir_shader_intrinsics_pass(nir, lower_load_global_constant_offset_instr,
@@ -2235,111 +2122,23 @@ hk_lower_multiview(nir_shader *nir)
 }
 
 static nir_def *
-query_custom_border(nir_builder *b, nir_tex_instr *tex)
+query_min_lod(nir_builder *b, nir_tex_instr *tex)
 {
-   return nir_build_texture_query(b, tex, nir_texop_custom_border_color_agx, 4,
-                                  tex->dest_type, false, false);
-}
-
-static nir_def *
-has_custom_border(nir_builder *b, nir_tex_instr *tex)
-{
-   return nir_build_texture_query(b, tex, nir_texop_has_custom_border_color_agx,
-                                  1, nir_type_bool1, false, false);
+   return nir_build_texture_query(b, tex, nir_texop_image_min_lod_agx, 1,
+                                  nir_type_float16, false, false);
 }
 
 static bool
-lower(nir_builder *b, nir_tex_instr *tex, UNUSED void *_data)
+lower_min_lod(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
 {
-   if (!nir_tex_instr_need_sampler(tex) || nir_tex_instr_is_query(tex))
-      return false;
-
-   /* XXX: this is a really weird edge case, is this even well-defined? */
-   if (tex->is_shadow)
-      return false;
-
-   b->cursor = nir_after_instr(&tex->instr);
-   nir_def *has_custom = has_custom_border(b, tex);
-
-   nir_instr *orig = nir_instr_clone(b->shader, &tex->instr);
-   nir_builder_instr_insert(b, orig);
-   nir_def *clamp_to_1 = &nir_instr_as_tex(orig)->def;
-
-   nir_push_if(b, has_custom);
-   nir_def *replaced = NULL;
-   {
-      /* Sample again, this time with clamp-to-0 instead of clamp-to-1 */
-      nir_instr *clone_instr = nir_instr_clone(b->shader, &tex->instr);
-      nir_builder_instr_insert(b, clone_instr);
-
-      nir_tex_instr *tex_0 = nir_instr_as_tex(clone_instr);
-      nir_def *clamp_to_0 = &tex_0->def;
-
-      tex_0->backend_flags |= AGX_TEXTURE_FLAG_CLAMP_TO_0;
-
-      /* Grab the border colour */
-      nir_def *border = query_custom_border(b, tex_0);
-
-      if (tex->op == nir_texop_tg4) {
-         border = nir_replicate(b, nir_channel(b, border, tex->component), 4);
-      }
-
-      /* Combine together with the border */
-      if (nir_alu_type_get_base_type(tex->dest_type) == nir_type_float &&
-          tex->op != nir_texop_tg4) {
-
-         /* For floats, lerp together:
-          *
-          * For border texels:  (1 * border) + (0 * border      ) = border
-          * For regular texels: (x * border) + (x * (1 - border)) = x.
-          *
-          * Linear filtering is linear (duh), so lerping is compatible.
-          */
-         replaced = nir_flrp(b, clamp_to_0, clamp_to_1, border);
-         b->shader->info.flrp_lowered = false;
-      } else {
-         /* For integers, just select componentwise since there is no linear
-          * filtering. Gathers also use this path since they are unfiltered in
-          * each component.
-          */
-         replaced = nir_bcsel(b, nir_ieq(b, clamp_to_0, clamp_to_1), clamp_to_0,
-                              border);
-      }
-   }
-   nir_pop_if(b, NULL);
-
-   /* Put it together with a phi */
-   nir_def *phi = nir_if_phi(b, replaced, clamp_to_1);
-   nir_def_replace(&tex->def, phi);
-   return true;
-}
-
-static bool
-agx_nir_lower_custom_border(nir_shader *nir)
-{
-   return nir_shader_tex_pass(nir, lower, nir_metadata_none, NULL);
-}
-
-static nir_def *
-query_min_lod(nir_builder *b, nir_tex_instr *tex, bool int_coords)
-{
-   nir_alu_type T = int_coords ? nir_type_uint16 : nir_type_float16;
-   return nir_build_texture_query(b, tex, nir_texop_image_min_lod_agx, 1, T,
-                                  false, false);
-}
-
-static bool
-lower_min_lod(nir_builder *b, nir_tex_instr *tex, void *data)
-{
-   const bool *float_fetch = data;
-   if (*float_fetch && tex->op == nir_texop_lod &&
+   if (tex->op == nir_texop_lod &&
        b->shader->info.stage == MESA_SHADER_COMPUTE &&
        b->shader->info.derivative_group == DERIVATIVE_GROUP_LINEAR) {
       /* The compute query consumes the view clamp after sampler/view level
        * clamping, before mip rounding. It is not a sampler minimum LOD. */
       b->cursor = nir_before_instr(&tex->instr);
       nir_tex_instr_add_src(tex, nir_tex_src_min_lod,
-                            query_min_lod(b, tex, false));
+                            query_min_lod(b, tex));
       return true;
    }
    if (nir_tex_instr_is_query(tex))
@@ -2358,7 +2157,7 @@ lower_min_lod(nir_builder *b, nir_tex_instr *tex, void *data)
    b->cursor = nir_before_instr(&tex->instr);
    /* Apple9 legalizes the minimum-LOD source as a float, so fetches take
     * the float minimum and compare against its floor. */
-   nir_def *min_lod = query_min_lod(b, tex, int_coords && !*float_fetch);
+   nir_def *min_lod = query_min_lod(b, tex);
    nir_def *other_min_lod = nir_steal_tex_src(tex, nir_tex_src_min_lod);
 
    if (tex->op == nir_texop_tg4) {
@@ -2376,8 +2175,7 @@ lower_min_lod(nir_builder *b, nir_tex_instr *tex, void *data)
        * but tg4 is rare enough I'm not bothered.
        */
       nir_def *old = &tex->def;
-      nir_def *oob = *float_fetch ? nir_fge_imm(b, min_lod, 1.0)
-                                  : nir_ine_imm(b, min_lod, 0);
+      nir_def *oob = nir_fge_imm(b, min_lod, 1.0);
       nir_def *zero = nir_imm_zero(b, old->num_components, old->bit_size);
       nir_def *new_ = nir_bcsel(b, oob, zero, old);
       nir_def_rewrite_uses_after(old, new_);
@@ -2403,36 +2201,9 @@ lower_min_lod(nir_builder *b, nir_tex_instr *tex, void *data)
 }
 
 static bool
-agx_nir_lower_image_view_min_lod(nir_shader *nir, bool float_fetch)
+agx_nir_lower_image_view_min_lod(nir_shader *nir)
 {
-   return nir_shader_tex_pass(nir, lower_min_lod, nir_metadata_none,
-                              &float_fetch);
-}
-
-/*
- * In Vulkan, the VIEWPORT should read 0 in the fragment shader if it is not
- * written by the vertex shader, but in our implementation, the varying would
- * otherwise be undefined. This small pass predicates VIEWPORT reads based on
- * whether the hardware vertex shader writes the VIEWPORT (nonzero UVS index).
- */
-static bool
-lower_viewport_fs(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
-{
-   if (intr->intrinsic != nir_intrinsic_load_input)
-      return false;
-
-   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
-   if (sem.location != VARYING_SLOT_VIEWPORT)
-      return false;
-
-   b->cursor = nir_after_instr(&intr->instr);
-   nir_def *orig = &intr->def;
-
-   nir_def *uvs = nir_load_uvs_index_agx(b, .io_semantics = sem);
-   nir_def *def = nir_bcsel(b, nir_ine_imm(b, uvs, 0), orig, nir_imm_int(b, 0));
-
-   nir_def_rewrite_uses_after(orig, def);
-   return true;
+   return nir_shader_tex_pass(nir, lower_min_lod, nir_metadata_none, NULL);
 }
 
 /* The Apple9 rasterizer delivers the layer to the fragment layer system
@@ -4399,7 +4170,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    /* Apple9 bounds-checks buffer images in software against their element
     * count (hk_apple9_lower_storage_image). */
    NIR_PASS(_, nir, agx_nir_lower_texture_early, true /* support_lod_bias */,
-            agx_is_apple9(&dev->dev));
+            true /* apple9 */);
    if (hk_device_physical(dev)->apple9_d3d_mip_rounding)
       NIR_PASS(_, nir, nir_shader_tex_pass, hk_lower_d3d_txl_rounding,
                nir_metadata_control_flow, NULL);
@@ -4407,26 +4178,14 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       NIR_PASS(_, nir, nir_shader_tex_pass, hk_apple9_lower_tex_2d_as_array,
                nir_metadata_control_flow, NULL);
 
-   struct hk_instance *instance = hk_physical_device_instance(
-      (struct hk_physical_device *)dev->vk.physical);
-
    /* Apple9 pays for the clamp only when the application enables the
     * extension. */
-   if (agx_is_apple9(&dev->dev)
-          ? dev->vk.enabled_features.minLod
-          : instance->drirc.misc.image_view_min_lod) {
-      NIR_PASS(_, nir, agx_nir_lower_image_view_min_lod,
-               agx_is_apple9(&dev->dev));
-   }
-
-   /* Apple9 exposes no custom border colors. */
-   if ((features & HK_FEAT_CUSTOM_BORDER) && !HK_PERF(dev, NOBORDER) &&
-       !agx_is_apple9(&dev->dev)) {
-      NIR_PASS(_, nir, agx_nir_lower_custom_border);
+   if (dev->vk.enabled_features.minLod) {
+      NIR_PASS(_, nir, agx_nir_lower_image_view_min_lod);
    }
 
    NIR_PASS(_, nir, hk_nir_lower_descriptors, rs, set_layout_count,
-            set_layouts, agx_is_apple9(&dev->dev));
+            set_layouts, true);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
@@ -4452,45 +4211,43 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * fields at x + c are no longer provably adjacent, and every field of a
     * dynamically indexed struct becomes a separate scalar load.
     */
-   if (agx_is_apple9(&dev->dev)) {
-      /* Explicit I/O builds each access's base and offset afresh. The
-       * vectorizer only merges accesses sharing those definitions. */
-      NIR_PASS(_, nir, nir_opt_cse);
-      if (agx_apple9_debug_enabled(AGX_A9_DBG_VECTORIZE) &&
-          nir->info.stage == MESA_SHADER_FRAGMENT)
-         nir_print_shader(nir, stderr);
-      /* Below the pressure budget, merge without windows, unless that
-       * raises the shader's peak of live words over windowed merging.
-       */
-      unsigned peak = hk_apple9_peak_live_words(nir);
-      struct hk_vectorize_policy policy = {
-         .windowed = peak > HK_APPLE9_VECTORIZE_PRESSURE_BUDGET};
-      unsigned peak_windowed = 0, peak_free = 0;
-      if (!policy.windowed) {
-         peak_windowed = hk_apple9_vectorized_peak(nir, true);
-         peak_free = hk_apple9_vectorized_peak(nir, false);
-         policy.windowed = peak_free > peak_windowed;
-      }
-      if (agx_apple9_debug_enabled(AGX_A9_DBG_PRESSURE))
-         fprintf(stderr,
-                 "HK_PRESSURE stage=%u peak=%u windowed=%u merged_peaks=%u/%u\n",
-                 nir->info.stage, peak,
-                 policy.windowed, peak_windowed, peak_free);
-      NIR_PASS(_, nir, nir_opt_load_store_vectorize,
-               &(const nir_load_store_vectorize_options){
-                  .modes = nir_var_mem_global,
-                  .bounds_checked_modes = nir_var_mem_global,
-                  .callback = hk_apple9_vectorize_cb,
-                  .cb_data = &policy,
-               });
+   /* Explicit I/O builds each access's base and offset afresh. The
+    * vectorizer only merges accesses sharing those definitions. */
+   NIR_PASS(_, nir, nir_opt_cse);
+   if (agx_apple9_debug_enabled(AGX_A9_DBG_VECTORIZE) &&
+       nir->info.stage == MESA_SHADER_FRAGMENT)
+      nir_print_shader(nir, stderr);
+   /* Below the pressure budget, merge without windows, unless that
+    * raises the shader's peak of live words over windowed merging.
+    */
+   unsigned peak = hk_apple9_peak_live_words(nir);
+   struct hk_vectorize_policy policy = {
+      .windowed = peak > HK_APPLE9_VECTORIZE_PRESSURE_BUDGET};
+   unsigned peak_windowed = 0, peak_free = 0;
+   if (!policy.windowed) {
+      peak_windowed = hk_apple9_vectorized_peak(nir, true);
+      peak_free = hk_apple9_vectorized_peak(nir, false);
+      policy.windowed = peak_free > peak_windowed;
    }
+   if (agx_apple9_debug_enabled(AGX_A9_DBG_PRESSURE))
+      fprintf(stderr,
+              "HK_PRESSURE stage=%u peak=%u windowed=%u merged_peaks=%u/%u\n",
+              nir->info.stage, peak,
+              policy.windowed, peak_windowed, peak_free);
+   NIR_PASS(_, nir, nir_opt_load_store_vectorize,
+            &(const nir_load_store_vectorize_options){
+               .modes = nir_var_mem_global,
+               .bounds_checked_modes = nir_var_mem_global,
+               .callback = hk_apple9_vectorize_cb,
+               .cb_data = &policy,
+            });
 
    nir_move_options opts = nir_move_load_ssbo | nir_move_load_ubo;
    NIR_PASS(progress, nir, nir_opt_sink, opts);
    NIR_PASS(progress, nir, nir_opt_move, opts);
 
    NIR_PASS(_, nir, hk_lower_bounded_global_loads,
-            agx_has_soft_fault(&dev->dev), agx_is_apple9(&dev->dev));
+            agx_has_soft_fault(&dev->dev), true);
 
    assert(nir->info.shared_size == 0);
 
@@ -4523,21 +4280,16 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    /* TODO: we can do indirect VS output */
    nir_variable_mode lower_indirect_modes = 0;
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
-      lower_indirect_modes |= nir_var_shader_out;
+      /* Apple9 interpolation packets address a fixed coefficient. Expand
+       * dynamic fragment input indexing before lowering away the array derefs. */
+      lower_indirect_modes |= nir_var_shader_in | nir_var_shader_out;
    else if (nir->info.stage == MESA_SHADER_VERTEX)
       lower_indirect_modes |= nir_var_shader_in | nir_var_shader_out;
-
-   /* Apple9 interpolation packets address a fixed coefficient. Expand
-    * dynamic fragment input indexing before lowering away the array derefs. */
-   if (agx_is_apple9(&dev->dev) &&
-       nir->info.stage == MESA_SHADER_FRAGMENT)
-      lower_indirect_modes |= nir_var_shader_in;
 
    /* Native mesh links a fixed component map. Resolve indirect output-array
     * slots while their declared bounds are still available as derefs. This
     * also covers arrays nested inside per-vertex/per-primitive blocks. */
-   if (agx_is_apple9(&dev->dev) &&
-       hk_apple9_native_mesh_available(hk_device_physical(dev)) &&
+   if (hk_apple9_native_mesh_available(hk_device_physical(dev)) &&
        ((hk_apple9_native_mesh_enabled() &&
          agx_apple9_native_mesh_shape_eligible(nir)) ||
         (hk_apple9_native_task_bridge_enabled() &&
@@ -4568,16 +4320,14 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             glsl_type_size,
             nir_lower_io_lower_64bit_to_32 |
                nir_lower_io_use_interpolated_input_intrinsics);
-   if (agx_is_apple9(&dev->dev))
-      NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_lower_io_16bit_to_32bit,
-               nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_lower_io_16bit_to_32bit,
+            nir_metadata_control_flow, NULL);
 
    /* The qualified index profile publishes Position only. It cannot consume
     * per-primitive fragment inputs, so keep their original early lowering.
     * Only the broader research P1 interface defers these inputs to linking.
     * Delaying them for every enabled device would change excluded shaders. */
    bool native_primitive_inputs =
-      agx_is_apple9(&dev->dev) &&
       hk_apple9_native_mesh_available(hk_device_physical(dev)) &&
       hk_apple9_native_mesh_enabled();
    if (nir->info.stage == MESA_SHADER_FRAGMENT && !native_primitive_inputs) {
@@ -4590,61 +4340,50 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass,
-               agx_is_apple9(&dev->dev)
-                  ? hk_apple9_lower_layer_viewport_fs
-                  : lower_viewport_fs,
+               hk_apple9_lower_layer_viewport_fs,
                nir_metadata_control_flow, NULL);
    }
 
-   bool fenced_stores = false;
-   if (agx_is_apple9(&dev->dev)) {
-      /* Buffer residency lookups add control flow. */
-      NIR_PASS(_, nir, hk_apple9_lower_sparse_residency);
-      /* Texel-buffer bounds and RGB32 checks add control flow. */
-      NIR_PASS(_, nir, nir_shader_tex_pass, hk_apple9_lower_texel_buffer,
-               nir_metadata_none, NULL);
-      struct set *texture_loads = _mesa_pointer_set_create(NULL);
-      const bool ordered = hk_apple9_native_store_shader(nir);
-      fenced_stores = !ordered && nir->info.stage == MESA_SHADER_COMPUTE &&
-                      !nir->info.internal && hk_apple9_single_entry(nir) &&
-                      hk_apple9_fenceable_reads(nir);
-      hk_apple9_texture_route_loads(nir, texture_loads, fenced_stores);
-      struct hk_apple9_storage_lowering lower = {
-         .texture_loads = texture_loads,
-         .native_stores = ordered || fenced_stores,
-         .fence_stores = fenced_stores,
-         .sparse_images = (features & HK_FEAT_SPARSE_IMAGE) != 0,
-         .checked = nir->info.internal,
-         .checked_buf = nir->info.internal || (features & HK_FEAT_CHECKED_BUF_STORES),
-         .buffer_residency = (features & HK_FEAT_STORE_BUFFER_RESIDENCY) != 0,
-      };
-      NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_apple9_lower_storage_image,
-               nir_metadata_none, &lower);
-      _mesa_set_destroy(texture_loads, NULL);
-   }
+   /* Buffer residency lookups add control flow. */
+   NIR_PASS(_, nir, hk_apple9_lower_sparse_residency);
+   /* Texel-buffer bounds and RGB32 checks add control flow. */
+   NIR_PASS(_, nir, nir_shader_tex_pass, hk_apple9_lower_texel_buffer,
+            nir_metadata_none, NULL);
+   struct set *texture_loads = _mesa_pointer_set_create(NULL);
+   const bool ordered = hk_apple9_native_store_shader(nir);
+   bool fenced_stores = !ordered && nir->info.stage == MESA_SHADER_COMPUTE &&
+                        !nir->info.internal && hk_apple9_single_entry(nir) &&
+                        hk_apple9_fenceable_reads(nir);
+   hk_apple9_texture_route_loads(nir, texture_loads, fenced_stores);
+   struct hk_apple9_storage_lowering lower = {
+      .texture_loads = texture_loads,
+      .native_stores = ordered || fenced_stores,
+      .fence_stores = fenced_stores,
+      .sparse_images = (features & HK_FEAT_SPARSE_IMAGE) != 0,
+      .checked = nir->info.internal,
+      .checked_buf = nir->info.internal || (features & HK_FEAT_CHECKED_BUF_STORES),
+      .buffer_residency = (features & HK_FEAT_STORE_BUFFER_RESIDENCY) != 0,
+   };
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_apple9_lower_storage_image,
+            nir_metadata_none, &lower);
+   _mesa_set_destroy(texture_loads, NULL);
 
-   if (agx_is_apple9(&dev->dev)) {
-      NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_apple9_lower_buffer_address,
-               nir_metadata_control_flow, NULL);
-      NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_apple9_lower_storage_queries,
-               nir_metadata_control_flow, NULL);
-      NIR_PASS(_, nir, agx_nir_lower_images);
-      /* Sampled views' queries (AGX_TEXTURE_FLAG_METADATA_QUERY) are answered
-       * from texture metadata by the Apple9 backend; uniform texel buffers use
-       * agx_nir_lower_texture_queries on their prefix. */
-      NIR_PASS(_, nir, agx_nir_lower_texture_queries);
-   } else {
-      NIR_PASS(_, nir, agx_nir_lower_texture);
-   }
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_apple9_lower_buffer_address,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_apple9_lower_storage_queries,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, agx_nir_lower_images);
+   /* Sampled views' queries (AGX_TEXTURE_FLAG_METADATA_QUERY) are answered
+    * from texture metadata by the Apple9 backend; uniform texel buffers use
+    * agx_nir_lower_texture_queries on their prefix. */
+   NIR_PASS(_, nir, agx_nir_lower_texture_queries);
    NIR_PASS(_, nir, agx_nir_lower_multisampled_image_store);
 
    /* Keep radians until Apple9 range reduction. The common preprocessor
     * otherwise replaces sine/cosine with the older fsin_agx operation. */
-   if (agx_is_apple9(&dev->dev))
-      NIR_PASS(_, nir, agx_nir_lower_apple9_math);
+   NIR_PASS(_, nir, agx_nir_lower_apple9_math);
    agx_preprocess_nir(nir);
-   if (agx_is_apple9(&dev->dev))
-      hk_apple9_lower_image_barriers(nir, fenced_stores);
+   hk_apple9_lower_image_barriers(nir, fenced_stores);
 
    nir_opt_peephole_select_options peephole_select_options = {
       .limit = 0,
@@ -5594,41 +5333,6 @@ hk_apple9_lower_roots(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
-static bool
-kill_psiz_write(nir_builder *b, nir_intrinsic_instr *intr, void *data)
-{
-   if (intr->intrinsic != nir_intrinsic_store_output ||
-       nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_PSIZ)
-      return false;
-
-   if (nir_remove_sysval_output(intr, MESA_SHADER_FRAGMENT)) {
-      b->shader->info.outputs_written &= ~VARYING_BIT_PSIZ;
-   }
-
-   return true;
-}
-
-static void
-hk_lower_hw_vs(nir_shader *nir, struct hk_shader *shader, bool kill_psiz)
-{
-   /* Point size must be clamped, excessively large points don't render
-    * properly on G13.
-    *
-    * Must be synced with pointSizeRange.
-    */
-   NIR_PASS(_, nir, nir_lower_point_size, 1.0f, 511.95f);
-
-   if (kill_psiz) {
-      NIR_PASS(_, nir, nir_shader_intrinsics_pass, kill_psiz_write,
-               nir_metadata_control_flow, NULL);
-   }
-
-   NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out, NULL, NULL);
-   NIR_PASS(_, nir, agx_nir_lower_cull_distance_vs);
-
-   NIR_PASS(_, nir, agx_nir_lower_uvs, &shader->info.uvs);
-}
-
 static VkResult
 hk_copy_shader_constant_data(struct hk_device *dev, struct hk_shader *shader,
                              const nir_shader *nir)
@@ -5655,202 +5359,6 @@ hk_copy_shader_constant_data(struct hk_device *dev, struct hk_shader *shader,
    }
 
    return VK_SUCCESS;
-}
-
-static VkResult
-hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
-               nir_shader *nir, VkShaderCreateFlagsEXT shader_flags,
-               const struct vk_pipeline_robustness_state *rs,
-               const union hk_key *key, enum hk_feature_key features,
-               struct hk_shader *shader, mesa_shader_stage sw_stage, bool hw,
-               nir_xfb_info *xfb_info, unsigned set_count)
-{
-   unsigned nr_vbos = 0;
-   bool kill_psiz = false;
-
-   /* For now, only shader objects are supported */
-   if (sw_stage == MESA_SHADER_VERTEX) {
-      nr_vbos = DIV_ROUND_UP(
-         BITSET_LAST_BIT(shader->info.vs.attrib_components_read), 4);
-      kill_psiz = key->vs.kill_psiz;
-   } else if (sw_stage == MESA_SHADER_FRAGMENT) {
-      shader->info.fs.writes_memory = nir->info.writes_memory;
-      shader->info.fs.interp.linear = nir->info.linear_varyings;
-      shader->info.fs.interp.flat =
-         ~(nir->info.linear_varyings | nir->info.perspective_varyings);
-
-      /* Discards must be lowering before lowering MSAA to handle discards */
-      NIR_PASS(_, nir, agx_nir_lower_discard_zs_emit);
-      NIR_PASS(_, nir, agx_nir_lower_fs_output_to_epilog,
-               &shader->info.fs.epilog_key);
-      NIR_PASS(_, nir, agx_nir_lower_sample_mask);
-
-      if (nir->info.fs.uses_sample_shading) {
-         /* Ensure the sample mask is preserved in register */
-         nir_builder b =
-            nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(nir)));
-
-         nir_def *mask =
-            nir_load_exported_agx(&b, 1, 16, .base = AGX_ABI_FIN_SAMPLE_MASK);
-
-         nir_export_agx(&b, mask, .base = AGX_ABI_FOUT_SAMPLE_MASK);
-
-         NIR_PASS(_, nir, agx_nir_lower_to_per_sample);
-      }
-
-      NIR_PASS(_, nir, agx_nir_lower_fs_active_samples_to_register);
-      NIR_PASS(_, nir, agx_nir_lower_interpolation);
-   } else if (sw_stage == MESA_SHADER_TESS_EVAL ||
-              sw_stage == MESA_SHADER_TESS_CTRL) {
-
-      shader->info.tess.info.ccw = nir->info.tess.ccw;
-      shader->info.tess.info.points = nir->info.tess.point_mode;
-      shader->info.tess.info.spacing = nir->info.tess.spacing;
-      shader->info.tess.info.mode = nir->info.tess._primitive_mode;
-
-      if (sw_stage == MESA_SHADER_TESS_CTRL) {
-         shader->info.tess.tcs_output_patch_size =
-            nir->info.tess.tcs_vertices_out;
-         shader->info.tess.tcs_per_vertex_outputs =
-            poly_tcs_per_vertex_outputs(nir);
-         shader->info.tess.tcs_nr_patch_outputs =
-            util_last_bit(nir->info.patch_outputs_written);
-         shader->info.tess.tcs_output_stride = poly_tcs_output_stride(nir);
-      } else {
-         /* This destroys info so it needs to happen after the gather */
-         NIR_PASS(_, nir, poly_nir_lower_tes, hw);
-      }
-   }
-
-   /* Normally, vertex shaders need to write a default point size. However, if
-    * we have a geometry/tessellation shader, the hardware vertex (software
-    * GS/TES) will handle this itself instead.
-    */
-   if (sw_stage == MESA_SHADER_VERTEX && hw && !kill_psiz) {
-      NIR_PASS(_, nir, nir_lower_default_point_size);
-   }
-
-   uint64_t outputs = nir->info.outputs_written;
-   if (sw_stage == MESA_SHADER_VERTEX || sw_stage == MESA_SHADER_TESS_EVAL) {
-      if (hw) {
-         hk_lower_hw_vs(nir, shader, kill_psiz);
-      } else {
-         NIR_PASS(_, nir, poly_nir_lower_vs_before_gs);
-         nir->info.stage = MESA_SHADER_COMPUTE;
-         memset(&nir->info.cs, 0, sizeof(nir->info.cs));
-         nir->xfb_info = NULL;
-      }
-   }
-
-   if (agx_is_apple9(&dev->dev) &&
-       !hk_apple9_texture_bindings(nir)) {
-      ralloc_free(nir);
-      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                       "Apple9 texture operation without a descriptor handle");
-   }
-
-   if (agx_is_apple9(&dev->dev)) {
-      const char *reason = NULL;
-      if (!agx_nir_lower_apple9_runtime_sampler_state(nir, &reason)) {
-         ralloc_free(nir);
-         return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT, "%s", reason);
-      }
-   }
-
-   unsigned root = 0;
-   if (sw_stage == MESA_SHADER_FRAGMENT)
-      root = AGX_ABI_FUNI_ROOT;
-   else if (sw_stage == MESA_SHADER_VERTEX)
-      root = AGX_ABI_VUNI_COUNT_VK(nr_vbos);
-
-   shader->info.set_count = set_count;
-
-   /* XXX: rename */
-   NIR_PASS(_, nir, hk_lower_uvs_index, sw_stage, nr_vbos);
-   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_apple9_lower_roots,
-            nir_metadata_control_flow, &root);
-
-   simple_mtx_t *lock = NULL;
-   if (agx_get_compiler_debug())
-      lock = &hk_device_physical(dev)->debug_compile_lock;
-
-   if (lock)
-      simple_mtx_lock(lock);
-
-   assert(nir->info.io_lowered);
-   hk_assert_final_push_mask(nir, shader);
-   /* A compute entrypoint without side effects has no GPU work, even
-    * when loads and arithmetic remain, for example once optimization has
-    * proved every store unreachable. Keep the common Asahi empty-shader
-    * marker so cached and freshly compiled shaders agree.
-    */
-   bool empty = sw_stage == MESA_SHADER_COMPUTE;
-   nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
-      nir_foreach_instr(instr, block) {
-         if (instr->type != nir_instr_type_intrinsic)
-            continue;
-         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-         if (intr->intrinsic != nir_intrinsic_barrier &&
-             !(nir_intrinsic_infos[intr->intrinsic].flags &
-               NIR_INTRINSIC_CAN_ELIMINATE))
-            empty = false;
-      }
-   }
-
-   const char *reason = NULL;
-   if (empty) {
-      shader->b.info.stats.instrs = 1;
-   } else if (sw_stage == MESA_SHADER_COMPUTE &&
-              agx_compile_apple9_tiny(nir, &shader->b, &shader->info.apple9,
-                                      &reason)) {
-      /* Compiled. */
-   } else if (reason == agx_apple9_compute_without_effects) {
-      /* Optimization removed every store: there is nothing to run. */
-      memset(&shader->b, 0, sizeof(shader->b));
-      memset(&shader->info.apple9, 0, sizeof(shader->info.apple9));
-      shader->b.info.stats.instrs = 1;
-   } else {
-      if (agx_get_compiler_debug())
-         fprintf(stderr, "Apple9 compute compilation failed: %s\n",
-                 reason ?: "unsupported stage");
-      if (lock)
-         simple_mtx_unlock(lock);
-      ralloc_free(nir);
-      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                       "Apple9 shader: %s", reason ? reason : "unsupported stage");
-   }
-
-   if (lock)
-      simple_mtx_unlock(lock);
-
-   shader->code_ptr = shader->b.binary;
-   shader->code_size = shader->b.info.binary_size;
-   hk_gpu_busy_shader_source(shader->code_ptr, shader->code_size, nir->info.name,
-                             nir->info.source_blake3, sw_stage);
-
-   shader->info.stage = sw_stage;
-   shader->info.clip_distance_array_size = nir->info.clip_distance_array_size;
-   shader->info.cull_distance_array_size = nir->info.cull_distance_array_size;
-   shader->b.info.outputs = outputs;
-
-   if (xfb_info) {
-      assert(xfb_info->output_count < ARRAY_SIZE(shader->info.xfb_outputs));
-
-      memcpy(&shader->info.xfb_info, xfb_info,
-             nir_xfb_info_size(xfb_info->output_count));
-
-      typed_memcpy(shader->info.xfb_stride, nir->info.xfb_stride, 4);
-   }
-
-   VkResult data_result = hk_copy_shader_constant_data(dev, shader, nir);
-   if (data_result != VK_SUCCESS) {
-      ralloc_free(nir);
-      return data_result;
-   }
-
-   ralloc_free(nir);
-
-   return hk_upload_shader(dev, shader);
 }
 
 static const struct vk_shader_ops hk_shader_ops;
@@ -6059,8 +5567,6 @@ hk_shader_destroy(struct hk_device *dev, struct hk_shader *s)
    free((void *)s->data_ptr);
    if (s->apple9_body)
       agx_shader_body_unreference(&dev->dev, s->apple9_body);
-   else
-      agx_bo_unreference(&dev->dev, s->bo);
    if (s->apple9_coefficients.size) {
       simple_mtx_lock(&dev->usc_heap_lock);
       hk_usc_heap_free(&dev->usc_heap, &s->apple9_coefficients);
@@ -6172,44 +5678,26 @@ hk_apple9_compile_graphics(struct hk_device *dev, uint32_t count,
                            struct vk_shader **out);
 
 VkResult
-hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
-                  const struct vk_graphics_pipeline_state *state,
-                  const struct vk_features *vk_features,
-                  const VkAllocationCallbacks *pAllocator,
-                  struct hk_api_shader **shader_out)
+hk_apple9_compile_compute(struct hk_device *dev,
+                          struct vk_shader_compile_info *info,
+                          const struct vk_features *vk_features,
+                          const VkAllocationCallbacks *pAllocator,
+                          struct hk_api_shader **shader_out)
 {
-   VkResult result;
    enum hk_feature_key features = hk_make_feature_key(vk_features);
 
    /* We consume the NIR, regardless of success or failure */
    nir_shader *nir = info->nir;
-   if (agx_is_apple9(&dev->dev) && info->stage == MESA_SHADER_GEOMETRY) {
-      /* Internal geometry shaders, such as the transform feedback
-       * passthrough, use the Apple9 geometry pipeline.
-       */
-      if (!nir->info.io_lowered) {
-         hk_lower_nir(dev, nir, info->robustness, false, info->set_layout_count,
-                      info->set_layouts, features);
-      }
-      struct vk_shader_compile_info gs_info = *info;
-      struct vk_shader *out = NULL;
-      VkResult result =
-         hk_apple9_compile_graphics(dev, 1, &gs_info, state, NULL, NULL, pAllocator,
-                                    &out);
-      *shader_out = out ? container_of(out, struct hk_api_shader, vk) : NULL;
-      return result;
-   }
-   if (agx_is_apple9(&dev->dev) && info->stage != MESA_SHADER_COMPUTE) {
+   if (info->stage != MESA_SHADER_COMPUTE) {
       ralloc_free(nir);
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                       "Apple9 Honeykrisp currently supports compute shaders only");
+                       "Apple9 compute compiler requires compute stage");
    }
 
-   size_t size = sizeof(struct hk_api_shader) +
-                 sizeof(struct hk_shader) * hk_num_variants(info->stage);
+   size_t size = sizeof(struct hk_api_shader) + sizeof(struct hk_shader);
    struct hk_api_shader *obj =
-      vk_shader_zalloc(&dev->vk, &hk_shader_ops, info->stage, pAllocator, size);
-
+      vk_shader_zalloc(&dev->vk, &hk_shader_ops, MESA_SHADER_COMPUTE,
+                       pAllocator, size);
    if (obj == NULL) {
       ralloc_free(nir);
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -6217,9 +5705,9 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
    obj->pre_raster_reads = HK_READS_UNKNOWN;
    obj->reads_draw_id = hk_nir_reads_draw_id(nir);
    obj->push_constant_mask = hk_nir_push_constant_mask(nir);
+   struct hk_shader *shader = hk_only_variant(obj);
 #ifndef NDEBUG
-   hk_foreach_variant(obj, variant)
-      variant->debug_owner = obj;
+   shader->debug_owner = obj;
 #endif
 
    if (!nir->info.io_lowered) {
@@ -6227,184 +5715,95 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
                    info->set_layouts, features);
    }
 
-   mesa_shader_stage sw_stage = nir->info.stage;
-
-   union hk_key key_tmp, *key = NULL;
-   if (sw_stage == MESA_SHADER_FRAGMENT) {
-      hk_populate_fs_key(&key_tmp.fs, state);
-      key = &key_tmp;
-
-      nir->info.fs.uses_sample_shading |= key->fs.force_sample_shading;
-
-      /* Force late-Z for Z/S self-deps. TODO: There's probably a less silly way
-       * to do this.
-       */
-      if (key->fs.zs_self_dep) {
-         nir_builder b =
-            nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(nir)));
-         nir_discard_if(&b, nir_imm_false(&b));
-         nir->info.fs.uses_discard = true;
-      }
-
-      NIR_PASS(_, nir, agx_nir_lower_sample_intrinsics, false);
-   } else if (sw_stage == MESA_SHADER_VERTEX) {
-      hk_populate_vs_key(&key_tmp.vs, state);
-      key = &key_tmp;
-   } else if (sw_stage == MESA_SHADER_TESS_CTRL) {
-      NIR_PASS(_, nir, poly_nir_lower_tcs, true);
+   if (!hk_apple9_texture_bindings(nir)) {
+      ralloc_free(nir);
+      hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "Apple9 texture operation without a descriptor handle");
    }
 
-   /* Compile all variants up front */
-   if (sw_stage == MESA_SHADER_GEOMETRY) {
-      struct hk_shader *main_variant = hk_main_gs_variant(obj);
-      struct hk_shader *count_variant = hk_count_gs_variant(obj);
+   const char *reason = NULL;
+   if (!agx_nir_lower_apple9_runtime_sampler_state(nir, &reason)) {
+      ralloc_free(nir);
+      hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT, "%s", reason);
+   }
 
-      nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
+   unsigned root = 0;
+   shader->info.set_count = info->set_layout_count;
+   NIR_PASS(_, nir, hk_lower_uvs_index, MESA_SHADER_COMPUTE, 0);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_apple9_lower_roots,
+            nir_metadata_control_flow, &root);
 
-      NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs,
-               &count_variant->info.gs);
+   simple_mtx_t *lock = NULL;
+   if (agx_get_compiler_debug())
+      lock = &hk_device_physical(dev)->debug_compile_lock;
+   if (lock)
+      simple_mtx_lock(lock);
 
-      agx_preprocess_nir(count);
-      agx_preprocess_nir(rast);
-      agx_preprocess_nir(pre_gs);
-
-      struct hk_shader *shader = &obj->variants[HK_GS_VARIANT_RAST];
-      hk_lower_hw_vs(rast, shader, false);
-      shader->info.gs = count_variant->info.gs;
-      main_variant->info.gs = count_variant->info.gs;
-
-      struct {
-         nir_shader *in;
-         struct hk_shader *out;
-      } variants[] = {
-         {nir, hk_main_gs_variant(obj)},
-         {pre_gs, hk_pre_gs_variant(obj)},
-         {count, count_variant},
-         {rast, &obj->variants[HK_GS_VARIANT_RAST]},
-      };
-
-      for (unsigned v = 0; v < ARRAY_SIZE(variants); ++v) {
-         if (variants[v].in) {
-            result =
-               hk_compile_nir(dev, pAllocator, variants[v].in, info->flags,
-                              info->robustness, NULL, features, variants[v].out,
-                              sw_stage, true, NULL, info->set_layout_count);
-
-            if (result != VK_SUCCESS) {
-               hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
-               ralloc_free(nir);
-               ralloc_free(pre_gs);
-               ralloc_free(count);
-               ralloc_free(rast);
-               return result;
-            }
-         }
-      }
-   } else if (sw_stage == MESA_SHADER_VERTEX ||
-              sw_stage == MESA_SHADER_TESS_EVAL) {
-
-      VkShaderStageFlags next_stage = info->next_stage_mask;
-
-      /* Transform feedback is layered on top of geometry shaders. If there is
-       * not a geometry shader in the pipeline, we will compile a geometry
-       * shader for the purpose. Update the next_stage mask accordingly.
-       */
-      if (nir->xfb_info != NULL) {
-         next_stage |= VK_SHADER_STAGE_GEOMETRY_BIT;
-      }
-
-      if (sw_stage == MESA_SHADER_VERTEX) {
-         assert(
-            !(nir->info.inputs_read & BITFIELD64_MASK(VERT_ATTRIB_GENERIC0)) &&
-            "Fixed-function attributes not used in Vulkan");
-
-         NIR_PASS(_, nir, nir_recompute_io_bases, nir_var_shader_in);
-      }
-
-      /* Fold constant offset srcs for IO. */
-      NIR_PASS(_, nir, nir_opt_constant_folding);
-
-      for (enum hk_vs_variant v = 0; v < HK_VS_VARIANTS; ++v) {
-         /* Only compile the software variant if we might use this shader with
-          * geometry/tessellation. We need to compile the hardware variant
-          * unconditionally to handle the VS -> null FS case, which does not
-          * require setting the FRAGMENT bit.
-          */
-         if (v == HK_VS_VARIANT_SW &&
-             !(next_stage & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
-                             VK_SHADER_STAGE_GEOMETRY_BIT)))
+   assert(nir->info.io_lowered);
+   hk_assert_final_push_mask(nir, shader);
+   /* A compute entrypoint without side effects has no GPU work, even
+    * when loads and arithmetic remain, for example once optimization has
+    * proved every store unreachable. Keep the common empty-shader
+    * marker so cached and freshly compiled shaders agree.
+    */
+   bool empty = true;
+   nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
             continue;
-
-         struct hk_shader *shader = &obj->variants[v];
-         bool hw = v == HK_VS_VARIANT_HW;
-         bool last = (v + 1) == HK_VS_VARIANTS;
-
-         /* Each variant gets its own NIR. To save an extra clone, we use the
-          * original NIR for the last stage.
-          */
-         nir_shader *clone = last ? nir : nir_shader_clone(NULL, nir);
-
-         NIR_PASS(_, clone, agx_nir_gather_vs_inputs,
-                  shader->info.vs.attrib_components_read);
-
-         if (sw_stage == MESA_SHADER_VERTEX) {
-            shader->info.vs.use_prolog = !(key && key->vs.skip_prolog);
-            shader->info.vs.attribs_read =
-               nir->info.inputs_read >> VERT_ATTRIB_GENERIC0;
-
-            if (shader->info.vs.use_prolog) {
-               NIR_PASS(_, clone, agx_nir_lower_vs_input_to_prolog);
-            } else {
-               struct agx_velem_key attribs[AGX_MAX_ATTRIBS];
-               for (unsigned a = 0; a < AGX_MAX_ATTRIBS; ++a) {
-                  if (key->vs.attribs[a].format) {
-                     unsigned slot = util_bitcount64(
-                        shader->info.vs.attribs_read & BITFIELD_MASK(a));
-
-                     attribs[slot] = key->vs.attribs[a];
-                  }
-               }
-
-               struct agx_robustness agx_rs = {
-                  .soft_fault = agx_has_soft_fault(&dev->dev),
-
-                  /* Correctly handling GPL + pipeline-robustness requires
-                   * runtime changes, and I don't care enough to optimize this.
-                   */
-                  .level = AGX_ROBUSTNESS_D3D,
-               };
-
-               agx_nir_lower_vbo(clone, attribs, agx_rs,
-                                 !key->vs.static_strides);
-
-               unsigned nr = DIV_ROUND_UP(
-                  BITSET_LAST_BIT(shader->info.vs.attrib_components_read), 4);
-               agx_nir_lower_non_monolithic_uniforms(clone, nr);
-            }
-         }
-
-         /* hk_compile_nir takes ownership of the clone */
-         result =
-            hk_compile_nir(dev, pAllocator, clone, info->flags,
-                           info->robustness, key, features, shader, sw_stage,
-                           hw, nir->xfb_info, info->set_layout_count);
-         if (result != VK_SUCCESS) {
-            hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
-            ralloc_free(nir);
-            return result;
-         }
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_barrier &&
+             !(nir_intrinsic_infos[intr->intrinsic].flags &
+               NIR_INTRINSIC_CAN_ELIMINATE))
+            empty = false;
       }
+   }
+
+   reason = NULL;
+   if (empty) {
+      shader->b.info.stats.instrs = 1;
+   } else if (agx_compile_apple9_tiny(nir, &shader->b, &shader->info.apple9,
+                                      &reason)) {
+      /* Compiled. */
+   } else if (reason == agx_apple9_compute_without_effects) {
+      /* Optimization removed every store: there is nothing to run. */
+      memset(&shader->b, 0, sizeof(shader->b));
+      memset(&shader->info.apple9, 0, sizeof(shader->info.apple9));
+      shader->b.info.stats.instrs = 1;
    } else {
-      struct hk_shader *shader = hk_only_variant(obj);
+      if (agx_get_compiler_debug())
+         fprintf(stderr, "Apple9 compute compilation failed: %s\n",
+                 reason ?: "unsupported stage");
+      if (lock)
+         simple_mtx_unlock(lock);
+      ralloc_free(nir);
+      hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "Apple9 shader: %s", reason ? reason : "unsupported stage");
+   }
 
-      /* hk_compile_nir takes ownership of nir */
-      result = hk_compile_nir(dev, pAllocator, nir, info->flags,
-                              info->robustness, key, features, shader, sw_stage,
-                              true, NULL, info->set_layout_count);
-      if (result != VK_SUCCESS) {
-         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
-         return result;
-      }
+   if (lock)
+      simple_mtx_unlock(lock);
+
+   shader->code_ptr = shader->b.binary;
+   shader->code_size = shader->b.info.binary_size;
+   hk_gpu_busy_shader_source(shader->code_ptr, shader->code_size, nir->info.name,
+                             nir->info.source_blake3, MESA_SHADER_COMPUTE);
+
+   shader->info.stage = MESA_SHADER_COMPUTE;
+   shader->info.clip_distance_array_size = nir->info.clip_distance_array_size;
+   shader->info.cull_distance_array_size = nir->info.cull_distance_array_size;
+   shader->b.info.outputs = nir->info.outputs_written;
+
+   VkResult result = hk_copy_shader_constant_data(dev, shader, nir);
+   ralloc_free(nir);
+   if (result == VK_SUCCESS)
+      result = hk_upload_shader(dev, shader);
+   if (result != VK_SUCCESS) {
+      hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+      return result;
    }
 
    hk_api_shader_init_constant_data(obj);
@@ -9951,8 +9350,7 @@ hk_compile_shaders_timed(struct vk_device *vk_dev, uint32_t shader_count,
          nir_shader_gather_info(shaders[i], nir_shader_get_entrypoint(shaders[i]));
    }
 
-   if (agx_is_apple9(&dev->dev) && shader_count &&
-       infos[0].stage != MESA_SHADER_COMPUTE) {
+   if (shader_count && infos[0].stage != MESA_SHADER_COMPUTE) {
       enum hk_apple9_deferral deferral =
          hk_apple9_needs_deferral(shader_count, infos, state, features);
       if (deferral != HK_APPLE9_COMPILE_NOW) {
@@ -9999,8 +9397,8 @@ hk_compile_shaders_timed(struct vk_device *vk_dev, uint32_t shader_count,
 
    for (uint32_t i = 0; i < shader_count; i++) {
       VkResult result =
-         hk_compile_shader(dev, &infos[i], state, features, pAllocator,
-                           (struct hk_api_shader **)&shaders_out[i]);
+         hk_apple9_compile_compute(dev, &infos[i], features, pAllocator,
+                                   (struct hk_api_shader **)&shaders_out[i]);
       if (result != VK_SUCCESS) {
          /* Clean up all the shaders before this point */
          for (uint32_t j = 0; j < i; j++)
