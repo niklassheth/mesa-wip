@@ -16041,3 +16041,51 @@ TEST(Apple9Compiler, EpilogFragmentLinkedProducerPrimId)
    free(out.binary);
    ralloc_free(b.shader);
 }
+
+TEST(Apple9Compiler, EpilogFragmentStatsOnlyNoDiscard)
+{
+   for (unsigned stats_only = 0; stats_only < 2; ++stats_only) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "epilog_fs_stats_only");
+      nir_def *addr = nir_load_ubo(&b, 1, 64, nir_imm_int(&b, 0),
+                                   nir_imm_int(&b, 0), .align_mul = 8,
+                                   .range = 8);
+      nir_global_atomic(&b, 32, addr, nir_imm_int(&b, 1),
+                        .atomic_op = nir_atomic_op_iadd);
+      nir_store_output(&b, nir_imm_vec4(&b, 1.0f, 0.5f, 0.25f, 1.0f),
+                       nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+
+      agx_apple9_blend blend = {
+         .use_epilog = 1,
+         .dynamic_samples = 1,
+         .writes_memory_stats_only = (uint8_t)stats_only,
+      };
+      agx_shader_part out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                  &out, &reason))
+         << (reason ?: "");
+      EXPECT_EQ(out.info.apple9_fs_epilog.has_killed_mask, !stats_only);
+      EXPECT_EQ(out.info.apple9_fs_epilog.main_defers_zs_test, !stats_only);
+
+      agx_apple9_fs_epilog_key ekey = {};
+      ekey.iface = out.info.apple9_fs_epilog;
+      ekey.nr_targets = 1;
+      ekey.blend[0].format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      ekey.blend[0].samples = 1;
+      ekey.blend[0].colormask = 0xf;
+      ekey.blend[0].rgb_src = ekey.blend[0].alpha_src = PIPE_BLENDFACTOR_ONE;
+      ekey.blend[0].rgb_dst = ekey.blend[0].alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      ekey.blend[0].rgb_func = ekey.blend[0].alpha_func = PIPE_BLEND_ADD;
+      agx_shader_part ep = {};
+      ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep, &reason))
+         << (reason ?: "");
+      EXPECT_EQ(ep.info.apple9_uses_discard, !stats_only);
+      free(ep.binary);
+      free(out.binary);
+      ralloc_free(b.shader);
+   }
+}

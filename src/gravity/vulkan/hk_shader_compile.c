@@ -2569,10 +2569,12 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
              * active and counts correctly in merged waves. Keep triangle
              * merging unless the shader itself requires disabling it. */
             bool tri_merging = true;
+            bool real_writes_memory = false;
             if (!nir->info.internal) {
                if (key.zs_self_dep && !key.fs_use_epilog)
                   hk_apple9_late_zs(nir);
                nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+               real_writes_memory = nir->info.writes_memory;
                tri_merging = !nir->info.uses_wide_subgroup_intrinsics &&
                              !nir->info.fs.needs_coarse_quad_helper_invocations &&
                              !nir->info.writes_memory &&
@@ -2588,7 +2590,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                         hk_apple9_lower_viewport_fs,
                         nir_metadata_control_flow, NULL);
             }
-            shader->info.fs.writes_memory = nir->info.writes_memory;
+            shader->info.fs.writes_memory = real_writes_memory;
             shader->info.fs.early_fragment_tests =
                nir->info.fs.early_fragment_tests;
             if (key.sample_shading) {
@@ -2603,6 +2605,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                key.blend[0].dynamic_samples = true;
                key.blend[0].per_sample =
                   key.sample_shading || nir->info.fs.uses_sample_shading;
+               key.blend[0].writes_memory_stats_only = !real_writes_memory;
                shader->info.apple9_undefined_colors = key.undefined_colors;
             } else {
                hk_apple9_remap_fs_outputs(nir, key.color_map);

@@ -2119,16 +2119,19 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                              dev, MESA_SHADER_TESS_EVAL)))
          UNSUPPORTED();
    }
-   /* Without an API fragment shader, the null program only applies the API
-    * sample mask. A full mask needs no fragment work at all. */
-   const bool null_fs = !gfx->shaders[MESA_SHADER_FRAGMENT] ||
+   /* Without an API fragment shader (or when rasterizer discard suppresses
+    * rasterization), the null program only applies the API sample mask. A full
+    * mask or rasterizer discard needs no fragment work at all. */
+   const bool null_fs = rasterizer_discard ||
+                        !gfx->shaders[MESA_SHADER_FRAGMENT] ||
                         gfx->shaders[MESA_SHADER_FRAGMENT] == dev->null_fs;
    const unsigned null_samples = MAX2(gfx->render.tilebuffer.nr_samples ?:
                                       dyn->ms.rasterization_samples, 1);
    const bool null_trivial =
       null_fs && dev->null_fs_trivial &&
-      (dyn->ms.sample_mask & BITFIELD_MASK(null_samples)) ==
-         BITFIELD_MASK(null_samples);
+      (rasterizer_discard ||
+       (dyn->ms.sample_mask & BITFIELD_MASK(null_samples)) ==
+          BITFIELD_MASK(null_samples));
    struct hk_api_shader *fragment_api = gfx->shaders[MESA_SHADER_FRAGMENT];
    if (native_grid && !null_fs) {
       fragment_api = hk_api_shader_native(fragment_api);
@@ -2297,10 +2300,12 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       : (util_bitcount(vertex->varyings.mask[VARYING_SLOT_CULL_PRIMITIVE]) +
          util_bitcount(vertex->varyings.mask[VARYING_SLOT_CULL_PRIMITIVE + 1]));
    const bool need_cull_prolog =
+      !rasterizer_discard &&
       cull_count > 0 &&
       !shaders[1]->b.info.apple9_varyings.mask[VARYING_SLOT_CULL_PRIMITIVE] &&
       !shaders[1]->b.info.apple9_varyings.mask[VARYING_SLOT_CULL_PRIMITIVE + 1];
    const bool need_stipple_prolog =
+      !rasterizer_discard &&
       lines && dyn->rs.line.stipple.enable &&
       (vertex->varyings.mask[VARYING_SLOT_TEX6] & 0x7) == 0x7 &&
       (vertex->varyings.mask[VARYING_SLOT_TEX7] & 0x3) == 0x3 &&
@@ -3003,7 +3008,7 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                           (stencil ? 3u << 18 : 0) |
                           (rasterizer_discard ? 1u << 21 : 0);
    record->occlusion_index = gfx->occlusion.index;
-   record->visibility_mode = gfx->occlusion.mode;
+   record->visibility_mode = rasterizer_discard ? 0 : gfx->occlusion.mode;
    record->depth_control |= record->visibility_mode << 14;
    /* Early tests keep a hardware NEVER: the shader must not run at all. */
    bool force_never_in_shader =
@@ -3039,6 +3044,7 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       cfg.cull_back = dyn->rs.cull_mode & VK_CULL_MODE_BACK_BIT;
       cfg.depth_clip = vk_rasterization_state_depth_clip_enable(&dyn->rs);
       cfg.depth_clamp = !cfg.depth_clip;
+      cfg.rasterizer_discard = rasterizer_discard;
       /* Bresenham lines cover every sample of a covered pixel. */
       cfg.primitive_msaa =
          lines && dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM_KHR;

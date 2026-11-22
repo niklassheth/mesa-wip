@@ -219,6 +219,9 @@ struct agx_apple9_blend {
    /* Lower fragment main for per-sample execution driven by a trampoline that
     * supplies the active sample bitmask in AGX_APPLE9_SAMPLE_MASK_ABI_REG. */
    uint8_t per_sample : 1;
+   /* Only the driver-injected fragment statistics counter writes memory; do
+    * not force epilog sample-mask demotion / punch-through for normal draws. */
+   uint8_t writes_memory_stats_only : 1;
    uint8_t advanced_mode, advanced_overlap;
    uint8_t src_premultiplied, dst_premultiplied;
    /* Optional per-draw depth range for shader-triggered early tests. */

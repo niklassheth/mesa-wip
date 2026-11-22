@@ -11991,7 +11991,8 @@ apple9_compile_graphics(nir_shader *nir, struct agx_shader_part *out,
             }
             fs_epilog.main_defers_zs_test = false;
          } else {
-            if (nir->info.writes_memory) {
+            if (nir->info.writes_memory &&
+                !(blend && blend[0].writes_memory_stats_only)) {
                nir_builder b0 = nir_builder_at(nir_before_impl(impl));
                nir_def *api_mask = nir_load_ubo(&b0, 1, 32,
                   nir_imm_int(&b0, AGX_APPLE9_GRAPHICS_SYSVAL_BINDING),
