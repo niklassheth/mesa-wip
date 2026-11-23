@@ -39,7 +39,7 @@ nir_lower_pstipple_fs(struct nir_shader *shader,
                       bool samplers_as_deref,
                       nir_alu_type bool_type);
 
-void
+nir_variable *
 nir_lower_aaline_fs(struct nir_shader *shader, int *varying,
                     nir_variable *stipple_counter,
                     nir_variable *stipple_pattern);

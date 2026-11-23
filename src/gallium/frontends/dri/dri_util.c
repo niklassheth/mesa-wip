@@ -503,6 +503,7 @@ driCreateContextAttribs(struct dri_screen *screen, int api,
      */
     if (mesa_api == API_OPENGL_CORE &&
         major_version == 3 && minor_version == 1 &&
+        !(flags & __DRI_CTX_FLAG_FORWARD_COMPATIBLE) &&
         screen->max_gl_compat_version == 31 &&
         screen->max_gl_core_version == 31)
        mesa_api = API_OPENGL_COMPAT;

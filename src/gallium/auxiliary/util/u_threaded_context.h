@@ -547,9 +547,21 @@ tc_renderpass_info_is_zsbuf_used(const struct tc_renderpass_info *info)
 static inline void
 tc_renderpass_info_reset(struct tc_renderpass_info *info)
 {
+   /* Once recording has ended, the state/partial-clear flags already bound
+    * all remaining depth/stencil writes. A driver split must discard clear
+    * and invalidate hints, but need not invent a depth/stencil write. Keep
+    * the conservative fallback if recording was only signalled to unblock
+    * the driver and future calls are not known yet. A recorded full clear
+    * stays a write: the flag covers every full clear in the region, including
+    * ones recorded after the split point (clears between DSA blits with the
+    * framebuffer unchanged), which the next render must still execute.
+    */
+   bool complete = info->ended;
+   bool zsbuf_clear_partial = info->zsbuf_clear_partial || info->zsbuf_clear;
    info->data32[0] = 0;
    info->cbuf_load = BITFIELD_MASK(8);
-   info->zsbuf_clear_partial = true;
+   info->zsbuf_clear_partial = !complete || zsbuf_clear_partial;
+   info->ended = complete;
    info->has_draw = true;
    info->has_query_ends = true;
 }
@@ -574,6 +586,8 @@ struct tc_batch {
    /* whether the first set_framebuffer_state call will increment the rp info in batch_execute */
    bool increment_rp_info_on_fb;
    int8_t batch_idx;
+   /* bytes written by unsynchronized texture_subdata while this batch was recorded */
+   uint64_t unsync_upload_bytes;
    struct tc_unflushed_batch_token *token;
    uint64_t slots[TC_SLOTS_PER_BATCH];
    struct util_dynarray renderpass_infos;
@@ -662,6 +676,11 @@ struct threaded_context {
     */
    uint64_t bytes_mapped_estimate;
    uint64_t bytes_mapped_limit;
+
+   /* Bytes of unsynchronized texture uploads in batches the driver thread
+    * hasn't executed yet (atomic).
+    */
+   int64_t unsync_upload_bytes;
 
    /* Estimation of how replacement buffer bytes are in
     * the current tc_batch.

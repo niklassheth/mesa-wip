@@ -1082,6 +1082,7 @@ void st_init_extensions(struct pipe_screen *screen,
    EXT_CAP(ARB_post_depth_coverage,          post_depth_coverage);
    EXT_CAP(ARB_query_buffer_object,          query_buffer_object);
    EXT_CAP(ARB_robust_buffer_access_behavior, robust_buffer_access_behavior);
+   EXT_CAP(OES_EGL_image_external, texture_external);
    EXT_CAP(ARB_sample_shading,               sample_shading);
    EXT_CAP(ARB_sample_locations,             programmable_sample_locations);
    EXT_CAP(ARB_seamless_cube_map,            seamless_cube_map);
@@ -1303,6 +1304,10 @@ void st_init_extensions(struct pipe_screen *screen,
           screen->caps.shader_array_components)
          extensions->ARB_enhanced_layouts = GL_TRUE;
    }
+
+   /* Depth cube textures are also part of the ESSL 3.00 contract. */
+   if (ESSLVersion >= 300)
+      extensions->OES_depth_texture_cube_map = GL_TRUE;
 
    if (GLSLVersion >= 130) {
       consts->NativeIntegers = GL_TRUE;
