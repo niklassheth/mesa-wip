@@ -19020,3 +19020,212 @@ TEST(Apple9CompactIsa, GoldenMovZeroBitwiseAndInPlaceFma)
       EXPECT_EQ(packed.length, 8u);
    }
 }
+
+TEST(Apple9CompactIsa, GoldenUniformBindlessTextureImageAndInlineImmLod)
+{
+   const char *reason = nullptr;
+   agx_apple9_packed_instruction packed = {};
+
+   /* 1. 14B TEXTURE_SAMPLE inline UQ4.2 level(imm) (mode 0x0009, 2D) matching
+    *    probe6b_mem_tex_u.out lines 82-88 (bytes[12]=0x01 for table-index ABI). */
+   {
+      struct {
+         uint8_t dst, slot, uq4_2;
+      } lod_cases[] = {
+         {20, AGX_APPLE9_SCOREBOARD_SLOT_2, 0x00}, /* 0.0 */
+         {24, AGX_APPLE9_SCOREBOARD_SLOT_2, 0x04}, /* 1.0 */
+         {16, AGX_APPLE9_SCOREBOARD_SLOT_3, 0x08}, /* 2.0 */
+         {12, AGX_APPLE9_SCOREBOARD_SLOT_4, 0x0c}, /* 3.0 */
+         {8, AGX_APPLE9_SCOREBOARD_SLOT_5, 0x10},  /* 4.0 */
+         {4, AGX_APPLE9_SCOREBOARD_SLOT_6, 0x02},  /* 0.5 */
+         {0, AGX_APPLE9_SCOREBOARD_SLOT_1, 0x3c},  /* 15.0 */
+         {0, AGX_APPLE9_SCOREBOARD_SLOT_1, 0x3f},  /* 15.75 */
+      };
+      for (const auto &tc : lod_cases) {
+         uint8_t phys[8] = {tc.dst, (uint8_t)(tc.dst + 1), (uint8_t)(tc.dst + 2),
+                            (uint8_t)(tc.dst + 3), 0, 1};
+         agx_apple9_vir_instr ins = {
+            .op = AGX_APPLE9_VIR_TEXTURE_SAMPLE,
+            .encoding = AGX_APPLE9_ENC_TEXTURE_SAMPLE,
+            .dest = 0,
+            .dest_components = 4,
+            .src = {4, 5},
+            .texture_imm_lod = true,
+            .texture_imm_lod_uq4_2 = tc.uq4_2,
+            .nr_srcs = 2,
+            .producer_scoreboard_slot = tc.slot,
+         };
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason))
+            << (reason ?: "");
+         ASSERT_EQ(packed.length, 14u);
+         EXPECT_EQ(packed.bytes[6], 0x09u);
+         EXPECT_EQ(packed.bytes[7], 0x00u);
+         EXPECT_EQ(packed.bytes[11], tc.uq4_2);
+         EXPECT_EQ(packed.bytes[5], ((tc.slot - 1) << 2) | ((tc.slot - 1) << 5));
+      }
+      /* Out-of-range uq4_2 >= 64 must be rejected. */
+      uint8_t phys[6] = {0, 1, 2, 3, 0, 1};
+      agx_apple9_vir_instr bad = {
+         .op = AGX_APPLE9_VIR_TEXTURE_SAMPLE,
+         .encoding = AGX_APPLE9_ENC_TEXTURE_SAMPLE,
+         .dest = 0,
+         .dest_components = 4,
+         .src = {4, 5},
+         .texture_imm_lod = true,
+         .texture_imm_lod_uq4_2 = 64,
+         .nr_srcs = 2,
+         .producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1,
+      };
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(&bad, phys, &packed, &reason));
+   }
+
+   /* 2. 20B bindless TEXTURE_SAMPLE uniform/GPR sweep matching probe6b_mem_tex_u.out
+    *    (u10/u12, u14/u12, u16/u18, u10/u20, u10/r28, r2/u12, r2/r28) + odd u15/u17
+    *    + boundary u127/u128. */
+   {
+      struct {
+         bool tex_u, samp_u;
+         uint8_t tex_idx, samp_idx;
+         uint8_t exp_b1, exp_b4, exp_b8, exp_b9, exp_b10, exp_b11, exp_b14, exp_b15;
+      } tcases[] = {
+         /* u10 / u12 */
+         {true, true, 10, 12, 0xa0, 0xb8, 0x92, 0x03, 0x90, 0x01, 0x80, 0x20},
+         /* u14 / u12 */
+         {true, true, 14, 12, 0xe0, 0xb8, 0x92, 0x03, 0x90, 0x01, 0x80, 0x20},
+         /* u16 / u18 */
+         {true, true, 16, 18, 0x80, 0xb4, 0xa4, 0x03, 0x90, 0x01, 0x80, 0x20},
+         /* u10 / u20 */
+         {true, true, 10, 20, 0xa0, 0xb8, 0x94, 0x03, 0x90, 0x01, 0x80, 0x20},
+         /* u10 / r28 (retained) */
+         {true, false, 10, 28, 0xa0, 0xb8, 0x96, 0x02, 0x90, 0x01, 0x80, 0x20},
+         /* r2 / u12 (retained) */
+         {false, true, 2, 12, 0xa0, 0xb8, 0x02, 0x03, 0x90, 0x01, 0x80, 0x20},
+         /* r2 / r28 (discarded) */
+         {false, false, 2, 28, 0xa0, 0xb8, 0x06, 0x02, 0x90, 0x01, 0xa0, 0x28},
+         /* Odd uniform handles u15 / u17 (32-bit table indices) */
+         {true, true, 15, 17, 0xf0, 0xb2, 0x94, 0x03, 0x90, 0x01, 0x80, 0x20},
+         /* Boundary u127 / u127 (half-index 254 -> bit 122 = 1, bit 116 = 1) */
+         {true, true, 127, 127, 0xf0, 0xbe, 0xfe, 0x03, 0x90, 0x01, 0x90, 0x24},
+      };
+      for (const auto &tc : tcases) {
+         uint8_t phys[8] = {0, 1, 2, 3, 0, 1, tc.tex_idx, tc.samp_idx};
+         agx_apple9_vir_instr ins = {
+            .op = AGX_APPLE9_VIR_TEXTURE_SAMPLE,
+            .encoding = AGX_APPLE9_ENC_TEXTURE_SAMPLE,
+            .dest = 0,
+            .dest_components = 4,
+            .texture_index = tc.tex_u ? tc.tex_idx : (uint8_t)0,
+            .sampler_index = tc.samp_u ? tc.samp_idx : (uint8_t)0,
+            .src = {4, 5},
+            .texture_bindless = !tc.tex_u,
+            .sampler_bindless = !tc.samp_u,
+            .texture_uniform_bindless = tc.tex_u,
+            .sampler_uniform_bindless = tc.samp_u,
+            .texture_imm_lod = true,
+            .texture_imm_lod_uq4_2 = 0,
+            .nr_srcs = 2,
+            .producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1,
+         };
+         if (!tc.tex_u) {
+            ins.src[ins.nr_srcs++] = 6;
+            if (tc.samp_u)
+               ins.live_after_mask |= 1u << (ins.nr_srcs - 1);
+         }
+         if (!tc.samp_u) {
+            ins.src[ins.nr_srcs++] = 7;
+            if (tc.tex_u)
+               ins.live_after_mask |= 1u << (ins.nr_srcs - 1);
+         }
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason))
+            << (reason ?: "");
+         ASSERT_EQ(packed.length, 20u);
+         EXPECT_EQ(packed.bytes[1], tc.exp_b1);
+         EXPECT_EQ(packed.bytes[4], tc.exp_b4);
+         EXPECT_EQ(packed.bytes[6], 0x09u);
+         EXPECT_EQ(packed.bytes[7], 0x00u);
+         EXPECT_EQ(packed.bytes[8], tc.exp_b8);
+         EXPECT_EQ(packed.bytes[9], tc.exp_b9);
+         EXPECT_EQ(packed.bytes[10], tc.exp_b10);
+         EXPECT_EQ(packed.bytes[11], tc.exp_b11);
+         EXPECT_EQ(packed.bytes[14], tc.exp_b14);
+         EXPECT_EQ(packed.bytes[15], tc.exp_b15);
+      }
+      /* Reject u128+ and reject non-zero imm LOD in 20B bindless mode. */
+      uint8_t phys[6] = {0, 1, 2, 3, 0, 1};
+      agx_apple9_vir_instr bad = {
+         .op = AGX_APPLE9_VIR_TEXTURE_SAMPLE,
+         .encoding = AGX_APPLE9_ENC_TEXTURE_SAMPLE,
+         .dest = 0,
+         .dest_components = 4,
+         .texture_index = 128,
+         .sampler_index = 10,
+         .src = {4, 5},
+         .texture_uniform_bindless = true,
+         .sampler_uniform_bindless = true,
+         .nr_srcs = 2,
+         .producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1,
+      };
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(&bad, phys, &packed, &reason));
+      bad.texture_index = 10;
+      bad.texture_imm_lod = true;
+      bad.texture_imm_lod_uq4_2 = 2;
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(&bad, phys, &packed, &reason));
+   }
+
+   /* 3. 16B uniform bindless IMAGE_WRITE matching probe7_final_bits.out lines 232-233. */
+   {
+      uint8_t phys[8] = {16, 17, 18, 19, 20, 21, 22, 23};
+      agx_apple9_vir_instr ins = {
+         .op = AGX_APPLE9_VIR_IMAGE_STORE,
+         .encoding = AGX_APPLE9_ENC_IMAGE_WRITE,
+         .dest = AGX_APPLE9_VREG_INVALID,
+         .texture_index = 8,
+         .src = {0, 1, 2, 3, 4, 5, 6, 7},
+         .texture_uniform_bindless = true,
+         .nr_srcs = 8,
+         .producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1,
+      };
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason))
+         << (reason ?: "");
+      const uint8_t exp_u8[16] = {0xd7, 0x10, 0x54, 0x20, 0x00, 0x40, 0x00, 0x10,
+                                  0x20, 0x04, 0x00, 0x00, 0x88, 0x3a, 0x09, 0x01};
+      ASSERT_EQ(packed.length, 16u);
+      EXPECT_EQ(memcmp(packed.bytes, exp_u8, 16), 0);
+
+      /* Odd uniform index or u128+ must be rejected. */
+      ins.texture_index = 9;
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+      ins.texture_index = 128;
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+   }
+
+   /* 4. Optimizer folds uniform bindless handles in VIR_TEXTURE_SAMPLE & VIR_IMAGE_STORE. */
+   {
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      uint32_t u_coord = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+                                             AGX_APPLE9_ENC_GET_SR, NULL, 0, 0);
+      uint32_t tex_u = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+                                           AGX_APPLE9_ENC_UNIFORM_MOVE, NULL, 0, 14);
+      uint32_t samp_u = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+                                            AGX_APPLE9_ENC_UNIFORM_MOVE, NULL, 0, 15);
+      uint32_t coords[2] = {u_coord, u_coord};
+      uint32_t res = agx_apple9_vir_emit_texture_lod_imm(&p, coords, 0, 0, 0);
+      ASSERT_NE(res, AGX_APPLE9_VREG_INVALID);
+      agx_apple9_vir_instr *sample = p.instructions[p.instruction_count - 1];
+      sample->texture_bindless = true;
+      sample->sampler_bindless = true;
+      sample->src[sample->nr_srcs++] = tex_u;
+      sample->src[sample->nr_srcs++] = samp_u;
+      p.output = res;
+      ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+      EXPECT_FALSE(sample->texture_bindless);
+      EXPECT_FALSE(sample->sampler_bindless);
+      EXPECT_TRUE(sample->texture_uniform_bindless);
+      EXPECT_TRUE(sample->sampler_uniform_bindless);
+      EXPECT_EQ(sample->texture_index, 14u);
+      EXPECT_EQ(sample->sampler_index, 15u);
+      EXPECT_EQ(sample->nr_srcs, 2u);
+      agx_apple9_vir_finish(&p);
+   }
+}

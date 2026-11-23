@@ -689,6 +689,71 @@ drop_zero_load_index(struct agx_apple9_vir_instr *I, const bool *constant,
    I->device_load_index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_NONE;
 }
 
+/* Fold uniform-loaded bindless texture/sampler handles (u0..u127) directly
+ * into 20B TEXTURE_SAMPLE (bit 71 / bit 72) and even zero-extended uniform
+ * pairs (u0..u126 with u+1 == 0) into 16B IMAGE_WRITE (byte 14/15 = 09/01),
+ * eliminating pinned IOR_UNIFORM GPRs across shaders. */
+static void
+inline_texture_image_uniforms(struct agx_apple9_vir_instr *I,
+                              struct agx_apple9_vir_instr **definitions,
+                              const uint16_t *uniform_read,
+                              const bool *constant, const uint32_t *values,
+                              const struct agx_apple9_uniform_constants *constants)
+{
+   if (I->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE) {
+      if (!I->texture_bindless && !I->sampler_bindless)
+         return;
+      if (I->sampler_bindless && I->nr_srcs >= 1) {
+         uint32_t s_vreg = I->src[I->nr_srcs - 1];
+         if (uniform_read[s_vreg] && (uniform_read[s_vreg] - 1u) < 128u) {
+            I->sampler_index = (uint8_t)(uniform_read[s_vreg] - 1u);
+            I->sampler_bindless = false;
+            I->sampler_uniform_bindless = true;
+            --I->nr_srcs;
+         }
+      }
+      if (I->texture_bindless && I->nr_srcs >= 1u + I->sampler_bindless) {
+         unsigned tex_pos = I->nr_srcs - 1u - I->sampler_bindless;
+         uint32_t t_vreg = I->src[tex_pos];
+         if (uniform_read[t_vreg] && (uniform_read[t_vreg] - 1u) < 128u) {
+            I->texture_index = (uint8_t)(uniform_read[t_vreg] - 1u);
+            I->texture_bindless = false;
+            I->texture_uniform_bindless = true;
+            if (I->sampler_bindless)
+               I->src[tex_pos] = I->src[tex_pos + 1];
+            --I->nr_srcs;
+         }
+      }
+      return;
+   }
+
+   if (I->op == AGX_APPLE9_VIR_IMAGE_STORE && !I->texture_uniform_bindless &&
+       I->nr_srcs == 10) {
+      struct agx_apple9_vir_instr *cdef = definitions[I->src[8]];
+      const bool from_collect = cdef && cdef->op == AGX_APPLE9_VIR_COLLECT &&
+                                cdef->nr_srcs == 2 &&
+                                I->src[9] == I->src[8] + 1;
+      uint32_t lo_v = from_collect ? cdef->src[0] : I->src[8];
+      uint32_t hi_v = from_collect ? cdef->src[1] : I->src[9];
+      if (!uniform_read[lo_v])
+         return;
+      unsigned u = uniform_read[lo_v] - 1u;
+      if ((u & 1u) || u >= 128u)
+         return;
+      bool hi_ok = uniform_read[hi_v] == u + 2u;
+      if (!hi_ok && constant[hi_v] && values[hi_v] == 0 && constants &&
+          u + 1u >= constants->base &&
+          u + 1u < constants->base + constants->count &&
+          constants->values[(u + 1u) - constants->base] == 0)
+         hi_ok = true;
+      if (!hi_ok)
+         return;
+      I->texture_index = (uint8_t)u;
+      I->texture_uniform_bindless = true;
+      I->nr_srcs = 8;
+   }
+}
+
 static void
 inline_alu_sources(struct agx_apple9_vir_instr *I, const uint16_t *uniform_read,
                       const bool *constant, const uint32_t *values)
@@ -1287,12 +1352,18 @@ agx_apple9_optimize_vir_with_constants(
       }
       const bool pure_alu = agx_apple9_instr_is_pure_alu(I);
       if (!pure_alu && !apple9_instr_is_cse_eligible(I)) {
+         if (I->op == AGX_APPLE9_VIR_COLLECT) {
+            for (unsigned c = 0; c < I->dest_components; ++c)
+               definitions[I->dest + c] = I;
+         }
          /* A predicate has no SSA destination and cannot be CSE'd as an ALU
           * value, but its explicit operands may still read uniforms. */
          if (I->op == AGX_APPLE9_VIR_PREDICATE_COMPARE) {
             inline_compare_literal(I, constant, values);
             inline_alu_sources(I, uniform_read, constant, values);
          }
+         inline_texture_image_uniforms(I, definitions, uniform_read, constant,
+                                       values, constants);
          drop_zero_load_index(I, constant, values);
          continue;
       }

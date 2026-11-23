@@ -2206,6 +2206,74 @@ agx_apple9_vir_emit_texture_sample(struct agx_apple9_vir_program *program,
    return apple9_vir_emit_texture(program, coords, one, texture, sampler, false, false);
 }
 
+static uint32_t
+apple9_vir_emit_texture_mov(struct agx_apple9_vir_program *program,
+                            const uint32_t coords[2], bool imm_lod,
+                            uint8_t lod_uq4_2, unsigned texture,
+                            unsigned sampler)
+{
+   if (!program || !coords || coords[0] >= program->value_count ||
+       coords[1] >= program->value_count ||
+       texture >= AGX_APPLE9_GRAPHICS_MAX_TEXTURES ||
+       sampler >= AGX_APPLE9_GRAPHICS_MAX_SAMPLERS ||
+       (imm_lod && lod_uq4_2 > 63))
+      return AGX_APPLE9_VREG_INVALID;
+
+   uint32_t published = program->value_count;
+   if (!apple9_vir_append_values(program, 2))
+      return AGX_APPLE9_VREG_INVALID;
+   struct agx_apple9_vir_instr *pub = apple9_vir_append_instruction(program);
+   if (!pub)
+      return AGX_APPLE9_VREG_INVALID;
+   *pub = (struct agx_apple9_vir_instr){
+      .op = AGX_APPLE9_VIR_PUBLICATION_TUPLE,
+      .encoding = AGX_APPLE9_ENC_TEXTURE_COORDS_MOV,
+      .dest = published,
+      .dest_components = 2,
+      .nr_srcs = 2,
+      .src = {coords[0], coords[1]},
+   };
+
+   uint32_t result = program->value_count;
+   if (!apple9_vir_append_values(program, 4))
+      return AGX_APPLE9_VREG_INVALID;
+   struct agx_apple9_vir_instr *sample = apple9_vir_append_instruction(program);
+   if (!sample)
+      return AGX_APPLE9_VREG_INVALID;
+   *sample = (struct agx_apple9_vir_instr){
+      .op = AGX_APPLE9_VIR_TEXTURE_SAMPLE,
+      .encoding = AGX_APPLE9_ENC_TEXTURE_SAMPLE,
+      .dest = result,
+      .dest_components = 4,
+      .texture_index = (uint8_t)texture,
+      .sampler_index = (uint8_t)sampler,
+      .texture_imm_lod = imm_lod,
+      .texture_imm_lod_uq4_2 = imm_lod ? lod_uq4_2 : 0,
+      .nr_srcs = 2,
+      .src = {published, published + 1},
+      .producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1,
+   };
+   return result;
+}
+
+uint32_t
+agx_apple9_vir_emit_texture_sample_mov(struct agx_apple9_vir_program *program,
+                                       const uint32_t coords[2],
+                                       unsigned texture, unsigned sampler)
+{
+   return apple9_vir_emit_texture_mov(program, coords, false, 0, texture,
+                                      sampler);
+}
+
+uint32_t
+agx_apple9_vir_emit_texture_lod_imm(struct agx_apple9_vir_program *program,
+                                    const uint32_t coords[2], uint8_t lod_uq4_2,
+                                    unsigned texture, unsigned sampler)
+{
+   return apple9_vir_emit_texture_mov(program, coords, true, lod_uq4_2, texture,
+                                      sampler);
+}
+
 uint32_t
 agx_apple9_vir_emit_texture_lod(struct agx_apple9_vir_program *program,
                                const uint32_t coords[2], uint32_t packed_lod,
@@ -3305,6 +3373,18 @@ encoding_tuple(const struct agx_apple9_vir_instr *instruction,
       return true;
    }
 
+   if (instruction->op == AGX_APPLE9_VIR_IMAGE_STORE &&
+       instruction->texture_uniform_bindless) {
+      if (instruction->nr_srcs != 8)
+         return false;
+      for (unsigned i = 0; i < 8; ++i)
+         gprs[i] = phys[instruction->src[i]];
+      gprs[8] = 0;
+      gprs[9] = 1;
+      *count = 10;
+      return true;
+   }
+
    if (instruction->op == AGX_APPLE9_VIR_MMA) {
       if (!apple9_mma_flags_valid(instruction->immediate) ||
           instruction->dest == AGX_APPLE9_VREG_INVALID)
@@ -4378,9 +4458,10 @@ agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
          continue;
       }
 
-      /* Inline uniform/immediate operands have their own file and range.
-       * The float packers validate those alongside the compact GPR list. */
-      if (instruction->alu_src_uniform_mask || instruction->alu_src_immediate_mask) {
+      /* Inline uniform/immediate operands and texture samples have their own
+       * file/range rules; validate them directly through the packer. */
+      if (instruction->alu_src_uniform_mask || instruction->alu_src_immediate_mask ||
+          instruction->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE) {
          struct agx_apple9_packed_instruction packed;
          if (!agx_apple9_pack_vir_instruction(instruction, program->phys,
                                              &packed, reason))
@@ -4683,7 +4764,11 @@ apple9_propagate_source_register_classes(struct agx_apple9_vir_program *program,
             &info->operands[operand];
          if (!(constraint->files & AGX_APPLE9_FILE_GPR) ||
              agx_apple9_inline_source_file(instruction, constraint->role) ||
-             constraint->role == AGX_APPLE9_OPERAND_DEST)
+             constraint->role == AGX_APPLE9_OPERAND_DEST ||
+             (instruction->op == AGX_APPLE9_VIR_IMAGE_STORE &&
+              instruction->texture_uniform_bindless &&
+              (constraint->role == AGX_APPLE9_OPERAND_SRC8 ||
+               constraint->role == AGX_APPLE9_OPERAND_SRC9)))
             continue;
          if (source >= instruction->nr_srcs ||
              instruction->src[source] >= program->value_count)
@@ -9480,6 +9565,26 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
          packed_init(packed, bytes, count * 4);
          return true;
       }
+      if (instruction->encoding == AGX_APPLE9_ENC_TEXTURE_COORDS_MOV) {
+         unsigned base = phys[instruction->dest];
+         if (instruction->nr_srcs != 2 || instruction->dest_components != 2 ||
+             base > 30 || (base & 1))
+            return false;
+         uint8_t bytes[8];
+         for (unsigned c = 0; c < 2; ++c) {
+            unsigned source = instruction->src[c];
+            bool keep = (instruction->live_after_mask & (1u << c)) ||
+                        (c == 0 && instruction->src[1] == source);
+            if (phys[source] >= AGX_APPLE9_GPR_COUNT)
+               return false;
+            if (!agx_apple9_encode_mov4(bytes + 4 * c, base + c, phys[source],
+                                        false, true, false, true, keep, !keep,
+                                        0))
+               return false;
+         }
+         packed_init(packed, bytes, sizeof(bytes));
+         return true;
+      }
       if (instruction->encoding != AGX_APPLE9_ENC_TEXTURE_COORDS ||
           instruction->nr_srcs != 3 || instruction->dest_components != 2 ||
           phys[instruction->dest] > 30 || (phys[instruction->dest] & 1))
@@ -9505,17 +9610,22 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
    }
    case AGX_APPLE9_VIR_IMAGE_STORE: {
       bool layered = instruction->encoding == AGX_APPLE9_ENC_IMAGE_WRITE_LAYERED;
+      bool uniform_handle = instruction->texture_uniform_bindless;
       unsigned dim = instruction->texture_dimension;
       unsigned bits = instruction->memory_bits ? instruction->memory_bits : 32;
       if ((!layered && instruction->encoding != AGX_APPLE9_ENC_IMAGE_WRITE) ||
-          instruction->nr_srcs != 10 || instruction->immediate > 1 ||
-          (bits != 16 && bits != 32) ||
+          instruction->nr_srcs != (uniform_handle ? 8u : 10u) ||
+          instruction->immediate > 1 || (bits != 16 && bits != 32) ||
           (layered ? (dim != 0 && dim != 2) : (dim != 0 && dim != 1 && dim != 3)))
          return false;
       unsigned base = phys[instruction->src[0]];
-      unsigned index = phys[instruction->src[8]];
-      if (base > 40 || (base & 7) || index >= AGX_APPLE9_GPR_COUNT - 1 ||
-          (index & 1) || phys[instruction->src[9]] != index + 1)
+      unsigned index = uniform_handle ? instruction->texture_index
+                                      : phys[instruction->src[8]];
+      if (base > 40 || (base & 7) || (index & 1) ||
+          (uniform_handle
+              ? index >= 128
+              : (index >= AGX_APPLE9_GPR_COUNT - 1 ||
+                 phys[instruction->src[9]] != index + 1)))
          return false;
       for (unsigned i = 1; i < 8; ++i)
          if (phys[instruction->src[i]] != base + i)
@@ -9526,8 +9636,8 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       if (slot > AGX_APPLE9_SCOREBOARD_SLOT_6)
          return false;
       /* Data type in byte 13: bit 5 = float, bit 4 = 32-bit (clear for 16-bit),
-       * low nibble 0x0a -> 0x3a f32, 0x1a i32, 0x2a f16, 0x0a i16. Byte 14 is
-       * 0x89 for GPR-indexed bindless PBE writes across all stages (CS/VS/FS).
+       * low nibble 0x0a -> 0x3a f32, 0x1a i32, 0x2a f16, 0x0a i16. Byte 14/15:
+       * 0x89/0x00 for GPR-indexed, 0x09/0x01 for uniform-indexed bindless PBE.
        * Dimension in byte 9: 0x04 (2D / 2D-array), 0x08 (3D), 0x0c (Cube).
        * Byte 5 bit 6 (0x40) marks non-layered 2D/3D/Cube; clearing it selects
        * layered 2D-array. Byte 1 waits on slot 1 for IMAGE_WRITE_PARAMS and
@@ -9543,9 +9653,11 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       const uint8_t bytes[] = {
          0xd7, 0x10, 0x54, base << 1, 0, layered ? 0x00 : 0x40, 0,
          index << 1,
-         0x20 | ((instruction->live_after_mask & (3u << 8)) ? 0 : 1),
+         uniform_handle
+            ? 0x20
+            : (uint8_t)(0x20 | ((instruction->live_after_mask & (3u << 8)) ? 0 : 1)),
          dim_byte, 0, 0, (uint8_t)(0x88 + (slot - 1)),
-         data_type, 0x89, 0,
+         data_type, uniform_handle ? 0x09 : 0x89, uniform_handle ? 0x01 : 0x00,
       };
       packed_init(packed, bytes, sizeof(bytes));
       return true;
@@ -9581,6 +9693,10 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       return true;
    }
    case AGX_APPLE9_VIR_TEXTURE_SAMPLE: {
+      const bool has_tex_bindless =
+         instruction->texture_bindless || instruction->texture_uniform_bindless;
+      const bool has_samp_bindless =
+         instruction->sampler_bindless || instruction->sampler_uniform_bindless;
       const unsigned table_sources =
          instruction->texture_bindless + instruction->sampler_bindless;
       bool lod = instruction->encoding == AGX_APPLE9_ENC_TEXTURE_LOD;
@@ -9590,13 +9706,27 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       unsigned mask = instruction->texture_result_mask ?
          instruction->texture_result_mask : 0xf;
       if ((!extended && instruction->encoding != AGX_APPLE9_ENC_TEXTURE_SAMPLE) ||
-          (instruction->sampler_bindless && !instruction->texture_bindless) ||
+          (instruction->texture_bindless && instruction->texture_uniform_bindless) ||
+          (instruction->sampler_bindless && instruction->sampler_uniform_bindless) ||
+          (has_samp_bindless && !has_tex_bindless) ||
           instruction->nr_srcs != (gradient ? 1 : extended ? 4 : 2) + table_sources ||
           mask > 0xf ||
           instruction->dest_components != util_bitcount(mask) + instruction->texture_sparse ||
-          instruction->texture_index >= AGX_APPLE9_GRAPHICS_MAX_TEXTURES ||
-          instruction->sampler_index >= AGX_APPLE9_GRAPHICS_MAX_SAMPLERS ||
+          (instruction->texture_uniform_bindless
+              ? instruction->texture_index >= 128
+              : instruction->texture_index >= AGX_APPLE9_GRAPHICS_MAX_TEXTURES) ||
+          (instruction->sampler_uniform_bindless
+              ? instruction->sampler_index >= 128
+              : instruction->sampler_index >= AGX_APPLE9_GRAPHICS_MAX_SAMPLERS) ||
           instruction->immediate > (lod ? 2u : 0u) ||
+          (instruction->texture_imm_lod &&
+           (extended || multisampled || instruction->texture_shadow ||
+            instruction->texture_fetch || instruction->texture_lod_query ||
+            instruction->texture_gather || instruction->texture_min_lod ||
+            instruction->texture_has_offset ||
+            instruction->texture_dimension != 0 ||
+            instruction->texture_imm_lod_uq4_2 > 63 ||
+            (has_tex_bindless && instruction->texture_imm_lod_uq4_2 != 0))) ||
           (instruction->immediate == 2u &&
            (instruction->texture_fetch || multisampled ||
             instruction->texture_min_lod ||
@@ -9612,7 +9742,7 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
          instruction->texture_dimension == 1 ||
          instruction->texture_dimension == 4;
       if (dst + instruction->dest_components >
-             (table_sources ? AGX_APPLE9_GPR_COUNT : 64) ||
+             (has_tex_bindless ? AGX_APPLE9_GPR_COUNT : 64) ||
           coord > (gradient   ? (grad_volume_block ? 16 : 24)
                    : extended ? 28
                               : 30) ||
@@ -9626,8 +9756,8 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
        * publication. The legacy database's sampler-byte 'coord' label is
        * not this operand. Direct texture/sampler table indices are distinct
        * fields, isolated with dependent and crossed own-source M4 samples. */
-      unsigned texture = instruction->texture_bindless ? 0 : instruction->texture_index;
-      unsigned sampler = instruction->sampler_bindless ? 0 : instruction->sampler_index;
+      unsigned texture = has_tex_bindless ? 0 : instruction->texture_index;
+      unsigned sampler = has_samp_bindless ? 0 : instruction->sampler_index;
       /* Keep helper invocations alive for subsequent samples and derivatives.
        * Byte 8 bit 0 retires them after this sample. Our authored multi-sample
        * shader sets it only on its last sample; like the common AGX packer,
@@ -9648,6 +9778,13 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
        * read and filtered-sample shaders with multiple outstanding results. */
       unsigned tag = instruction->producer_scoreboard_slot - 1;
       bytes[5] = (tag << 2) | (tag << 5);
+      if (instruction->texture_imm_lod) {
+         /* Inline UQ4.2 immediate explicit LOD (mode 0x0009, 2D only):
+          * 2 coords in cr0..cr1, UQ4.2 LOD (0.00..15.75) in byte[11] bits 0..5. */
+         bytes[6] = 0x09;
+         bytes[7] = 0x00;
+         bytes[11] = instruction->texture_imm_lod_uq4_2;
+      }
       if (gradient) {
          bytes[6] = 4;
          bytes[7] = 1;
@@ -9874,16 +10011,13 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       set_bits(bytes, 27, 2, selector & 3);
       set_bits(bytes, 37, 1, (selector >> 2) & 1);
       set_bits(bytes, 86, 1, selector >> 3);
-      if (table_sources) {
-         /* The 20-byte form (bit 73) reads 32-bit table indices from GPRs
-          * named in half-register units, in the fields otherwise holding
-          * the immediate indices. Bit 87 and byte 15 bit 5
-          * select a register texture index; bit 88 and byte 14 bit 7 a
-          * register sampler index. Both scattered register fields contain
-          * eight half-register bits, validated through r95 on T8132.
-          * Byte 15 bit 3
-          * and byte 14 bit 5 discard those registers at their last use.
-          */
+      if (has_tex_bindless) {
+         /* The 20-byte form (bit 73) reads 32-bit table indices from GPRs or
+          * uniform words (u0..u127) named in half-register units. Bit 87 and
+          * byte 15 bit 5 select a bindless texture index (bit 71 = uniform);
+          * bit 88 and byte 14 bit 7 select a bindless sampler index (bit 72 =
+          * uniform). Byte 15 bit 3 and byte 14 bit 5 discard GPR sources at
+          * their last use and stay clear for uniform sources. */
          const unsigned texture_src = instruction->nr_srcs - table_sources;
          uint8_t wide[20] = {0};
          /* Bits 39..41 wait for the coordinate publication's completion
@@ -9894,31 +10028,44 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
          memcpy(wide, bytes, 14);
          wide[9] |= 0x02;
          wide[15] = 0x20;
-         if (!(instruction->live_after_mask & BITFIELD_BIT(texture_src)))
-            wide[15] |= 0x08;
          wide[18] = 0x40;
-         /* Only the register form has the measured high destination bit. */
+         /* Only the 20-byte bindless form has the measured high destination bit. */
          set_bits(wide, 153, 1, dst >> 6);
-         unsigned texture_reg = phys[instruction->src[texture_src]];
-         if (texture_reg >= AGX_APPLE9_GPR_COUNT)
-            return false;
+         unsigned texture_reg;
+         if (instruction->texture_uniform_bindless) {
+            texture_reg = instruction->texture_index;
+            wide[8] |= 0x80; /* bit 71: tex_is_uniform */
+         } else {
+            texture_reg = phys[instruction->src[texture_src]];
+            if (texture_reg >= AGX_APPLE9_GPR_COUNT)
+               return false;
+            if (!(instruction->live_after_mask & BITFIELD_BIT(texture_src)))
+               wide[15] |= 0x08;
+         }
          set_bits(wide, 11, 4, (texture_reg * 2) & 0xf);
          set_bits(wide, 68, 3, ((texture_reg * 2) >> 4) & 7);
          set_bits(wide, 122, 1, (texture_reg * 2) >> 7);
          wide[10] |= 0x80;
-         if (instruction->sampler_bindless) {
-            unsigned sampler_reg = phys[instruction->src[instruction->nr_srcs - 1]];
-            if (sampler_reg >= AGX_APPLE9_GPR_COUNT)
-               return false;
+         if (has_samp_bindless) {
+            unsigned sampler_reg;
+            if (instruction->sampler_uniform_bindless) {
+               sampler_reg = instruction->sampler_index;
+               wide[9] |= 0x01; /* bit 72: samp_is_uniform */
+               wide[14] = 0x80;
+            } else {
+               sampler_reg = phys[instruction->src[instruction->nr_srcs - 1]];
+               if (sampler_reg >= AGX_APPLE9_GPR_COUNT)
+                  return false;
+               wide[9] &= ~0x01;
+               wide[14] = 0x80;
+               if (!(instruction->live_after_mask &
+                     BITFIELD_BIT(instruction->nr_srcs - 1)))
+                  wide[14] |= 0x20;
+            }
             set_bits(wide, 32, 4, (sampler_reg * 2) & 0xf);
             set_bits(wide, 65, 3, ((sampler_reg * 2) >> 4) & 7);
-            wide[9] &= ~0x01;
             wide[11] |= 0x01;
-            wide[14] = 0x80;
             set_bits(wide, 116, 1, (sampler_reg * 2) >> 7);
-            if (!(instruction->live_after_mask &
-                  BITFIELD_BIT(instruction->nr_srcs - 1)))
-               wide[14] |= 0x20;
          }
          packed_init(packed, wide, sizeof(wide));
          return true;

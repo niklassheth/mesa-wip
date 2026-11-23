@@ -2885,15 +2885,40 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
             }
             result = agx_apple9_vir_emit_texture_volume(&lower->program, coords,
                packed_lod, texture, sampler, dimension, bias, tex->is_shadow);
-         } else
-            result = agx_apple9_vir_emit_texture_lod(
-               &lower->program, coords, packed_lod, texture, sampler, bias);
+         } else {
+            /* 2D explicit constant LOD: use inline UQ4.2 mode 0x0009 (2 coords,
+             * 0 LOD GPRs) for exact quarter-integers 0.00..15.75 in 14B direct
+             * mode, and for level(0.0f) in 20B bindless mode. */
+            uint32_t packed_const = 0;
+            bool use_imm_lod = false;
+            uint8_t uq4_2 = 0;
+            if (tex->op == nir_texop_txl && dimension == 0 && !tex->is_array &&
+                !tex->is_shadow && !tex->is_sparse &&
+                !(tex->backend_flags & AGX_APPLE9_TEXTURE_LOD_QUERY) &&
+                nir_tex_instr_src_index(tex, nir_tex_src_offset) < 0 &&
+                lod_source >= 0 &&
+                apple9_const_u32(nir_get_scalar(tex->src[lod_source].src.ssa, 0),
+                                 &packed_const) &&
+                (packed_const & ~0x0fff0000u) == 0) {
+               int32_t q6 = ((int32_t)(packed_const << 4)) >> 20;
+               if (q6 >= 0 && q6 <= 63 * 16 && (q6 & 15) == 0) {
+                  uq4_2 = (uint8_t)(q6 >> 4);
+                  use_imm_lod = !handle_count || uq4_2 == 0;
+               }
+            }
+            if (use_imm_lod) {
+               result = agx_apple9_vir_emit_texture_lod_imm(
+                  &lower->program, coords, uq4_2, texture, sampler);
+            } else {
+               result = agx_apple9_vir_emit_texture_lod(
+                  &lower->program, coords, packed_lod, texture, sampler, bias);
+            }
+         }
          if (fetch && result != AGX_APPLE9_VREG_INVALID)
             lower->program.instructions[lower->program.instruction_count - 1]->texture_fetch = true;
       } else {
-         uint32_t one = apple9_dag_imm(lower, 0x3f800000);
-         result = agx_apple9_vir_emit_texture_sample(
-            &lower->program, coords, one, texture,
+         result = agx_apple9_vir_emit_texture_sample_mov(
+            &lower->program, coords, texture,
             util_bitcount(lower->sampler_mask & BITFIELD_MASK(tex->sampler_index)));
       }
       if (result == AGX_APPLE9_VREG_INVALID) {

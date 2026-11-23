@@ -482,6 +482,15 @@ struct agx_apple9_vir_instr {
     * order, replace the immediate texture and sampler indices. */
    bool texture_bindless;
    bool sampler_bindless;
+   /* Uniform-supplied bindless handles (u0..u127 for TEXTURE_SAMPLE; even
+    * u0..u126 pair with zero upper word for IMAGE_STORE) stored in
+    * texture_index / sampler_index without consuming GPR sources. */
+   bool texture_uniform_bindless;
+   bool sampler_uniform_bindless;
+   /* Inline UQ4.2 immediate explicit LOD (mode 0x0009, 2D only, byte[11] =
+    * texture_imm_lod_uq4_2 in 0..63; restricted to 0 in 20B bindless mode). */
+   bool texture_imm_lod;
+   uint8_t texture_imm_lod_uq4_2;
    /* Set when emitted from a fragment shader; GPR bindless PBE writes share
     * the same byte 13/14 encoding as compute/vertex stages. */
    bool image_fragment;
@@ -1253,6 +1262,12 @@ bool agx_apple9_vir_emit_block_image_store(
 uint32_t agx_apple9_vir_emit_texture_sample(
    struct agx_apple9_vir_program *program, const uint32_t coords[2],
    uint32_t one, unsigned texture, unsigned sampler);
+uint32_t agx_apple9_vir_emit_texture_sample_mov(
+   struct agx_apple9_vir_program *program, const uint32_t coords[2],
+   unsigned texture, unsigned sampler);
+uint32_t agx_apple9_vir_emit_texture_lod_imm(
+   struct agx_apple9_vir_program *program, const uint32_t coords[2],
+   uint8_t lod_uq4_2, unsigned texture, unsigned sampler);
 
 uint32_t agx_apple9_vir_emit_texture_min_lod(
    struct agx_apple9_vir_program *program, const uint32_t coords[2],

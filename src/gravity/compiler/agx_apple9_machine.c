@@ -1663,6 +1663,23 @@ static const struct agx_apple9_encoding_info encodings[] = {
                           95, 2, AGX_APPLE9_OPERAND_ALLOCATABLE,
                           AGX_APPLE9_EVIDENCE_HARDWARE)},
       },
+   [AGX_APPLE9_ENC_TEXTURE_COORDS_MOV] =
+      {
+         .name = "texture_coords_mov",
+         .length = 8,
+         .operand_count = 3,
+         .allocator_safe = true,
+         .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
+         .operands = {GPR(AGX_APPLE9_OPERAND_DEST, AGX_APPLE9_WIDTH_32,
+                          31, 4, AGX_APPLE9_OPERAND_ALLOCATABLE,
+                          AGX_APPLE9_EVIDENCE_HARDWARE),
+                      GPR(AGX_APPLE9_OPERAND_SRC0, AGX_APPLE9_WIDTH_32,
+                          95, 2, AGX_APPLE9_OPERAND_ALLOCATABLE,
+                          AGX_APPLE9_EVIDENCE_HARDWARE),
+                      GPR(AGX_APPLE9_OPERAND_SRC1, AGX_APPLE9_WIDTH_32,
+                          95, 2, AGX_APPLE9_OPERAND_ALLOCATABLE,
+                          AGX_APPLE9_EVIDENCE_HARDWARE)},
+      },
    [AGX_APPLE9_ENC_TEXTURE_SAMPLE] =
       {
          .name = "texture_sample",
