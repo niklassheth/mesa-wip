@@ -239,7 +239,7 @@ agx_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
    ret = drmIoctl(dev->fd, DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET, &gem_mmap_offset);
    if (ret) {
       fprintf(stderr, "DRM_IOCTL_ASAHI_MMAP_BO failed: %m\n");
-      assert(0);
+      return NULL;
    }
 
    flags = MAP_SHARED | (fixed_addr ? MAP_FIXED : 0);
@@ -295,35 +295,52 @@ retry:
    }
 
    if (!bo->size) {
+      int prime_fd = os_dupfd_cloexec(fd);
+      if (prime_fd < 0) {
+         fprintf(stderr, "import failed: Could not dup prime fd %d: %m\n", fd);
+         struct drm_gem_close close_req = {.handle = gem_handle};
+         drmIoctl(dev->fd, DRM_IOCTL_GEM_CLOSE, &close_req);
+         pthread_mutex_unlock(&dev->bo_map_lock);
+         return NULL;
+      }
+
+      struct agx_va *va = agx_va_alloc(dev, size, AIL_PAGESIZE, 0, 0);
+      if (!va) {
+         fprintf(
+            stderr,
+            "import failed: Could not allocate from VMA heap (0x%llx bytes)\n",
+            (long long)size);
+         close(prime_fd);
+         struct drm_gem_close close_req = {.handle = gem_handle};
+         drmIoctl(dev->fd, DRM_IOCTL_GEM_CLOSE, &close_req);
+         pthread_mutex_unlock(&dev->bo_map_lock);
+         return NULL;
+      }
+
       bo->dev = dev;
       bo->size = size;
       bo->align = AIL_PAGESIZE;
 
       bo->flags = AGX_BO_SHARED | AGX_BO_SHAREABLE;
       bo->handle = gem_handle;
-      bo->prime_fd = os_dupfd_cloexec(fd);
+      bo->uapi_handle = gem_handle;
+      bo->prime_fd = prime_fd;
       bo->label = "Imported BO";
-      assert(bo->prime_fd >= 0);
-
+      bo->va = va;
       p_atomic_set(&bo->refcnt, 1);
-      bo->va = agx_va_alloc(dev, bo->size, bo->align, 0, 0);
-
-      if (!bo->va) {
-         fprintf(
-            stderr,
-            "import failed: Could not allocate from VMA heap (0x%llx bytes)\n",
-            (long long)bo->size);
-         abort();
-      }
-
-      bo->uapi_handle = bo->handle;
 
       ret = agx_bo_bind(dev, bo, bo->va->addr, bo->size, 0,
                         DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE);
       if (ret) {
          fprintf(stderr, "import failed: Could not bind BO at 0x%llx\n",
                  (long long)bo->va->addr);
-         abort();
+         agx_va_free(dev, va, false);
+         close(prime_fd);
+         memset(bo, 0, sizeof(*bo));
+         struct drm_gem_close close_req = {.handle = gem_handle};
+         drmIoctl(dev->fd, DRM_IOCTL_GEM_CLOSE, &close_req);
+         pthread_mutex_unlock(&dev->bo_map_lock);
+         return NULL;
       }
    } else {
       /* Final unreference, resurrection and reaper removal all serialize
@@ -349,22 +366,25 @@ retry:
    return bo;
 }
 
-void
+bool
 agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo)
 {
    assert(bo->flags & AGX_BO_SHAREABLE);
    if (bo->flags & AGX_BO_SHARED) {
       assert(bo->prime_fd >= 0);
-      return;
+      return true;
    }
 
-   bo->flags |= AGX_BO_SHARED;
    assert(bo->prime_fd == -1);
 
+   int prime_fd = -1;
    int ret = drmPrimeHandleToFD(dev->fd, bo->handle, DRM_CLOEXEC | DRM_RDWR,
-                                &bo->prime_fd);
-   assert(ret == 0);
-   assert(bo->prime_fd >= 0);
+                                &prime_fd);
+   if (ret || prime_fd < 0)
+      return false;
+
+   bo->prime_fd = prime_fd;
+   bo->flags |= AGX_BO_SHARED;
 
    /* If there is a pending writer to this BO, import it into the buffer
     * for implicit sync.
@@ -381,12 +401,15 @@ agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo)
       assert(ret >= 0);
       close(out_sync_fd);
    }
+
+   return true;
 }
 
 int
 agx_bo_export(struct agx_device *dev, struct agx_bo *bo)
 {
-   agx_bo_make_shared(dev, bo);
+   if (!agx_bo_make_shared(dev, bo))
+      return -1;
 
    assert(bo->prime_fd >= 0);
    return os_dupfd_cloexec(bo->prime_fd);
@@ -753,6 +776,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
    dev->apple9_trace = agx_apple9_trace_enabled();
 
+   simple_mtx_init(&dev->apple9_entry_back_lock, mtx_plain);
    simple_mtx_init(&dev->apple9_entry_lock, mtx_plain);
    list_inithead(&dev->apple9_entry_lru);
    util_vma_heap_init(&dev->apple9_entry_heap, AGX_APPLE9_ENTRY_HEADER_SIZE,
@@ -770,11 +794,11 @@ agx_open_device(void *memctx, struct agx_device *dev)
                       dev->shader_base);
       if (!dev->apple9_entry_va) {
          fprintf(stderr, "Failed to reserve compact Apple9 shader entries\n");
-         return false;
+         goto fail;
       }
       if (!agx_apple9_entry_back(dev, AGX_APPLE9_ENTRY_HEADER_SIZE)) {
          fprintf(stderr, "Failed to back compact Apple9 shader entries\n");
-         return false;
+         goto fail;
       }
    }
 
@@ -783,24 +807,41 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * robustness optimization even without soft fault.
     */
    {
-      void *bo = agx_bo_create(dev, 16384, 0, 0, "Zero page");
+      struct agx_bo *bo = agx_bo_create(dev, 16384, 0, 0, "Zero page");
+      if (!bo) {
+         fprintf(stderr, "Failed to allocate zero page\n");
+         goto fail;
+      }
       int ret = agx_bo_bind(dev, bo, AGX_ZERO_PAGE_ADDRESS, 16384, 0,
                             DRM_ASAHI_BIND_READ);
       if (ret) {
-         fprintf(stderr, "Failed to bind zero page");
-         return false;
+         fprintf(stderr, "Failed to bind zero page\n");
+         agx_bo_unreference(dev, bo);
+         goto fail;
       }
 
       dev->zero_bo = bo;
    }
 
    {
-      void *bo = agx_bo_create(dev, AIL_PAGESIZE, 0, 0, "Scratch page");
+      struct agx_bo *bo = agx_bo_create(dev, AIL_PAGESIZE, 0, 0, "Scratch page");
+      if (!bo) {
+         fprintf(stderr, "Failed to allocate scratch page\n");
+         goto fail;
+      }
       int ret = agx_bo_bind(dev, bo, AGX_SCRATCH_PAGE_ADDRESS, AIL_PAGESIZE, 0,
                             DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE);
       if (ret) {
-         fprintf(stderr, "Failed to bind zero page");
-         return false;
+         fprintf(stderr, "Failed to bind scratch page\n");
+         agx_bo_unreference(dev, bo);
+         goto fail;
+      }
+
+      void *map = agx_bo_map(bo);
+      if (!map) {
+         fprintf(stderr, "Failed to map scratch page\n");
+         agx_bo_unreference(dev, bo);
+         goto fail;
       }
 
       dev->scratch_bo = bo;
@@ -808,34 +849,49 @@ agx_open_device(void *memctx, struct agx_device *dev)
       /* The contents of the scratch page are undefined, but making them nonzero
        * helps fuzz for bugs where we incorrectly read from the write section.
        */
-      memset(agx_bo_map(dev->scratch_bo), 0xCA, AIL_PAGESIZE);
+      memset(map, 0xCA, AIL_PAGESIZE);
    }
 
-   void *bo = agx_bo_create(dev, LIBAGX_PRINTF_BUFFER_SIZE, 0, AGX_BO_WRITEBACK,
-                            "Printf/abort");
+   struct agx_bo *bo = agx_bo_create(dev, LIBAGX_PRINTF_BUFFER_SIZE, 0,
+                                     AGX_BO_WRITEBACK, "Printf/abort");
+   if (!bo) {
+      fprintf(stderr, "Failed to allocate printf buffer\n");
+      goto fail;
+   }
 
    ret = agx_bo_bind(dev, bo, LIBAGX_PRINTF_BUFFER_ADDRESS,
                      LIBAGX_PRINTF_BUFFER_SIZE, 0,
                      DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE);
    if (ret) {
-      fprintf(stderr, "Failed to bind printf buffer");
-      return false;
+      fprintf(stderr, "Failed to bind printf buffer\n");
+      agx_bo_unreference(dev, bo);
+      goto fail;
    }
 
-   u_printf_init(&dev->printf, bo, agx_bo_map(bo));
+   void *printf_map = agx_bo_map(bo);
+   if (!printf_map) {
+      fprintf(stderr, "Failed to map printf buffer\n");
+      agx_bo_unreference(dev, bo);
+      goto fail;
+   }
+
+   u_printf_init(&dev->printf, bo, printf_map);
    /* Start only after initialization succeeds: no worker may outlive a
     * failed device open. All allocations made above are still idle. */
-   if (!agx_bo_cache_start(dev)) {
-      agx_finish_device(dev);
-      return false;
-   }
+   if (!agx_bo_cache_start(dev))
+      goto fail;
    return true;
+
+fail:
+   agx_finish_device(dev);
+   return false;
 }
 
 bool
 agx_apple9_entry_back(struct agx_device *dev, uint32_t end_B)
 {
    assert(end_B <= AGX_APPLE9_ENTRY_ARENA_SIZE);
+   simple_mtx_lock(&dev->apple9_entry_back_lock);
    for (unsigned i = 0; i * AGX_APPLE9_ENTRY_CHUNK_SIZE < end_B; ++i) {
       if (dev->apple9_entry_chunks[i])
          continue;
@@ -844,8 +900,10 @@ agx_apple9_entry_back(struct agx_device *dev, uint32_t end_B)
          agx_bo_create(dev, AGX_APPLE9_ENTRY_CHUNK_SIZE, 0,
                        AGX_BO_EXEC | AGX_BO_WRITEBACK | AGX_BO_READONLY,
                        "Apple9 shader entries");
-      if (!bo)
+      if (!bo) {
+         simple_mtx_unlock(&dev->apple9_entry_back_lock);
          return false;
+      }
 
       /* The chunk's place in the arena, read-only for the GPU. */
       uint32_t offset = i * AGX_APPLE9_ENTRY_CHUNK_SIZE;
@@ -853,11 +911,15 @@ agx_apple9_entry_back(struct agx_device *dev, uint32_t end_B)
                       AGX_APPLE9_ENTRY_CHUNK_SIZE, 0, DRM_ASAHI_BIND_READ) ||
           !agx_bo_map(bo)) {
          agx_bo_unreference(dev, bo);
+         simple_mtx_unlock(&dev->apple9_entry_back_lock);
          return false;
       }
 
+      simple_mtx_lock(&dev->apple9_entry_lock);
       dev->apple9_entry_chunks[i] = bo;
+      simple_mtx_unlock(&dev->apple9_entry_lock);
    }
+   simple_mtx_unlock(&dev->apple9_entry_back_lock);
    return true;
 }
 
@@ -889,11 +951,13 @@ agx_finish_device(struct agx_device *dev)
    agx_bo_unreference(dev, dev->printf.bo);
    agx_bo_unreference(dev, dev->zero_bo);
    agx_bo_unreference(dev, dev->scratch_bo);
-   u_printf_destroy(&dev->printf);
+   if (dev->printf.bo)
+      u_printf_destroy(&dev->printf);
    agx_bo_cache_finish(dev);
    agx_va_quarantine_finish(dev);
    util_vma_heap_finish(&dev->apple9_entry_heap);
    simple_mtx_destroy(&dev->apple9_entry_lock);
+   simple_mtx_destroy(&dev->apple9_entry_back_lock);
    util_sparse_array_finish(&dev->bo_map);
    pthread_mutex_destroy(&dev->bo_map_lock);
 
@@ -913,17 +977,18 @@ agx_close_device(struct agx_device *dev)
    dev->fd = -1;
 }
 
-uint32_t
+int
 agx_create_command_queue(struct agx_device *dev,
-                         enum drm_asahi_priority priority)
+                         enum drm_asahi_priority priority,
+                         uint32_t *queue_id_out)
 {
-
    if (dev->debug & AGX_DBG_1QUEUE) {
       // Abuse this lock for this, it's debug only anyway
       simple_mtx_lock(&dev->vma_lock);
       if (dev->queue_id) {
+         *queue_id_out = dev->queue_id;
          simple_mtx_unlock(&dev->vma_lock);
-         return dev->queue_id;
+         return 0;
       }
    }
 
@@ -936,8 +1001,11 @@ agx_create_command_queue(struct agx_device *dev,
    int ret =
       asahi_simple_ioctl(dev, DRM_IOCTL_ASAHI_QUEUE_CREATE, &queue_create);
    if (ret) {
+      int err = errno ? -errno : -EIO;
       fprintf(stderr, "DRM_IOCTL_ASAHI_QUEUE_CREATE failed: %m\n");
-      assert(0);
+      if (dev->debug & AGX_DBG_1QUEUE)
+         simple_mtx_unlock(&dev->vma_lock);
+      return err;
    }
 
    if (dev->debug & AGX_DBG_1QUEUE) {
@@ -945,7 +1013,8 @@ agx_create_command_queue(struct agx_device *dev,
       simple_mtx_unlock(&dev->vma_lock);
    }
 
-   return queue_create.queue_id;
+   *queue_id_out = queue_create.queue_id;
+   return 0;
 }
 
 int

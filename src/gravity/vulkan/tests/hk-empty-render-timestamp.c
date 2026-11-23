@@ -28,6 +28,7 @@ ctx_init(struct test_ctx *t)
    t->dev->dev.chip = AGX_CHIP_G16G;
    vk_object_base_init(&t->dev->vk, &t->cmd->vk.base,
                        VK_OBJECT_TYPE_COMMAND_BUFFER);
+   t->cmd->vk.state = MESA_VK_COMMAND_BUFFER_STATE_RECORDING;
    t->cmd->sync_events = UTIL_DYNARRAY_INIT;
    t->cmd->sync_remap = UTIL_DYNARRAY_INIT;
    t->cmd->sync_first_event = UTIL_DYNARRAY_INIT;

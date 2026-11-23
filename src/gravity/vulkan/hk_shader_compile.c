@@ -481,7 +481,11 @@ hk_apple9_fragment_dump_begin(const nir_shader *nir, struct blob *blob)
       return false;
    blob_init(blob);
    nir_serialize(blob, nir, false);
-   return !blob->out_of_memory;
+   if (blob->out_of_memory) {
+      blob_finish(blob);
+      return false;
+   }
+   return true;
 }
 
 static void

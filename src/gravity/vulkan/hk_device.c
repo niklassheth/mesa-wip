@@ -151,8 +151,13 @@ hk_usc_slab_create(void *data, uint64_t size, uint64_t reserve,
       "Immutable USC state");
    if (!bo)
       return false;
+   void *map = agx_bo_map(bo);
+   if (!map) {
+      agx_bo_unreference(&dev->dev, bo);
+      return false;
+   }
    *out = (struct hk_descriptor_backing){
-      .bo = bo, .addr = bo->va->addr, .map = agx_bo_map(bo), .size = bo->size,
+      .bo = bo, .addr = bo->va->addr, .map = map, .size = bo->size,
    };
    return true;
 }
@@ -382,9 +387,9 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    const char *path = drm_device->nodes[DRM_NODE_RENDER];
    dev->dev.fd = open(path, O_RDWR | O_CLOEXEC);
    if (dev->dev.fd < 0) {
-      drmFreeDevice(&drm_device);
       result = vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                          "failed to open device %s", path);
+      drmFreeDevice(&drm_device);
       goto fail_init;
    }
 
@@ -443,6 +448,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_samplers;
    }
    uint8_t *samplers = agx_bo_map(dev->apple9_fetch_sampler);
+   if (!samplers) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_samplers;
+   }
    memset(samplers, 0, 64 + AGX_APPLE9_SAMPLER_TABLE_STRIDE);
    agx_apple9_pack_fetch_sampler(samplers);
    agx_apple9_pack_sampler(samplers + 64, false, false, 1, 0, 14,
@@ -457,7 +466,12 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
       goto fail_samplers;
    }
-   hk_apple9_compute_sysvals(dev, agx_bo_map(dev->apple9_compute_sysvals));
+   void *sysvals_map = agx_bo_map(dev->apple9_compute_sysvals);
+   if (!sysvals_map) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_samplers;
+   }
+   hk_apple9_compute_sysvals(dev, sysvals_map);
 
    result = hk_upload_rodata(dev);
    if (result != VK_SUCCESS)

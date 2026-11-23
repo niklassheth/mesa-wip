@@ -176,6 +176,11 @@ struct agx_device {
    struct agx_va *apple9_entry_va;
    struct agx_bo *apple9_entry_chunks[AGX_APPLE9_ENTRY_CHUNKS];
    struct util_vma_heap apple9_entry_heap;
+   /* Lock ordering: apple9_entry_back_lock -> bo_map_lock -> apple9_entry_lock.
+    * Backing chunk allocation/binding must never run while holding
+    * apple9_entry_lock, since agx_bo_unreference takes bo_map_lock before
+    * agx_shader_body_finish takes apple9_entry_lock. */
+   simple_mtx_t apple9_entry_back_lock;
    simple_mtx_t apple9_entry_lock;
    /* Bodies holding an entry, least recently pinned first. */
    struct list_head apple9_entry_lru;
@@ -260,8 +265,9 @@ agx_rw_addr_to_ro(struct agx_device *dev, uint64_t addr)
 
 void agx_bo_note_cpu_write(struct agx_bo *bo, uint64_t offset, uint64_t size);
 
-/* Back the shader entry arena up to end_B, with apple9_entry_lock held (or
- * while opening the device). Returns false if a chunk cannot be allocated. */
+/* Back the shader entry arena up to end_B. Must NOT be called with
+ * apple9_entry_lock held (takes apple9_entry_back_lock -> bo_map_lock ->
+ * apple9_entry_lock). Returns false if a chunk cannot be allocated. */
 bool agx_apple9_entry_back(struct agx_device *dev, uint32_t end_B);
 /* Write size bytes at offset in the backed shader entry arena. */
 void agx_apple9_entry_write(struct agx_device *dev, uint32_t offset,
@@ -324,8 +330,9 @@ agx_lookup_bo(struct agx_device *dev, uint32_t handle)
    return util_sparse_array_get(&dev->bo_map, handle);
 }
 
-uint32_t agx_create_command_queue(struct agx_device *dev,
-                                  enum drm_asahi_priority priority);
+int agx_create_command_queue(struct agx_device *dev,
+                             enum drm_asahi_priority priority,
+                             uint32_t *queue_id_out);
 int agx_destroy_command_queue(struct agx_device *dev, uint32_t queue_id);
 
 int agx_import_sync_file(struct agx_device *dev, struct agx_bo *bo, int fd);

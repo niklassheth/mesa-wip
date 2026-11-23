@@ -224,8 +224,8 @@ hk_CreateDescriptorSetLayout(VkDevice device,
       vk_find_struct_const(pCreateInfo->pNext,
                            MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT);
 
-   uint32_t buffer_size = 0;
-   uint8_t dynamic_buffer_count = 0;
+   uint64_t buffer_size = 0;
+   uint64_t dynamic_buffer_count = 0;
    for (uint32_t b = 0; b < num_bindings; b++) {
       /* We stashed the pCreateInfo->pBindings[] index (plus one) in the
        * immutable_samplers pointer.  Check for NULL (empty binding) and then
@@ -313,11 +313,13 @@ hk_CreateDescriptorSetLayout(VkDevice device,
              * but the buffer size will be already aligned as this binding will
              * be the last
              */
-            buffer_size += stride * binding->descriptorCount;
+            buffer_size += (uint64_t)stride * binding->descriptorCount;
          }
       }
    }
 
+   assert(buffer_size <= UINT32_MAX);
+   assert(dynamic_buffer_count <= UINT8_MAX);
    layout->non_variable_descriptor_buffer_size = buffer_size;
    layout->descriptor_buffer = descriptor_buffer;
    layout->vk.dynamic_descriptor_count = dynamic_buffer_count;
@@ -367,8 +369,12 @@ hk_CreateDescriptorSetLayout(VkDevice device,
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
       layout->vk.destroy = hk_descriptor_set_layout_destroy;
-      hk_descriptor_pack_embedded_samplers(dev, layout,
-                                           agx_bo_map(layout->embedded_samplers));
+      void *sampler_map = agx_bo_map(layout->embedded_samplers);
+      if (!sampler_map) {
+         vk_descriptor_set_layout_unref(&dev->vk, &layout->vk);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      hk_descriptor_pack_embedded_samplers(dev, layout, sampler_map);
    }
 
    *pSetLayout = hk_descriptor_set_layout_to_handle(layout);
@@ -414,7 +420,7 @@ hk_GetDescriptorSetLayoutSupport(
    uint32_t variable_stride = 0;
    uint32_t variable_count = 0;
    bool variable_is_inline_uniform_block = false;
-   uint8_t dynamic_buffer_count = 0;
+   uint64_t dynamic_buffer_count = 0;
 
    for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
       const VkDescriptorSetLayoutBinding *binding = &pCreateInfo->pBindings[i];
@@ -456,7 +462,7 @@ hk_GetDescriptorSetLayoutSupport(
              * check for whether or not the max buffer size is big enough, we
              * keep non_variable_size aligned to max_align.
              */
-            non_variable_size += stride * binding->descriptorCount;
+            non_variable_size += (uint64_t)stride * binding->descriptorCount;
             non_variable_size = align64(non_variable_size, max_align);
          }
       }
@@ -464,7 +470,7 @@ hk_GetDescriptorSetLayoutSupport(
 
    uint64_t buffer_size = non_variable_size;
    if (variable_stride > 0) {
-      buffer_size += variable_stride * variable_count;
+      buffer_size += (uint64_t)variable_stride * variable_count;
       buffer_size = align64(buffer_size, max_align);
    }
 
@@ -484,9 +490,10 @@ hk_GetDescriptorSetLayoutSupport(
          VkDescriptorSetVariableDescriptorCountLayoutSupport *vs = ext;
          uint32_t max_var_count;
 
-         if (variable_stride > 0) {
-            max_var_count =
+         if (variable_stride > 0 && non_variable_size <= max_buffer_size) {
+            uint64_t count =
                (max_buffer_size - non_variable_size) / variable_stride;
+            max_var_count = (uint32_t)MIN2(count, UINT32_MAX);
          } else {
             max_var_count = 0;
          }

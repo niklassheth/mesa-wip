@@ -1532,20 +1532,31 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
    /* Use vectorized copies for as much of the buffer as possible. This requires
     * that dst, src, and size are all properly aligned. Failing to check for
     * alignment on the buffers causes subtle and hard-to-debug issues!
+    * Chunk large copies so 32-bit compute thread counts never overflow.
     */
    if (size >= 16 && (dst & 0xf) == 0 && (src & 0xf) == 0) {
-      unsigned uint4s = size / 16;
-      unsigned bytes = uint4s * 16;
+      const uint64_t max_uint4s = 1ull << 26; /* 1 GiB per dispatch */
+      uint64_t uint4s = size / 16;
+      while (uint4s > 0) {
+         uint32_t chunk = (uint32_t)MIN2(uint4s, max_uint4s);
+         uint64_t bytes = (uint64_t)chunk * 16;
 
-      libagx_copy_uint4(cmd, agx_1d(uint4s), AGX_BARRIER_ALL, dst, src);
+         libagx_copy_uint4(cmd, agx_1d(chunk), AGX_BARRIER_ALL, dst, src);
 
-      dst += bytes;
-      src += bytes;
-      size -= bytes;
+         dst += bytes;
+         src += bytes;
+         size -= bytes;
+         uint4s -= chunk;
+      }
    }
 
-   if (size) {
-      libagx_copy_uchar(cmd, agx_1d(size), AGX_BARRIER_ALL, dst, src);
+   const uint64_t max_bytes = 1ull << 28; /* 256 MiB per dispatch */
+   while (size > 0) {
+      uint32_t chunk = (uint32_t)MIN2(size, max_bytes);
+      libagx_copy_uchar(cmd, agx_1d(chunk), AGX_BARRIER_ALL, dst, src);
+      dst += chunk;
+      src += chunk;
+      size -= chunk;
    }
    cmd->merge_move_stage = saved_move;
    cmd->sync_scope = saved_scope;
@@ -1700,10 +1711,24 @@ hk_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
                            VK_PIPELINE_STAGE_2_COPY_BIT;
 
    if (util_is_aligned(addr, 16) && util_is_aligned(range, 16)) {
-      libagx_fill_uint4(cmd, agx_2d(range / 16, 1), AGX_BARRIER_ALL,
-                        addr, 0, data, data, data, data);
+      const uint64_t max_uint4s = 1ull << 26; /* 1 GiB per dispatch */
+      uint64_t uint4s = range / 16;
+      while (uint4s > 0) {
+         uint32_t chunk = (uint32_t)MIN2(uint4s, max_uint4s);
+         libagx_fill_uint4(cmd, agx_2d(chunk, 1), AGX_BARRIER_ALL,
+                           addr, 0, data, data, data, data);
+         addr += (uint64_t)chunk * 16;
+         uint4s -= chunk;
+      }
    } else {
-      libagx_fill(cmd, agx_1d(range / 4), AGX_BARRIER_ALL, addr, data);
+      const uint64_t max_u32s = 1ull << 28; /* 1 GiB per dispatch */
+      uint64_t u32s = range / 4;
+      while (u32s > 0) {
+         uint32_t chunk = (uint32_t)MIN2(u32s, max_u32s);
+         libagx_fill(cmd, agx_1d(chunk), AGX_BARRIER_ALL, addr, data);
+         addr += (uint64_t)chunk * 4;
+         u32s -= chunk;
+      }
    }
    cmd->merge_move_stage = saved_move;
    cmd->sync_scope = saved_scope;

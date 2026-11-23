@@ -91,7 +91,8 @@ uint64_t agx_best_modifiers[] = {
 
 static VkFormatFeatureFlags2
 hk_modifier_features(const struct agx_device *dev, uint64_t mod,
-                     VkFormat vk_format, const VkFormatProperties *props)
+                     VkFormat vk_format, VkFormatFeatureFlags2 linear2,
+                     VkFormatFeatureFlags2 optimal2)
 {
    /* There's no corresponding fourcc, so don't advertise modifiers */
    if (vk_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
@@ -105,9 +106,9 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
       return 0;
 
    if (mod == DRM_FORMAT_MOD_LINEAR)
-      return props->linearTilingFeatures;
+      return linear2;
 
-   VkFormatFeatureFlags2 features = props->optimalTilingFeatures;
+   VkFormatFeatureFlags2 features = optimal2;
 
    /* Compressed images are never storage images (ail writeable_image). */
    if (mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED)
@@ -122,7 +123,8 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
 static void
 get_drm_format_modifier_properties_list(
    const struct hk_physical_device *physical_device, VkFormat vk_format,
-   VkDrmFormatModifierPropertiesListEXT *list, const VkFormatProperties *props)
+   VkDrmFormatModifierPropertiesListEXT *list, VkFormatFeatureFlags2 linear2,
+   VkFormatFeatureFlags2 optimal2)
 {
    VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierPropertiesEXT, out,
                           list->pDrmFormatModifierProperties,
@@ -131,7 +133,8 @@ get_drm_format_modifier_properties_list(
    for (unsigned i = 0; i < ARRAY_SIZE(agx_best_modifiers); ++i) {
       uint64_t mod = agx_best_modifiers[i];
       VkFormatFeatureFlags2 flags =
-         hk_modifier_features(&physical_device->dev, mod, vk_format, props);
+         hk_modifier_features(&physical_device->dev, mod, vk_format, linear2,
+                              optimal2);
 
       if (!flags)
          continue;
@@ -142,7 +145,8 @@ get_drm_format_modifier_properties_list(
          *out_props = (VkDrmFormatModifierPropertiesEXT){
             .drmFormatModifier = mod,
             .drmFormatModifierPlaneCount = vk_format_get_plane_count(vk_format),
-            .drmFormatModifierTilingFeatures = flags,
+            .drmFormatModifierTilingFeatures =
+               vk_format_features2_to_features(flags),
          };
       };
    }
@@ -151,7 +155,8 @@ get_drm_format_modifier_properties_list(
 static void
 get_drm_format_modifier_properties_list_2(
    const struct hk_physical_device *physical_device, VkFormat vk_format,
-   VkDrmFormatModifierPropertiesList2EXT *list, const VkFormatProperties *props)
+   VkDrmFormatModifierPropertiesList2EXT *list, VkFormatFeatureFlags2 linear2,
+   VkFormatFeatureFlags2 optimal2)
 {
    VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierProperties2EXT, out,
                           list->pDrmFormatModifierProperties,
@@ -160,7 +165,8 @@ get_drm_format_modifier_properties_list_2(
    for (unsigned i = 0; i < ARRAY_SIZE(agx_best_modifiers); ++i) {
       uint64_t mod = agx_best_modifiers[i];
       VkFormatFeatureFlags2 flags =
-         hk_modifier_features(&physical_device->dev, mod, vk_format, props);
+         hk_modifier_features(&physical_device->dev, mod, vk_format, linear2,
+                              optimal2);
 
       if (!flags)
          continue;
@@ -208,13 +214,13 @@ hk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
       }
 
       case VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT:
-         get_drm_format_modifier_properties_list(
-            pdevice, format, ext, &pFormatProperties->formatProperties);
+         get_drm_format_modifier_properties_list(pdevice, format, ext, linear2,
+                                                 optimal2);
          break;
 
       case VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT:
-         get_drm_format_modifier_properties_list_2(
-            pdevice, format, ext, &pFormatProperties->formatProperties);
+         get_drm_format_modifier_properties_list_2(pdevice, format, ext,
+                                                   linear2, optimal2);
          break;
 
       default:

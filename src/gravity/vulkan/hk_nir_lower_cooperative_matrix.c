@@ -55,6 +55,8 @@ remap_matrix_type(struct hk_lower_cmat_ctx *ctx, const struct glsl_type *orig)
       if (changed) {
          struct glsl_struct_field *fields =
             malloc(sizeof(*fields) * num_fields);
+         if (!fields)
+            return orig;
          for (unsigned i = 0; i < num_fields; ++i) {
             fields[i] = *glsl_get_struct_field_data(orig, i);
             fields[i].type = remap_matrix_type(ctx, fields[i].type);

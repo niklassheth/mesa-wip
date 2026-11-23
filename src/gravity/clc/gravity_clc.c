@@ -87,6 +87,10 @@ compile(void *memctx, const uint32_t *spirv, size_t spirv_size)
    nir_shader *nir =
       spirv_to_nir(spirv, spirv_size / 4, NULL, MESA_SHADER_KERNEL, "library",
                    &spirv_options, nir_options);
+   if (!nir) {
+      fprintf(stderr, "Failed to translate SPIR-V to NIR\n");
+      return NULL;
+   }
    nir_validate_shader(nir, "after spirv_to_nir");
    ralloc_steal(memctx, nir);
 
@@ -219,12 +223,29 @@ main(int argc, char **argv)
 
    FILE *fp_h = fopen(outh_file, "w");
    FILE *fp_c = fopen(outc_file, "w");
+   if (!fp_h || !fp_c) {
+      fprintf(stderr, "Failed to open output file(s): %s / %s\n", outh_file,
+              outc_file);
+      if (fp_h)
+         fclose(fp_h);
+      if (fp_c)
+         fclose(fp_c);
+      ralloc_free(mem_ctx);
+      return 1;
+   }
    glsl_type_singleton_init_or_ref();
 
    nir_precomp_print_header(fp_c, fp_h, "The Asahi Linux Contributors",
                             "libagx_shaders.h");
 
    nir_shader *nir = compile(mem_ctx, spirv_map, spirv_len);
+   if (!nir) {
+      glsl_type_singleton_decref();
+      fclose(fp_c);
+      fclose(fp_h);
+      ralloc_free(mem_ctx);
+      return 1;
+   }
 
    /* load_preamble works at 16-bit granularity */
    struct nir_precomp_opts opt = {.arg_align_B = 2};
@@ -319,8 +340,16 @@ main(int argc, char **argv)
    nir_precomp_print_binary_map(fp_c, nir, "libagx", "nir", NULL);
 
    glsl_type_singleton_decref();
-   fclose(fp_c);
-   fclose(fp_h);
+   bool io_err = ferror(fp_c) || ferror(fp_h);
+   if (fclose(fp_c) != 0)
+      io_err = true;
+   if (fclose(fp_h) != 0)
+      io_err = true;
    ralloc_free(mem_ctx);
+   if (io_err) {
+      fprintf(stderr, "Failed to write output file(s): %s / %s\n", outh_file,
+              outc_file);
+      return 1;
+   }
    return 0;
 }

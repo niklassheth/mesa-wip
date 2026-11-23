@@ -567,8 +567,9 @@ hk_apple9_dispatch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    /* Reserve the emitted record and any preceding helper flush together.
     * The space check also adds stream-link and overread padding.
     */
-   hk_ensure_cs_has_space(cmd, cs, record_size +
-                         (flush_before ? AGX_CDM_BARRIER_LENGTH : 0));
+   if (!hk_ensure_cs_has_space(cmd, cs, record_size +
+                              (flush_before ? AGX_CDM_BARRIER_LENGTH : 0)))
+      return;
    if (flush_before)
       hk_cdm_cache_flush(dev, cs);
    if (agx_is_indirect(grid))
@@ -635,18 +636,6 @@ dispatch(struct hk_cmd_buffer *cmd, struct agx_grid grid)
    cmd->merge_move_stage = saved_move;
    if (!cs)
       return;
-   uint64_t stat = hk_pipeline_stat_addr(
-      cmd, VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT);
-   if (hk_stat_enabled(stat)) {
-      unsigned saved_scope = cmd->sync_scope;
-      cmd->sync_scope = HK_SYNC_COMPUTE | HK_SYNC_DISPATCH_INDIRECT;
-      libagx_increment_cs_invocations(
-         cmd, agx_1d(1), AGX_BARRIER_ALL,
-         cmd->state.cs.descriptors.root.cs.group_count_addr, stat,
-         s->info.apple9.local_size[0] * s->info.apple9.local_size[1] *
-            s->info.apple9.local_size[2]);
-      cmd->sync_scope = saved_scope;
-   }
    if (hk_cond_render_applies(cmd)) {
       /* Predicated dispatches read zero group counts when skipped. */
       struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
@@ -660,6 +649,21 @@ dispatch(struct hk_cmd_buffer *cmd, struct agx_grid grid)
       if (!cs)
          return;
    }
+   uint64_t stat = hk_pipeline_stat_addr(
+      cmd, VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT);
+   if (hk_stat_enabled(stat)) {
+      unsigned saved_scope = cmd->sync_scope;
+      cmd->sync_scope = HK_SYNC_COMPUTE | HK_SYNC_DISPATCH_INDIRECT;
+      libagx_increment_cs_invocations(
+         cmd, agx_1d(1), AGX_BARRIER_ALL,
+         cmd->state.cs.descriptors.root.cs.group_count_addr, stat,
+         s->info.apple9.local_size[0] * s->info.apple9.local_size[1] *
+            s->info.apple9.local_size[2]);
+      cmd->sync_scope = saved_scope;
+      cs = hk_cmd_buffer_get_cs(cmd, true);
+      if (!cs)
+         return;
+   }
    if (!agx_is_indirect(grid)) {
       for (unsigned d = 0; d < 3; ++d)
          grid.count[d] *= s->info.apple9.local_size[d];
@@ -669,9 +673,12 @@ dispatch(struct hk_cmd_buffer *cmd, struct agx_grid grid)
    hk_apple9_dispatch(cmd, cs, s->apple9_body, &s->info.apple9, grid, root, s, NULL);
    cmd->api_dispatch = false;
    static int split = -1;
-   if (split < 0)
-      split = getenv("HK_GPU_PASS_SPLIT") != NULL;
-   if (split && !cmd->in_meta) {
+   int do_split = __atomic_load_n(&split, __ATOMIC_RELAXED);
+   if (do_split < 0) {
+      do_split = getenv("HK_GPU_PASS_SPLIT") != NULL;
+      __atomic_store_n(&split, do_split, __ATOMIC_RELAXED);
+   }
+   if (do_split && !cmd->in_meta) {
       hk_cs_end_hint(cmd, HK_CS_END_PASS_SPLIT);
       hk_cmd_buffer_end_compute(cmd);
    }
@@ -884,7 +891,11 @@ hk_tess_batch_flush(struct hk_cmd_buffer *cmd)
       bool first = true;
       while (data < end) {
          unsigned size = *data++;
-         hk_ensure_cs_has_space(cmd, cs, size + 2 * AGX_CDM_BARRIER_LENGTH);
+         if (!hk_ensure_cs_has_space(cmd, cs, size + 2 * AGX_CDM_BARRIER_LENGTH)) {
+            for (unsigned r = l; r < HK_TESS_BATCH_LANES; ++r)
+               util_dynarray_clear(&cmd->tess_batch.lane[r]);
+            return;
+         }
          /* Whatever came before the batch must be complete. */
          if (first && cs->cdm_dirty && !cs->cdm_compute_barrier)
             hk_cdm_cache_flush(dev, cs);

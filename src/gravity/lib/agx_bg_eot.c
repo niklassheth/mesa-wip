@@ -58,7 +58,14 @@ agx_compile_apple9_precompiled(struct agx_bg_eot_cache *cache,
       free(part.binary);
       return false;
    }
-   memcpy(agx_bo_map(p->bo), part.binary, part.info.binary_size);
+   void *map = agx_bo_map(p->bo);
+   if (!map) {
+      agx_bo_unreference(cache->dev, p->bo);
+      p->bo = NULL;
+      free(part.binary);
+      return false;
+   }
+   memcpy(map, part.binary, part.info.binary_size);
    agx_bo_note_cpu_write(p->bo, 0, part.info.binary_size);
    p->ptr = p->bo->va->addr;
    free(part.binary);
@@ -78,6 +85,8 @@ agx_get_precompiled_locked(struct agx_bg_eot_cache *cache, unsigned program)
 
    struct agx_precompiled_shader *p =
       rzalloc(cache->mem_ctx, struct agx_precompiled_shader);
+   if (!p)
+      return NULL;
 
    if (!agx_compile_apple9_precompiled(cache, p, program)) {
       ralloc_free(p);

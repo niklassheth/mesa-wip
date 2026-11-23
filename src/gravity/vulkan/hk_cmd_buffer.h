@@ -1202,7 +1202,7 @@ hk_cmd_flush_empty_clears(struct hk_cmd_buffer *cmd)
 #define HK_HEAP_DECAY_NS       (10ull * 1000 * 1000 * 1000)
 
 uint64_t hk_heap(struct hk_cmd_buffer *cmd);
-void hk_heap_prepare_submit(struct hk_device *dev, uint64_t min_B);
+VkResult hk_heap_prepare_submit(struct hk_device *dev, uint64_t min_B);
 
 size_t hk_apple9_graphics_root_size(const struct hk_device *dev);
 
@@ -1346,13 +1346,14 @@ hk_cmd_buffer_get_cs(struct hk_cmd_buffer *cmd, bool compute)
    return hk_cmd_buffer_get_cs_general(cmd, ptr, compute, stages);
 }
 
-void hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+bool hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                             size_t space);
 
 static inline uint64_t
 hk_cs_alloc_for_indirect(struct hk_cs *cs, size_t size_B)
 {
-   hk_ensure_cs_has_space(cs->cmd, cs, size_B);
+   if (!hk_ensure_cs_has_space(cs->cmd, cs, size_B))
+      return 0;
 
    uint64_t addr = hk_cs_current_addr(cs);
    cs->current += size_B;

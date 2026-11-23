@@ -800,7 +800,7 @@ lower_ssbo_resource_index(nir_builder *b, nir_intrinsic_instr *intrin,
       get_binding_layout(set, binding, ctx);
 
    nir_def *binding_addr;
-   uint8_t binding_stride;
+   uint32_t binding_stride;
    switch (binding_layout->type) {
    case VK_DESCRIPTOR_TYPE_MUTABLE_EXT:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
@@ -837,8 +837,12 @@ lower_ssbo_resource_index(nir_builder *b, nir_intrinsic_instr *intrin,
       UNREACHABLE("Not an SSBO descriptor");
    }
 
-   /* Tuck the stride in the top 8 bits of the binding address */
-   binding_addr = nir_ior_imm(b, binding_addr, (uint64_t)binding_stride << 56);
+   /* Tuck the stride (in 16-byte units, supporting up to 4080B mutable
+    * descriptors including 256B combined-image-sampler+SSBO slots) in the top
+    * 8 bits of the binding address. */
+   assert(binding_stride % 16 == 0 && (binding_stride >> 4) <= UINT8_MAX);
+   binding_addr =
+      nir_ior_imm(b, binding_addr, (uint64_t)(binding_stride >> 4) << 56);
 
    const uint32_t binding_size = binding_layout->array_size * binding_stride;
    nir_def *offset_in_binding = nir_amul_imm(b, index, binding_stride);
@@ -866,7 +870,7 @@ lower_ssbo_resource_reindex(nir_builder *b, nir_intrinsic_instr *intrin,
    nir_def *index = intrin->src[1].ssa;
 
    nir_def *addr_high32 = nir_channel(b, addr, 1);
-   nir_def *stride = nir_ushr_imm(b, addr_high32, 24);
+   nir_def *stride = nir_ishl_imm(b, nir_ushr_imm(b, addr_high32, 24), 4);
    nir_def *offset = nir_imul(b, index, stride);
 
    addr = nir_build_addr_iadd(b, addr, ctx->ssbo_addr_format, nir_var_mem_ssbo,

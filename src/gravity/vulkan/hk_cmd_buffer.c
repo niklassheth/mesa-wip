@@ -51,16 +51,14 @@ hk_descriptor_state_fini(struct hk_cmd_buffer *cmd,
    }
 }
 
-/* Called only after reset, or when trimming an already initial buffer. GPU
- * storage has been released; discard CPU high-water marks on explicit trim. */
-void
-hk_trim_cmd_buffer(struct hk_cmd_buffer *cmd)
+static void
+hk_fini_cmd_buffer_storage(struct hk_cmd_buffer *cmd)
 {
-   assert(cmd->vk.state == MESA_VK_COMMAND_BUFFER_STATE_INITIAL);
    struct util_dynarray *arrays[] = {
       &cmd->large_bos, &cmd->implicit_sync_res, &cmd->query_adds,
       &cmd->query_writes, &cmd->occlusion_accum, &cmd->sync_events,
       &cmd->sync_remap, &cmd->sync_first_event, &cmd->empty_barriers,
+      &cmd->feedback_raw, &cmd->cdm_narrow_barriers,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(arrays); ++i)
       util_dynarray_fini(arrays[i]);
@@ -71,6 +69,15 @@ hk_trim_cmd_buffer(struct hk_cmd_buffer *cmd)
    cmd->apple9_pinned = NULL;
    free(cmd->merge_empty_render);
    cmd->merge_empty_render = NULL;
+}
+
+/* Called only after reset, or when trimming an already initial buffer. GPU
+ * storage has been released; discard CPU high-water marks on explicit trim. */
+void
+hk_trim_cmd_buffer(struct hk_cmd_buffer *cmd)
+{
+   assert(cmd->vk.state == MESA_VK_COMMAND_BUFFER_STATE_INITIAL);
+   hk_fini_cmd_buffer_storage(cmd);
 }
 
 static void
@@ -111,9 +118,10 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd, bool release)
    util_dynarray_clear(&cmd->empty_barriers);
    util_dynarray_clear(&cmd->sync_remap);
    util_dynarray_clear(&cmd->sync_first_event);
+   util_dynarray_clear(&cmd->feedback_raw);
+   util_dynarray_clear(&cmd->cdm_narrow_barriers);
    if (release)
       hk_trim_cmd_buffer(cmd);
-   util_dynarray_clear(&cmd->feedback_raw);
 }
 
 void
@@ -169,22 +177,7 @@ hk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
 
    hk_free_resettable_cmd_buffer(cmd, false);
-   _mesa_set_destroy(cmd->apple9_pinned, NULL);
-   util_dynarray_fini(&cmd->large_bos);
-   util_dynarray_fini(&cmd->implicit_sync_res);
-   util_dynarray_fini(&cmd->query_adds);
-   util_dynarray_fini(&cmd->query_writes);
-   util_dynarray_fini(&cmd->occlusion_accum);
-   util_dynarray_fini(&cmd->sync_events);
-   util_dynarray_fini(&cmd->empty_barriers);
-   for (unsigned i = 0; i < HK_TESS_BATCH_LANES; ++i)
-      util_dynarray_fini(&cmd->tess_batch.lane[i]);
-   util_dynarray_fini(&cmd->tess_batch.fold);
-   util_dynarray_fini(&cmd->sync_remap);
-   util_dynarray_fini(&cmd->sync_first_event);
-   util_dynarray_fini(&cmd->feedback_raw);
-   util_dynarray_fini(&cmd->cdm_narrow_barriers);
-   free(cmd->merge_empty_render);
+   hk_fini_cmd_buffer_storage(cmd);
    vk_command_buffer_finish(&cmd->vk);
    vk_free(&pool->vk.alloc, cmd);
 }
@@ -349,10 +342,23 @@ hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
          return (struct agx_ptr){0};
       }
 
-      util_dynarray_append(&cmd->large_bos, bo);
+      void *map = agx_bo_map(bo);
+      if (!map) {
+         agx_bo_unreference(&dev->dev, bo);
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return (struct agx_ptr){0};
+      }
+
+      struct agx_bo **slot = util_dynarray_grow(&cmd->large_bos, struct agx_bo *, 1);
+      if (!slot) {
+         agx_bo_unreference(&dev->dev, bo);
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return (struct agx_ptr){0};
+      }
+      *slot = bo;
       return (struct agx_ptr){
          .gpu = bo->va->addr,
-         .cpu = agx_bo_map(bo),
+         .cpu = map,
       };
    }
 
@@ -431,7 +437,7 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
                       const VkCommandBufferBeginInfo *pBeginInfo)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
-   hk_reset_cmd_buffer(&cmd->vk, 0);
+   vk_command_buffer_begin(&cmd->vk, pBeginInfo);
 
    perf_debug(cmd, "Begin command buffer");
    hk_cmd_buffer_begin_compute(cmd, pBeginInfo);
@@ -443,7 +449,12 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 void
 hk_cmd_record_narrow_cdm_barrier(struct hk_cmd_buffer *cmd, uint32_t *word)
 {
-   util_dynarray_append(&cmd->cdm_narrow_barriers, word);
+   uint32_t **slot = util_dynarray_grow(&cmd->cdm_narrow_barriers, uint32_t *, 1);
+   if (!slot) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+   *slot = word;
 }
 
 void
@@ -529,7 +540,7 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
       }
    }
 
-   return vk_command_buffer_get_record_result(&cmd->vk);
+   return vk_command_buffer_end(&cmd->vk);
 }
 
 void
@@ -974,7 +985,8 @@ hk_cmd_sync_barrier_group(struct hk_cmd_buffer *cmd,
        * need the full flush.
        */
       struct hk_device *dev = hk_cmd_buffer_device(cmd);
-      hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
+      if (!hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH))
+         return;
       if (!(dst_stages & HK_SYNC_DISPATCH_INDIRECT) &&
           !(dst & VK_PIPELINE_STAGE_2_HOST_BIT) &&
           !hk_device_has_va_alias(dev))
@@ -1684,7 +1696,7 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    hk_cmd_buffer_dirty_all(cmd);
 }
 
-void
+bool
 hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                        size_t space)
 {
@@ -1705,7 +1717,7 @@ hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    /* If there is room in the command buffer, we're done */
    if (likely((cs->end - cs->current) >= space))
-      return;
+      return true;
 
    /* Otherwise, we need to allocate a new command buffer. We use memory owned
     * by the batch to simplify lifetime management for the BO.
@@ -1713,7 +1725,7 @@ hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    size_t size = 65536;
    struct agx_ptr T = hk_pool_cs_alloc(cmd, size, 256, !vdm);
    if (!T.cpu)
-      return;
+      return false;
 
    /* Native VDM continuation pointers are relative to the render context. */
    uint64_t target = T.gpu;
@@ -1729,6 +1741,7 @@ hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs->end = cs->current + size;
    cs->chunk = T;
    cs->stream_linked = true;
+   return true;
 }
 
 static void

@@ -455,6 +455,7 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
                      const VkBindBufferMemoryInfo *pBindInfos)
 {
    VK_FROM_HANDLE(hk_device, dev, device);
+   VkResult result = VK_SUCCESS;
    for (uint32_t i = 0; i < bindInfoCount; ++i) {
       VK_FROM_HANDLE(hk_device_memory, mem, pBindInfos[i].memory);
       VK_FROM_HANDLE(hk_buffer, buffer, pBindInfos[i].buffer);
@@ -486,6 +487,7 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
          }
       }
 
+      VkResult bind_res = VK_SUCCESS;
       if (buffer->va) {
          size_t size = MIN2(mem->bo->size - pBindInfos[i].memoryOffset,
                             buffer->va->size_B);
@@ -494,33 +496,37 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
          int ret = agx_bo_bind(&dev->dev, mem->bo, buffer->vk.device_address,
                                size, pBindInfos[i].memoryOffset,
                                DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE);
-         if (ret)
-            return VK_ERROR_UNKNOWN;
-
-         /* Apple9 index aliases and USC-aperture buffers need only one
-          * read-write mapping. */
-         if (!buffer->apple9_index_va &&
-             hk_va_has_ro_shadow(dev, buffer->vk.device_address)) {
+         if (ret) {
+            bind_res = vk_error(dev, VK_ERROR_UNKNOWN);
+         } else if (!buffer->apple9_index_va &&
+                    hk_va_has_ro_shadow(dev, buffer->vk.device_address)) {
             /* Upper mapping: read-only */
             ret =
                agx_bo_bind(&dev->dev, mem->bo,
                            buffer->vk.device_address + dev->dev.sparse_ro_offset,
                            size, pBindInfos[i].memoryOffset, DRM_ASAHI_BIND_READ);
-            if (ret)
-               return VK_ERROR_UNKNOWN;
+            if (ret) {
+               agx_bo_bind(&dev->dev, NULL, buffer->vk.device_address, size, 0,
+                           DRM_ASAHI_BIND_UNBIND);
+               bind_res = vk_error(dev, VK_ERROR_UNKNOWN);
+            }
          }
       }
 
-      hk_memory_record_va_bind(dev, mem, pBindInfos[i].memoryOffset,
-                               buffer->vk.size, buffer->vk.device_address,
-                               &buffer->va_bind_bo_key, &buffer->va_bind_id);
+      if (bind_res == VK_SUCCESS) {
+         hk_memory_record_va_bind(dev, mem, pBindInfos[i].memoryOffset,
+                                  buffer->vk.size, buffer->vk.device_address,
+                                  &buffer->va_bind_bo_key, &buffer->va_bind_id);
+      } else if (result == VK_SUCCESS) {
+         result = bind_res;
+      }
 
       const VkBindMemoryStatusKHR *status =
          vk_find_struct_const(pBindInfos[i].pNext, BIND_MEMORY_STATUS_KHR);
       if (status != NULL && status->pResult != NULL)
-         *status->pResult = VK_SUCCESS;
+         *status->pResult = bind_res;
    }
-   return VK_SUCCESS;
+   return result;
 }
 
 VKAPI_ATTR uint64_t VKAPI_CALL

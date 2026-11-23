@@ -117,7 +117,13 @@ hk_apple9_tile_helper(struct hk_device *dev,
       free(created);
       goto done;
    }
-   memcpy(agx_bo_map(created->bo), part.binary, part.info.binary_size);
+   void *map = agx_bo_map(created->bo);
+   if (!map) {
+      agx_bo_unreference(&dev->dev, created->bo);
+      free(created);
+      goto done;
+   }
+   memcpy(map, part.binary, part.info.binary_size);
    agx_bo_note_cpu_write(created->bo, 0, part.info.binary_size);
    agx_apple9_stage_launch_cache_init(&created->launch);
    if (!_mesa_hash_table_insert(ht, &created->key, created)) {
@@ -2287,7 +2293,8 @@ hk_apple9_try_cached_draw(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       desc->root_dirty = false;
    }
 
-   hk_ensure_cs_has_space(cmd, cs, 256);
+   if (!hk_ensure_cs_has_space(cmd, cs, 256))
+      return true;
    const uint8_t *before = cs->current;
    hk_apple9_emit_ordinary_draw(cs, pipeline, draw);
    if (!hk_apple9_check_native_block(cmd, cs, before))
@@ -3431,7 +3438,8 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    pipeline.ppp_viewport_words = record->ppp_viewport_words;
    pipeline.vertex_launch = record->launch[0] / 0x40;
    pipeline.pipeline_word = 0x01000000;
-   hk_ensure_cs_has_space(cmd, cs, 256);
+   if (!hk_ensure_cs_has_space(cmd, cs, 256))
+      goto cleanup;
    if (!hk_apple9_record_draw(cmd, cs, &pipeline, draw, native_grid,
                                mesh, shaders[0], record)) {
       if (vk_command_buffer_has_error(&cmd->vk))

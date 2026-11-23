@@ -335,22 +335,27 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
     * sync-file snapshots until retirement. Do this for every ioctl slice.
     */
    struct drm_asahi_submit tracked_submit = *submit;
+   STACK_ARRAY(struct drm_asahi_sync, tracked_syncs,
+               queue->completion_initialized
+                  ? submit->in_sync_count + submit->out_sync_count + 1
+                  : 0);
    if (queue->completion_initialized) {
       unsigned count = submit->in_sync_count + submit->out_sync_count;
-      struct drm_asahi_sync *syncs = alloca((count + 1) * sizeof(*syncs));
       if (count)
-         memcpy(syncs, (const void *)(uintptr_t)submit->syncs,
-                count * sizeof(*syncs));
-      syncs[count] = (struct drm_asahi_sync){
+         memcpy(tracked_syncs, (const void *)(uintptr_t)submit->syncs,
+                count * sizeof(*tracked_syncs));
+      tracked_syncs[count] = (struct drm_asahi_sync){
          .sync_type = DRM_ASAHI_SYNC_SYNCOBJ,
          .handle = queue->completion.syncobj,
       };
-      tracked_submit.syncs = (uint64_t)(uintptr_t)syncs;
+      tracked_submit.syncs = (uint64_t)(uintptr_t)tracked_syncs;
       tracked_submit.out_sync_count++;
       submit = &tracked_submit;
 
-      if (hk_queue_completion_begin(&queue->completion) < 0)
+      if (hk_queue_completion_begin(&queue->completion) < 0) {
+         STACK_ARRAY_FINISH(tracked_syncs);
          return VK_ERROR_DEVICE_LOST;
+      }
    }
 
 #ifdef HK_WAIT_WATCHDOG
@@ -394,6 +399,7 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
     * a command is invalid. Either way the queue cannot make progress: report
     * device loss rather than silently dropping the work.
     */
+   STACK_ARRAY_FINISH(tracked_syncs);
    if (ret) {
       mesa_loge("DRM_IOCTL_ASAHI_SUBMIT failed: %s", strerror(submit_errno));
       return VK_ERROR_DEVICE_LOST;
@@ -540,6 +546,10 @@ hk_flush_bind(struct hk_bind_builder *b)
     */
    if (b->buffer && b->buffer->apple9_residency != NULL) {
       uint8_t *r = agx_bo_map(b->buffer->apple9_residency);
+      if (!r) {
+         b->result = vk_error(b->dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return b->result;
+      }
       uint64_t first_page = b->resourceOffset / AIL_PAGESIZE;
       uint64_t end_page =
          MIN2(DIV_ROUND_UP(b->resourceOffset + b->size, AIL_PAGESIZE),
@@ -553,6 +563,10 @@ hk_flush_bind(struct hk_bind_builder *b)
       assert(b->image->plane_count == 1 && "multiplane sparse not supported");
 
       uint32_t *map = agx_bo_map(b->image->planes[0].sparse_map);
+      if (!map) {
+         b->result = vk_error(b->dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return b->result;
+      }
       uint64_t size_page = ail_bytes_to_pages(b->size);
 
       struct ail_layout *layout = &b->image->planes[0].layout;
@@ -649,16 +663,20 @@ hk_flush_bind(struct hk_bind_builder *b)
    return VK_SUCCESS;
 }
 
-static int
+static VkResult
 hk_bind_builder_finish(struct hk_bind_builder *b)
 {
    hk_flush_bind(b);
 
    /* Submit everything to the kernel at once */
-   if (b->binds.size > 0) {
-      b->dev->dev.ops.bo_bind(
+   if (b->result == VK_SUCCESS && b->binds.size > 0) {
+      int ret = b->dev->dev.ops.bo_bind(
          &b->dev->dev, b->binds.data,
          util_dynarray_num_elements(&b->binds, struct drm_asahi_gem_bind_op));
+      if (ret) {
+         b->result = vk_errorf(b->dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                               "Sparse VM bind failed: %m");
+      }
    }
 
    util_dynarray_fini(&b->binds);
@@ -1039,6 +1057,13 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    /* TODO: Support asynchronous sparse queue? */
    if (submit->buffer_bind_count || submit->image_bind_count ||
        submit->image_opaque_bind_count) {
+      if (submit->wait_count > 0) {
+         VkResult wait_res =
+            vk_sync_wait_many(&dev->vk, submit->wait_count, submit->waits,
+                              VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+         if (wait_res != VK_SUCCESS)
+            return wait_res;
+      }
 
       VkResult result = hk_queue_submit_bind_sparse_memory(dev, submit);
       if (result != VK_SUCCESS)
@@ -1088,9 +1113,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    }
 
    unsigned wait_count = 0;
-   struct drm_asahi_sync *syncs =
-      alloca((submit->wait_count + submit->signal_count + 1) *
-             sizeof(struct drm_asahi_sync));
+   STACK_ARRAY(struct drm_asahi_sync, syncs,
+               submit->wait_count + submit->signal_count + 1);
 
    for (unsigned i = 0; i < submit->wait_count; ++i) {
       /* The kernel rejects the submission if we try to wait on the same
@@ -1102,9 +1126,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
        */
       bool skip = false;
       if (submit->waits[i].sync->flags & VK_SYNC_IS_TIMELINE) {
-         uint32_t v1 = submit->waits[i].wait_value;
+         uint64_t v1 = submit->waits[i].wait_value;
          for (unsigned j = 0; j < submit->wait_count; ++j) {
-            uint32_t v2 = submit->waits[j].wait_value;
+            uint64_t v2 = submit->waits[j].wait_value;
             if (i != j && submit->waits[i].sync == submit->waits[j].sync &&
                 (v1 < v2 || (v1 == v2 && i < j))) {
                skip = true;
@@ -1151,6 +1175,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
          hk_resolve_sync(cmdbuf, &sync, nr_vdm, nr_cdm);
       if (!streams) {
          util_dynarray_fini(&payload);
+         STACK_ARRAY_FINISH(syncs);
          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       }
 
@@ -1177,7 +1202,15 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
          last_cmd_offset = payload.size;
          slice_waits_vdm |= header.vdm_barrier == 0;
          slice_waits_cdm |= header.cdm_barrier == 0;
-         util_dynarray_append(&payload, header);
+          struct drm_asahi_cmd_header *hdr_slot =
+             util_dynarray_grow(&payload, struct drm_asahi_cmd_header, 1);
+          if (!hdr_slot) {
+             free(streams);
+             util_dynarray_fini(&payload);
+             STACK_ARRAY_FINISH(syncs);
+             return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+          }
+          *hdr_slot = header;
 
          if (cs->type == HK_CS_CDM) {
             perf_debug(
@@ -1193,7 +1226,15 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             asahi_fill_cdm_command(dev, cs, &cmd);
             hk_gpu_busy_set_pass(queue, cs->pass_code, cs->pass_grid, cs->pass_count, 0);
             hk_gpu_busy_compute(queue, &cmd);
-            util_dynarray_append(&payload, cmd);
+            struct drm_asahi_cmd_compute *cmd_slot =
+               util_dynarray_grow(&payload, struct drm_asahi_cmd_compute, 1);
+            if (!cmd_slot) {
+               free(streams);
+               util_dynarray_fini(&payload);
+               STACK_ARRAY_FINISH(syncs);
+               return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+            }
+            *cmd_slot = cmd;
             nr_cdm++;
          } else {
             assert(cs->type == HK_CS_VDM);
@@ -1233,7 +1274,15 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                   cs->stats.cmds | ((uint64_t)cs->stats.calls << 32),
                   cs->pass_code);
             }
-            util_dynarray_append(&payload, cmd);
+            struct drm_asahi_cmd_render *cmd_slot =
+               util_dynarray_grow(&payload, struct drm_asahi_cmd_render, 1);
+            if (!cmd_slot) {
+               free(streams);
+               util_dynarray_fini(&payload);
+               STACK_ARRAY_FINISH(syncs);
+               return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+            }
+            *cmd_slot = cmd;
             nr_vdm++;
          }
       }
@@ -1288,6 +1337,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
 
    free(reasons);
    util_dynarray_fini(&payload);
+   STACK_ARRAY_FINISH(syncs);
    if (result == VK_SUCCESS) {
       hk_sync_next_submit(&sync);
       queue->sync = sync;
@@ -1328,7 +1378,11 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    }
    if (uses_heap) {
       simple_mtx_lock(&dev->heap_lock);
-      hk_heap_prepare_submit(dev, heap_min_B);
+      VkResult heap_res = hk_heap_prepare_submit(dev, heap_min_B);
+      if (heap_res != VK_SUCCESS) {
+         simple_mtx_unlock(&dev->heap_lock);
+         return vk_queue_set_lost(&queue->vk, "Geometry heap prepare failed");
+      }
    }
 
    hk_gpu_busy_sample(queue);
@@ -1392,11 +1446,6 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
 
    assert(pCreateInfo->queueFamilyIndex < pdev->queue_family_count);
 
-   struct hk_queue *queue = vk_zalloc(&dev->vk.alloc, sizeof(struct hk_queue),
-                                      8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
-   if (!queue)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-
    const VkDeviceQueueGlobalPriorityCreateInfoKHR *priority_info =
       vk_find_struct_const(pCreateInfo->pNext,
                            DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR);
@@ -1408,23 +1457,37 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
     * create_command_queue.
     */
    enum drm_asahi_priority drm_priority = translate_priority(priority);
-   if (drm_priority >= DRM_ASAHI_PRIORITY_HIGH) {
+   if (drm_priority >= DRM_ASAHI_PRIORITY_HIGH)
       return VK_ERROR_NOT_PERMITTED_EXT;
-   }
+
+   struct hk_queue *queue = vk_zalloc(&dev->vk.alloc, sizeof(struct hk_queue),
+                                      8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (!queue)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    result = vk_queue_init(&queue->vk, &dev->vk, pCreateInfo, index_in_family);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      vk_free(&dev->vk.alloc, queue);
       return result;
+   }
 
    queue->vk.driver_submit = hk_queue_submit;
    hk_sync_init(&queue->sync);
 
-   queue->drm.id = agx_create_command_queue(&dev->dev, drm_priority);
+   int qret = agx_create_command_queue(&dev->dev, drm_priority, &queue->drm.id);
+   if (qret < 0) {
+      vk_queue_finish(&queue->vk);
+      vk_free(&dev->vk.alloc, queue);
+      return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                       "DRM_IOCTL_ASAHI_QUEUE_CREATE failed: %s",
+                       strerror(-qret));
+   }
 
    if (drmSyncobjCreate(dev->dev.fd, 0, &queue->drm.syncobj)) {
       mesa_loge("drmSyncobjCreate() failed %d\n", errno);
       agx_destroy_command_queue(&dev->dev, queue->drm.id);
       vk_queue_finish(&queue->vk);
+      vk_free(&dev->vk.alloc, queue);
 
       return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
                        "DRM_IOCTL_SYNCOBJ_CREATE failed: %m");
@@ -1437,8 +1500,8 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
       return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
                        "DRM_IOCTL_TIMELINE_SYNCOBJ_SIGNAL failed: %m");
    }
+   queue->drm.timeline_value = initial_value;
 
-   queue->completion_initialized = true;
    int status = hk_queue_completion_init(&queue->completion, dev->dev.fd);
    if (status < 0) {
       hk_queue_finish(dev, queue);
@@ -1446,6 +1509,7 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
                        "Queue completion initialization failed: %s",
                        strerror(-status));
    }
+   queue->completion_initialized = true;
 
    hk_gpu_busy_init(queue);
    return VK_SUCCESS;

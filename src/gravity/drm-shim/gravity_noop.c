@@ -66,7 +66,7 @@ asahi_ioctl_vm_create(int fd, unsigned long request, void *arg)
 {
    static uint32_t next_vm = 1;
    struct drm_asahi_vm_create *create = arg;
-   create->vm_id = next_vm++;
+   create->vm_id = __atomic_fetch_add(&next_vm, 1, __ATOMIC_RELAXED);
    return 0;
 }
 
@@ -75,7 +75,7 @@ asahi_ioctl_queue_create(int fd, unsigned long request, void *arg)
 {
    static uint32_t next_queue = 1;
    struct drm_asahi_queue_create *create = arg;
-   create->queue_id = next_queue++;
+   create->queue_id = __atomic_fetch_add(&next_queue, 1, __ATOMIC_RELAXED);
    return 0;
 }
 

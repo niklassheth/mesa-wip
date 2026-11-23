@@ -62,6 +62,9 @@ enum agx_va_flags {
 
 struct agx_va {
    enum agx_va_flags flags;
+   /* Owning VMA heap flags (may differ from flags when AGX_VA_REPLAY falls
+    * back to an ordinary heap for legacy captures). */
+   enum agx_va_flags heap_flags;
    uint64_t addr;
    uint64_t size_B;
 
@@ -161,7 +164,7 @@ void agx_bo_reference(struct agx_bo *bo);
 void agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo);
 struct agx_bo *agx_bo_import(struct agx_device *dev, int fd);
 int agx_bo_export(struct agx_device *dev, struct agx_bo *bo);
-void agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo);
+bool agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo);
 
 /* Queue an unreferenced, uncached BO for close; does not wait for the kernel. */
 void agx_bo_free(struct agx_device *dev, struct agx_bo *bo);

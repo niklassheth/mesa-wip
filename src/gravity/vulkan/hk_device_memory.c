@@ -727,9 +727,13 @@ hk_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo,
 
    switch (pGetFdInfo->handleType) {
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
-   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
-      *pFD = agx_bo_export(&dev->dev, memory->bo);
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT: {
+      int fd = agx_bo_export(&dev->dev, memory->bo);
+      if (fd < 0)
+         return vk_error(dev, VK_ERROR_TOO_MANY_OBJECTS);
+      *pFD = fd;
       return VK_SUCCESS;
+   }
    default:
       assert(!"unsupported handle type");
       return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);

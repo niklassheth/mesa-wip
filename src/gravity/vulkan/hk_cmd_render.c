@@ -1347,11 +1347,13 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
             hk_cmd_buffer_end_graphics(cmd);
          }
       }
-      /* Barriers before the next pass go ahead of the stream's first event. */
-      cmd->merge_event = *util_dynarray_element(&cmd->sync_first_event, uint32_t,
-                                                cs->sync_id);
-      assert(cmd->merge_event != HK_SYNC_NONE &&
-             "a stream with draws has a sync event");
+      if (cmd->merge_cs) {
+         /* Barriers before the next pass go ahead of the stream's first event. */
+         cmd->merge_event = *util_dynarray_element(&cmd->sync_first_event, uint32_t,
+                                                   cs->sync_id);
+         assert(cmd->merge_event != HK_SYNC_NONE &&
+                "a stream with draws has a sync event");
+      }
    } else {
       if (cs) {
          /* Why this render is not kept open (diagnostic). */

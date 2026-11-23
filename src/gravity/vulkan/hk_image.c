@@ -1101,8 +1101,10 @@ hk_image_plane_alloc_vma(struct hk_device *dev, struct hk_image_plane *plane,
       /* Zero-initialize the sparse map. This ensures all tiles are disabled,
        * which provides correct behaviour for unmapped tiles.
        */
-      memset(agx_bo_map(plane->sparse_map), 0,
-             plane->layout.sparse_table_size_B);
+      void *sparse_map = agx_bo_map(plane->sparse_map);
+      if (!sparse_map)
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      memset(sparse_map, 0, plane->layout.sparse_table_size_B);
    }
 
    return VK_SUCCESS;
@@ -1952,8 +1954,8 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
             block_width = block_height = MIN2(block_width, 32);
          }
 
-         uint32_t temp_pitch = block_width * src_block_B;
-         size_t temp_tile_size = temp_pitch * (src_offset.y + extent.height);
+         size_t temp_pitch = (size_t)block_width * src_block_B;
+         size_t temp_tile_size = temp_pitch * MIN2(block_height, extent.height);
 
          /* Work tile-by-tile, holding the unswizzled tile in a temporary
           * buffer.

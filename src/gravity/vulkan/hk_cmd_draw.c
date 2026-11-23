@@ -114,35 +114,47 @@ hk_heap_map(struct hk_device *dev)
 }
 
 /* Back the geometry heap's VA range with a new BO of size_B bytes from its
- * start, releasing the old backing. The heap must be idle. */
-static bool
+ * start, releasing the old backing. The heap must be idle.
+ * Returns VK_SUCCESS on replacement, VK_ERROR_OUT_OF_DEVICE_MEMORY if the old
+ * backing remains intact, or VK_ERROR_DEVICE_LOST if unbind succeeded but
+ * neither new nor old backing could be bound. */
+static VkResult
 hk_heap_back(struct hk_device *dev, uint64_t size_B)
 {
    struct agx_bo *bo =
       agx_bo_create(&dev->dev, size_B, 0, 0, "Geometry heap");
    if (!bo)
-      return false;
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
    if (dev->heap) {
-      agx_bo_bind(&dev->dev, NULL, dev->heap_va->addr, dev->heap->size, 0,
-                  DRM_ASAHI_BIND_UNBIND);
+      if (agx_bo_bind(&dev->dev, NULL, dev->heap_va->addr, dev->heap->size, 0,
+                      DRM_ASAHI_BIND_UNBIND)) {
+         agx_bo_unreference(&dev->dev, bo);
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      }
    }
 
    if (agx_bo_bind(&dev->dev, bo, dev->heap_va->addr, size_B, 0,
                    DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE)) {
       agx_bo_unreference(&dev->dev, bo);
       /* Keep the old backing mapped, if any. */
-      if (dev->heap)
-         agx_bo_bind(&dev->dev, dev->heap, dev->heap_va->addr,
-                     dev->heap->size, 0,
-                     DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE);
-      return false;
+      if (dev->heap) {
+         if (agx_bo_bind(&dev->dev, dev->heap, dev->heap_va->addr,
+                         dev->heap->size, 0,
+                         DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE)) {
+            agx_bo_unreference(&dev->dev, dev->heap);
+            dev->heap = NULL;
+            return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
+                             "Failed to restore geometry heap mapping");
+         }
+      }
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
 
    agx_bo_unreference(&dev->dev, dev->heap);
    dev->heap = bo;
    hk_heap_map(dev)->size = size_B - POLY_HEAP_SINK_B;
-   return true;
+   return VK_SUCCESS;
 }
 
 static void
@@ -173,7 +185,8 @@ hk_init_heap(const void *data)
       .base = dev->heap_va->addr,
    };
 
-   if (!hk_heap_back(dev, MIN2(cmd->heap_min_B, dev->heap_va->size_B))) {
+   if (hk_heap_back(dev, MIN2(cmd->heap_min_B, dev->heap_va->size_B)) !=
+       VK_SUCCESS) {
       agx_va_free(&dev->dev, dev->heap_va, false);
       dev->heap_va = NULL;
    }
@@ -199,7 +212,7 @@ hk_device_idle(struct hk_device *dev)
  * high_water, and shrink the backing if it is more than twice what this
  * submission and the period needed (at least HK_HEAP_MIN_B).
  */
-static void
+static VkResult
 hk_heap_decay(struct hk_device *dev, uint64_t min_B, uint64_t needed_B)
 {
    dev->heap_period_need_B = MAX2(dev->heap_period_need_B, needed_B);
@@ -207,7 +220,7 @@ hk_heap_decay(struct hk_device *dev, uint64_t min_B, uint64_t needed_B)
    uint64_t now = os_time_get_nano();
    if (now - dev->heap_period_start_ns < HK_HEAP_DECAY_NS ||
        !hk_device_idle(dev))
-      return;
+      return VK_SUCCESS;
 
    uint64_t target_B =
       MAX3(min_B, HK_HEAP_MIN_B,
@@ -215,7 +228,10 @@ hk_heap_decay(struct hk_device *dev, uint64_t min_B, uint64_t needed_B)
    if (dev->heap->size > 2 * target_B) {
       perf_debug_dev(&dev->dev, "Shrinking the geometry heap to %" PRIu64
                      " MiB", target_B >> 20);
-      if (hk_heap_back(dev, target_B))
+      VkResult res = hk_heap_back(dev, target_B);
+      if (res == VK_ERROR_DEVICE_LOST)
+         return res;
+      if (res == VK_SUCCESS)
          dev->heap_reported_B = 0;
    }
 
@@ -225,6 +241,7 @@ hk_heap_decay(struct hk_device *dev, uint64_t min_B, uint64_t needed_B)
    heap->bottom = 0;
    dev->heap_period_need_B = 0;
    dev->heap_period_start_ns = now;
+   return VK_SUCCESS;
 }
 
 /* Before a submission whose command buffers use the geometry heap, with the
@@ -232,11 +249,11 @@ hk_heap_decay(struct hk_device *dev, uint64_t min_B, uint64_t needed_B)
  * needed. Allocations that did not fit dropped their draws, and the heap grows
  * past them at once, to the next power of two. Waits for the device to idle.
  */
-void
+VkResult
 hk_heap_prepare_submit(struct hk_device *dev, uint64_t min_B)
 {
    if (!dev->heap)
-      return;
+      return VK_SUCCESS;
 
    const struct poly_heap *heap = hk_heap_map(dev);
    uint64_t needed_B = poly_heap_needed_B(heap);
@@ -254,22 +271,28 @@ hk_heap_prepare_submit(struct hk_device *dev, uint64_t min_B)
                      ? util_next_power_of_two64(needed_B + POLY_HEAP_SINK_B)
                      : 0);
    target_B = MIN2(target_B, dev->heap_va->size_B);
-   if (target_B <= dev->heap->size) {
-      hk_heap_decay(dev, min_B, needed_B);
-      return;
-   }
+   if (target_B <= dev->heap->size)
+      return hk_heap_decay(dev, min_B, needed_B);
 
    /* Earlier submissions may still use the heap. */
    vk_foreach_queue(iter, &dev->vk) {
       struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
-      drmSyncobjTimelineWait(dev->dev.fd, &queue->drm.syncobj,
-                             &queue->drm.timeline_value, 1, INT64_MAX,
-                             DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+      int err;
+      do {
+         err = drmSyncobjTimelineWait(dev->dev.fd, &queue->drm.syncobj,
+                                      &queue->drm.timeline_value, 1, INT64_MAX,
+                                      DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+                                      NULL);
+      } while (err < 0 && errno == EINTR);
+      if (err)
+         return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
+                          "Geometry heap wait failed: %m");
    }
 
    perf_debug_dev(&dev->dev, "Growing the geometry heap to %" PRIu64 " MiB",
                   target_B >> 20);
-   hk_heap_back(dev, target_B);
+   VkResult res = hk_heap_back(dev, target_B);
+   return res == VK_ERROR_DEVICE_LOST ? res : VK_SUCCESS;
 }
 
 uint64_t

@@ -31,6 +31,11 @@ hk_descriptor_table_grow_locked(struct hk_device *dev,
    }
 
    void *new_map = agx_bo_map(new_bo);
+   if (new_map == NULL) {
+      agx_bo_unreference(&dev->dev, new_bo);
+      return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
+                       "Failed to map the descriptor table");
+   }
 
    assert(table->bo == NULL && "not yet implemented sparse binding");
    table->bo = new_bo;

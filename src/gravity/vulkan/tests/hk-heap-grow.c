@@ -81,7 +81,7 @@ main(void)
    list_inithead(&dev->vk.queues);
 
    const uint64_t mib = 1024 * 1024;
-   CHECK(hk_heap_back(dev, HK_HEAP_MIN_B));
+   CHECK(hk_heap_back(dev, HK_HEAP_MIN_B) == VK_SUCCESS);
    CHECK(map.size == HK_HEAP_MIN_B - POLY_HEAP_SINK_B && map.base == va.addr);
 
    /* Fits: nothing happens. */

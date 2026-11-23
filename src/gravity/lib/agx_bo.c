@@ -566,7 +566,7 @@ agx_bo_dump_all(struct agx_device *dev)
    if (verbose)
       fprintf(stderr, "---\n");
 
-   for (uint32_t handle = 0; handle < dev->max_handle; handle++) {
+   for (uint32_t handle = 0; handle <= dev->max_handle; handle++) {
       struct agx_bo *bo = agx_lookup_bo(dev, handle);
       if (!bo->size)
          continue;
@@ -635,11 +635,13 @@ agx_bo_dump_all_periodic(struct agx_device *dev)
    static time_t agx_last_dumped_time = 0;
 
    time_t now = time(NULL);
-   if (now == agx_last_dumped_time)
+   time_t last = __atomic_load_n(&agx_last_dumped_time, __ATOMIC_RELAXED);
+   if (now == last ||
+       !__atomic_compare_exchange_n(&agx_last_dumped_time, &last, now, false,
+                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED))
       return;
 
    agx_bo_dump_all(dev);
-   agx_last_dumped_time = now;
 }
 
 void
@@ -791,11 +793,21 @@ agx_bo_sync_cpu_read(struct agx_bo *bo)
    return !read || read(bo->dev->fd, bo->uapi_handle) == 0;
 }
 
+typedef void (*agx_note_cpu_write_fn)(int, uint32_t, uint64_t, uint64_t);
+static agx_note_cpu_write_fn agx_note_cpu_write_cb;
+static once_flag agx_note_cpu_write_once = ONCE_FLAG_INIT;
+
+static void
+agx_resolve_note_cpu_write(void)
+{
+   agx_note_cpu_write_cb =
+      (agx_note_cpu_write_fn)dlsym(RTLD_DEFAULT, "asahi_m1n1_cpu_written");
+}
+
 void
 agx_bo_note_cpu_write(struct agx_bo *bo, uint64_t offset, uint64_t size)
 {
-   typedef void (*note_fn)(int, uint32_t, uint64_t, uint64_t);
-   note_fn note = (note_fn)dlsym(RTLD_DEFAULT, "asahi_m1n1_cpu_written");
-   if (note)
-      note(bo->dev->fd, bo->uapi_handle, offset, size);
+   call_once(&agx_note_cpu_write_once, agx_resolve_note_cpu_write);
+   if (agx_note_cpu_write_cb)
+      agx_note_cpu_write_cb(bo->dev->fd, bo->uapi_handle, offset, size);
 }

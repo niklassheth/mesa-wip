@@ -123,7 +123,8 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
     * dEQP-VK.query_pool.occlusion_query.get_results_conservative_size_64_wait_query_without_availability_draw_triangles_discard
     */
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
+   if (!hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH))
+      return;
    hk_cdm_cache_flush(dev, cs);
 
    perf_debug(cmd, "Queued writes");
@@ -169,7 +170,8 @@ hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
     * dEQP-VK.query_pool.occlusion_query.get_results_conservative_size_64_wait_query_without_availability_draw_triangles_discard
     */
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
+   if (!hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH))
+      return;
    hk_cdm_cache_flush(dev, cs);
 
    perf_debug(cmd, "Queued write");
@@ -209,9 +211,8 @@ hk_flush_query_writes(struct hk_cmd_buffer *cmd)
    if (accums) {
       struct hk_cs *cs = hk_cmd_buffer_get_cs_general(
          cmd, &cmd->current_cs.cs, true, HK_SYNC_TRANSFER);
-      if (cs) {
+      if (cs && hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH)) {
          /* The segments were written by rendering that has to complete. */
-         hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
          hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
          uint64_t params = hk_pool_upload(cmd, cmd->occlusion_accum.data,
                                           cmd->occlusion_accum.size, 16);
@@ -229,10 +230,9 @@ hk_flush_query_writes(struct hk_cmd_buffer *cmd)
    if (writes) {
       struct hk_cs *cs = hk_cmd_buffer_get_cs_general(
          cmd, &cmd->current_cs.cs, true, HK_SYNC_TRANSFER);
-      if (cs) {
+      if (cs && hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH)) {
          /* Results must be visible system-wide once marked available, as in
           * hk_dispatch_imm_writes. */
-         hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
          hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
          uint64_t params = hk_pool_upload(cmd, cmd->query_writes.data,
                                           cmd->query_writes.size, 16);
@@ -741,24 +741,32 @@ hk_query_is_available(struct hk_device *dev, struct hk_query_pool *pool,
    }
 }
 
-#define HK_QUERY_TIMEOUT 2000000000ull
-
 static VkResult
 hk_query_wait_for_available(struct hk_device *dev, struct hk_query_pool *pool,
                             uint32_t query)
 {
-   uint64_t abs_timeout_ns = os_time_get_absolute_timeout(HK_QUERY_TIMEOUT);
+   /* Spin briefly for fast queries, then back off to avoid burning CPU while
+    * waiting on long-running or semaphore-delayed work. Only report device
+    * loss if the device/queues actually fault. */
+   unsigned spins = 0;
+   int64_t sleep_us = 10;
 
-   while (os_time_get_nano() < abs_timeout_ns) {
+   for (;;) {
       if (hk_query_is_available(dev, pool, query))
          return VK_SUCCESS;
 
       VkResult status = vk_device_check_status(&dev->vk);
       if (status != VK_SUCCESS)
          return status;
-   }
 
-   return vk_device_set_lost(&dev->vk, "query timeout");
+      if (spins < 64) {
+         spins++;
+      } else {
+         os_time_sleep(sleep_us);
+         if (sleep_us < 1000)
+            sleep_us = MIN2(sleep_us * 2, 1000);
+      }
+   }
 }
 
 static void

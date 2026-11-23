@@ -536,11 +536,34 @@ apple9_shader_entry(struct agx_device *dev, void *allocator,
                                      AGX_APPLE9_ENTRY_BLOCK_SIZE,
                                      AGX_APPLE9_ENTRY_ALIGNMENT);
       }
-      if (block &&
-          !agx_apple9_entry_back(dev, block + AGX_APPLE9_ENTRY_BLOCK_SIZE)) {
-         util_vma_heap_free(&dev->apple9_entry_heap, block,
-                            AGX_APPLE9_ENTRY_BLOCK_SIZE);
-         block = 0;
+      if (block) {
+         uint32_t end_B = block + AGX_APPLE9_ENTRY_BLOCK_SIZE;
+         bool need_back = false;
+         for (unsigned i = 0; i * AGX_APPLE9_ENTRY_CHUNK_SIZE < end_B; ++i) {
+            if (!dev->apple9_entry_chunks[i]) {
+               need_back = true;
+               break;
+            }
+         }
+         if (need_back) {
+            /* Never allocate/bind entry chunks under apple9_entry_lock:
+             * agx_bo_unreference nests bo_map_lock -> apple9_entry_lock.
+             * body is already pinned/fixed so it stays alive while unlocked. */
+            simple_mtx_unlock(&dev->apple9_entry_lock);
+            bool backed = agx_apple9_entry_back(dev, end_B);
+            simple_mtx_lock(&dev->apple9_entry_lock);
+            if (!backed) {
+               util_vma_heap_free(&dev->apple9_entry_heap, block,
+                                  AGX_APPLE9_ENTRY_BLOCK_SIZE);
+               block = 0;
+            } else if (body->entry_offset) {
+               util_vma_heap_free(&dev->apple9_entry_heap, block,
+                                  AGX_APPLE9_ENTRY_BLOCK_SIZE);
+               block = 0;
+               entry = body->entry_offset;
+               list_move_to(&body->entry_link, &dev->apple9_entry_lru);
+            }
+         }
       }
       if (block) {
          entry = block + AGX_APPLE9_ENTRY_CODE_OFFSET;

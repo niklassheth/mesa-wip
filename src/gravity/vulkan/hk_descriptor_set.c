@@ -31,10 +31,24 @@ align_u32(uint32_t v, uint32_t a)
    return (v + a - 1) & ~(a - 1);
 }
 
+static inline void
+hk_advance_binding(const struct hk_descriptor_set_layout *layout,
+                   uint32_t *binding, uint32_t *elem)
+{
+   while (*binding < layout->binding_count &&
+          (layout->binding[*binding].array_size == 0 ||
+           *elem >= layout->binding[*binding].array_size)) {
+      *elem -= MIN2(*elem, layout->binding[*binding].array_size);
+      (*binding)++;
+   }
+   assert(*binding < layout->binding_count);
+}
+
 static inline void *
 desc_ubo_data(struct hk_descriptor_set *set, uint32_t binding, uint32_t elem,
               uint32_t *size_out)
 {
+   hk_advance_binding(set->layout, &binding, &elem);
    const struct hk_descriptor_set_binding_layout *binding_layout =
       &set->layout->binding[binding];
 
@@ -288,8 +302,20 @@ write_inline_uniform_data(struct hk_descriptor_set *set,
                           const VkWriteDescriptorSetInlineUniformBlock *info,
                           uint32_t binding, uint32_t offset)
 {
-   assert(set->layout->binding[binding].stride == 1);
-   write_desc(set, binding, offset, info->pData, info->dataSize);
+   const uint8_t *src = info->pData;
+   uint32_t remaining = info->dataSize;
+
+   while (remaining > 0) {
+      hk_advance_binding(set->layout, &binding, &offset);
+      const struct hk_descriptor_set_binding_layout *b =
+         &set->layout->binding[binding];
+      assert(b->stride == 1);
+      uint32_t chunk = MIN2(remaining, b->array_size - offset);
+      write_desc(set, binding, offset, src, chunk);
+      src += chunk;
+      remaining -= chunk;
+      offset += chunk;
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -426,16 +452,42 @@ hk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
          &dst->layout->binding[copy->dstBinding];
 
       if (dst_binding_layout->stride > 0 && src_binding_layout->stride > 0) {
-         for (uint32_t j = 0; j < copy->descriptorCount; j++) {
-            ASSERTED uint32_t dst_max_size, src_max_size;
-            void *dst_map = desc_ubo_data(
-               dst, copy->dstBinding, copy->dstArrayElement + j, &dst_max_size);
-            const void *src_map = desc_ubo_data(
-               src, copy->srcBinding, copy->srcArrayElement + j, &src_max_size);
-            const uint32_t copy_size =
-               MIN2(dst_binding_layout->stride, src_binding_layout->stride);
-            assert(copy_size <= dst_max_size && copy_size <= src_max_size);
-            memcpy(dst_map, src_map, copy_size);
+         if (src_binding_layout->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK &&
+             dst_binding_layout->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+            uint32_t src_b = copy->srcBinding, src_off = copy->srcArrayElement;
+            uint32_t dst_b = copy->dstBinding, dst_off = copy->dstArrayElement;
+            uint32_t remaining = copy->descriptorCount;
+            while (remaining > 0) {
+               hk_advance_binding(src->layout, &src_b, &src_off);
+               hk_advance_binding(dst->layout, &dst_b, &dst_off);
+               uint32_t src_avail = src->layout->binding[src_b].array_size - src_off;
+               uint32_t dst_avail = dst->layout->binding[dst_b].array_size - dst_off;
+               uint32_t chunk = MIN3(remaining, src_avail, dst_avail);
+               ASSERTED uint32_t dst_max_size, src_max_size;
+               void *dst_map = desc_ubo_data(dst, dst_b, dst_off, &dst_max_size);
+               const void *src_map = desc_ubo_data(src, src_b, src_off, &src_max_size);
+               assert(chunk <= dst_max_size && chunk <= src_max_size);
+               memcpy(dst_map, src_map, chunk);
+               src_off += chunk;
+               dst_off += chunk;
+               remaining -= chunk;
+            }
+         } else {
+            uint32_t src_b = copy->srcBinding, src_elem = copy->srcArrayElement;
+            uint32_t dst_b = copy->dstBinding, dst_elem = copy->dstArrayElement;
+            for (uint32_t j = 0; j < copy->descriptorCount; j++) {
+               hk_advance_binding(src->layout, &src_b, &src_elem);
+               hk_advance_binding(dst->layout, &dst_b, &dst_elem);
+               ASSERTED uint32_t dst_max_size, src_max_size;
+               void *dst_map = desc_ubo_data(dst, dst_b, dst_elem, &dst_max_size);
+               const void *src_map = desc_ubo_data(src, src_b, src_elem, &src_max_size);
+               const uint32_t copy_size = MIN2(dst->layout->binding[dst_b].stride,
+                                               src->layout->binding[src_b].stride);
+               assert(copy_size <= dst_max_size && copy_size <= src_max_size);
+               memcpy(dst_map, src_map, copy_size);
+               src_elem++;
+               dst_elem++;
+            }
          }
       }
 
@@ -543,10 +595,16 @@ hk_descriptor_bo_create(void *data, uint64_t size, uint64_t reserve,
    if (!bo)
       return false;
 
+   void *map = agx_bo_map(bo);
+   if (!map) {
+      agx_bo_unreference(&dev->dev, bo);
+      return false;
+   }
+
    *out = (struct hk_descriptor_backing){
       .bo = bo,
       .addr = bo->va->addr,
-      .map = agx_bo_map(bo),
+      .map = map,
       .size = bo->size,
    };
 
@@ -632,6 +690,7 @@ hk_CreateDescriptorPool(VkDevice _device,
                            MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT);
 
    uint32_t max_align = 0;
+   uint32_t max_stride = 0;
    for (unsigned i = 0; i < pCreateInfo->poolSizeCount; ++i) {
       const VkMutableDescriptorTypeListEXT *type_list = NULL;
       if (pCreateInfo->pPoolSizes[i].type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT &&
@@ -642,6 +701,7 @@ hk_CreateDescriptorPool(VkDevice _device,
       hk_descriptor_stride_align_for_type(pdev, pCreateInfo->pPoolSizes[i].type,
                                           type_list, false, &stride, &alignment);
       max_align = MAX2(max_align, alignment);
+      max_stride = MAX2(max_stride, stride);
    }
 
    uint64_t bo_size = 0;
@@ -654,19 +714,17 @@ hk_CreateDescriptorPool(VkDevice _device,
       uint32_t stride, alignment;
       hk_descriptor_stride_align_for_type(pdev, pCreateInfo->pPoolSizes[i].type,
                                           type_list, false, &stride, &alignment);
-      bo_size +=
-         MAX2(stride, max_align) * pCreateInfo->pPoolSizes[i].descriptorCount;
+      bo_size += (uint64_t)MAX2(stride, max_align) *
+                 pCreateInfo->pPoolSizes[i].descriptorCount;
    }
 
-   /* Individual descriptor sets are aligned to the min UBO alignment to
-    * ensure that we don't end up with unaligned data access in any shaders.
-    * This means that each descriptor buffer allocated may burn up to 16B of
-    * extra space to get the right alignment.  (Technically, it's at most 28B
-    * because we're always going to start at least 4B aligned but we're being
-    * conservative here.)  Allocate enough extra space that we can chop it
-    * into maxSets pieces and align each one of them to 32B.
+   /* Individual descriptor sets are aligned to HK_MIN_UBO_ALIGNMENT and
+    * variable-count sets reserve one trailing sentinel descriptor of up to
+    * max_stride bytes (see hk_descriptor_set_create). Budget both per set so
+    * allocating a pool's full advertised variable-count capacity never fails.
     */
-   bo_size += HK_MIN_UBO_ALIGNMENT * pCreateInfo->maxSets;
+   bo_size += (uint64_t)(HK_MIN_UBO_ALIGNMENT + max_stride) *
+              pCreateInfo->maxSets;
 
    if (hk_descriptor_memory_init(&pool->mem, &hk_descriptor_bo_ops, dev,
                                  bo_size) != HK_DESCRIPTOR_MEMORY_OK) {
@@ -705,7 +763,7 @@ hk_descriptor_set_create(struct hk_device *dev, struct hk_descriptor_pool *pool,
       /* Off by one so we don't underallocate the end. Otherwise vkd3d-proton
        * descriptor-performance underallocates.
        */
-      set->size += stride * (variable_count + 1);
+      set->size += (uint64_t)stride * ((uint64_t)variable_count + 1);
    }
 
    set->size = align64(set->size, HK_MIN_UBO_ALIGNMENT);

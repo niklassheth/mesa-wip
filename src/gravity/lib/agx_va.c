@@ -45,9 +45,9 @@ static void
 agx_va_release_locked(struct agx_device *dev, struct agx_va *va)
 {
    list_del(&va->link);
-   dev->va_quarantine.bytes[agx_va_heap_index(va->flags)] -= va->size_B;
-   dev->va_quarantine.heap_used_B[agx_va_heap_index(va->flags)] -= va->size_B;
-   util_vma_heap_free(agx_vma_heap(dev, va->flags), va->addr, va->size_B);
+   dev->va_quarantine.bytes[agx_va_heap_index(va->heap_flags)] -= va->size_B;
+   dev->va_quarantine.heap_used_B[agx_va_heap_index(va->heap_flags)] -= va->size_B;
+   util_vma_heap_free(agx_vma_heap(dev, va->heap_flags), va->addr, va->size_B);
    free(va);
 }
 
@@ -65,7 +65,7 @@ agx_va_unquarantine_locked(struct agx_device *dev, enum agx_va_flags flags,
       if (flags & AGX_VA_FIXED) {
          if (va->addr >= fixed_va + size_B || fixed_va >= va->addr + va->size_B)
             continue;
-      } else if (agx_va_heap_index(va->flags) != heap) {
+      } else if (agx_va_heap_index(va->heap_flags) != heap) {
          continue;
       }
       agx_va_release_locked(dev, va);
@@ -128,7 +128,7 @@ agx_va_retire(struct agx_device *dev, struct agx_va *va)
    if (!va)
       return;
 
-   unsigned heap = agx_va_heap_index(va->flags);
+   unsigned heap = agx_va_heap_index(va->heap_flags);
    simple_mtx_lock(&dev->vma_lock);
    list_addtail(&va->link, &dev->va_quarantine.list);
    dev->va_quarantine.bytes[heap] += va->size_B;
@@ -140,7 +140,7 @@ agx_va_retire(struct agx_device *dev, struct agx_va *va)
    list_for_each_entry_safe(struct agx_va, old, &dev->va_quarantine.list, link) {
       if (dev->va_quarantine.bytes[heap] <= dev->va_quarantine.cap[heap])
          break;
-      if (agx_va_heap_index(old->flags) == heap) {
+      if (agx_va_heap_index(old->heap_flags) == heap) {
          agx_va_release_locked(dev, old);
          /* A zero cap (replay heaps) is no quarantine: not a cap release. */
          if (dev->va_quarantine.cap[heap])
@@ -156,6 +156,10 @@ agx_va_alloc(struct agx_device *dev, uint64_t size_B, uint64_t align_B,
 {
    assert((fixed_va != 0) == !!(flags & AGX_VA_FIXED));
    assert((fixed_va % align_B) == 0);
+
+   struct agx_va *va = malloc(sizeof(struct agx_va));
+   if (!va)
+      return NULL;
 
    /* All allocations need a guard at the end to prevent overreads.
     *
@@ -205,12 +209,14 @@ agx_va_alloc(struct agx_device *dev, uint64_t size_B, uint64_t align_B,
    }
    simple_mtx_unlock(&dev->vma_lock);
 
-   if (addr == 0)
+   if (addr == 0) {
+      free(va);
       return NULL;
+   }
 
-   struct agx_va *va = malloc(sizeof(struct agx_va));
    *va = (struct agx_va){
-      .flags = flags,
+      .flags = requested,
+      .heap_flags = flags,
       .size_B = size_B,
       .addr = addr,
    };
@@ -227,10 +233,10 @@ agx_va_free(struct agx_device *dev, struct agx_va *va, bool unbind)
       agx_bo_bind(dev, NULL, va->addr, va->size_B, 0, DRM_ASAHI_BIND_UNBIND);
    }
 
-   struct util_vma_heap *heap = agx_vma_heap(dev, va->flags);
+   struct util_vma_heap *heap = agx_vma_heap(dev, va->heap_flags);
 
    simple_mtx_lock(&dev->vma_lock);
-   dev->va_quarantine.heap_used_B[agx_va_heap_index(va->flags)] -= va->size_B;
+   dev->va_quarantine.heap_used_B[agx_va_heap_index(va->heap_flags)] -= va->size_B;
    util_vma_heap_free(heap, va->addr, va->size_B);
    simple_mtx_unlock(&dev->vma_lock);
    free(va);
