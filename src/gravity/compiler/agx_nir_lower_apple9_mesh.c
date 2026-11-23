@@ -284,6 +284,13 @@ validate(nir_shader *nir, const struct agx_apple9_mesh_key *key,
    if (vertex[VARYING_SLOT_VIEWPORT] & 1)
       vertex[VARYING_SLOT_LAYER] |= 1;
 
+   /* On Apple9, point rasterization drops primitives unless PointSize is
+    * published in the UVS (PPP bit 18). Always allocate the VARYING_SLOT_PSIZ
+    * plane for points topology so native completion supplies default 1.0f
+    * when gl_PointSize is omitted. */
+   if (nir->info.mesh.primitive_type == MESA_PRIM_POINTS)
+      vertex[VARYING_SLOT_PSIZ] |= 1;
+
    /* Output contract validated with the retained opaque mesh completion at
     * 256V/32P, 64V/512P and 64V/32P with primitive attributes (dynamic indices).
     * Culling remains provisional. Which fields fixed-function hardware reads

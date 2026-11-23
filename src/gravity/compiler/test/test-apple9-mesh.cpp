@@ -2733,9 +2733,35 @@ TEST(Apple9MeshNativeExpand, PointsTopologyAndPointSizeBuiltin)
             << (reason ?: "");
          EXPECT_EQ(info.layout.indices_per_primitive, 1u);
          EXPECT_EQ(info.layout.primitive_count_B, ALIGN_POT(max_v, 16));
-         EXPECT_EQ(info.writes_point_size, with_psiz);
+         /* Apple9 requires PointSize in the UVS for points topology even when
+          * the shader omits gl_PointSize (default 1.0f initialized at entry). */
+         EXPECT_TRUE(info.writes_point_size);
          EXPECT_EQ(info.clip_distances, 2u);
-         EXPECT_EQ(info.layout.vertex_components, 4u + 1u + with_psiz + 2u);
+         EXPECT_EQ(info.layout.vertex_components, 4u + 1u + 1u + 2u);
+
+         bool saw_default_psiz = false, saw_fmax_1 = false, saw_fmin_max = false;
+         nir_foreach_block(block, nir_shader_get_entrypoint(lowered)) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_intrinsic) {
+                  nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+                  if (intr->intrinsic == nir_intrinsic_store_local_apple9_agx &&
+                      nir_src_is_const(intr->src[0]) &&
+                      nir_src_as_float(intr->src[0]) == 1.0f)
+                     saw_default_psiz = true;
+               } else if (instr->type == nir_instr_type_alu) {
+                  nir_alu_instr *alu = nir_instr_as_alu(instr);
+                  if (alu->op == nir_op_fmax && nir_src_is_const(alu->src[1].src) &&
+                      nir_src_as_float(alu->src[1].src) == 1.0f)
+                     saw_fmax_1 = true;
+                  if (alu->op == nir_op_fmin && nir_src_is_const(alu->src[1].src) &&
+                      nir_src_as_float(alu->src[1].src) == 511.9375f)
+                     saw_fmin_max = true;
+               }
+            }
+         }
+         EXPECT_TRUE(saw_default_psiz);
+         EXPECT_EQ(saw_fmax_1, with_psiz);
+         EXPECT_EQ(saw_fmin_max, with_psiz);
 
          auto audit = audit_publication(lowered);
          unsigned v_rounds = DIV_ROUND_UP(max_v, 32u);
@@ -2743,14 +2769,12 @@ TEST(Apple9MeshNativeExpand, PointsTopologyAndPointSizeBuiltin)
          EXPECT_EQ(audit.controls, 1u);
          EXPECT_EQ(audit.scalar_offsets.size(), p_rounds);
          EXPECT_EQ(audit.channels.size(), v_rounds * info.layout.vertex_components);
-         /* Verify exact UVS order: 0..3 POS, 4 VAR0, [5 PSIZ], next CLIP0..1. */
+         /* Verify exact UVS order: 0..3 POS, 4 VAR0, 5 PSIZ, 6..7 CLIP0..1. */
          unsigned psiz_ch = 5;
-         unsigned clip_ch = with_psiz ? 6 : 5;
-         if (with_psiz) {
-            unsigned plane =
-               agx_apple9_mesh_plane_offset(&info.layout, VARYING_SLOT_PSIZ, 0);
-            EXPECT_TRUE(audit.channels.count({psiz_ch, plane}));
-         }
+         unsigned clip_ch = 6;
+         unsigned psiz_plane =
+            agx_apple9_mesh_plane_offset(&info.layout, VARYING_SLOT_PSIZ, 0);
+         EXPECT_TRUE(audit.channels.count({psiz_ch, psiz_plane}));
          for (unsigned d = 0; d < 2; ++d) {
             unsigned plane = agx_apple9_mesh_plane_offset(
                &info.layout, VARYING_SLOT_CLIP_DIST0, d);
@@ -2763,7 +2787,7 @@ TEST(Apple9MeshNativeExpand, PointsTopologyAndPointSizeBuiltin)
          ASSERT_TRUE(agx_compile_apple9_native_mesh(nir, true, &opts, &code,
                                                     &info, &reason))
             << (reason ?: "");
-         EXPECT_EQ(code.info.apple9_writes_point_size, with_psiz);
+         EXPECT_TRUE(code.info.apple9_writes_point_size);
          EXPECT_EQ(code.info.apple9_clip_distance_count, 2u);
          EXPECT_EQ(code.info.apple9_varyings.count, 1u);
          free(code.binary);

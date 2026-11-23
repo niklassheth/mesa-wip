@@ -78,6 +78,29 @@ drop_unused_point_size(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* Apple9 hardware drops points with size >= 512.0 and requires >= 1.0.
+ * Clamp authored gl_PointSize stores to [1.0, 511.9375], matching the
+ * vertex shader path (apple9_lower_point_size). */
+static bool
+clamp_point_size(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_per_vertex_output)
+      return false;
+   if (!nir_src_is_const(intr->src[2]))
+      return false;
+   uint64_t slot = nir_intrinsic_io_semantics(intr).location +
+                   (uint64_t)nir_src_as_uint(intr->src[2]);
+   if (slot != VARYING_SLOT_PSIZ || intr->num_components != 1 ||
+       nir_intrinsic_component(intr) || nir_src_bit_size(intr->src[0]) != 32)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *size =
+      nir_fmin(b, nir_fmax(b, intr->src[0].ssa, nir_imm_float(b, 1.0f)),
+               nir_imm_float(b, 511.9375f));
+   nir_src_rewrite(&intr->src[0], size);
+   return true;
+}
+
 /* Keep the actual vertex count in compiler-owned local storage. The body
  * lowerer leaves the count marker so completion can consume both operands. */
 static bool
@@ -724,11 +747,15 @@ agx_nir_lower_apple9_native_mesh(
    }
 
    /* Strip unused gl_PointSize stores on lines and triangles before IO
-    * validation runs. Point topology retains VARYING_SLOT_PSIZ. */
-   if (nir->info.mesh.primitive_type != MESA_PRIM_POINTS &&
-       nir_shader_intrinsics_pass(nir, drop_unused_point_size,
-                                  nir_metadata_control_flow, NULL))
+    * validation runs. Point topology retains VARYING_SLOT_PSIZ and clamps
+    * authored sizes to Apple9's [1.0, 511.9375] hardware range. */
+   if (nir->info.mesh.primitive_type == MESA_PRIM_POINTS) {
+      nir_shader_intrinsics_pass(nir, clamp_point_size,
+                                 nir_metadata_control_flow, NULL);
+   } else if (nir_shader_intrinsics_pass(nir, drop_unused_point_size,
+                                         nir_metadata_control_flow, NULL)) {
       nir->info.outputs_written &= ~VARYING_BIT_PSIZ;
+   }
 
    nir_remove_dead_variables(nir, nir_var_mem_shared, NULL);
    nir_lower_vars_to_explicit_types(nir, nir_var_mem_shared,
@@ -907,12 +934,19 @@ agx_nir_lower_apple9_native_mesh(
       /* All physical lanes rendezvous before any application cull store. */
       agx_nir_apple9_mesh_workgroup_barrier(&entry);
    }
-   if (info->writes_layer_viewport) {
-      /* Initialize Layer/Viewport planes to zero so conditionally unwritten
-       * primitives never read stale LDS values from a prior workgroup. */
+   if (info->writes_point_size || info->writes_layer_viewport) {
+      /* Initialize default PointSize (1.0f) and Layer/Viewport (0) planes
+       * before the application body runs so omitted or conditionally unwritten
+       * outputs never read stale LDS values from a prior workgroup. */
       nir_def *lane = nir_load_local_invocation_index(&entry);
-      unsigned layer_plane = agx_apple9_mesh_plane_offset(layout, VARYING_SLOT_LAYER, 0);
+      unsigned psiz_plane =
+         info->writes_point_size
+            ? agx_apple9_mesh_plane_offset(layout, VARYING_SLOT_PSIZ, 0) : 0;
+      unsigned layer_plane =
+         info->writes_layer_viewport
+            ? agx_apple9_mesh_plane_offset(layout, VARYING_SLOT_LAYER, 0) : 0;
       bool has_vp =
+         info->writes_layer_viewport &&
          layout->vertex_component[VARYING_SLOT_VIEWPORT][0] != AGX_APPLE9_MESH_UNUSED;
       unsigned vp_plane =
          has_vp ? agx_apple9_mesh_plane_offset(layout, VARYING_SLOT_VIEWPORT, 0) : 0;
@@ -921,9 +955,14 @@ agx_nir_lower_apple9_native_mesh(
          nir_def *v = nir_iadd_imm(&entry, lane, first);
          nir_push_if(&entry, nir_ult_imm(&entry, v, layout->max_vertices));
          nir_def *off = nir_imul_imm(&entry, v, 4);
-         nir_store_local_apple9_agx(&entry, nir_imm_int(&entry, 0),
-                                    nir_iadd_imm(&entry, off, layer_plane),
-                                    .base = key.output_root, .bit_size = 32);
+         if (info->writes_point_size)
+            nir_store_local_apple9_agx(&entry, nir_imm_float(&entry, 1.0f),
+                                       nir_iadd_imm(&entry, off, psiz_plane),
+                                       .base = key.output_root, .bit_size = 32);
+         if (info->writes_layer_viewport)
+            nir_store_local_apple9_agx(&entry, nir_imm_int(&entry, 0),
+                                       nir_iadd_imm(&entry, off, layer_plane),
+                                       .base = key.output_root, .bit_size = 32);
          if (has_vp)
             nir_store_local_apple9_agx(&entry, nir_imm_int(&entry, 0),
                                        nir_iadd_imm(&entry, off, vp_plane),
