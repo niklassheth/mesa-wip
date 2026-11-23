@@ -32,6 +32,7 @@ DEBUG_GET_ONCE_OPTION(cached_hk_apple9_sparse_scratch,
                       "HK_APPLE9_SPARSE_SCRATCH", NULL)
 
 struct hk_physical_device;
+struct nir_builder;
 struct vk_pipeline_cache;
 
 typedef void (*hk_internal_builder_t)(struct nir_builder *b, const void *key);

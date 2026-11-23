@@ -733,7 +733,7 @@ parseDeviceAttr(struct OptConfData *data, const char **attr)
       if (!strcmp(attr[i], "driver")) driver = attr[i+1];
       else if (!strcmp(attr[i], "screen")) screen = attr[i+1];
       else if (!strcmp(attr[i], "kernel_driver")) kernel = attr[i+1];
-      else if (!strcmp(attr[i], "device")) device = attr[i+1];
+      else if (!strcmp(attr[i], "device") || !strcmp(attr[i], "device_name")) device = attr[i+1];
       else if (!strcmp(attr[i], "device_version_regexp")) device_version_regexp = attr[i+1];
       else XML_WARNING("unknown device attribute: %s.", attr[i]);
    }
