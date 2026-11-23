@@ -580,12 +580,9 @@ struct agx_apple9_block {
    /* A closed NIR call region may contain structured masks selected into this
     * same logical block. Its last NIR block owns the outgoing caller edges. */
    struct nir_block *nir_exit;
-   struct agx_apple9_block **predecessors;
-   unsigned predecessor_count;
    struct list_head instructions;
    bool placed;
    unsigned index;
-   struct agx_apple9_block *successors[2];
    BITSET_WORD *live_in, *live_out;
    unsigned live_words; /* Allocated size of live_in and live_out. */
    unsigned start_index; /* Derived analysis position, never a branch identity. */
@@ -631,7 +628,7 @@ struct agx_apple9_vir_program {
    unsigned live_out_capacity;
    bool reserved_gprs[AGX_APPLE9_GPR_COUNT];
 
-   /* Filled by agx_apple9_allocate_vir(). */
+   /* Physical GPR or publication index assigned to each SSA value. */
    uint8_t *phys;
    /* Export publications have their own index namespace. Slots remain distinct
     * through completion; ordinary GPRs with the same index are independent. */
@@ -1116,8 +1113,6 @@ bool agx_apple9_vir_set_device_load_raw_contract(
 bool agx_apple9_vir_set_device_load_index_kind(
    struct agx_apple9_vir_program *program, uint32_t value,
    enum agx_apple9_device_load_index_kind index_kind);
-bool agx_apple9_vir_set_fixed_phys(struct agx_apple9_vir_program *program,
-                                   uint32_t value, unsigned phys);
 bool agx_apple9_vir_add_live_out(struct agx_apple9_vir_program *program,
                                  uint32_t value);
 bool agx_apple9_vir_add_abi_output(struct agx_apple9_vir_program *program,
@@ -1125,14 +1120,7 @@ bool agx_apple9_vir_add_abi_output(struct agx_apple9_vir_program *program,
 uint32_t agx_apple9_vir_emit_entry_reg(struct agx_apple9_vir_program *program,
                                        unsigned phys_gpr);
 bool agx_apple9_vir_emit_abi_return(struct agx_apple9_vir_program *program);
-/*
- * CFG liveness with conservative enclosing-interval allocation for scalar
- * and adjacent-tuple values. General encodings prefer
- * r16-r63 so the r0-r15 compact-result bank stays available to hard-low
- * instructions, then fall back to that low bank. Destinations remain distinct
- * from their inputs; killed sources become available to following
- * instructions. Spills use per-thread Dynamic-Caching scratch storage.
- */
+
 struct nir_shader;
 struct agx_apple9_allocation_cost {
    uint64_t spills, instructions, bytes, dependency_gaps;
@@ -1145,9 +1133,6 @@ bool agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
                                  struct nir_shader *nir, const char **reason);
 bool agx_apple9_allocate_publications(struct agx_apple9_vir_program *program,
                                       const char **reason);
-
-bool agx_apple9_allocate_vir(struct agx_apple9_vir_program *program,
-                             const char **reason);
 
 bool
 agx_apple9_validate_mesh_control(const struct agx_apple9_vir_program *program,
