@@ -2114,7 +2114,8 @@ hk_apple9_native_mesh_state_eligible(struct hk_cmd_buffer *cmd,
           gfx, dyn, hk_apple9_native_mesh_enabled()) ||
        hk_cond_render_applies(cmd) ||
        gfx->mesh_pg_query || gfx->descriptors.root.draw.pipeline_stats_flags ||
-       gfx->occlusion.active_count || gfx->xfb_enabled ||
+       (!hk_apple9_native_mesh_enabled() && gfx->occlusion.active_count) ||
+       gfx->xfb_enabled ||
        dyn->rs.line.stipple.enable ||
        dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL)
       return false;

@@ -130,6 +130,9 @@ main(int argc, char **argv)
       cmd->state.gfx.render.tilebuffer.nr_samples = 4;
       CHECK(!hk_apple9_use_native_mesh(cmd, groups, 0));
       cmd->state.gfx.render.tilebuffer.nr_samples = 0;
+      cmd->state.gfx.occlusion.active_count = 1;
+      CHECK(!hk_apple9_use_native_mesh(cmd, groups, 0));
+      cmd->state.gfx.occlusion.active_count = 0;
    }
    uint32_t command[256] = {0};
    struct hk_cs cs = {.cmd = cmd, .type = HK_CS_VDM,

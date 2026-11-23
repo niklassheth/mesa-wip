@@ -97,7 +97,11 @@ routes(struct hk_cmd_buffer *cmd)
    FALLBACK(gfx->mesh_pg_query, 0x2000);
    FALLBACK(gfx->descriptors.root.draw.pipeline_stats_flags,
             VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT);
-   FALLBACK(gfx->occlusion.active_count, 1);
+   /* Occlusion queries are handled in the 3D/ISP fragment stage and admitted
+    * under HK_APPLE9_NATIVE_MESH=1. */
+   gfx->occlusion.active_count = 1;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   gfx->occlusion.active_count = 0;
    FALLBACK(cmd->state.cond_render.active, true);
    FALLBACK(dyn->rs.polygon_mode, VK_POLYGON_MODE_LINE);
    FALLBACK(dyn->rs.polygon_mode, VK_POLYGON_MODE_POINT);
