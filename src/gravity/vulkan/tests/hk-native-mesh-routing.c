@@ -84,7 +84,16 @@ routes(struct hk_cmd_buffer *cmd)
    FALLBACK(gfx->shaders[MESA_SHADER_GEOMETRY], mesh);
    FALLBACK(gfx->shaders[MESA_SHADER_TESS_EVAL], mesh);
    FALLBACK(gfx->render.view_mask, 3);
-   FALLBACK(gfx->render.layer_count, 2);
+   /* Multi-layer (1..=2048) and MSAA (1x/2x/4x) are admitted under
+    * HK_APPLE9_NATIVE_MESH=1 (paired with kernel 932adc520b3c); out-of-range
+    * layer counts and sample counts still fall back cleanly. */
+   FALLBACK(gfx->render.layer_count, 0);
+   FALLBACK(gfx->render.layer_count, 2049);
+   gfx->render.layer_count = 2;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   gfx->render.layer_count = 2048;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   gfx->render.layer_count = 1;
    FALLBACK(gfx->mesh_pg_query, 0x2000);
    FALLBACK(gfx->descriptors.root.draw.pipeline_stats_flags,
             VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT);
@@ -92,8 +101,18 @@ routes(struct hk_cmd_buffer *cmd)
    FALLBACK(cmd->state.cond_render.active, true);
    FALLBACK(dyn->rs.polygon_mode, VK_POLYGON_MODE_LINE);
    FALLBACK(dyn->rs.polygon_mode, VK_POLYGON_MODE_POINT);
-   FALLBACK(dyn->ms.rasterization_samples, 4);
-   FALLBACK(gfx->render.tilebuffer.nr_samples, 4);
+   dyn->ms.rasterization_samples = 2;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   dyn->ms.rasterization_samples = 4;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   FALLBACK(dyn->ms.rasterization_samples, 8);
+   dyn->ms.rasterization_samples = 0;
+   gfx->render.tilebuffer.nr_samples = 2;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   gfx->render.tilebuffer.nr_samples = 4;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   FALLBACK(gfx->render.tilebuffer.nr_samples, 8);
+   gfx->render.tilebuffer.nr_samples = 0;
    FALLBACK(gfx->xfb_enabled, true);
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.primitive_broadcast =
       VARYING_BIT_CULL_PRIMITIVE;
@@ -248,7 +267,11 @@ gs_routes(struct hk_cmd_buffer *cmd)
       FALLBACK(gfx->shaders[MESA_SHADER_TASK], gs);
       FALLBACK(gfx->shaders[MESA_SHADER_MESH], gs);
       FALLBACK(gfx->render.view_mask, 3);
-      FALLBACK(gfx->render.layer_count, 2);
+      FALLBACK(gfx->render.layer_count, 0);
+      FALLBACK(gfx->render.layer_count, 2049);
+      gfx->render.layer_count = 4;
+      CHECK(hk_apple9_use_native_gs(cmd, draw));
+      gfx->render.layer_count = 1;
       FALLBACK(cmd->state.cond_render.active, true);
       FALLBACK(gfx->descriptors.root.draw.pipeline_stats_flags, 1);
       FALLBACK(gfx->occlusion.active_count, 1);
@@ -260,8 +283,14 @@ gs_routes(struct hk_cmd_buffer *cmd)
       FALLBACK(dyn->rs.rasterizer_discard_enable, true);
       FALLBACK(dyn->rs.polygon_mode, VK_POLYGON_MODE_LINE);
       FALLBACK(dyn->rs.conservative_mode, VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT);
-      FALLBACK(dyn->ms.rasterization_samples, 4);
-      FALLBACK(gfx->render.tilebuffer.nr_samples, 4);
+      dyn->ms.rasterization_samples = 4;
+      CHECK(hk_apple9_use_native_gs(cmd, draw));
+      FALLBACK(dyn->ms.rasterization_samples, 8);
+      dyn->ms.rasterization_samples = 0;
+      gfx->render.tilebuffer.nr_samples = 4;
+      CHECK(hk_apple9_use_native_gs(cmd, draw));
+      FALLBACK(gfx->render.tilebuffer.nr_samples, 8);
+      gfx->render.tilebuffer.nr_samples = 0;
 #undef FALLBACK
       main->info.apple9_native.layout.max_vertices = 4;
       main->info.apple9_native.layout.max_primitives = 2;
@@ -430,7 +459,11 @@ tess_routes(struct hk_cmd_buffer *cmd)
       FALLBACK(gfx->shaders[MESA_SHADER_TASK], gs);
       FALLBACK(gfx->shaders[MESA_SHADER_MESH], gs);
       FALLBACK(gfx->render.view_mask, 3);
-      FALLBACK(gfx->render.layer_count, 2);
+      FALLBACK(gfx->render.layer_count, 0);
+      FALLBACK(gfx->render.layer_count, 2049);
+      gfx->render.layer_count = 4;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      gfx->render.layer_count = 1;
       FALLBACK(cmd->state.cond_render.active, true);
       FALLBACK(gfx->descriptors.root.draw.pipeline_stats_flags, 1);
       FALLBACK(gfx->occlusion.active_count, 1);
@@ -443,8 +476,14 @@ tess_routes(struct hk_cmd_buffer *cmd)
       FALLBACK(dyn->rs.polygon_mode, VK_POLYGON_MODE_LINE);
       FALLBACK(dyn->rs.conservative_mode,
                VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT);
-      FALLBACK(dyn->ms.rasterization_samples, 4);
-      FALLBACK(gfx->render.tilebuffer.nr_samples, 4);
+      dyn->ms.rasterization_samples = 4;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      FALLBACK(dyn->ms.rasterization_samples, 8);
+      dyn->ms.rasterization_samples = 0;
+      gfx->render.tilebuffer.nr_samples = 4;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      FALLBACK(gfx->render.tilebuffer.nr_samples, 8);
+      gfx->render.tilebuffer.nr_samples = 0;
 #undef FALLBACK
       for (unsigned p = 1; p <= 32; ++p) {
          draw.b.count[0] = dyn->ts.patch_control_points = p;

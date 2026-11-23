@@ -3044,9 +3044,15 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
     * the profile admits. Keep this backstop before publishing a malformed
     * stream. */
    bool append = hk_apple9_native_can_append(cmd, cs, !!native_grid);
+   bool allow_multilayer_msaa = hk_apple9_native_mesh_enabled();
    if ((cs->apple9_native_mesh && !append) ||
-       (native_grid && ((!append && cs->current != cs->start) ||
-                        pipeline.samples != 1 || gfx->render.layer_count != 1)))
+       (native_grid &&
+        ((!append && cs->current != cs->start) ||
+         (!allow_multilayer_msaa &&
+          (pipeline.samples != 1 || gfx->render.layer_count != 1)) ||
+         (pipeline.samples != 1 && pipeline.samples != 2 &&
+          pipeline.samples != 4) ||
+         !gfx->render.layer_count || gfx->render.layer_count > 2048)))
       UNSUPPORTED();
    cs->tib = gfx->render.tilebuffer;
    const struct vk_dynamic_graphics_state *ms_dyn = &cmd->vk.dynamic_graphics_state;

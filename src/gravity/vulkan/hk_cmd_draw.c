@@ -1558,6 +1558,19 @@ hk_apple9_native_gs_triangles(const struct vk_dynamic_graphics_state *dyn,
  * true (or tell the kernel) before admitting indirect, predicated or queried
  * native draws. */
 static bool
+hk_apple9_native_layers_samples_eligible(const struct hk_graphics_state *gfx,
+                                         const struct vk_dynamic_graphics_state *dyn,
+                                         bool allow_multilayer_msaa)
+{
+   unsigned samples =
+      MAX2(gfx->render.tilebuffer.nr_samples ?: dyn->ms.rasterization_samples, 1);
+   if (!allow_multilayer_msaa)
+      return gfx->render.layer_count == 1 && samples == 1;
+   return gfx->render.layer_count >= 1 && gfx->render.layer_count <= 2048 &&
+          (samples == 1 || samples == 2 || samples == 4);
+}
+
+static bool
 hk_apple9_native_gs_state_eligible(struct hk_cmd_buffer *cmd,
                                   struct agx_draw draw)
 {
@@ -1577,15 +1590,15 @@ hk_apple9_native_gs_state_eligible(struct hk_cmd_buffer *cmd,
        gfx->shaders[MESA_SHADER_TESS_CTRL] ||
        gfx->shaders[MESA_SHADER_TESS_EVAL] || gfx->shaders[MESA_SHADER_TASK] ||
        gfx->shaders[MESA_SHADER_MESH] || gfx->render.view_mask ||
-       gfx->render.layer_count != 1 || hk_cond_render_applies(cmd) ||
+       !hk_apple9_native_layers_samples_eligible(
+          gfx, dyn, hk_apple9_native_gs_enabled()) ||
+       hk_cond_render_applies(cmd) ||
        gfx->descriptors.root.draw.pipeline_stats_flags ||
        gfx->occlusion.active_count || gfx->mesh_pg_query || gfx->xfb_enabled ||
        dyn->rs.rasterization_stream || dyn->rs.rasterizer_discard_enable ||
        dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL ||
        dyn->rs.conservative_mode !=
-          VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT ||
-       MAX2(gfx->render.tilebuffer.nr_samples ?: dyn->ms.rasterization_samples,
-            1) != 1)
+          VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT)
       return false;
    for (unsigned i = 0; i < ARRAY_SIZE(gfx->pg_query); ++i) {
       if (gfx->pg_query[i] || gfx->xfb_query[i])
@@ -1617,15 +1630,15 @@ hk_apple9_native_tess_state_eligible(struct hk_cmd_buffer *cmd,
        !gfx->shaders[MESA_SHADER_TESS_EVAL] ||
        gfx->shaders[MESA_SHADER_GEOMETRY] || gfx->shaders[MESA_SHADER_TASK] ||
        gfx->shaders[MESA_SHADER_MESH] || gfx->render.view_mask ||
-       gfx->render.layer_count != 1 || hk_cond_render_applies(cmd) ||
+       !hk_apple9_native_layers_samples_eligible(
+          gfx, dyn, hk_apple9_native_tess_enabled()) ||
+       hk_cond_render_applies(cmd) ||
        gfx->descriptors.root.draw.pipeline_stats_flags ||
        gfx->occlusion.active_count || gfx->mesh_pg_query || gfx->xfb_enabled ||
        dyn->rs.rasterization_stream || dyn->rs.rasterizer_discard_enable ||
        dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL ||
        dyn->rs.conservative_mode !=
-          VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT ||
-       MAX2(gfx->render.tilebuffer.nr_samples ?: dyn->ms.rasterization_samples,
-            1) != 1)
+          VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT)
       return false;
    for (unsigned i = 0; i < ARRAY_SIZE(gfx->pg_query); ++i) {
       if (gfx->pg_query[i] || gfx->xfb_query[i])
@@ -2097,13 +2110,13 @@ hk_apple9_native_mesh_state_eligible(struct hk_cmd_buffer *cmd,
         !hk_apple9_native_task_bridge_enabled()) ||
        gfx->shaders[MESA_SHADER_GEOMETRY] ||
        gfx->shaders[MESA_SHADER_TESS_EVAL] || gfx->render.view_mask ||
-       gfx->render.layer_count != 1 || hk_cond_render_applies(cmd) ||
+       !hk_apple9_native_layers_samples_eligible(
+          gfx, dyn, hk_apple9_native_mesh_enabled()) ||
+       hk_cond_render_applies(cmd) ||
        gfx->mesh_pg_query || gfx->descriptors.root.draw.pipeline_stats_flags ||
        gfx->occlusion.active_count || gfx->xfb_enabled ||
        dyn->rs.line.stipple.enable ||
-       dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL ||
-       MAX2(gfx->render.tilebuffer.nr_samples ?: dyn->ms.rasterization_samples,
-            1) != 1)
+       dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL)
       return false;
 
    /* Primitive and cull-distance culling use degenerate indices, which

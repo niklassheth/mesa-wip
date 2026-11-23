@@ -118,6 +118,19 @@ main(int argc, char **argv)
    const uint32_t groups[] = {1, 1, 1};
    bool route = hk_apple9_use_native_mesh(cmd, groups, 0);
    CHECK(route == expected);
+   /* Production HK_APPLE9_NATIVE_INDEX=1 stays single-layer/single-sample for
+    * backward safety with older v1 kernels lacking 932adc520b3c. */
+   if (expected) {
+      cmd->state.gfx.render.layer_count = 2;
+      CHECK(!hk_apple9_use_native_mesh(cmd, groups, 0));
+      cmd->state.gfx.render.layer_count = 1;
+      cmd->vk.dynamic_graphics_state.ms.rasterization_samples = 4;
+      CHECK(!hk_apple9_use_native_mesh(cmd, groups, 0));
+      cmd->vk.dynamic_graphics_state.ms.rasterization_samples = 0;
+      cmd->state.gfx.render.tilebuffer.nr_samples = 4;
+      CHECK(!hk_apple9_use_native_mesh(cmd, groups, 0));
+      cmd->state.gfx.render.tilebuffer.nr_samples = 0;
+   }
    uint32_t command[256] = {0};
    struct hk_cs cs = {.cmd = cmd, .type = HK_CS_VDM,
                      .start = (uint8_t *)command, .current = (uint8_t *)command};
