@@ -160,6 +160,10 @@ def callee_publication(rows, lanes=32, grid=(1, 1, 1)):
                 literal = (b[3] & 126) | (((w >> 20) & 1) << 7) | ((w >> 36) & 1)
                 assert (w >> 41) & 1 and literal == 3 and r['src'] == [f'r{a}']
                 predicate = regs[f'r{a}'] < literal
+            elif op == 'IADD':
+                assert len(b) == 10 and b[0] == 0x9f and r['imm'] == 2
+                assert not (b[8] & 1) and not (b[7] & 0x40) and (b[9] & 0x10)
+                value = (regs[r['src'][0]] << 2) & 0xffffffff
             elif op in ('ISHL', 'USHR'):
                 assert len(b) == 12 and r['imm'] == 2
                 assert b[0] == (0x27 if op == 'ISHL' else 0xa7)

@@ -198,6 +198,8 @@ static const struct agx_apple9_encoding_info encodings[] = {
    [AGX_APPLE9_ENC_SHARED_LOAD] = {
       .name = "shared_load", .length = 14, .operand_count = 2,
       .allocator_safe = true, .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
+      .dependency_layout = AGX_APPLE9_DEPENDENCY_MASK_12_17,
+      .dependency_retains_sources = true,
       .operands = {
          GPR(AGX_APPLE9_OPERAND_DEST, AGX_APPLE9_WIDTH_32, 95, 2,
              AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_HARDWARE),
@@ -208,6 +210,7 @@ static const struct agx_apple9_encoding_info encodings[] = {
    [AGX_APPLE9_ENC_SHARED_STORE] = {
       .name = "shared_store", .length = 14, .operand_count = 2,
       .allocator_safe = true, .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
+      .dependency_layout = AGX_APPLE9_DEPENDENCY_MASK_12_17,
       .operands = {
          GPR(AGX_APPLE9_OPERAND_SRC0, AGX_APPLE9_WIDTH_32, 95, 2,
              AGX_APPLE9_OPERAND_ALLOCATABLE | AGX_APPLE9_OPERAND_CLOBBER,
@@ -1115,9 +1118,9 @@ static const struct agx_apple9_encoding_info encodings[] = {
          .operands = {
             GPR(AGX_APPLE9_OPERAND_DEST, AGX_APPLE9_WIDTH_64, 94, 4,
                 AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_HARDWARE),
-            GPR(AGX_APPLE9_OPERAND_SRC0, AGX_APPLE9_WIDTH_32, 95, 2,
+            REGISTER_SOURCE(AGX_APPLE9_OPERAND_SRC0, AGX_APPLE9_WIDTH_32, 95, 2,
                 AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_HARDWARE),
-            GPR(AGX_APPLE9_OPERAND_SRC1, AGX_APPLE9_WIDTH_32, 95, 2,
+            INT_IMM_SOURCE(AGX_APPLE9_OPERAND_SRC1, AGX_APPLE9_WIDTH_32, 95, 2,
                 AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_HARDWARE),
          },
       },
@@ -1234,15 +1237,15 @@ static const struct agx_apple9_encoding_info encodings[] = {
                   AGX_APPLE9_OPERAND_SRC0, AGX_APPLE9_WIDTH_32, 95,
                   2, AGX_APPLE9_OPERAND_ALLOCATABLE | AGX_APPLE9_OPERAND_SCATTERED,
                   AGX_APPLE9_EVIDENCE_HARDWARE),
-               REGISTER_SOURCE(
+               INT_IMM_SOURCE(
                   AGX_APPLE9_OPERAND_SRC1, AGX_APPLE9_WIDTH_32, 95,
                   2, AGX_APPLE9_OPERAND_ALLOCATABLE | AGX_APPLE9_OPERAND_SCATTERED,
                   AGX_APPLE9_EVIDENCE_HARDWARE),
-               REGISTER_SOURCE(
+               INT_IMM_SOURCE(
                   AGX_APPLE9_OPERAND_SRC2, AGX_APPLE9_WIDTH_32, 95,
                   2, AGX_APPLE9_OPERAND_ALLOCATABLE | AGX_APPLE9_OPERAND_SCATTERED,
                   AGX_APPLE9_EVIDENCE_HARDWARE),
-               REGISTER_SOURCE(
+               INT_IMM_SOURCE(
                   AGX_APPLE9_OPERAND_SRC3, AGX_APPLE9_WIDTH_32, 95,
                   2, AGX_APPLE9_OPERAND_ALLOCATABLE | AGX_APPLE9_OPERAND_SCATTERED,
                   AGX_APPLE9_EVIDENCE_HARDWARE),

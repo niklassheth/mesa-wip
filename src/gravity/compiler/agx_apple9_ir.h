@@ -491,6 +491,10 @@ struct agx_apple9_vir_instr {
     * texture_imm_lod_uq4_2 in 0..63; restricted to 0 in 20B bindless mode). */
    bool texture_imm_lod;
    uint8_t texture_imm_lod_uq4_2;
+   /* For SELECT: when true, src2/src3 immediates use wide 9-bit signed
+    * minifloat encoding (bit 18 = 0) instead of 8-bit integer immediates
+    * (bit 18 = 1). */
+   bool select_float_immediates;
    /* Set when emitted from a fragment shader; GPR bindless PBE writes share
     * the same byte 13/14 encoding as compute/vertex stages. */
    bool image_fragment;
@@ -851,8 +855,10 @@ agx_apple9_integer_immediate_encoding(enum agx_apple9_encoding encoding)
 {
    return encoding == AGX_APPLE9_ENC_INT_ADD_EXTENDED ||
           encoding == AGX_APPLE9_ENC_INT_MAD_EXTENDED ||
+          encoding == AGX_APPLE9_ENC_INT_MUL_WIDE ||
           encoding == AGX_APPLE9_ENC_LOGIC_EXTENDED ||
-          encoding == AGX_APPLE9_ENC_SELECT_GPR_WIDE;
+          encoding == AGX_APPLE9_ENC_SELECT_GPR_WIDE ||
+          encoding == AGX_APPLE9_ENC_SELECT_MODIFIER_EXTENDED;
 }
 
 
@@ -882,7 +888,8 @@ agx_apple9_compare_literal_slot(const struct agx_apple9_vir_instr *I,
 {
    return slot == 1 &&
           ((I->op == AGX_APPLE9_VIR_SELECT &&
-            I->encoding == AGX_APPLE9_ENC_SELECT_GPR_WIDE) ||
+            (I->encoding == AGX_APPLE9_ENC_SELECT_GPR_WIDE ||
+             I->encoding == AGX_APPLE9_ENC_SELECT_MODIFIER_EXTENDED)) ||
            (I->op == AGX_APPLE9_VIR_PREDICATE_COMPARE &&
             (I->encoding == AGX_APPLE9_ENC_PREDICATE_COMPARE_SHORT ||
              I->encoding == AGX_APPLE9_ENC_PREDICATE_COMPARE_EXTENDED)));
@@ -921,6 +928,27 @@ agx_apple9_source_immediate_encodable(enum agx_apple9_encoding encoding,
    if (agx_apple9_wide_float_immediate_slot(encoding, slot))
       return agx_apple9_encode_float_immediate_wide(value, &encoded, &low);
    return agx_apple9_encode_float_immediate(value, &encoded);
+}
+
+static inline bool
+agx_apple9_instr_immediate_encodable(const struct agx_apple9_vir_instr *I,
+                                     unsigned slot, uint32_t value)
+{
+   uint8_t encoded;
+   bool low;
+   if (agx_apple9_compare_literal_slot(I, slot))
+      return agx_apple9_compare_literal_encodable(I, value);
+   if (I->op == AGX_APPLE9_VIR_SELECT && (slot == 2 || slot == 3)) {
+      if (I->select_float_immediates)
+         return agx_apple9_encode_float_immediate_wide(value, &encoded, &low);
+      return value <= UINT8_MAX;
+   }
+   if (I->encoding == AGX_APPLE9_ENC_MINMAX_COMPACT && slot == 1) {
+      if (I->op == AGX_APPLE9_VIR_FMIN || I->op == AGX_APPLE9_VIR_FMAX)
+         return agx_apple9_encode_float_immediate_wide(value, &encoded, &low);
+      return value <= UINT8_MAX;
+   }
+   return agx_apple9_source_immediate_encodable(I->encoding, slot, value);
 }
 
 uint32_t agx_apple9_vir_emit(struct agx_apple9_vir_program *program,

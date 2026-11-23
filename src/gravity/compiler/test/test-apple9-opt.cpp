@@ -367,15 +367,15 @@ TEST_F(Apple9Optimization, FloatSelectCanonicalizesNegatedComparisons)
          ASSERT_TRUE(agx_apple9_optimize_vir(&p));
          ASSERT_TRUE(agx_apple9_analyze_uses(&p));
          const auto *I = agx_apple9_definition(&p, p.output);
-         EXPECT_EQ(I->src[0], both ? a : b);
-         EXPECT_EQ(I->src[1], both ? b : a);
+         EXPECT_EQ(I->src[0], a);
+         EXPECT_EQ(I->src[1], b);
          EXPECT_EQ(I->src[2], c);
          EXPECT_EQ(I->src[3], d);
-         EXPECT_EQ(I->src_neg_mask, both ? 0 : 2);
+         EXPECT_EQ(I->src_neg_mask, both ? 0 : 1);
          auto reversed = condition == AGX_APPLE9_SELECT_FGT ? AGX_APPLE9_SELECT_FLT
             : condition == AGX_APPLE9_SELECT_FLT ? AGX_APPLE9_SELECT_FGT
             : AGX_APPLE9_SELECT_FEQ;
-         EXPECT_EQ(I->immediate, reversed);
+         EXPECT_EQ(I->immediate, both ? reversed : condition);
       }
    }
 }

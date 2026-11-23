@@ -29,8 +29,9 @@ def check(rows, root):
         code = row["code"]
         atomic = row["op"] == "SHARED_ATOMIC"
         assert len(code) == (12 if atomic else 14)
-        assert code[:3] == bytes([0x67 if atomic or row["op"] == "SHARED_LOAD" else 0xe7,
-                                 3 if atomic else 2, 0x54])
+        assert code[0] == (0x67 if atomic or row["op"] == "SHARED_LOAD" else 0xe7)
+        assert (code[1] & 0x0f) == (3 if atomic else 2)
+        assert (code[2] & 0xfc) == 0x54
         # Atomic roots use a split halfword index; ordinary local memory uses
         # the root's four-halfword selector directly in byte 4.
         encoded = (((code[4] << 1) | (code[3] >> 7)) // 4

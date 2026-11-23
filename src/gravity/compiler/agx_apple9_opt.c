@@ -135,7 +135,7 @@ apple9_instr_is_cse_eligible(const struct agx_apple9_vir_instr *I)
 
 struct expression {
    uint32_t op, encoding, immediate, nr_srcs, components;
-   uint32_t src_abs, src_neg, saturate;
+   uint32_t src_abs, src_neg, saturate, select_float_immediates;
    uint32_t src_uniform, src_immediate, src_value[4];
    uint32_t src_half, src_hi, src_sext;
    uint32_t src[AGX_APPLE9_MAX_VIR_SRCS];
@@ -238,9 +238,17 @@ fold_integer(struct agx_apple9_vir_instr *I, const bool *constant,
 
    uint32_t value;
    switch (I->op) {
-   case AGX_APPLE9_VIR_IADD: value = c[0] + c[1]; break;
+   case AGX_APPLE9_VIR_IADD:
+      if (I->immediate > 4)
+         return false;
+      value = c[0] + (c[1] << I->immediate);
+      break;
    case AGX_APPLE9_VIR_IMUL: value = c[0] * c[1]; break;
-   case AGX_APPLE9_VIR_ISUB: value = c[0] - c[1]; break;
+   case AGX_APPLE9_VIR_ISUB:
+      if (I->immediate > 4)
+         return false;
+      value = c[0] - (c[1] << I->immediate);
+      break;
    case AGX_APPLE9_VIR_IMAD: value = c[0] * c[1] + c[2]; break;
    case AGX_APPLE9_VIR_IAND: value = c[0] & c[1]; break;
    case AGX_APPLE9_VIR_IANDN: value = c[0] & ~c[1]; break;
@@ -271,11 +279,67 @@ fold_integer(struct agx_apple9_vir_instr *I, const bool *constant,
    }
 
    I->op = AGX_APPLE9_VIR_IMM;
-   I->encoding = value <= 0x7f ? AGX_APPLE9_ENC_MOV_IMM_COMPACT
-                              : AGX_APPLE9_ENC_MOV_IMM32;
+   I->encoding = (value == 0 || value > 0x7f) ? AGX_APPLE9_ENC_MOV_IMM32
+                                              : AGX_APPLE9_ENC_MOV_IMM_COMPACT;
    I->nr_srcs = 0;
    I->immediate = value;
    return true;
+}
+
+/* Fuse `a +/- (b << 1..4)` into a single 10B IADD/ISUB with inline lsl, and
+ * lower standalone `x << 1..4` from 12B ISHL to 10B `iadd 0, x, lsl k`. */
+static void
+fold_iadd_shift(struct agx_apple9_vir_instr *I,
+                struct agx_apple9_vir_instr **definitions)
+{
+   if (I->op == AGX_APPLE9_VIR_ISHL &&
+       I->encoding == AGX_APPLE9_ENC_SHIFT_LOGICAL_IMMEDIATE &&
+       I->nr_srcs == 1 && !I->alu_src_uniform_mask &&
+       !I->alu_src_immediate_mask &&
+       (I->immediate >> AGX_APPLE9_SHIFT_WIDTH_SHIFT) == 0 &&
+       I->immediate >= 1 && I->immediate <= 4) {
+      I->op = AGX_APPLE9_VIR_IADD;
+      I->encoding = AGX_APPLE9_ENC_INT_ADD_EXTENDED;
+      I->alu_src_immediate_mask = 1;
+      I->alu_src_value[0] = 0;
+      return;
+   }
+
+   if ((I->op != AGX_APPLE9_VIR_IADD && I->op != AGX_APPLE9_VIR_ISUB) ||
+       I->encoding != AGX_APPLE9_ENC_INT_ADD_EXTENDED || I->immediate ||
+       I->saturate || I->src_half_mask || I->alu_src_uniform_mask ||
+       I->alu_src_immediate_mask || I->nr_srcs != 2)
+      return;
+
+   /* Prefer src1 (no swap needed); for commutative IADD, also check src0. */
+   for (int s = 1; s >= (I->op == AGX_APPLE9_VIR_IADD ? 0 : 1); --s) {
+      const struct agx_apple9_vir_instr *D = definitions[I->src[s]];
+      if (!D || !agx_apple9_instr_is_pure_alu(D) ||
+          agx_apple9_instr_block(D) != agx_apple9_instr_block(I) ||
+          D->nr_srcs != 1 || D->alu_src_uniform_mask || D->src_half_mask)
+         continue;
+      bool is_shl = D->op == AGX_APPLE9_VIR_ISHL &&
+                    D->encoding == AGX_APPLE9_ENC_SHIFT_LOGICAL_IMMEDIATE &&
+                    !D->alu_src_immediate_mask &&
+                    (D->immediate >> AGX_APPLE9_SHIFT_WIDTH_SHIFT) == 0 &&
+                    D->immediate >= 1 && D->immediate <= 4;
+      bool is_iadd_shl = D->op == AGX_APPLE9_VIR_IADD &&
+                         D->encoding == AGX_APPLE9_ENC_INT_ADD_EXTENDED &&
+                         !D->saturate && D->alu_src_immediate_mask == 1 &&
+                         D->alu_src_value[0] == 0 &&
+                         D->immediate >= 1 && D->immediate <= 4;
+      if (!is_shl && !is_iadd_shl)
+         continue;
+      if (s == 0) {
+         uint32_t other = I->src[1];
+         I->src[0] = other;
+         I->src[1] = D->src[0];
+      } else {
+         I->src[1] = D->src[0];
+      }
+      I->immediate = D->immediate;
+      return;
+   }
 }
 
 bool
@@ -346,6 +410,7 @@ fold_select_xor(struct agx_apple9_vir_instr *I,
       I->immediate = S->immediate;
       I->src_abs_mask = S->src_abs_mask;
       I->src_neg_mask = S->src_neg_mask;
+      I->select_float_immediates = S->select_float_immediates;
       I->alu_src_uniform_mask = S->alu_src_uniform_mask;
       I->alu_src_immediate_mask = S->alu_src_immediate_mask;
       memcpy(I->alu_src_value, S->alu_src_value, sizeof(I->alu_src_value));
@@ -427,21 +492,13 @@ select_float_sources(struct agx_apple9_vir_instr *I,
    }
 
    if (select) {
-      /* Swap the ordered comparison for a negated first operand. When both
-       * inputs are negated, reversing the relation removes both negations.
-       * These identities preserve equality and unordered NaN comparisons. */
-      if (I->src_neg_mask & 1) {
+      /* When both compare inputs are negated, reversing the relation removes
+       * both negations while preserving equality and unordered NaNs. A lone
+       * src0.neg stays in src0 (bit 65) so src1 remains free for a literal. */
+      if ((I->src_neg_mask & 3) == 3) {
          if (condition == AGX_APPLE9_SELECT_FGT) condition = AGX_APPLE9_SELECT_FLT;
          else if (condition == AGX_APPLE9_SELECT_FLT) condition = AGX_APPLE9_SELECT_FGT;
-         if (I->src_neg_mask & 2) {
-            I->src_neg_mask &= ~3u;
-         } else {
-            uint32_t source = I->src[0];
-            I->src[0] = I->src[1]; I->src[1] = source;
-            I->src_neg_mask = (I->src_neg_mask & ~3u) | 2;
-            I->src_abs_mask = (I->src_abs_mask & ~3u) |
-               ((I->src_abs_mask & 1) << 1) | ((I->src_abs_mask & 2) >> 1);
-         }
+         I->src_neg_mask &= ~3u;
          I->immediate = (I->immediate & ~0xffu) | condition;
       }
       I->encoding = (I->src_abs_mask & 3) ? AGX_APPLE9_ENC_SELECT_MODIFIER_EXTENDED
@@ -547,12 +604,12 @@ inline_compare_literal(struct agx_apple9_vir_instr *I, const bool *constant,
          reversed = condition ^ 1;
       else
          reversed = ~0u;
-      if (!can[0] || reversed == ~0u || (modifiers & 2))
+      if (!can[0] || reversed == ~0u || (predicate && (modifiers & 2)))
          return;
       uint32_t src = I->src[0];
       I->src[0] = I->src[1]; I->src[1] = src;
-      I->src_abs_mask = (I->src_abs_mask & ~3u) | ((I->src_abs_mask & 1) << 1);
-      I->src_neg_mask = (I->src_neg_mask & ~3u) | ((I->src_neg_mask & 1) << 1);
+      I->src_abs_mask = (I->src_abs_mask & ~3u) | ((I->src_abs_mask & 2) >> 1);
+      I->src_neg_mask = (I->src_neg_mask & ~3u) | ((I->src_neg_mask & 2) >> 1);
       I->immediate = (I->immediate & ~0xffu) | reversed;
       literal[1] = literal[0];
    }
@@ -561,6 +618,9 @@ inline_compare_literal(struct agx_apple9_vir_instr *I, const bool *constant,
    I->alu_src_value[1] = literal[1];
    I->src_abs_mask &= ~2u;
    I->src_neg_mask &= ~2u;
+   if (I->encoding == AGX_APPLE9_ENC_SELECT_MODIFIER_EXTENDED &&
+       !(I->src_abs_mask & 3))
+      I->encoding = AGX_APPLE9_ENC_SELECT_GPR_WIDE;
    for (unsigned s = 1; s + 1 < I->nr_srcs; ++s)
       I->src[s] = I->src[s + 1];
    --I->nr_srcs;
@@ -576,15 +636,21 @@ inline_integer_immediates(struct agx_apple9_vir_instr *I, const bool *constant,
 {
    bool add = I->op == AGX_APPLE9_VIR_IADD || I->op == AGX_APPLE9_VIR_ISUB;
    bool mad = I->op == AGX_APPLE9_VIR_IMAD && !I->immediate;
+   bool mul_wide = I->op == AGX_APPLE9_VIR_IMUL_WIDE && !I->immediate;
+   bool iminmax = (I->op == AGX_APPLE9_VIR_IMIN || I->op == AGX_APPLE9_VIR_IMAX ||
+                   I->op == AGX_APPLE9_VIR_UMIN || I->op == AGX_APPLE9_VIR_UMAX) &&
+                  I->encoding == AGX_APPLE9_ENC_MINMAX_COMPACT;
    bool logic = I->op == AGX_APPLE9_VIR_IAND || I->op == AGX_APPLE9_VIR_IOR ||
                 I->op == AGX_APPLE9_VIR_IXOR;
-   bool select = I->op == AGX_APPLE9_VIR_SELECT;
+   bool select = I->op == AGX_APPLE9_VIR_SELECT &&
+                 (I->encoding == AGX_APPLE9_ENC_SELECT_GPR_WIDE ||
+                  I->encoding == AGX_APPLE9_ENC_SELECT_MODIFIER_EXTENDED);
    unsigned arity = select ? 4 : mad ? 3 : 2;
-   if (!(add || mad || logic || select) ||
-       !agx_apple9_integer_immediate_encoding(I->encoding) ||
+   if (!(add || mad || mul_wide || iminmax || logic || select) ||
+       (!iminmax && !agx_apple9_integer_immediate_encoding(I->encoding)) ||
        I->saturate || I->src_sext_mask ||
        I->alu_src_uniform_mask || I->alu_src_immediate_mask ||
-       I->nr_srcs != arity || I->dest_components != 1)
+       I->nr_srcs != arity || I->dest_components != (mul_wide ? 2 : 1))
       return;
 
    /* Operand values, with the literal each would take inline. Every source
@@ -602,31 +668,37 @@ inline_integer_immediates(struct agx_apple9_vir_instr *I, const bool *constant,
    }
 
    if (add) {
-      /* An exact negation moves a small negative addend into the
-       * subtrahend: x + (-c) is x - c, and x - (-c) is x + c. */
-      bool sub = I->op == AGX_APPLE9_VIR_ISUB;
-      if (!sub && !fits[1] && fits[0]) {
-         uint32_t src = I->src[0];
-         I->src[0] = I->src[1]; I->src[1] = src;
-         literal[1] = literal[0]; fits[1] = true;
-         fits[0] = constant[I->src[0]] && values[I->src[0]] <= UINT8_MAX;
-         literal[0] = values[I->src[0]];
+      if (I->immediate) {
+         /* Shifted src1 cannot be commuted or turned into an immediate; src0
+          * still takes an 8-bit immediate (including 0 for `0 + (x << k)`). */
+         fits[1] = false;
+      } else {
+         /* An exact negation moves a small negative addend into the
+          * subtrahend: x + (-c) is x - c, and x - (-c) is x + c. */
+         bool sub = I->op == AGX_APPLE9_VIR_ISUB;
+         if (!sub && !fits[1] && fits[0]) {
+            uint32_t src = I->src[0];
+            I->src[0] = I->src[1]; I->src[1] = src;
+            literal[1] = literal[0]; fits[1] = true;
+            fits[0] = constant[I->src[0]] && values[I->src[0]] <= UINT8_MAX;
+            literal[0] = values[I->src[0]];
+         }
+         if (!fits[1] && constant[I->src[1]] && -literal[1] <= UINT8_MAX &&
+             (sub || !fits[0])) {
+            I->op = sub ? AGX_APPLE9_VIR_IADD : AGX_APPLE9_VIR_ISUB;
+            literal[1] = -literal[1];
+            fits[1] = true;
+         } else if (!fits[1] && !sub && constant[I->src[0]] &&
+                    -values[I->src[0]] <= UINT8_MAX) {
+            uint32_t src = I->src[0];
+            I->src[0] = I->src[1]; I->src[1] = src;
+            I->op = AGX_APPLE9_VIR_ISUB;
+            literal[1] = -values[src];
+            fits[1] = true;
+         }
       }
-      if (!fits[1] && constant[I->src[1]] && -literal[1] <= UINT8_MAX &&
-          (sub || !fits[0])) {
-         I->op = sub ? AGX_APPLE9_VIR_IADD : AGX_APPLE9_VIR_ISUB;
-         literal[1] = -literal[1];
-         fits[1] = true;
-      } else if (!fits[1] && !sub && constant[I->src[0]] &&
-                 -values[I->src[0]] <= UINT8_MAX) {
-         uint32_t src = I->src[0];
-         I->src[0] = I->src[1]; I->src[1] = src;
-         I->op = AGX_APPLE9_VIR_ISUB;
-         literal[1] = -values[src];
-         fits[1] = true;
-      }
-   } else if (mad) {
-      /* The multiplicands commute; A has no literal form. */
+   } else if (mad || mul_wide || iminmax || logic) {
+      /* Commutative binary/multiplicand slots: A has no literal form. */
       if (fits[0] && !fits[1]) {
          uint32_t src = I->src[0];
          I->src[0] = I->src[1]; I->src[1] = src;
@@ -634,20 +706,47 @@ inline_integer_immediates(struct agx_apple9_vir_instr *I, const bool *constant,
          literal[1] = literal[0];
       }
       fits[0] = false;
-   } else if (logic) {
-      if (fits[0] && !fits[1]) {
-         uint32_t src = I->src[0];
-         I->src[0] = I->src[1]; I->src[1] = src;
-         fits[1] = true;
-         literal[1] = literal[0];
-      }
-      fits[0] = false;
    } else {
-      /* Comparison operands keep registers; the selected values do not
-       * take float modifiers in literal form. */
+      /* Comparison operands are handled by inline_compare_literal. Selected
+       * arms share bit 18: 1 = 8-bit integer immediates (no arm modifiers),
+       * 0 = wide 9-bit signed minifloat immediates (compatible with arm
+       * abs/neg modifiers). Pick the mode that inlines more arms. */
       fits[0] = fits[1] = false;
-      for (unsigned s = 2; s < 4; ++s)
-         fits[s] &= !((I->src_abs_mask | I->src_neg_mask) & BITFIELD_BIT(s));
+      bool has_arm_mods = ((I->src_abs_mask | I->src_neg_mask) & 0xc) != 0;
+      bool int_ok[4] = {false};
+      bool flt_ok[4] = {false};
+      uint32_t flt_lit[4] = {0};
+      for (unsigned s = 2; s < 4; ++s) {
+         if (!constant[I->src[s]])
+            continue;
+         int_ok[s] = !has_arm_mods && literal[s] <= UINT8_MAX;
+         uint32_t fval = literal[s];
+         if (I->src_abs_mask & BITFIELD_BIT(s)) fval &= 0x7fffffffu;
+         if (I->src_neg_mask & BITFIELD_BIT(s)) fval ^= 0x80000000u;
+         uint8_t encoded;
+         bool low;
+         if (agx_apple9_encode_float_immediate_wide(fval, &encoded, &low)) {
+            flt_ok[s] = true;
+            flt_lit[s] = fval;
+         }
+      }
+      unsigned int_cnt = (unsigned)int_ok[2] + (unsigned)int_ok[3];
+      unsigned flt_cnt = (unsigned)flt_ok[2] + (unsigned)flt_ok[3];
+      if (flt_cnt > int_cnt) {
+         I->select_float_immediates = true;
+         for (unsigned s = 2; s < 4; ++s) {
+            fits[s] = flt_ok[s];
+            if (fits[s]) {
+               literal[s] = flt_lit[s];
+               I->src_abs_mask &= ~BITFIELD_BIT(s);
+               I->src_neg_mask &= ~BITFIELD_BIT(s);
+            }
+         }
+      } else {
+         I->select_float_immediates = false;
+         fits[2] = int_ok[2];
+         fits[3] = int_ok[3];
+      }
    }
    /* Both add operands constant were folded already; keep one register. */
    if (add && fits[0] && fits[1])
@@ -778,7 +877,7 @@ inline_alu_sources(struct agx_apple9_vir_instr *I, const uint16_t *uniform_read,
    bool minmax_float = (I->op == AGX_APPLE9_VIR_FMIN || I->op == AGX_APPLE9_VIR_FMAX) &&
                        I->encoding == AGX_APPLE9_ENC_MINMAX_COMPACT;
    bool integer = I->op == AGX_APPLE9_VIR_IADD || I->op == AGX_APPLE9_VIR_ISUB ||
-                  I->op == AGX_APPLE9_VIR_IMAD;
+                  I->op == AGX_APPLE9_VIR_IMAD || I->op == AGX_APPLE9_VIR_IMUL_WIDE;
    unsigned arity = unary ? 1 : shift ? I->nr_srcs : select ? 4 : fma || I->op == AGX_APPLE9_VIR_IMAD ? 3 : 2;
    bool float2 = I->op == AGX_APPLE9_VIR_FADD || I->op == AGX_APPLE9_VIR_FSUB ||
                  I->op == AGX_APPLE9_VIR_FMUL;
@@ -1022,6 +1121,8 @@ fold_uniform_stores(struct agx_apple9_vir_program *p)
       switch (alu->op) {
       case AGX_APPLE9_VIR_IADD:
       case AGX_APPLE9_VIR_ISUB:
+         if (alu->immediate)
+            continue;
          encoding = AGX_APPLE9_ENC_STORE_UNIFORM_ADD;
          break;
       case AGX_APPLE9_VIR_IMAD:
@@ -1224,7 +1325,7 @@ fold_half_sources(struct agx_apple9_vir_program *p,
             ok = (float2 && slot < 2) ||
                  (fma && (slot == 2 || (slot == 1 && !hi) || fma_swap));
          else
-            ok = (add && !R->saturate &&
+            ok = (add && !R->saturate && !R->immediate &&
                   R->encoding == AGX_APPLE9_ENC_INT_ADD_EXTENDED && slot < 2) ||
                  (mad && R->encoding == AGX_APPLE9_ENC_INT_MAD_EXTENDED &&
                   (!sext || slot == 0));
@@ -1377,6 +1478,7 @@ agx_apple9_optimize_vir_with_constants(
 
       if (pure_alu) {
          fold_integer(I, constant, values);
+         fold_iadd_shift(I, definitions);
          fold_select_xor(I, definitions, constant, values, uniform_writes);
          select_float_sources(I, definitions, constant, values);
          inline_integer_immediates(I, constant, values);
@@ -1403,6 +1505,7 @@ agx_apple9_optimize_vir_with_constants(
          .components = I->dest_components,
          .src_abs = I->src_abs_mask, .src_neg = I->src_neg_mask,
          .saturate = I->saturate,
+         .select_float_immediates = I->select_float_immediates,
          .src_uniform = I->alu_src_uniform_mask,
          .src_immediate = I->alu_src_immediate_mask,
          .src_half = I->src_half_mask, .src_hi = I->src_hi_mask,

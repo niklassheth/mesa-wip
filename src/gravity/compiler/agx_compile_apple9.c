@@ -1403,11 +1403,11 @@ static uint32_t
 apple9_dag_imm(struct apple9_dag_lower *lower, uint32_t value)
 {
    /* Metal normally folds a scalar literal into the consuming ALU operand
-    * descriptor.  Until those immediate forms are selected generally, use
-    * the independently executed mode-2 raw write.  EXP-M4-37 validates its
-    * complete six-bit destination field, so the allocator may place the
-    * result anywhere in r0..r63. */
-   if (value > 0x7f)
+    * descriptor. For remaining materialized literals: 0 uses ENC_MOV_IMM32
+    * (r0..r63, no hard-low pressure; packs to 2B MOV_IMM_COMPACT on r0..r15
+    * and 4B ZERO on r16..r63), 1..127 uses 2B MOV_IMM_COMPACT, and >127 uses
+    * 8B MOV_IMM32. */
+   if (value == 0 || value > 0x7f)
       return apple9_dag_emit(lower, AGX_APPLE9_VIR_IMM,
                              AGX_APPLE9_ENC_MOV_IMM32, NULL, 0, value);
 
@@ -1428,27 +1428,15 @@ apple9_closed_context_boundary(struct apple9_dag_lower *lower, bool enter)
    agx_apple9_dag_cache_reset(&lower->cache);
    lower->object_region = enter;
    lower->object_calls |= enter;
-   if (enter) {
-      /* This definition dominates every callee mask. DCE removes it if unused;
-       * ordinary allocation chooses its register. After returning, use a fresh
-       * block-local zero rather than claiming dominance over the caller CFG.
-       */
-      lower->cache.entry_zero = apple9_dag_imm(lower, 0);
-      return lower->cache.entry_zero != AGX_APPLE9_VREG_INVALID;
-   }
    return true;
 }
 
 static uint32_t
 apple9_dag_zero(struct apple9_dag_lower *lower)
 {
-   /* One zero from the entry block serves every block. Rematerializing a
-    * zero per block made each constant memory index rewrite the register a
-    * preceding store or load was still reading, costing a wait. */
-   if (lower->cache.entry_zero != AGX_APPLE9_VREG_INVALID)
-      return lower->cache.entry_zero;
-   /* Otherwise reuse the zero only within its block, which need not dominate
-    * later blocks. */
+   /* Reuse zero only within the current block and active execution mask
+    * (invalidated on every mask transition) rather than pinning a GPR from
+    * the entry block across blocks and loops. */
    if (lower->cache.zero_vreg == AGX_APPLE9_VREG_INVALID ||
        lower->cache.zero_block != lower->program.current_block) {
       lower->cache.zero_vreg = apple9_dag_imm(lower, 0);
@@ -2376,6 +2364,60 @@ apple9_shared_index(struct apple9_dag_lower *lower, uint32_t base,
    return apple9_dag_shift_imm(lower, nir_op_ushr, address, shift);
 }
 
+/* Fold constant shared-memory byte displacements (0..8191) directly into the
+ * hardware 13-bit immediate byte offset of SHARED_LOAD/SHARED_STORE when the
+ * remaining dynamic byte address preserves element alignment. */
+static uint32_t
+apple9_shared_address(struct apple9_dag_lower *lower,
+                      const nir_intrinsic_instr *intr, unsigned src_idx,
+                      unsigned offset_B, unsigned shift, int16_t *imm_offset)
+{
+   *imm_offset = 0;
+   const unsigned elem_bytes = 1u << shift;
+   nir_scalar base_s =
+      apple9_chase_trivial(nir_get_scalar(intr->src[src_idx].ssa, 0));
+   uint32_t const_base = 0;
+   if (apple9_const_u32(base_s, &const_base)) {
+      uint64_t total = (uint64_t)const_base + offset_B;
+      if (total < 8192) {
+         *imm_offset = (int16_t)total;
+         return apple9_dag_zero(lower);
+      }
+      uint32_t base = apple9_dag_imm(lower, const_base);
+      return apple9_shared_index(lower, base, offset_B, shift);
+   }
+
+   nir_scalar dyn_s = base_s;
+   uint64_t total = offset_B;
+   if (nir_def_instr_type(base_s.def) == nir_instr_type_alu &&
+       nir_scalar_alu_op(base_s) == nir_op_iadd) {
+      for (unsigned s = 0; s < 2; ++s) {
+         uint32_t c = 0;
+         if (apple9_const_u32(nir_scalar_chase_alu_src(base_s, s), &c) &&
+             c < 8192 && total + c < 8192) {
+            dyn_s = apple9_chase_trivial(
+               nir_scalar_chase_alu_src(base_s, 1 - s));
+            total += c;
+            break;
+         }
+      }
+   }
+
+   if (total > 0 && total < 8192 && (total & (elem_bytes - 1u)) == 0 &&
+       apple9_shared_align(intr, src_idx, offset_B) >= elem_bytes) {
+      uint32_t dyn = apple9_lower_dag_scalar(lower, dyn_s);
+      if (dyn == AGX_APPLE9_VREG_INVALID)
+         return AGX_APPLE9_VREG_INVALID;
+      *imm_offset = (int16_t)total;
+      return shift ? apple9_dag_shift_imm(lower, nir_op_ushr, dyn, shift) : dyn;
+   }
+
+   uint32_t base = apple9_lower_dag_scalar(lower, base_s);
+   if (base == AGX_APPLE9_VREG_INVALID)
+      return AGX_APPLE9_VREG_INVALID;
+   return apple9_shared_index(lower, base, offset_B, shift);
+}
+
 static uint32_t
 apple9_pack_u16x2(struct apple9_dag_lower *lower, uint32_t lo, uint32_t hi)
 {
@@ -2673,8 +2715,9 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
       constant = nir_scalar_as_uint(scalar);
       if (scalar.def->bit_size < 32)
          constant &= BITFIELD_MASK(scalar.def->bit_size);
-      value = constant == 0 && lower->cache.entry_zero != AGX_APPLE9_VREG_INVALID
-                 ? apple9_dag_zero(lower) : apple9_dag_imm(lower, constant);
+      if (constant == 0 && lower->structured_cf)
+         return apple9_dag_zero(lower);
+      value = apple9_dag_imm(lower, constant);
    } else if (nir_def_instr_type(scalar.def) == nir_instr_type_tex) {
       nir_tex_instr *tex = nir_instr_as_tex(nir_def_instr(scalar.def));
       if (!apple9_texture_supported(tex)) {
@@ -3070,10 +3113,6 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
              apple9_shared_align(intr, 0, nir_intrinsic_base(intr)) < bits / 8 ||
              lower->shared_root == UINT_MAX)
             return AGX_APPLE9_VREG_INVALID;
-         uint32_t base = apple9_lower_dag_scalar(lower,
-            nir_get_scalar(intr->src[0].ssa, 0));
-         if (base == AGX_APPLE9_VREG_INVALID)
-            return AGX_APPLE9_VREG_INVALID;
          const bool is_volatile = !!(nir_intrinsic_access(intr) & ACCESS_VOLATILE);
          const nir_component_mask_t read =
             (is_volatile ? BITFIELD_MASK(scalar.def->num_components)
@@ -3114,13 +3153,17 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
                   shift = 2;
                }
             }
-            uint32_t idx = apple9_shared_index(lower, base, offset_B, shift);
+            int16_t imm_offset = 0;
+            uint32_t idx =
+               apple9_shared_address(lower, intr, 0, offset_B, shift, &imm_offset);
             if (idx == AGX_APPLE9_VREG_INVALID)
                return AGX_APPLE9_VREG_INVALID;
             uint32_t loaded = agx_apple9_vir_emit_shared_load_typed(
                &lower->program, idx, lower->shared_root, w, bits);
             if (loaded == AGX_APPLE9_VREG_INVALID)
                return AGX_APPLE9_VREG_INVALID;
+            lower->program.instructions[lower->program.instruction_count - 1]
+               ->memory_offset = imm_offset;
             if (bits == 16 && (w == 2 || w == 4)) {
                for (unsigned p = 0; p < w / 2; ++p) {
                   lower->ssa_to_vreg[scalar.def->index * APPLE9_SSA_COMPONENTS + c + 2 * p] =
@@ -5133,6 +5176,8 @@ apple9_emit_jump(struct apple9_dag_lower *lower, nir_block *block,
       &lower->program, AGX_APPLE9_VIR_BREAK_MASK_UNWIND,
       AGX_APPLE9_ENC_BREAK_MASK_UNWIND, NULL, 0,
       AGX_APPLE9_BREAK_IMMEDIATE(scope_tag, break_bank));
+   if (ok)
+      lower->cache.zero_vreg = AGX_APPLE9_VREG_INVALID;
    if (!ok)
       lower->reason = "could not emit an Apple9 loop break";
    return ok;
@@ -5696,10 +5741,6 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
                 apple9_shared_align(intr, 1, nir_intrinsic_base(intr)) < bits / 8 ||
                 lower->shared_root == UINT_MAX)
                return false;
-            uint32_t base = apple9_lower_dag_scalar(lower,
-               nir_get_scalar(intr->src[1].ssa, 0));
-            if (base == AGX_APPLE9_VREG_INVALID)
-               return false;
             const unsigned wmask = nir_intrinsic_write_mask(intr);
             for (unsigned c = 0; c < intr->num_components;) {
                if (!(wmask & BITFIELD_BIT(c))) {
@@ -5757,11 +5798,15 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
                         return false;
                   }
                }
-               uint32_t idx = apple9_shared_index(lower, base, offset_B, shift);
+               int16_t imm_offset = 0;
+               uint32_t idx =
+                  apple9_shared_address(lower, intr, 1, offset_B, shift, &imm_offset);
                if (idx == AGX_APPLE9_VREG_INVALID ||
                    !agx_apple9_vir_emit_shared_store_typed(
                       &lower->program, data, w, bits, idx, lower->shared_root))
                   return false;
+               lower->program.instructions[lower->program.instruction_count - 1]
+                  ->memory_offset = imm_offset;
                c += w;
             }
             continue;
@@ -6431,6 +6476,8 @@ apple9_emit_exec_mask(struct apple9_dag_lower *lower, bool push, bool invert)
       push ? AGX_APPLE9_VIR_EXEC_MASK_PUSH : AGX_APPLE9_VIR_EXEC_MASK_POP,
       push ? AGX_APPLE9_ENC_EXEC_MASK_PUSH : AGX_APPLE9_ENC_EXEC_MASK_POP, NULL,
       0, selector | (invert ? AGX_APPLE9_EXEC_MASK_INVERT : 0));
+   if (ok)
+      lower->cache.zero_vreg = AGX_APPLE9_VREG_INVALID;
    if (ok && lower->object_region)
       lower->program.instructions[lower->program.instruction_count - 1]
          ->local_control = true;
@@ -6445,6 +6492,8 @@ apple9_emit_exec_mask_else(struct apple9_dag_lower *lower)
    const bool ok = agx_apple9_vir_emit_side_effect(
       &lower->program, AGX_APPLE9_VIR_EXEC_MASK_ELSE,
       AGX_APPLE9_ENC_EXEC_MASK_ELSE, NULL, 0, 0);
+   if (ok)
+      lower->cache.zero_vreg = AGX_APPLE9_VREG_INVALID;
    if (ok && lower->object_region)
       lower->program.instructions[lower->program.instruction_count - 1]
          ->local_control = true;
@@ -6571,6 +6620,8 @@ apple9_emit_loop_mask_op(struct apple9_dag_lower *lower,
 {
    const bool ok = agx_apple9_vir_emit_side_effect(
       &lower->program, op, encoding, NULL, 0, immediate);
+   if (ok)
+      lower->cache.zero_vreg = AGX_APPLE9_VREG_INVALID;
    if (!ok)
       lower->reason = failure;
    return ok;
@@ -8039,15 +8090,6 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
          }
       }
    }
-   /* Synthetic values cached across NIR blocks must dominate their uses.
-    * A lazy zero first requested inside a conditional is undefined for lanes
-    * bypassing that arm, even if its GPR remains live at the later use. */
-   if (lower.structured_cf && apple9_dag_zero(&lower) == AGX_APPLE9_VREG_INVALID) {
-      *reason = "could not initialize Apple9 control-flow zero";
-      goto fail;
-   }
-   if (lower.structured_cf)
-      lower.cache.entry_zero = lower.cache.zero_vreg;
    /* System values are cached by selector across the whole shader. Read them
     * before divergent control flow so a first use in one arm cannot leave
     * lanes in another arm with an undefined cached value. This also applies
@@ -8813,6 +8855,9 @@ apple9_uniform_constant_use(nir_alu_instr *alu, unsigned s, uint32_t *value)
        !nir_src_is_const(alu->src[s].src))
       return false;
    *value = nir_src_comp_as_uint(alu->src[s].src, alu->src[s].swizzle[0]);
+   /* Constant 0 is always cheap via 2B MOV_IMM_COMPACT / 4B ZERO / ALU imm. */
+   if (*value == 0)
+      return false;
    /* Low-bit masks select as bitfield extracts, and shifted masks on matching
     * shifts select as bfi_imm; both need no operand. */
    if (alu->op == nir_op_iand && *value && *value != UINT32_MAX) {
@@ -8855,8 +8900,14 @@ apple9_uniform_constant_use(nir_alu_instr *alu, unsigned s, uint32_t *value)
    switch (alu->op) {
    case nir_op_iadd:
       return *value > UINT8_MAX && -*value > UINT8_MAX;
-   case nir_op_iand: case nir_op_ior: case nir_op_ixor: case nir_op_bcsel:
+   case nir_op_iand: case nir_op_ior: case nir_op_ixor:
+   case nir_op_imin: case nir_op_imax: case nir_op_umin: case nir_op_umax:
       return *value > UINT8_MAX;
+   case nir_op_bcsel: {
+      bool low;
+      return *value > UINT8_MAX &&
+             !agx_apple9_encode_float_immediate_wide(*value, &encoded, &low);
+   }
    default:
       return true;
    }
