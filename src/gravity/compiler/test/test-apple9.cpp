@@ -16196,6 +16196,66 @@ TEST(Apple9Compiler, LazyFragmentTileLockPlacement)
       free(main_out.binary);
       ralloc_free(b.shader);
    }
+
+   /* 10. Epilog depth/stencil export + color output (e.g. writes_memory late-Z
+    * synthetic depth export or gl_FragDepth): fs_epilog MUST run store_zs_agx
+    * (0x600 -> 0x001 -> DEPTH_STORE) BEFORE tile color lock/store (0x80c ->
+    * TILE_STORE -> 0x020c) so depth/stencil tests reject failing samples first. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "lazy_epilog_depth_before_color");
+      b.shader->info.writes_memory = true;
+      nir_store_ssbo(&b, nir_imm_int(&b, 1), nir_imm_int(&b, 0),
+                     nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
+      nir_store_output(&b, nir_imm_vec4(&b, 1, 1, 0, 1), nir_imm_int(&b, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+      nir_store_output(&b, nir_load_frag_coord_z(&b), nir_imm_int(&b, 0),
+                       .write_mask = 1, .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DEPTH,
+                                        .num_slots = 1});
+      b.shader->info.io_lowered = true;
+      agx_apple9_blend blend = {.use_epilog = 1, .dynamic_samples = 1};
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(main_out.info.apple9_fs_epilog.writes_depth);
+      EXPECT_TRUE(main_out.info.apple9_fs_epilog.has_killed_mask);
+      EXPECT_FALSE(main_out.info.apple9_fs_epilog.has_tile_preamble);
+      EXPECT_FALSE(main_out.info.apple9_fs_epilog.has_tile_lock);
+
+      agx_apple9_fs_epilog_key ekey = {};
+      ekey.iface = main_out.info.apple9_fs_epilog;
+      ekey.nr_targets = 1;
+      ekey.blend[0].format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      ekey.blend[0].samples = 1;
+      ekey.blend[0].colormask = 0xf;
+      ekey.blend[0].rgb_src = ekey.blend[0].alpha_src = PIPE_BLENDFACTOR_ONE;
+      ekey.blend[0].rgb_dst = ekey.blend[0].alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      ekey.blend[0].rgb_func = ekey.blend[0].alpha_func = PIPE_BLEND_ADD;
+      agx_shader_part ep_out = {};
+      ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                         &reason))
+         << (reason ?: "");
+      unsigned n600 = 0, n001 = 0, n80c = 0, n20c = 0;
+      size_t off_600 = apple9_find_bytes(ep_out, tile_600, sizeof(tile_600), &n600);
+      size_t off_001 = apple9_find_bytes(ep_out, tile_001, sizeof(tile_001), &n001);
+      size_t off_80c = apple9_find_bytes(ep_out, tile_80c, sizeof(tile_80c), &n80c);
+      size_t off_20c = apple9_find_bytes(ep_out, fence_20c, sizeof(fence_20c), &n20c);
+      EXPECT_EQ(n600, 1u);
+      EXPECT_EQ(n001, 1u);
+      EXPECT_EQ(n80c, 1u);
+      EXPECT_EQ(n20c, 1u);
+      EXPECT_LT(off_600, off_001);
+      EXPECT_LT(off_001, off_80c);
+      EXPECT_LT(off_80c, off_20c);
+      free(ep_out.binary);
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
 }
 
 TEST(Apple9Compiler, EarlyZFallbackKeepsDepthStencilTest)

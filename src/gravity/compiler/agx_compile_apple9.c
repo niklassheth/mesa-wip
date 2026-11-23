@@ -13143,10 +13143,6 @@ apple9_compile_graphics(nir_shader *nir, struct agx_shader_part *out,
          nir_function_impl *impl = nir_shader_get_entrypoint(nir);
          nir_variable *killed_var = nir_local_variable_create(
             impl, glsl_uint16_t_type(), "epilog killed");
-         {
-            nir_builder b0 = nir_builder_at(nir_before_impl(impl));
-            nir_store_var(&b0, killed_var, nir_imm_intN_t(&b0, 0, 16), 1);
-         }
          if (nir->info.fs.early_fragment_tests) {
             struct apple9_epilog_demote_state dstate = {
                .killed = killed_var,
@@ -13157,7 +13153,8 @@ apple9_compile_graphics(nir_shader *nir, struct agx_shader_part *out,
             nir_shader_gather_info(nir, impl);
             agx_nir_lower_sample_mask(nir);
             /* Kill disabled API samples before early ZS tests and memory
-             * side effects so disabled samples never pass early tests. */
+             * side effects so disabled samples never pass early tests, and
+             * initialize killed_var with them before any later demote. */
             {
                nir_builder b0 = nir_builder_at(nir_before_impl(impl));
                nir_def *api_mask = nir_load_ubo(&b0, 1, 32,
@@ -13182,9 +13179,10 @@ apple9_compile_graphics(nir_shader *nir, struct agx_shader_part *out,
             }
             fs_epilog.main_defers_zs_test = false;
          } else {
+            nir_builder b0 = nir_builder_at(nir_before_impl(impl));
+            nir_store_var(&b0, killed_var, nir_imm_intN_t(&b0, 0, 16), 1);
             if (nir->info.writes_memory &&
                 !(blend && blend[0].writes_memory_stats_only)) {
-               nir_builder b0 = nir_builder_at(nir_before_impl(impl));
                nir_def *api_mask = nir_load_ubo(&b0, 1, 32,
                   nir_imm_int(&b0, AGX_APPLE9_GRAPHICS_SYSVAL_BINDING),
                   nir_imm_int(&b0, AGX_APPLE9_API_SAMPLE_MASK_OFFSET),
@@ -13478,31 +13476,11 @@ agx_compile_apple9_fragment_epilog_key(
    }
 
    nir_def *zero = nir_imm_int(&b, 0);
-   if (loaded_src1) {
-      nir_store_output(&b, loaded_src1, zero, .write_mask = 0xf,
-         .src_type = nir_type_float32,
-         .io_semantics = {.location = FRAG_RESULT_DATA0,
-                          .dual_source_blend_index = 1,
-                          .num_slots = 1});
-   }
-   for (unsigned rt = 0; rt < nr_targets; ++rt) {
-      nir_def *val = NULL;
-      if (key->iface.writes_frag_color) {
-         val = loaded[0];
-      } else {
-         unsigned loc = key->color_map[rt];
-         if (loc < 8)
-            val = loaded[loc];
-      }
-      if (!val)
-         continue;
-      nir_store_output(&b, val, zero, .write_mask = 0xf,
-         .src_type = nir_type_float32,
-         .io_semantics = {.location = FRAG_RESULT_DATA0 + rt, .num_slots = 1});
-   }
 
    /* Depth/stencil exports (explicit from fs_main, or synthetic late_zs for
-    * depth/stencil attachment feedback loops). */
+    * depth/stencil attachment feedback loops). Emit after coverage kills and
+    * alpha-to-coverage but BEFORE color outputs so store_zs_agx performs the
+    * depth/stencil test before store_local_pixel_agx writes color to the tile. */
    if (!early_z) {
       nir_def *depth_out = loaded_depth;
       if (!depth_out && key->late_zs) {
@@ -13538,6 +13516,29 @@ agx_compile_apple9_fragment_epilog_key(
             .io_semantics = {.location = FRAG_RESULT_STENCIL, .num_slots = 1});
          nir->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_STENCIL);
       }
+   }
+
+   if (loaded_src1) {
+      nir_store_output(&b, loaded_src1, zero, .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = FRAG_RESULT_DATA0,
+                          .dual_source_blend_index = 1,
+                          .num_slots = 1});
+   }
+   for (unsigned rt = 0; rt < nr_targets; ++rt) {
+      nir_def *val = NULL;
+      if (key->iface.writes_frag_color) {
+         val = loaded[0];
+      } else {
+         unsigned loc = key->color_map[rt];
+         if (loc < 8)
+            val = loaded[loc];
+      }
+      if (!val)
+         continue;
+      nir_store_output(&b, val, zero, .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = FRAG_RESULT_DATA0 + rt, .num_slots = 1});
    }
 
    bool preserves_color = false;
