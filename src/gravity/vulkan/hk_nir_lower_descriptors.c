@@ -247,8 +247,7 @@ static bool
 try_lower_load_vulkan_descriptor(nir_builder *b, nir_intrinsic_instr *intrin,
                                  const struct lower_descriptors_ctx *ctx)
 {
-   ASSERTED const nir_descriptor_type desc_type =
-      nir_intrinsic_desc_type(intrin);
+   const nir_descriptor_type desc_type = nir_intrinsic_desc_type(intrin);
    b->cursor = nir_before_instr(&intrin->instr);
 
    nir_intrinsic_instr *idx_intrin = nir_src_as_intrinsic(intrin->src[0]);
@@ -258,6 +257,15 @@ try_lower_load_vulkan_descriptor(nir_builder *b, nir_intrinsic_instr *intrin,
    }
 
    nir_def *desc = load_descriptor_for_idx_intrin(b, idx_intrin, ctx);
+
+   if (desc_type == nir_descriptor_type_uniform_buffer ||
+       desc_type == nir_descriptor_type_storage_buffer) {
+      /* Buffer descriptors always use struct hk_buffer_address whose .w
+       * component (initial byte offset) is zero, including in
+       * VK_DESCRIPTOR_TYPE_MUTABLE_EXT bindings. */
+      assert(desc->num_components == 4 && desc->bit_size == 32);
+      desc = nir_vector_insert_imm(b, desc, nir_imm_int(b, 0), 3);
+   }
 
    nir_def_rewrite_uses(&intrin->def, desc);
 
@@ -920,6 +928,9 @@ lower_load_ssbo_descriptor(nir_builder *b, nir_intrinsic_instr *intrin,
    default:
       UNREACHABLE("Unknown address mode");
    }
+
+   /* struct hk_buffer_address::zero is always zero. */
+   desc = nir_vector_insert_imm(b, desc, nir_imm_int(b, 0), 3);
 
    nir_def_rewrite_uses(&intrin->def, desc);
 

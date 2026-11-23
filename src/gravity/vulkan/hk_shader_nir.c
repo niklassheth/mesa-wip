@@ -1202,7 +1202,6 @@ hk_apple9_vectorized_peak(const nir_shader *nir, bool windowed, bool soft_fault)
    nir_opt_load_store_vectorize(clone,
                                 &(const nir_load_store_vectorize_options){
                                    .modes = nir_var_mem_global,
-                                   .robust_modes = nir_var_mem_global,
                                    .bounds_checked_modes = nir_var_mem_global,
                                    .callback = hk_apple9_vectorize_cb,
                                    .cb_data = &policy,
@@ -1231,13 +1230,14 @@ hk_apple9_offset_pow2_stride(nir_scalar s, uint32_t *const_out, unsigned depth)
       return 1;
    }
    switch (nir_scalar_alu_op(s)) {
-   case nir_op_iadd: {
+   case nir_op_iadd:
+   case nir_op_isub: {
       uint32_t ca = 0, cb = 0;
       uint32_t sa = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 0),
                                                  &ca, depth + 1);
       uint32_t sb = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 1),
                                                  &cb, depth + 1);
-      *const_out = ca + cb;
+      *const_out = nir_scalar_alu_op(s) == nir_op_iadd ? (ca + cb) : (ca - cb);
       if (sa == 0)
          return sb;
       if (sb == 0)
@@ -1261,7 +1261,8 @@ hk_apple9_offset_pow2_stride(nir_scalar s, uint32_t *const_out, unsigned depth)
       *const_out = 0;
       return 1;
    }
-   case nir_op_imul: {
+   case nir_op_imul:
+   case nir_op_amul: {
       uint32_t ca = 0, cb = 0;
       uint32_t sa = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 0),
                                                  &ca, depth + 1);
@@ -1316,19 +1317,93 @@ hk_apple9_offset_pow2_stride(nir_scalar s, uint32_t *const_out, unsigned depth)
       uint32_t sb = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 1),
                                                  &cb, depth + 1);
       if (sb == 0) {
-         *const_out = 0;
-         return cb == 0 ? 0u : (cb & -cb);
+         if (sa == 0) {
+            *const_out = ca & cb;
+            return 0;
+         }
+         uint32_t known_lo = (ca & (sa - 1)) & cb;
+         uint32_t high_mask = cb & ~(sa - 1);
+         *const_out = known_lo;
+         return high_mask == 0 ? 0u : (high_mask & -high_mask);
       }
       if (sa == 0) {
-         *const_out = 0;
-         return ca == 0 ? 0u : (ca & -ca);
+         uint32_t known_lo = (cb & (sb - 1)) & ca;
+         uint32_t high_mask = ca & ~(sb - 1);
+         *const_out = known_lo;
+         return high_mask == 0 ? 0u : (high_mask & -high_mask);
       }
-      *const_out = 0;
-      return 1;
+      uint32_t min_s = MIN2(sa, sb);
+      *const_out = (ca & cb) & (min_s - 1);
+      return min_s;
    }
    default:
       *const_out = 0;
       return 1;
+   }
+}
+
+/* Compute a sound unsigned 32-bit upper bound for a 32-bit offset expression. */
+static uint32_t
+hk_apple9_offset_max_u32(nir_scalar s, unsigned depth)
+{
+   s = nir_scalar_resolved(s.def, s.comp);
+   if (nir_scalar_is_const(s))
+      return (uint32_t)nir_scalar_as_uint(s);
+   if (!nir_scalar_is_alu(s) || depth >= 8)
+      return UINT32_MAX;
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_umin:
+   case nir_op_iand: {
+      uint32_t ma = hk_apple9_offset_max_u32(nir_scalar_chase_alu_src(s, 0), depth + 1);
+      uint32_t mb = hk_apple9_offset_max_u32(nir_scalar_chase_alu_src(s, 1), depth + 1);
+      return MIN2(ma, mb);
+   }
+   case nir_op_ushr: {
+      uint32_t ma = hk_apple9_offset_max_u32(nir_scalar_chase_alu_src(s, 0), depth + 1);
+      nir_scalar sh = nir_scalar_chase_alu_src(s, 1);
+      sh = nir_scalar_resolved(sh.def, sh.comp);
+      if (nir_scalar_is_const(sh))
+         return ma >> (nir_scalar_as_uint(sh) & 31u);
+      return ma;
+   }
+   case nir_op_u2u32: {
+      nir_scalar src = nir_scalar_chase_alu_src(s, 0);
+      if (src.def->bit_size < 32)
+         return (1u << src.def->bit_size) - 1u;
+      if (src.def->bit_size == 32)
+         return hk_apple9_offset_max_u32(src, depth + 1);
+      return UINT32_MAX;
+   }
+   case nir_op_iadd:
+   case nir_op_ior: {
+      uint32_t ma = hk_apple9_offset_max_u32(nir_scalar_chase_alu_src(s, 0), depth + 1);
+      uint32_t mb = hk_apple9_offset_max_u32(nir_scalar_chase_alu_src(s, 1), depth + 1);
+      uint64_t sum = (uint64_t)ma + mb;
+      return sum > UINT32_MAX ? UINT32_MAX : (uint32_t)sum;
+   }
+   case nir_op_imul:
+   case nir_op_amul: {
+      uint32_t ma = hk_apple9_offset_max_u32(nir_scalar_chase_alu_src(s, 0), depth + 1);
+      uint32_t mb = hk_apple9_offset_max_u32(nir_scalar_chase_alu_src(s, 1), depth + 1);
+      uint64_t prod = (uint64_t)ma * mb;
+      return prod > UINT32_MAX ? UINT32_MAX : (uint32_t)prod;
+   }
+   case nir_op_ishl: {
+      nir_scalar sh = nir_scalar_chase_alu_src(s, 1);
+      sh = nir_scalar_resolved(sh.def, sh.comp);
+      if (!nir_scalar_is_const(sh))
+         return UINT32_MAX;
+      uint32_t ma = hk_apple9_offset_max_u32(nir_scalar_chase_alu_src(s, 0), depth + 1);
+      uint64_t r = (uint64_t)ma << (nir_scalar_as_uint(sh) & 31u);
+      return r > UINT32_MAX ? UINT32_MAX : (uint32_t)r;
+   }
+   case nir_op_bcsel: {
+      uint32_t ma = hk_apple9_offset_max_u32(nir_scalar_chase_alu_src(s, 1), depth + 1);
+      uint32_t mb = hk_apple9_offset_max_u32(nir_scalar_chase_alu_src(s, 2), depth + 1);
+      return MAX2(ma, mb);
+   }
+   default:
+      return UINT32_MAX;
    }
 }
 
@@ -1382,20 +1457,28 @@ hk_apple9_vectorize_cb(unsigned align_mul, unsigned align_offset,
          return false;
       /* Ensure the 32-bit dynamic offset cannot wrap modulo 2^32 across the
        * merged span (e.g. non-power-of-two stride 20*0x33333333 == 0xfffffffc
-       * wraps at +4). */
+       * wraps at +4). Accept when either the proven power-of-two residue
+       * satisfies rem + total_bytes <= stride or the proven unsigned upper
+       * bound satisfies max_off + total_bytes <= 2^32. */
       if (low->src[1].ssa->bit_size != 32)
          return false;
+      nir_scalar off_scalar = nir_get_scalar(low->src[1].ssa, 0);
       uint32_t off_const = 0;
-      uint32_t off_stride = hk_apple9_offset_pow2_stride(
-         nir_get_scalar(low->src[1].ssa, 0), &off_const, 0);
+      uint32_t off_stride =
+         hk_apple9_offset_pow2_stride(off_scalar, &off_const, 0);
+      bool non_wrapping;
       if (off_stride == 0) {
-         if ((uint64_t)off_const + total_bytes > (1ULL << 32))
-            return false;
+         non_wrapping = (uint64_t)off_const + total_bytes <= (1ULL << 32);
       } else {
          uint32_t rem = off_const & (off_stride - 1);
-         if ((uint64_t)rem + total_bytes > off_stride)
-            return false;
+         non_wrapping = (uint64_t)rem + total_bytes <= off_stride;
       }
+      if (!non_wrapping) {
+         uint32_t max_off = hk_apple9_offset_max_u32(off_scalar, 0);
+         non_wrapping = (uint64_t)max_off + total_bytes <= (1ULL << 32);
+      }
+      if (!non_wrapping)
+         return false;
    }
    return true;
 }
@@ -3230,10 +3313,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
               "HK_PRESSURE stage=%u peak=%u windowed=%u merged_peaks=%u/%u\n",
               nir->info.stage, peak,
               policy.windowed, peak_windowed, peak_free);
+   /* Bounded loads perform their own exact 32-bit non-wrap proof inside
+    * hk_apple9_vectorize_cb (avoiding both false rejects on iand/umin offsets
+    * and false accepts on non-power-of-two gcd strides in check_for_robustness). */
    NIR_PASS(_, nir, nir_opt_load_store_vectorize,
             &(const nir_load_store_vectorize_options){
                .modes = nir_var_mem_global,
-               .robust_modes = nir_var_mem_global,
                .bounds_checked_modes = nir_var_mem_global,
                .callback = hk_apple9_vectorize_cb,
                .cb_data = &policy,
