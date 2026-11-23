@@ -321,6 +321,43 @@ max_renders_per_submit(UNUSED struct hk_device *dev)
    return 1;
 }
 
+unsigned
+hk_fill_submit_wait_syncs(struct drm_asahi_sync *syncs,
+                          const struct vk_sync_wait *waits,
+                          unsigned wait_count)
+{
+   unsigned out_count = 0;
+
+   for (unsigned i = 0; i < wait_count; ++i) {
+      /* The kernel rejects the submission if we try to wait on the same
+       * timeline semaphore at multiple points.
+       *
+       * TODO: Can we relax the UAPI?
+       *
+       * XXX: This is quadratic time.
+       */
+      bool skip = false;
+      if (waits[i].sync->flags & VK_SYNC_IS_TIMELINE) {
+         uint64_t v1 = waits[i].wait_value;
+         for (unsigned j = 0; j < wait_count; ++j) {
+            uint64_t v2 = waits[j].wait_value;
+            if (i != j && waits[i].sync == waits[j].sync &&
+                (v1 < v2 || (v1 == v2 && i < j))) {
+               skip = true;
+               break;
+            }
+         }
+
+         if (skip)
+            continue;
+      }
+
+      asahi_fill_sync(&syncs[out_count++], waits[i].sync, waits[i].wait_value);
+   }
+
+   return out_count;
+}
+
 static VkResult
 queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
                     struct hk_queue *queue, const uint16_t *reasons)
@@ -1100,37 +1137,10 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       return result;
    }
 
-   unsigned wait_count = 0;
    STACK_ARRAY(struct drm_asahi_sync, syncs,
                submit->wait_count + submit->signal_count + 1);
-
-   for (unsigned i = 0; i < submit->wait_count; ++i) {
-      /* The kernel rejects the submission if we try to wait on the same
-       * timeline semaphore at multiple points.
-       *
-       * TODO: Can we relax the UAPI?
-       *
-       * XXX: This is quadratic time.
-       */
-      bool skip = false;
-      if (submit->waits[i].sync->flags & VK_SYNC_IS_TIMELINE) {
-         uint64_t v1 = submit->waits[i].wait_value;
-         for (unsigned j = 0; j < submit->wait_count; ++j) {
-            uint64_t v2 = submit->waits[j].wait_value;
-            if (i != j && submit->waits[i].sync == submit->waits[j].sync &&
-                (v1 < v2 || (v1 == v2 && i < j))) {
-               skip = true;
-               break;
-            }
-         }
-
-         if (skip)
-            continue;
-      }
-
-      asahi_fill_sync(&syncs[wait_count++], submit->waits[i].sync,
-                      submit->waits[i].wait_value);
-   }
+   unsigned wait_count =
+      hk_fill_submit_wait_syncs(syncs, submit->waits, submit->wait_count);
 
    for (unsigned i = 0; i < submit->signal_count; ++i) {
       asahi_fill_sync(&syncs[wait_count + i], submit->signals[i].sync,

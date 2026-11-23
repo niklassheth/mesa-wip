@@ -210,6 +210,13 @@ if with_tests
     link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_unreference',
                  '-Wl,--wrap=agx_bo_cache_evict_all']),
     suite : ['gravity'])
+  test('gravity-hk-p0-fixes', executable('gravity-hk-p0-fixes', 'tests/hk-p0-fixes.c',
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include,
+                           inc_src, inc_gravity],
+    dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
+    link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_unreference',
+                 '-Wl,--wrap=agx_bo_cache_evict_all']),
+    suite : ['gravity'])
   test('gravity-hk-feedback-oom', executable('gravity-hk-feedback-oom', 'tests/hk-feedback-oom.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
                            inc_src, inc_gravity],
