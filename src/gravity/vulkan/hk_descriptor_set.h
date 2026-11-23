@@ -216,7 +216,7 @@ struct hk_descriptor_set {
    struct hk_descriptor_set_layout *layout;
    void *mapped_ptr;
    uint64_t addr;
-   uint32_t size;
+   uint64_t size;
    struct hk_descriptor_allocation alloc;
 
    struct hk_buffer_address dynamic_buffers[];

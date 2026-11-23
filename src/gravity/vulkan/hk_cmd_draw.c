@@ -250,7 +250,9 @@ hk_heap_prepare_submit(struct hk_device *dev, uint64_t min_B)
    perf_debug_dev(&dev->dev, "Growing the geometry heap to %" PRIu64 " MiB",
                   target_B >> 20);
    VkResult res = hk_heap_back(dev, target_B);
-   return res == VK_ERROR_DEVICE_LOST ? res : VK_SUCCESS;
+   if (res == VK_ERROR_OUT_OF_DEVICE_MEMORY && dev->heap->size >= min_B)
+      return VK_SUCCESS;
+   return res;
 }
 
 uint64_t

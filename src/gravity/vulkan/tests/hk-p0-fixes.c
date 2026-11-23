@@ -176,11 +176,12 @@ test_cmd_buffer_lifecycle_and_trim(void)
    CHECK(cb2->feedback_raw.data == NULL);
    CHECK(cb2->feedback_raw.capacity == 0);
 
-   /* Releasing reset on CB1 must transition to INITIAL, unref large_bos,
-    * and free cdm_narrow_barriers + feedback_raw storage.
+   /* Releasing reset via public vkResetCommandBuffer entrypoint must transition
+    * to INITIAL, unref large_bos, and free cdm_narrow_barriers + feedback_raw.
     */
-   hk_cmd_buffer_ops.reset(&cb1->vk,
-                           VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+   CHECK(hk_ResetCommandBuffer(hk_cmd_buffer_to_handle(cb1),
+                               VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) ==
+         VK_SUCCESS);
    CHECK(cb1->vk.state == MESA_VK_COMMAND_BUFFER_STATE_INITIAL);
    CHECK(cb1->cdm_narrow_barriers.data == NULL);
    CHECK(cb1->feedback_raw.data == NULL);
@@ -342,8 +343,14 @@ test_inline_ubo_and_variable_pool(void)
       .type = VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK,
       .descriptorCount = 16,
    };
+   const VkDescriptorPoolInlineUniformBlockCreateInfo ubo_pool_inline = {
+      .sType =
+         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_INLINE_UNIFORM_BLOCK_CREATE_INFO,
+      .maxInlineUniformBlockBindings = 4,
+   };
    const VkDescriptorPoolCreateInfo ubo_pool_ci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+      .pNext = &ubo_pool_inline,
       .maxSets = 2,
       .poolSizeCount = 1,
       .pPoolSizes = &ubo_pool_size,

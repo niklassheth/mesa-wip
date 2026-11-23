@@ -110,12 +110,14 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
 
    VkFormatFeatureFlags2 features = optimal2;
 
-   /* Compressed images are never storage images (ail writeable_image). */
+   /* Compressed images are never storage images (ail writeable_image) and
+    * cannot be used for host image transfer (hk_image.c). */
    if (mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED)
       features &= ~(VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
                     VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |
                     VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
-                    VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT);
+                    VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT |
+                    VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT);
 
    return features;
 }

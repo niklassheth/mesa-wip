@@ -496,6 +496,7 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
             memcpy(last->pass_grid, cs->pass_grid, sizeof(last->pass_grid));
          }
          last->pass_count += cs->pass_count;
+         last->end_reason = cs->end_reason;
          *util_dynarray_element(&cmd->sync_remap, uint32_t, cs->sync_id) =
             last->sync_id;
          hk_sync_remap_first_event(cmd->sync_first_event.data, cs->sync_id,

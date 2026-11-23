@@ -435,7 +435,8 @@ hk_cpu_DestroyDevice(VkDevice d, const VkAllocationCallbacks *a)
 #define HK_INSTALL(name)                                                       \
    do {                                                                        \
       if (t->name && t->name != hk_cpu_##name) {                               \
-         hk_cpu_orig_##name = t->name;                                         \
+         if (!hk_cpu_orig_##name)                                              \
+            hk_cpu_orig_##name = t->name;                                      \
          t->name = hk_cpu_##name;                                              \
       }                                                                        \
    } while (0)
@@ -448,7 +449,8 @@ hk_cpu_timing_install(struct vk_device_dispatch_table *t)
       return;
 
    pthread_mutex_lock(&hk_cpu_install_lock);
-   hk_cpu_level = atoi(level);
+   if (!hk_cpu_level)
+      hk_cpu_level = atoi(level);
 
    if (!hk_cpu_out) {
       const char *path = getenv("HK_CPU_TIMING_LOG");

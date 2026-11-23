@@ -372,6 +372,9 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
                   ? submit->in_sync_count + submit->out_sync_count + 1
                   : 0);
    if (queue->completion_initialized) {
+      if (!tracked_syncs)
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
       unsigned count = submit->in_sync_count + submit->out_sync_count;
       if (count)
          memcpy(tracked_syncs, (const void *)(uintptr_t)submit->syncs,
@@ -390,42 +393,48 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
       }
    }
 
+   int ret;
+   int submit_errno;
+   {
 #ifdef HK_WAIT_WATCHDOG
-   const struct drm_asahi_sync *wd_syncs = (const void *)(uintptr_t)submit->syncs;
-   const struct drm_asahi_sync *wd_signals = wd_syncs + submit->in_sync_count;
-   struct u_watchdog_objects wd_waits = {
-      .objects = submit->in_sync_count ? &wd_syncs[0].handle : NULL,
-      .points = submit->in_sync_count ? &wd_syncs[0].timeline_value : NULL,
-      .object_stride = sizeof(*wd_syncs), .point_stride = sizeof(*wd_syncs),
-      .count = submit->in_sync_count, .object32 = true,
-   };
-   struct u_watchdog_objects wd_out = {
-      .objects = submit->out_sync_count ? &wd_signals[0].handle : NULL,
-      .points = submit->out_sync_count ? &wd_signals[0].timeline_value : NULL,
-      .object_stride = sizeof(*wd_syncs), .point_stride = sizeof(*wd_syncs),
-      .count = submit->out_sync_count, .object32 = true,
-   };
-   uint64_t wd_id = u_watchdog_submit(dev->dev.fd, submit->queue_id, wd_waits, wd_out);
-   U_WATCHDOG_SCOPE(wd, "HK submit ioctl", dev->dev.fd, submit->queue_id, wd_id,
-                    0, UINT64_MAX, wd_waits);
+      const struct drm_asahi_sync *wd_syncs =
+         (const void *)(uintptr_t)submit->syncs;
+      const struct drm_asahi_sync *wd_signals = wd_syncs + submit->in_sync_count;
+      struct u_watchdog_objects wd_waits = {
+         .objects = submit->in_sync_count ? &wd_syncs[0].handle : NULL,
+         .points = submit->in_sync_count ? &wd_syncs[0].timeline_value : NULL,
+         .object_stride = sizeof(*wd_syncs), .point_stride = sizeof(*wd_syncs),
+         .count = submit->in_sync_count, .object32 = true,
+      };
+      struct u_watchdog_objects wd_out = {
+         .objects = submit->out_sync_count ? &wd_signals[0].handle : NULL,
+         .points = submit->out_sync_count ? &wd_signals[0].timeline_value : NULL,
+         .object_stride = sizeof(*wd_syncs), .point_stride = sizeof(*wd_syncs),
+         .count = submit->out_sync_count, .object32 = true,
+      };
+      uint64_t wd_id =
+         u_watchdog_submit(dev->dev.fd, submit->queue_id, wd_waits, wd_out);
+      U_WATCHDOG_SCOPE(wd, "HK submit ioctl", dev->dev.fd, submit->queue_id,
+                       wd_id, 0, UINT64_MAX, wd_waits);
 #endif
-   /* HK_TIMELINE_FILE: ioctl begin/end records around the submit. */
-   uint64_t trace_id = agx_timeline_enabled() ? agx_timeline_id() : 0;
-   agx_timeline_submit(TL_IOCTL_BEGIN, trace_id, dev->dev.fd, submit, 0,
-                       reasons);
-   int ret = dev->dev.ops.submit(&dev->dev, submit);
-   agx_timeline_emit(TL_IOCTL_END, 0, trace_id, (uint64_t)(int64_t)ret,
-                     errno, 0, 0, 0, 0, 0);
-   int submit_errno = errno;
-   if (queue->completion_initialized) {
-      int status = hk_queue_completion_end(&queue->completion, ret == 0);
-      if (!ret && status < 0) {
-         ret = -1;
-         submit_errno = -status;
+      /* HK_TIMELINE_FILE: ioctl begin/end records around the submit. */
+      uint64_t trace_id = agx_timeline_enabled() ? agx_timeline_id() : 0;
+      agx_timeline_submit(TL_IOCTL_BEGIN, trace_id, dev->dev.fd, submit, 0,
+                          reasons);
+      ret = dev->dev.ops.submit(&dev->dev, submit);
+      agx_timeline_emit(TL_IOCTL_END, 0, trace_id, (uint64_t)(int64_t)ret,
+                        errno, 0, 0, 0, 0, 0);
+      submit_errno = errno;
+      if (queue->completion_initialized) {
+         int status = hk_queue_completion_end(&queue->completion, ret == 0);
+         if (!ret && status < 0) {
+            ret = -1;
+            submit_errno = -status;
+         }
       }
+      u_watchdog_submit_result(wd_id, ret, errno);
+      u_watchdog_ioctl("HK submit", dev->dev.fd, ret, errno);
    }
-   u_watchdog_submit_result(wd_id, ret, errno);
-   u_watchdog_ioctl("HK submit", dev->dev.fd, ret, errno);
 
    /* The kernel rejects submissions once the GPU has failed (EIO) or when
     * a command is invalid. Either way the queue cannot make progress: report
@@ -643,6 +652,7 @@ hk_flush_bind(struct hk_bind_builder *b)
     * in the shadow view, while texture reads consult sparse_map.
     */
    struct drm_asahi_gem_bind_op op;
+   struct drm_asahi_gem_bind_op *slot;
    if (!b->mem && b->buffer != NULL && hk_sparse_unbound_unmapped(&b->dev->dev)) {
       /* Map the zero page read-only in both views, see hk_bind_scratch
        * and hk_sparse_unbound_unmapped. */
@@ -652,10 +662,20 @@ hk_flush_bind(struct hk_bind_builder *b)
          .addr = b->va->addr + b->resourceOffset,
          .range = b->size,
       };
-      util_dynarray_append(&b->binds, op);
+      slot = util_dynarray_grow(&b->binds, struct drm_asahi_gem_bind_op, 1);
+      if (!slot) {
+         b->result = vk_error(b->dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return b->result;
+      }
+      *slot = op;
       if (hk_va_has_ro_shadow(b->dev, op.addr)) {
          op.addr = agx_rw_addr_to_ro(&b->dev->dev, op.addr);
-         util_dynarray_append(&b->binds, op);
+         slot = util_dynarray_grow(&b->binds, struct drm_asahi_gem_bind_op, 1);
+         if (!slot) {
+            b->result = vk_error(b->dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+            return b->result;
+         }
+         *slot = op;
       }
       return VK_SUCCESS;
    } else if (!b->mem) {
@@ -678,7 +698,12 @@ hk_flush_bind(struct hk_bind_builder *b)
       };
    }
 
-   util_dynarray_append(&b->binds, op);
+   slot = util_dynarray_grow(&b->binds, struct drm_asahi_gem_bind_op, 1);
+   if (!slot) {
+      b->result = vk_error(b->dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return b->result;
+   }
+   *slot = op;
    if (!hk_va_has_ro_shadow(b->dev, op.addr))
       return VK_SUCCESS;
 
@@ -690,7 +715,12 @@ hk_flush_bind(struct hk_bind_builder *b)
       op.handle = b->dev->dev.zero_bo->uapi_handle;
    }
 
-   util_dynarray_append(&b->binds, op);
+   slot = util_dynarray_grow(&b->binds, struct drm_asahi_gem_bind_op, 1);
+   if (!slot) {
+      b->result = vk_error(b->dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return b->result;
+   }
+   *slot = op;
 
    return VK_SUCCESS;
 }
@@ -814,7 +844,7 @@ static void
 bind_hw_tile(struct hk_bind_builder *b, struct hk_device_memory *mem,
              struct ail_layout *layout, unsigned layer, unsigned level,
              VkOffset3D offset, VkExtent3D extent, struct ail_tile std_size_el,
-             unsigned mem_offset, unsigned x, unsigned y, unsigned z)
+             uint64_t mem_offset, unsigned x, unsigned y, unsigned z)
 {
    uint64_t bo_offset_B = ail_get_twiddled_block_B(
       layout, level, offset.x + x, offset.y + y, layer + offset.z + z);
@@ -826,13 +856,13 @@ bind_hw_tile(struct hk_bind_builder *b, struct hk_device_memory *mem,
    unsigned mem_y_stl = y / std_size_el.height_el;
    unsigned extent_w_stl = DIV_ROUND_UP(extent.width, std_size_el.width_el);
    unsigned extent_y_stl = DIV_ROUND_UP(extent.height, std_size_el.height_el);
-   unsigned mem_offs_stl = (extent_y_stl * extent_w_stl * z) +
-                           (extent_w_stl * mem_y_stl) + mem_x_stl;
+   uint64_t mem_offs_stl = ((uint64_t)extent_y_stl * extent_w_stl * z) +
+                           ((uint64_t)extent_w_stl * mem_y_stl) + mem_x_stl;
 
    /* There are 4 hardware tiles per standard tile, so offset
     * accordingly for each hardware tile.
     */
-   unsigned mem_offset_B = mem_offset + (mem_offs_stl * 4 * AIL_PAGESIZE);
+   uint64_t mem_offset_B = mem_offset + (mem_offs_stl * 4 * AIL_PAGESIZE);
 
    if (x % std_size_el.width_el)
       mem_offset_B += AIL_PAGESIZE;
@@ -1082,12 +1112,19 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    /* TODO: Support asynchronous sparse queue? */
    if (submit->buffer_bind_count || submit->image_bind_count ||
        submit->image_opaque_bind_count) {
-      if (submit->wait_count > 0) {
-         VkResult wait_res =
-            vk_sync_wait_many(&dev->vk, submit->wait_count, submit->waits,
-                              VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
-         if (wait_res != VK_SUCCESS)
-            return wait_res;
+      while (submit->wait_count > 0) {
+         VkResult wait_res = vk_sync_wait_many(
+            &dev->vk, submit->wait_count, submit->waits, VK_SYNC_WAIT_COMPLETE,
+            os_time_get_absolute_timeout(100000000ULL));
+         if (wait_res == VK_SUCCESS)
+            break;
+         if (wait_res == VK_TIMEOUT) {
+            VkResult status = vk_device_check_status(&dev->vk);
+            if (status != VK_SUCCESS)
+               return status;
+            continue;
+         }
+         return wait_res;
       }
 
       VkResult result = hk_queue_submit_bind_sparse_memory(dev, submit);
@@ -1139,6 +1176,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
 
    STACK_ARRAY(struct drm_asahi_sync, syncs,
                submit->wait_count + submit->signal_count + 1);
+   if (!syncs)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    unsigned wait_count =
       hk_fill_submit_wait_syncs(syncs, submit->waits, submit->wait_count);
 

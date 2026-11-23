@@ -746,8 +746,12 @@ hk_query_wait_for_available(struct hk_device *dev, struct hk_query_pool *pool,
                             uint32_t query)
 {
    /* Spin briefly for fast queries, then back off to avoid burning CPU while
-    * waiting on long-running or semaphore-delayed work. Only report device
-    * loss if the device/queues actually fault. */
+    * waiting on long-running or semaphore-delayed work. Poll device status so
+    * native GPU faults exit immediately, and keep a generous 30s upper bound
+    * so virtio guests (whose fences carry no fault status) still terminate in
+    * finite time on device loss. */
+   const int64_t abs_timeout_ns =
+      os_time_get_absolute_timeout(30ULL * 1000000000ULL);
    unsigned spins = 0;
    int64_t sleep_us = 10;
 
@@ -758,6 +762,9 @@ hk_query_wait_for_available(struct hk_device *dev, struct hk_query_pool *pool,
       VkResult status = vk_device_check_status(&dev->vk);
       if (status != VK_SUCCESS)
          return status;
+
+      if (os_time_get_nano() >= abs_timeout_ns)
+         return vk_device_set_lost(&dev->vk, "Query timed out");
 
       if (spins < 64) {
          spins++;

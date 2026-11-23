@@ -89,6 +89,7 @@ struct busy_device {
    char *out;
    size_t out_len, out_cap;
    uint64_t next_sample_ns;
+   uint64_t flushed_gen;
    struct busy_bin bins[BUSY_SECONDS];
    struct busy_pass *passes;
    uint64_t passes_dropped, pass_next_dump_ns;
@@ -547,6 +548,7 @@ hk_gpu_busy_sample(struct hk_queue *queue)
 static void *
 collector_main(void *arg)
 {
+   uint64_t collector_flush_gen = 0;
    pthread_mutex_lock(&busy_lock);
    while (!collector_stop) {
       struct timespec wake;
@@ -566,7 +568,8 @@ collector_main(void *arg)
          }
       }
 
-      for (;;) {
+      uint64_t flush_gen = ++collector_flush_gen;
+      while (!collector_stop) {
          struct pending {
             int fd;
             char *data;
@@ -575,11 +578,12 @@ collector_main(void *arg)
          unsigned count = 0;
          for (struct busy_device *d = devices; d && count < ARRAY_SIZE(pending);
               d = d->next) {
-            if (!d->out_len)
+            if (d->flushed_gen == flush_gen || !d->out_len)
                continue;
             int fd = dup(d->fd);
             if (fd < 0)
                continue;
+            d->flushed_gen = flush_gen;
             pending[count++] = (struct pending){fd, d->out, d->out_len};
             d->out = NULL;
             d->out_len = d->out_cap = 0;

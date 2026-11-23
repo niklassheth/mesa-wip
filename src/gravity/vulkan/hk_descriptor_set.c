@@ -45,11 +45,12 @@ desc_ubo_data(struct hk_descriptor_set *set, uint32_t binding, uint32_t elem,
    const struct hk_descriptor_set_binding_layout *binding_layout =
       &set->layout->binding[binding];
 
-   uint32_t offset = binding_layout->offset + elem * binding_layout->stride;
+   uint64_t offset =
+      (uint64_t)binding_layout->offset + (uint64_t)elem * binding_layout->stride;
    assert(offset < set->size);
 
    if (size_out != NULL)
-      *size_out = set->size - offset;
+      *size_out = MIN2(set->size - offset, UINT32_MAX);
 
    return (char *)set->mapped_ptr + offset;
 }
@@ -474,10 +475,27 @@ hk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
                ASSERTED uint32_t dst_max_size, src_max_size;
                void *dst_map = desc_ubo_data(dst, dst_b, dst_elem, &dst_max_size);
                const void *src_map = desc_ubo_data(src, src_b, src_elem, &src_max_size);
-               const uint32_t copy_size = MIN2(dst->layout->binding[dst_b].stride,
+               const struct hk_descriptor_set_binding_layout *dst_bl =
+                  &dst->layout->binding[dst_b];
+               const uint32_t copy_size = MIN2(dst_bl->stride,
                                                src->layout->binding[src_b].stride);
                assert(copy_size <= dst_max_size && copy_size <= src_max_size);
-               memcpy(dst_map, src_map, copy_size);
+               if (dst_bl->immutable_samplers != NULL &&
+                   dst_bl->type == VK_DESCRIPTOR_TYPE_SAMPLER) {
+                  /* Immutable sampler bytes are fixed at allocation. */
+               } else if (dst_bl->immutable_samplers != NULL &&
+                          dst_bl->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                  const size_t record = sizeof(struct hk_apple9_image_part) +
+                                        sizeof(struct hk_apple9_sampler_part);
+                  const unsigned planes = copy_size / record;
+                  for (unsigned p = 0; p < planes; ++p) {
+                     memcpy((uint8_t *)dst_map + p * record,
+                            (const uint8_t *)src_map + p * record,
+                            sizeof(struct hk_apple9_image_part));
+                  }
+               } else {
+                  memcpy(dst_map, src_map, copy_size);
+               }
                src_elem++;
                dst_elem++;
             }
@@ -694,7 +712,14 @@ hk_CreateDescriptorPool(VkDevice _device,
       hk_descriptor_stride_align_for_type(pdev, pCreateInfo->pPoolSizes[i].type,
                                           type_list, false, &stride, &alignment);
       max_align = MAX2(max_align, alignment);
-      max_stride = MAX2(max_stride, stride);
+      /* Multi-plane YCbCr combined image samplers can multiply a single
+       * descriptor's stride by up to 3 planes, including the trailing sentinel.
+       */
+      uint32_t sentinel_stride =
+         pCreateInfo->pPoolSizes[i].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+            ? stride * 3
+            : stride;
+      max_stride = MAX2(max_stride, sentinel_stride);
    }
 
    uint64_t bo_size = 0;
