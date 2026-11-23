@@ -1345,24 +1345,26 @@ hk_apple9_vectorize_global(nir_shader *nir, bool soft_fault)
          policy.windowed = true;
          NIR_PASS(_, nir, nir_opt_load_store_vectorize, &vec_opts);
       } else {
-         bool free_progress = false;
-         NIR_PASS(free_progress, nir, nir_opt_load_store_vectorize, &vec_opts);
+         /* Call passes directly while backup_impl is detached from func->impl:
+          * NIR_PASS under NIR_DEBUG=clone/serialize replaces nir's contents
+          * and would free detached children owned by nir. */
+         bool free_progress = nir_opt_load_store_vectorize(nir, &vec_opts);
          if (!free_progress) {
             /* Windowed mode is strictly more restrictive than unwindowed, so
              * it would also make no merges. */
             peak_free = peak_windowed = peak;
             ralloc_free(backup_impl);
          } else {
-            NIR_PASS(_, nir, nir_opt_dce);
+            nir_opt_dce(nir);
             peak_free = hk_apple9_peak_live_words(nir);
             if (peak_free <= HK_APPLE9_VECTORIZE_PRESSURE_BUDGET && !dbg_pressure) {
                ralloc_free(backup_impl);
             } else {
                nir_function_set_impl(func, backup_impl);
                policy.windowed = true;
-               NIR_PASS(_, nir, nir_opt_load_store_vectorize, &vec_opts);
+               nir_opt_load_store_vectorize(nir, &vec_opts);
                if (peak_free <= 88u || dbg_pressure) {
-                  NIR_PASS(_, nir, nir_opt_dce);
+                  nir_opt_dce(nir);
                   peak_windowed = hk_apple9_peak_live_words(nir);
                }
                /* Keep windowed merging if unwindowed merging still exceeds the
@@ -1380,6 +1382,7 @@ hk_apple9_vectorize_global(nir_shader *nir, bool soft_fault)
                }
             }
          }
+         nir_validate_shader(nir, "after hk_apple9_vectorize_global");
       }
    } else {
       policy.windowed = true;

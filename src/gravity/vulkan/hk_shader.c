@@ -374,6 +374,8 @@ hk_preprocess_nir_early(struct vk_physical_device *vk_pdev, nir_shader *nir)
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_dce);
    NIR_PASS(_, nir, nir_opt_dead_cf);
+   NIR_PASS(_, nir, nir_opt_deref);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_all, NULL);
 
    /* Constant-offset reads can fold away after extraction. Do not upload
     * or bind an unused blob: besides wasting storage, that would extend
