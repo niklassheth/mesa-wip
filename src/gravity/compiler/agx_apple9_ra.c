@@ -171,6 +171,9 @@ apple9_dependency_delay(const struct agx_apple9_vir_instr *I)
    case AGX_APPLE9_VIR_FSIN_FACTOR:
    case AGX_APPLE9_VIR_FEXP2:
    case AGX_APPLE9_VIR_FLOG2:
+   case AGX_APPLE9_VIR_SUBGROUP_REDUCE:
+   case AGX_APPLE9_VIR_SUBGROUP_SHUFFLE:
+   case AGX_APPLE9_VIR_SUBGROUP_ROTATE:
       return 4;
    default:
       return 1;
@@ -1306,6 +1309,7 @@ apple9_resource_hazard(const struct agx_apple9_vir_instr *ins,
            ins->encoding == AGX_APPLE9_ENC_BLOCK_IMAGE_STORE_EXTENDED ||
            ins->encoding == AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS ||
            ins->encoding == AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS_16 ||
+           ins->encoding == AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS_2D ||
            ins->op == AGX_APPLE9_VIR_IMAGE_STORE) &&
           producer->producer_scoreboard_slot == AGX_APPLE9_SCOREBOARD_SLOT_1;
 }

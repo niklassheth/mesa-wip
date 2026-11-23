@@ -47,11 +47,23 @@ enum agx_apple9_vir_opcode {
    AGX_APPLE9_VIR_I2F32,
    AGX_APPLE9_VIR_F2I32,
    AGX_APPLE9_VIR_F2U32,
+   /* Direct integer-to-FP16 and FP32-to-narrow-integer conversions. Results
+    * occupy the low 16-bit half of a 32-bit SSA register. */
+   AGX_APPLE9_VIR_U2F16,
+   AGX_APPLE9_VIR_I2F16,
+   AGX_APPLE9_VIR_U16_2F16,
+   AGX_APPLE9_VIR_I16_2F16,
+   AGX_APPLE9_VIR_F2I16,
+   AGX_APPLE9_VIR_F2U16,
+   AGX_APPLE9_VIR_F2I8,
+   AGX_APPLE9_VIR_F2U8,
    /* Native binary16 conversions. Values still occupy 32-bit SSA registers. */
    AGX_APPLE9_VIR_F2F16,
    AGX_APPLE9_VIR_PACK_HALF_2X16,
    AGX_APPLE9_VIR_PACK_UNORM_2X16,
    AGX_APPLE9_VIR_PACK_UNORM_4X8,
+   AGX_APPLE9_VIR_PACK_SNORM_2X16,
+   AGX_APPLE9_VIR_PACK_SNORM_4X8,
    /* Three or four FP32 channels to one packed word; immediate is an
     * enum agx_apple9_pack_format. */
    AGX_APPLE9_VIR_PACK_FORMAT,
@@ -66,6 +78,7 @@ enum agx_apple9_vir_opcode {
    /* Full 32x32 product, low word followed by high word. immediate is signed. */
    AGX_APPLE9_VIR_IMUL_WIDE,
    AGX_APPLE9_VIR_IAND,
+   AGX_APPLE9_VIR_IANDN,
    AGX_APPLE9_VIR_IOR,
    AGX_APPLE9_VIR_IXOR,
    /* immediate selects a 32-bit uniform word; IOR has one GPR source. */
@@ -74,6 +87,8 @@ enum agx_apple9_vir_opcode {
    AGX_APPLE9_VIR_ISHR,
    AGX_APPLE9_VIR_USHR,
    AGX_APPLE9_VIR_ISHL,
+   /* Funnel shift right: ((uint64_t)src0 << 32 | src1) >> src2. */
+   AGX_APPLE9_VIR_EXTR,
    AGX_APPLE9_VIR_IMIN,
    AGX_APPLE9_VIR_IMAX,
    AGX_APPLE9_VIR_UMIN,
@@ -154,6 +169,15 @@ enum agx_apple9_vir_opcode {
    AGX_APPLE9_VIR_SUBGROUP_REDUCE_UMAX,
    AGX_APPLE9_VIR_SUBGROUP_BROADCAST,
    AGX_APPLE9_VIR_SUBGROUP_BALLOT,
+   /* Generalized 1-instruction SIMD & Quad reductions and exclusive scans.
+    * immediate encodes enum agx_apple9_subgroup_reduce_op | flags. */
+   AGX_APPLE9_VIR_SUBGROUP_REDUCE,
+   /* Generalized 10-byte SIMD & Quad shuffles (immediate encodes
+    * enum agx_apple9_subgroup_shuffle_mode; src1 is GPR or 5-bit immediate). */
+   AGX_APPLE9_VIR_SUBGROUP_SHUFFLE,
+   /* 12-byte simd_shuffle_and_fill_down (C7 06): shifts src0 down by src2
+    * (GPR or 5-bit immediate), filling upper lanes from src1. */
+   AGX_APPLE9_VIR_SUBGROUP_ROTATE,
    AGX_APPLE9_VIR_WORKGROUP_BARRIER,
    AGX_APPLE9_VIR_DEVICE_FENCE,
    AGX_APPLE9_VIR_HALT,
@@ -886,6 +910,115 @@ bool agx_apple9_vir_emit_private_store(
  * automatically compacted to 4-byte GET_SR when allocated to r0..r63). */
 uint32_t agx_apple9_vir_emit_get_sr_async(
    struct agx_apple9_vir_program *program, uint8_t selector, uint8_t datapath);
+
+enum agx_apple9_subgroup_reduce_op {
+   AGX_APPLE9_SUBGROUP_REDUCE_AND = 0,
+   AGX_APPLE9_SUBGROUP_REDUCE_OR = 1,
+   AGX_APPLE9_SUBGROUP_REDUCE_XOR = 2,
+   AGX_APPLE9_SUBGROUP_REDUCE_IADD = 3,
+   AGX_APPLE9_SUBGROUP_REDUCE_IMIN = 4,
+   AGX_APPLE9_SUBGROUP_REDUCE_IMAX = 5,
+   AGX_APPLE9_SUBGROUP_REDUCE_UMIN = 6,
+   AGX_APPLE9_SUBGROUP_REDUCE_UMAX = 7,
+   AGX_APPLE9_SUBGROUP_REDUCE_FADD = 8,
+   AGX_APPLE9_SUBGROUP_REDUCE_FMUL = 9,
+   AGX_APPLE9_SUBGROUP_REDUCE_FMIN = 10,
+   AGX_APPLE9_SUBGROUP_REDUCE_FMAX = 11,
+   AGX_APPLE9_SUBGROUP_REDUCE_HADD = 12,
+   AGX_APPLE9_SUBGROUP_REDUCE_HMIN = 13,
+   AGX_APPLE9_SUBGROUP_REDUCE_HMAX = 14,
+};
+
+enum agx_apple9_subgroup_reduce_flags {
+   AGX_APPLE9_SUBGROUP_REDUCE_QUAD = 1u << 8,
+   AGX_APPLE9_SUBGROUP_REDUCE_PREFIX = 1u << 9,
+   AGX_APPLE9_SUBGROUP_REDUCE_16BIT = 1u << 10,
+};
+
+enum agx_apple9_subgroup_shuffle_mode {
+   AGX_APPLE9_SUBGROUP_SHUFFLE_IDX = 0,
+   AGX_APPLE9_SUBGROUP_SHUFFLE_XOR = 1,
+   AGX_APPLE9_SUBGROUP_SHUFFLE_UP = 2,
+   AGX_APPLE9_SUBGROUP_SHUFFLE_DOWN = 3,
+   AGX_APPLE9_QUAD_SHUFFLE_IDX = 4,
+   AGX_APPLE9_QUAD_SHUFFLE_XOR = 5,
+};
+
+/* Native 1-instruction SIMD & Quad reductions and exclusive prefix scans.
+ * Integer ops support bits=16 or 32; FADD/FMUL/FMIN/FMAX require bits=32;
+ * HADD/HMIN/HMAX require bits=16. Exclusive prefix scans are supported for
+ * IADD (32/16-bit), FADD, FMUL (32-bit), and HADD (16-bit). */
+uint32_t agx_apple9_vir_emit_subgroup_reduce(
+   struct agx_apple9_vir_program *program,
+   enum agx_apple9_subgroup_reduce_op op, uint32_t src, unsigned bits,
+   bool quad, bool prefix_exclusive);
+
+/* 2-instruction inclusive prefix scan (exclusive scan + IADD/FADD/FMUL/HADD). */
+uint32_t agx_apple9_vir_emit_subgroup_inclusive_scan(
+   struct agx_apple9_vir_program *program,
+   enum agx_apple9_subgroup_reduce_op op, uint32_t src, unsigned bits,
+   bool quad);
+
+/* Native 10-byte SIMD & Quad shuffles (register or 5-bit immediate lane/delta). */
+uint32_t agx_apple9_vir_emit_subgroup_shuffle(
+   struct agx_apple9_vir_program *program,
+   enum agx_apple9_subgroup_shuffle_mode mode, uint32_t src,
+   uint32_t lane_or_delta);
+uint32_t agx_apple9_vir_emit_subgroup_shuffle_imm(
+   struct agx_apple9_vir_program *program,
+   enum agx_apple9_subgroup_shuffle_mode mode, uint32_t src,
+   uint8_t lane_or_delta);
+
+/* Native 12-byte simd_shuffle_and_fill_down (C7 06) for subgroupRotate:
+ * shifts data down by delta (register or 0..31 immediate), filling upper lanes
+ * from fill (pass fill == data for full 32-lane rotate). */
+uint32_t agx_apple9_vir_emit_subgroup_rotate(
+   struct agx_apple9_vir_program *program, uint32_t data, uint32_t fill,
+   uint32_t delta);
+uint32_t agx_apple9_vir_emit_subgroup_rotate_imm(
+   struct agx_apple9_vir_program *program, uint32_t data, uint32_t fill,
+   uint8_t delta);
+
+/* Native single-instruction ALU unlocks. */
+uint32_t agx_apple9_vir_emit_iadd_sat(struct agx_apple9_vir_program *program,
+                                      uint32_t a, uint32_t b, bool is_sub,
+                                      bool is_signed);
+uint32_t agx_apple9_vir_emit_iandn(struct agx_apple9_vir_program *program,
+                                   uint32_t a, uint32_t b);
+uint32_t agx_apple9_vir_emit_extr(struct agx_apple9_vir_program *program,
+                                  uint32_t hi, uint32_t lo, uint32_t shift);
+uint32_t agx_apple9_vir_emit_extr_imm(struct agx_apple9_vir_program *program,
+                                      uint32_t hi, uint32_t lo, uint8_t shift);
+/* Masked left shift: (src & ((1u << width) - 1)) << shift (width 1..31). */
+uint32_t agx_apple9_vir_emit_bfi_imm(struct agx_apple9_vir_program *program,
+                                     uint32_t src, uint8_t shift,
+                                     uint8_t width);
+uint32_t agx_apple9_vir_emit_pack_snorm_2x16(
+   struct agx_apple9_vir_program *program, uint32_t a, uint32_t b);
+uint32_t agx_apple9_vir_emit_pack_snorm_4x8(
+   struct agx_apple9_vir_program *program, const uint32_t src[4]);
+uint32_t agx_apple9_vir_emit_int_to_f16(struct agx_apple9_vir_program *program,
+                                        uint32_t src, unsigned src_bits,
+                                        bool is_signed);
+uint32_t agx_apple9_vir_emit_f32_to_narrow_int(
+   struct agx_apple9_vir_program *program, uint32_t src, unsigned dst_bits,
+   bool is_signed);
+
+/* 1D and 1D-array texture sample (0x0080/0x00a0) or fetch (0x0c80/0x0ca0).
+ * Pass layer_or_invalid == AGX_APPLE9_VREG_INVALID for non-array 1D. */
+uint32_t agx_apple9_vir_emit_texture_1d(struct agx_apple9_vir_program *program,
+                                        uint32_t coord,
+                                        uint32_t layer_or_invalid, uint32_t one,
+                                        unsigned texture, unsigned sampler,
+                                        bool fetch);
+
+/* Implicit-LOD array / shadow sample using a 4-word parameter tuple:
+ * - dimension=2 (2D-array): !shadow (0x0408, +offset 0x0301) or shadow (0x0420,
+ *   +offset 0x0321)
+ * - dimension=4 (Cube-array): shadow (0x0430) */
+uint32_t agx_apple9_vir_emit_texture_array_implicit(
+   struct agx_apple9_vir_program *program, const uint32_t coords[4],
+   unsigned texture, unsigned sampler, unsigned dimension, bool shadow);
 
 bool agx_apple9_vir_emit_block_image_store(
    struct agx_apple9_vir_program *program, const uint32_t src[4],

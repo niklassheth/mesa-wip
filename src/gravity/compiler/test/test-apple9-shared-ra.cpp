@@ -1447,3 +1447,107 @@ TEST(Apple9SharedRa, TypedSharedPrivateDeviceU16AndAsyncGetSrAllocateAndPack)
    agx_apple9_vir_finish(&p);
    ralloc_free(nir.shader);
 }
+
+TEST(Apple9SharedRa, SubgroupAluUnlocksAndCompactImageStoreAllocateAndPack)
+{
+   nir_builder nir = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "hw_unlock_wave2_e2e");
+   nir_block logical = {};
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+   p.fragment_shader = true;
+   auto block = agx_apple9_block_create(&p);
+   block->nir = &logical;
+   agx_apple9_block_begin(&p, block);
+
+   uint32_t zero = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+      AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+   uint32_t one = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+      AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0x3f800000);
+   agx_apple9_device_load_contract contract = {
+      .index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR,
+      .flags = AGX_APPLE9_DEVICE_LOAD_HAS_NEXT,
+      .raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_1100,
+   };
+   uint32_t a = agx_apple9_vir_emit_device_load(&p, 1, zero, &contract);
+   uint32_t b = agx_apple9_vir_emit_device_load(&p, 2, zero, &contract);
+   uint32_t delta = agx_apple9_vir_emit_device_load(&p, 3, zero, &contract);
+
+   /* Subgroup reduce (folds wait on device load), inclusive scan, shuffle, rotate. */
+   uint32_t r_sum = agx_apple9_vir_emit_subgroup_reduce(
+      &p, AGX_APPLE9_SUBGROUP_REDUCE_FADD, a, 32, false, false);
+   uint32_t r_scan = agx_apple9_vir_emit_subgroup_inclusive_scan(
+      &p, AGX_APPLE9_SUBGROUP_REDUCE_IADD, a, 32, false);
+   uint32_t r_qmin = agx_apple9_vir_emit_subgroup_reduce(
+      &p, AGX_APPLE9_SUBGROUP_REDUCE_IMIN, b, 32, true, false);
+   uint32_t r_shuf = agx_apple9_vir_emit_subgroup_shuffle(
+      &p, AGX_APPLE9_SUBGROUP_SHUFFLE_XOR, r_sum, delta);
+   uint32_t r_shuf_i = agx_apple9_vir_emit_subgroup_shuffle_imm(
+      &p, AGX_APPLE9_QUAD_SHUFFLE_IDX, r_qmin, 2);
+   uint32_t r_rot = agx_apple9_vir_emit_subgroup_rotate(&p, r_scan, b, delta);
+   uint32_t r_rot_i = agx_apple9_vir_emit_subgroup_rotate_imm(&p, r_rot, a, 5);
+
+   /* ALU unlocks: sat add/sub, andn, extr (reg & imm), bfi, pack_snorm, narrow convs. */
+   uint32_t s_add = agx_apple9_vir_emit_iadd_sat(&p, r_rot_i, r_shuf_i, false, true);
+   uint32_t u_sub = agx_apple9_vir_emit_iadd_sat(&p, s_add, r_shuf, true, false);
+   uint32_t andn = agx_apple9_vir_emit_iandn(&p, u_sub, delta);
+   uint32_t ext_r = agx_apple9_vir_emit_extr(&p, andn, b, delta);
+   uint32_t ext_i = agx_apple9_vir_emit_extr_imm(&p, ext_r, a, 12);
+   uint32_t bfi = agx_apple9_vir_emit_bfi_imm(&p, ext_i, 4, 8);
+   uint32_t sn2 = agx_apple9_vir_emit_pack_snorm_2x16(&p, r_sum, one);
+   uint32_t sn4_in[4] = {r_sum, one, a, b};
+   uint32_t sn4 = agx_apple9_vir_emit_pack_snorm_4x8(&p, sn4_in);
+   uint32_t h1 = agx_apple9_vir_emit_int_to_f16(&p, bfi, 32, false);
+   uint32_t h2 = agx_apple9_vir_emit_int_to_f16(&p, sn2, 16, true);
+   uint32_t n1 = agx_apple9_vir_emit_f32_to_narrow_int(&p, h1, 16, true);
+   uint32_t n2 = agx_apple9_vir_emit_f32_to_narrow_int(&p, h2, 8, false);
+
+   /* Tier 2 textures: 1D sample, 1D-array fetch, 2D-array implicit, Cube grad. */
+   uint32_t t1d = agx_apple9_vir_emit_texture_1d(
+      &p, a, AGX_APPLE9_VREG_INVALID, one, 0, 0, false);
+   uint32_t t1da = agx_apple9_vir_emit_texture_1d(&p, a, zero, one, 1, 0, true);
+   uint32_t c4[4] = {a, b, zero, one};
+   uint32_t t2da = agx_apple9_vir_emit_texture_array_implicit(&p, c4, 2, 0, 2, true);
+   uint32_t cg[9] = {a, b, one, a, b, one, a, b, one};
+   uint32_t tcg = agx_apple9_vir_emit_texture_grad(&p, cg, 3, 0, 1, false, false);
+
+   /* Compact 2D 32-bit image store consumes results -> IMAGE_WRITE_PARAMS_2D (60B). */
+   uint32_t xy[2] = {n1, n2};
+   uint32_t rgba[4] = {t1d, t1da, t2da, tcg};
+   uint32_t mix[2] = {rgba[0], sn4};
+   rgba[0] = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IXOR,
+      AGX_APPLE9_ENC_LOGIC_EXTENDED, mix, 2, 0);
+   ASSERT_TRUE(agx_apple9_vir_emit_image_store(&p, xy, rgba, zero,
+                                               AGX_APPLE9_VREG_INVALID, false));
+
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << reason;
+
+   unsigned compact_2d_params = 0, rotates = 0, extrs = 0, sat_adds = 0;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      const auto *I = p.instructions[i];
+      if (I->encoding == AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS_2D)
+         ++compact_2d_params;
+      if (I->op == AGX_APPLE9_VIR_SUBGROUP_ROTATE)
+         ++rotates;
+      if (I->op == AGX_APPLE9_VIR_EXTR)
+         ++extrs;
+      if ((I->op == AGX_APPLE9_VIR_IADD || I->op == AGX_APPLE9_VIR_ISUB) &&
+          I->saturate)
+         ++sat_adds;
+      agx_apple9_packed_instruction packed;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(I, p.phys, &packed, &reason))
+         << "instr " << i << " op=" << I->op << ": " << (reason ?: "");
+      if (I->encoding == AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS_2D) {
+         EXPECT_EQ(packed.length, 60u);
+      }
+   }
+   EXPECT_EQ(compact_2d_params, 1u);
+   EXPECT_EQ(rotates, 2u);
+   EXPECT_EQ(extrs, 2u);
+   EXPECT_EQ(sat_adds, 2u);
+   agx_apple9_vir_finish(&p);
+   ralloc_free(nir.shader);
+}

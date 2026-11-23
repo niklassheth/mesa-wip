@@ -60,10 +60,20 @@ agx_apple9_instr_is_pure_alu(const struct agx_apple9_vir_instr *I)
    case AGX_APPLE9_VIR_I2F32:
    case AGX_APPLE9_VIR_F2I32:
    case AGX_APPLE9_VIR_F2U32:
+   case AGX_APPLE9_VIR_U2F16:
+   case AGX_APPLE9_VIR_I2F16:
+   case AGX_APPLE9_VIR_U16_2F16:
+   case AGX_APPLE9_VIR_I16_2F16:
+   case AGX_APPLE9_VIR_F2I16:
+   case AGX_APPLE9_VIR_F2U16:
+   case AGX_APPLE9_VIR_F2I8:
+   case AGX_APPLE9_VIR_F2U8:
    case AGX_APPLE9_VIR_F2F16:
    case AGX_APPLE9_VIR_PACK_HALF_2X16:
    case AGX_APPLE9_VIR_PACK_UNORM_2X16:
    case AGX_APPLE9_VIR_PACK_UNORM_4X8:
+   case AGX_APPLE9_VIR_PACK_SNORM_2X16:
+   case AGX_APPLE9_VIR_PACK_SNORM_4X8:
    case AGX_APPLE9_VIR_PACK_FORMAT:
    case AGX_APPLE9_VIR_UNPACK_HALF:
    case AGX_APPLE9_VIR_UNPACK_NORM:
@@ -73,12 +83,14 @@ agx_apple9_instr_is_pure_alu(const struct agx_apple9_vir_instr *I)
    case AGX_APPLE9_VIR_IMAD:
    case AGX_APPLE9_VIR_IMUL_WIDE:
    case AGX_APPLE9_VIR_IAND:
+   case AGX_APPLE9_VIR_IANDN:
    case AGX_APPLE9_VIR_IOR_UNIFORM:
    case AGX_APPLE9_VIR_IOR:
    case AGX_APPLE9_VIR_IXOR:
    case AGX_APPLE9_VIR_ISHR:
    case AGX_APPLE9_VIR_USHR:
    case AGX_APPLE9_VIR_ISHL:
+   case AGX_APPLE9_VIR_EXTR:
    case AGX_APPLE9_VIR_IMIN:
    case AGX_APPLE9_VIR_IMAX:
    case AGX_APPLE9_VIR_UMIN:
@@ -209,6 +221,9 @@ fold_integer(struct agx_apple9_vir_instr *I, const bool *constant,
       c[s] = values[I->src[s]];
    }
 
+   if (I->saturate)
+      return false;
+
    uint32_t value;
    switch (I->op) {
    case AGX_APPLE9_VIR_IADD: value = c[0] + c[1]; break;
@@ -216,6 +231,7 @@ fold_integer(struct agx_apple9_vir_instr *I, const bool *constant,
    case AGX_APPLE9_VIR_ISUB: value = c[0] - c[1]; break;
    case AGX_APPLE9_VIR_IMAD: value = c[0] * c[1] + c[2]; break;
    case AGX_APPLE9_VIR_IAND: value = c[0] & c[1]; break;
+   case AGX_APPLE9_VIR_IANDN: value = c[0] & ~c[1]; break;
    case AGX_APPLE9_VIR_IOR: value = c[0] | c[1]; break;
    case AGX_APPLE9_VIR_IXOR: value = c[0] ^ c[1]; break;
    case AGX_APPLE9_VIR_ISHR:
@@ -228,7 +244,10 @@ fold_integer(struct agx_apple9_vir_instr *I, const bool *constant,
             ? UINT32_MAX : 0;
          break;
       }
-      value = I->op == AGX_APPLE9_VIR_ISHL ? c[0] << shift : c[0] >> shift;
+      uint32_t src0 = (I->op == AGX_APPLE9_VIR_ISHL && width)
+                         ? (c[0] & BITFIELD_MASK(width))
+                         : c[0];
+      value = I->op == AGX_APPLE9_VIR_ISHL ? src0 << shift : c[0] >> shift;
       if (I->op == AGX_APPLE9_VIR_ISHR && shift && (c[0] & 0x80000000u))
          value |= UINT32_MAX << (32 - shift);
       if (I->op == AGX_APPLE9_VIR_USHR && width)
@@ -551,6 +570,7 @@ inline_integer_immediates(struct agx_apple9_vir_instr *I, const bool *constant,
    unsigned arity = select ? 4 : mad ? 3 : 2;
    if (!(add || mad || logic || select) ||
        !agx_apple9_integer_immediate_encoding(I->encoding) ||
+       I->saturate || I->src_sext_mask ||
        I->alu_src_uniform_mask || I->alu_src_immediate_mask ||
        I->nr_srcs != arity || I->dest_components != 1)
       return;
@@ -917,6 +937,7 @@ fold_uniform_stores(struct agx_apple9_vir_program *p)
           store->encoding != AGX_APPLE9_ENC_STORE_UNIFORM || store->nr_srcs != 1 ||
           store->immediate >= AGX_APPLE9_UNIFORM_COUNT ||
           alu->dest != store->src[0] ||
+          alu->saturate || alu->src_sext_mask ||
           agx_apple9_instr_block(alu) != agx_apple9_instr_block(store) ||
           alu->alu_src_uniform_mask || alu->alu_src_immediate_mask)
          continue;
@@ -1126,7 +1147,8 @@ fold_half_sources(struct agx_apple9_vir_program *p,
             ok = (float2 && slot < 2) ||
                  (fma && (slot == 2 || (slot == 1 && !hi) || fma_swap));
          else
-            ok = (add && R->encoding == AGX_APPLE9_ENC_INT_ADD_EXTENDED && slot < 2) ||
+            ok = (add && !R->saturate &&
+                  R->encoding == AGX_APPLE9_ENC_INT_ADD_EXTENDED && slot < 2) ||
                  (mad && R->encoding == AGX_APPLE9_ENC_INT_MAD_EXTENDED &&
                   (!sext || slot == 0));
          all = slot >= 0 && ok && !(R->src_half_mask & BITFIELD_BIT(slot)) &&
