@@ -9389,6 +9389,71 @@ apple9_lower_idiv(nir_shader *nir)
 }
 
 static bool
+apple9_subgroup_operand_uniform(const nir_def *def, unsigned depth)
+{
+   if (!def || depth > 8)
+      return false;
+   const nir_instr *instr = nir_def_instr(def);
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+      return true;
+   case nir_instr_type_alu: {
+      const nir_alu_instr *alu = nir_instr_as_alu(instr);
+      unsigned num_srcs = nir_op_infos[alu->op].num_inputs;
+      for (unsigned i = 0; i < num_srcs; ++i) {
+         if (!apple9_subgroup_operand_uniform(alu->src[i].src.ssa, depth + 1))
+            return false;
+      }
+      return true;
+   }
+   case nir_instr_type_intrinsic: {
+      const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      switch (intr->intrinsic) {
+      case nir_intrinsic_load_ubo:
+      case nir_intrinsic_load_push_constant:
+      case nir_intrinsic_load_preamble:
+      case nir_intrinsic_load_uniform:
+      case nir_intrinsic_load_workgroup_id:
+      case nir_intrinsic_load_num_workgroups:
+      case nir_intrinsic_load_workgroup_size:
+      case nir_intrinsic_load_subgroup_id:
+      case nir_intrinsic_load_num_subgroups:
+      case nir_intrinsic_load_subgroup_size:
+      case nir_intrinsic_read_first_invocation:
+      case nir_intrinsic_ballot:
+      case nir_intrinsic_vote_any:
+      case nir_intrinsic_vote_all:
+      case nir_intrinsic_vote_ieq:
+      case nir_intrinsic_vote_feq:
+      case nir_intrinsic_load_ssbo:
+      case nir_intrinsic_load_global:
+      case nir_intrinsic_load_global_constant: {
+         if (nir_intrinsic_has_access(intr) &&
+             (nir_intrinsic_access(intr) & ACCESS_VOLATILE))
+            return false;
+         unsigned num_srcs = nir_intrinsic_infos[intr->intrinsic].num_srcs;
+         for (unsigned i = 0; i < num_srcs; ++i) {
+            if (!apple9_subgroup_operand_uniform(intr->src[i].ssa, depth + 1))
+               return false;
+         }
+         return true;
+      }
+      case nir_intrinsic_read_invocation:
+         return apple9_subgroup_operand_uniform(intr->src[1].ssa, depth + 1);
+      case nir_intrinsic_reduce: {
+         unsigned cluster = nir_intrinsic_cluster_size(intr);
+         return cluster == 0 || cluster >= 32;
+      }
+      default:
+         return false;
+      }
+   }
+   default:
+      return false;
+   }
+}
+
+static bool
 apple9_lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
 {
    if (intr->def.num_components != 1)
@@ -9413,6 +9478,12 @@ apple9_lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
    case nir_intrinsic_shuffle_xor:
    case nir_intrinsic_shuffle_up:
    case nir_intrinsic_shuffle_down:
+      /* Apple9 native simd_shuffle_{xor,up,down} require a uniform mask/delta
+       * across the subgroup/quad; lower per-lane divergent forms via
+       * nir_intrinsic_shuffle so they use the quad-uniform 4-way loop. */
+      if (!apple9_subgroup_operand_uniform(intr->src[1].ssa, 0))
+         return true;
+      return bits != 32 && bits != 1;
    case nir_intrinsic_quad_broadcast:
    case nir_intrinsic_quad_swap_horizontal:
    case nir_intrinsic_quad_swap_vertical:
@@ -9618,7 +9689,8 @@ apple9_lower_subgroups(nir_shader *nir)
    };
    nir_lower_subgroups(nir, &subgroups);
    /* Pass 2+: lower unsupported quad/rotate forms (e.g., 64-bit quad or
-    * cluster 8/16 rotate) and any reductions/shuffles created above. */
+    * cluster 8/16 rotate), divergent relative shuffles, and any reductions or
+    * shuffles created above. */
    subgroups.lower_relative_shuffle = true;
    subgroups.lower_quad = true;
    subgroups.lower_rotate_to_shuffle = true;

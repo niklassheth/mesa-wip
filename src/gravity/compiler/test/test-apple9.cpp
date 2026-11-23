@@ -16968,18 +16968,19 @@ TEST(Apple9Compiler, NativeSubgroupReduceScanShuffleAndRotate)
       ralloc_free(b.shader);
    }
 
-   /* Native 1-instruction SIMD & Quad shuffles (const & dynamic, plus 1-bit). */
+   /* Native 1-instruction SIMD & Quad shuffles (const & uniform dynamic, plus 1-bit). */
    {
       nir_builder b = apple9_compute_builder("native_shuffles");
       b.shader->info.num_ssbos = 2;
       nir_def *id = apple9_global_id_x(&b);
       nir_def *w = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 1),
                                  nir_imul_imm(&b, id, 4));
-      nir_def *dyn = nir_iand_imm(&b, id, 3);
+      nir_def *unif = nir_iand_imm(
+         &b, nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 1), nir_imm_int(&b, 0)), 3);
       nir_def *s0 = nir_shuffle_xor(&b, w, nir_imm_int(&b, 4));
-      nir_def *s1 = nir_shuffle_up(&b, s0, dyn);
+      nir_def *s1 = nir_shuffle_up(&b, s0, unif);
       nir_def *s2 = nir_shuffle_down(&b, s1, nir_imm_int(&b, 2));
-      nir_def *s3 = nir_quad_broadcast(&b, s2, dyn);
+      nir_def *s3 = nir_quad_broadcast(&b, s2, unif);
       nir_def *s4 = nir_quad_swap_horizontal(&b, s3);
       nir_def *s5 = nir_quad_swap_vertical(&b, s4);
       nir_def *s6 = nir_quad_swap_diagonal(&b, s5);
@@ -16995,6 +16996,31 @@ TEST(Apple9Compiler, NativeSubgroupReduceScanShuffleAndRotate)
       EXPECT_EQ(count_shuffle(compiled, 0xc7, 0x05), 1u); /* shuffle_down */
       EXPECT_EQ(count_shuffle(compiled, 0x47, 0x00), 1u); /* quad_broadcast */
       EXPECT_EQ(count_shuffle(compiled, 0xc7, 0x00), 3u); /* quad_swap h/v/d */
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* Divergent delta/mask on shuffle_{up,down,xor} must lower via generic
+    * quad-uniform simd_shuffle (47 04), never 1-instruction relative shuffles. */
+   {
+      nir_builder b = apple9_compute_builder("divergent_relative_shuffles");
+      b.shader->info.num_ssbos = 2;
+      nir_def *id = apple9_global_id_x(&b);
+      nir_def *w = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 1),
+                                 nir_imul_imm(&b, id, 4));
+      nir_def *div = nir_iand_imm(&b, id, 31);
+      nir_def *s0 = nir_shuffle_xor(&b, w, div);
+      nir_def *s1 = nir_shuffle_up(&b, s0, div);
+      nir_def *s2 = nir_shuffle_down(&b, s1, div);
+      apple9_store_output(&b, id, s2);
+      agx_shader_part compiled = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, nullptr, &reason))
+         << (reason ?: "");
+      EXPECT_EQ(count_shuffle(compiled, 0xc7, 0x04), 0u);
+      EXPECT_EQ(count_shuffle(compiled, 0x47, 0x05), 0u);
+      EXPECT_EQ(count_shuffle(compiled, 0xc7, 0x05), 0u);
+      EXPECT_GE(count_shuffle(compiled, 0x47, 0x04), 12u); /* 3 * 4-way quad loop */
       free(compiled.binary);
       ralloc_free(b.shader);
    }
