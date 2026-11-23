@@ -340,6 +340,18 @@ if with_tests
     ),
     suite : ['gravity'],
   )
+  test(
+    'gravity-hk-cts-clusters-1245',
+    executable(
+      'gravity-hk-cts-clusters-1245', 'tests/hk-cts-clusters-1245.c',
+      include_directories : [inc_gallium, inc_gallium_aux, inc_include,
+                             inc_src, inc_gravity],
+      dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
+      link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_reference',
+                   '-Wl,--wrap=agx_bo_unreference'],
+    ),
+    suite : ['gravity'],
+  )
   test('gravity-hk-native-mesh-routing', gravity_routing_test,
     env : ['HK_APPLE9_NATIVE_MESH=1'],
     suite : ['gravity'])
