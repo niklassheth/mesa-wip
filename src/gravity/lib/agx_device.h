@@ -19,7 +19,6 @@
 #include "util/u_thread.h"
 #include "util/vma.h"
 #include "agx_bo.h"
-#include "agx_apple9_layout.h"
 #include "agx_pack.h"
 #include "layout.h"
 #include "libagx_dgc.h"
@@ -186,8 +185,6 @@ struct agx_device {
     */
    bool (*apple9_pin_entry)(void *allocator, struct agx_shader_body *body);
 
-   struct renderonly *ro;
-
    pthread_mutex_t bo_map_lock;
    pthread_cond_t bo_map_cond;
    /* The reaper has removed this shared handle from bo_map and is closing it.
@@ -333,9 +330,6 @@ int agx_destroy_command_queue(struct agx_device *dev, uint32_t queue_id);
 
 int agx_import_sync_file(struct agx_device *dev, struct agx_bo *bo, int fd);
 int agx_syncobj_error(struct agx_device *dev, uint32_t syncobj);
-int agx_export_sync_file(struct agx_device *dev, struct agx_bo *bo);
-
-void agx_debug_fault(struct agx_device *dev, uint64_t addr);
 
 uint64_t agx_get_gpu_timestamp(struct agx_device *dev);
 
@@ -347,8 +341,6 @@ agx_gpu_timestamp_to_ns(struct agx_device *dev, uint64_t gpu_timestamp)
 }
 
 void agx_get_device_uuid(const struct agx_device *dev, void *uuid);
-void agx_get_driver_uuid(void *uuid);
-unsigned agx_get_num_cores(const struct agx_device *dev);
 
 struct agx_va *agx_va_alloc(struct agx_device *dev, uint64_t size_B,
                             uint64_t align_B, enum agx_va_flags flags,

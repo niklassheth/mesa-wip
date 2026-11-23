@@ -8,9 +8,6 @@
 /* Texture backend flags */
 #define AGX_TEXTURE_FLAG_NO_CLAMP (1 << 0)
 
-/* Indicates that the sampler should be overriden to clamp to 0 instead of 1 */
-#define AGX_TEXTURE_FLAG_CLAMP_TO_0 (1 << 1)
-
 /* A 2D access the driver rewrote as layer 0 of a one-layer array, so the
  * Apple9 texture lowering still treats it as 2D, for unnormalized samplers. */
 #define AGX_TEXTURE_FLAG_ARRAYED_2D (1 << 2)

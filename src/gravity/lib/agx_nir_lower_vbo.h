@@ -38,13 +38,6 @@ struct agx_robustness {
    bool soft_fault;
 };
 
-struct agx_velem_key;
-
-bool agx_nir_lower_vbo(nir_shader *shader, const struct agx_velem_key *attribs,
-                       struct agx_robustness rs, bool dynamic_strides);
-
-enum pipe_format agx_vbo_internal_format(enum pipe_format format);
-
 bool agx_vbo_supports_format(enum pipe_format format);
 
 #ifdef __cplusplus

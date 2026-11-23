@@ -223,28 +223,6 @@ libagx_buffer_texel_address(constant const struct agx_pbe_packed *ptr,
 }
 
 /* Buffer texture lowerings */
-bool
-libagx_texture_is_rgb32(constant struct agx_texture_packed *ptr)
-{
-   agx_unpack(NULL, ptr, TEXTURE, d);
-   return d.channels == AGX_CHANNELS_R32G32B32_EMULATED;
-}
-
-uint4
-libagx_texture_load_rgb32(constant struct agx_texture_packed *ptr, uint coord,
-                          bool is_float)
-{
-   agx_unpack(NULL, ptr, TEXTURE, d);
-
-   /* This is carefully written to let us do the * 3 with a 32-bit operation but
-    * still use the free 64-bit add-extend-shift for the rest.
-    */
-   uint64_t addr = d.address + ((uint64_t)(coord * 3)) * 4;
-   constant uint3 *data = (constant uint3 *)addr;
-
-   return (uint4)(*data, is_float ? as_uint(1.0f) : 1);
-}
-
 uint
 libagx_buffer_texture_offset(constant struct agx_texture_packed *ptr, uint x)
 {

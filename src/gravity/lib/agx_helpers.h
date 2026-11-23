@@ -6,57 +6,11 @@
 #pragma once
 
 #include <stdbool.h>
-#include "gravity/compiler/agx_compile.h"
 #include "gravity/layout/layout.h"
 #include "agx_abi.h"
 #include "agx_border.h"
 #include "agx_pack.h"
-#include "agx_ppp.h"
 #include "libagx_shaders.h"
-
-#define AGX_MAX_OCCLUSION_QUERIES (32768)
-#define AGX_MAX_VIEWPORTS         (16)
-
-static inline enum agx_sampler_states
-agx_translate_sampler_state_count(unsigned count, bool extended)
-{
-   assert(count <= 17 && "max 17 sampler state registers supported");
-
-   if (count == 0) {
-      return AGX_SAMPLER_STATES_0;
-   } else if (extended) {
-      if (count <= 8)
-         return AGX_SAMPLER_STATES_8_EXTENDED;
-      else
-         return AGX_SAMPLER_STATES_16_EXTENDED;
-   } else {
-      if (count <= 4)
-         return AGX_SAMPLER_STATES_4_COMPACT;
-      else if (count <= 8)
-         return AGX_SAMPLER_STATES_8_COMPACT;
-      else if (count <= 12)
-         return AGX_SAMPLER_STATES_12_COMPACT;
-      else
-         return AGX_SAMPLER_STATES_16_COMPACT;
-   }
-}
-
-static void
-agx_pack_txf_sampler(struct agx_sampler_packed *out)
-{
-   agx_pack(out, SAMPLER, cfg) {
-      /* Allow mipmapping. This is respected by txf, weirdly. */
-      cfg.minimum_lod = 0.0;
-      cfg.maximum_lod = INFINITY;
-      cfg.mip_filter = AGX_MIP_FILTER_NEAREST;
-
-      /* Out-of-bounds reads must return 0 */
-      cfg.wrap_s = AGX_WRAP_CLAMP_TO_BORDER;
-      cfg.wrap_t = AGX_WRAP_CLAMP_TO_BORDER;
-      cfg.wrap_r = AGX_WRAP_CLAMP_TO_BORDER;
-      cfg.border_colour = AGX_BORDER_COLOUR_TRANSPARENT_BLACK;
-   }
-}
 
 /* Channels agree for RGBA but are weird for force 0/1 */
 
@@ -155,52 +109,6 @@ agx_translate_sample_count(unsigned samples)
    }
 }
 
-static enum agx_conservative_depth
-agx_translate_depth_layout(enum gl_frag_depth_layout layout)
-{
-   switch (layout) {
-   case FRAG_DEPTH_LAYOUT_ANY:
-      return AGX_CONSERVATIVE_DEPTH_ANY;
-   case FRAG_DEPTH_LAYOUT_LESS:
-      return AGX_CONSERVATIVE_DEPTH_LESS;
-   case FRAG_DEPTH_LAYOUT_GREATER:
-      return AGX_CONSERVATIVE_DEPTH_GREATER;
-   case FRAG_DEPTH_LAYOUT_UNCHANGED:
-      return AGX_CONSERVATIVE_DEPTH_UNCHANGED;
-   default:
-      UNREACHABLE("depth layout should have been canonicalized");
-   }
-}
-
-static void
-agx_pack_fragment_face_2(struct agx_fragment_face_2_packed *out,
-                         enum agx_object_type object_type,
-                         struct agx_shader_info *info)
-{
-   agx_pack(out, FRAGMENT_FACE_2, cfg) {
-      /* These act like disables, ANDed in the hardware. Setting them like this
-       * means the draw-time flag is used.
-       */
-      cfg.disable_depth_write = true;
-      cfg.depth_function = AGX_ZS_FUNC_ALWAYS;
-
-      cfg.object_type = object_type;
-      cfg.conservative_depth =
-         info ? agx_translate_depth_layout(info->depth_layout)
-              : AGX_CONSERVATIVE_DEPTH_UNCHANGED;
-   }
-}
-
-static void
-agx_ppp_fragment_face_2(struct agx_ppp_update *ppp,
-                        enum agx_object_type object_type,
-                        struct agx_shader_info *info)
-{
-   struct agx_fragment_face_2_packed packed;
-   agx_pack_fragment_face_2(&packed, object_type, info);
-   agx_ppp_push_packed(ppp, &packed, FRAGMENT_FACE_2);
-}
-
 static inline uint32_t
 agx_pack_line_width(float line_width)
 {
@@ -248,48 +156,6 @@ agx_set_null_pbe(struct agx_pbe_packed *pbe)
       cfg.swizzle_b = AGX_CHANNEL_R;
       cfg.swizzle_a = AGX_CHANNEL_R;
       cfg.buffer = AGX_SCRATCH_PAGE_ADDRESS;
-   }
-}
-
-/*
- * Determine the maximum vertex/divided instance index.  For robustness,
- * the index will be clamped to this before reading (if soft fault is
- * disabled).
- *
- * Index i accesses up to (exclusive) offset:
- *
- *    src_offset + (i * stride) + elsize_B
- *
- * so we require
- *
- *    src_offset + (i * stride) + elsize_B <= size
- *
- * <==>
- *
- *    i <= floor((size - src_offset - elsize_B) / stride)
- */
-static inline uint32_t
-agx_calculate_vbo_clamp(uint64_t vbuf, enum pipe_format format, uint32_t size_B,
-                        uint32_t stride_B, uint32_t offset_B,
-                        uint64_t *vbuf_out)
-{
-   unsigned elsize_B = util_format_get_blocksize(format);
-   unsigned subtracted_B = offset_B + elsize_B;
-
-   /* If at least one index is valid, determine the max. Otherwise, direct reads
-    * to zero.
-    */
-   if (size_B >= subtracted_B) {
-      *vbuf_out = vbuf + offset_B;
-
-      /* If stride is zero, do not clamp, everything is valid. */
-      if (stride_B)
-         return ((size_B - subtracted_B) / stride_B);
-      else
-         return UINT32_MAX;
-   } else {
-      *vbuf_out = AGX_ZERO_PAGE_ADDRESS;
-      return 0;
    }
 }
 

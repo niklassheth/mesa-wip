@@ -38,7 +38,6 @@
 #include "util/simple_mtx.h"
 #include "util/u_math.h"
 #include "util/u_printf.h"
-#include "git_sha1.h"
 
 static void agx_finish_device(struct agx_device *dev);
 
@@ -1001,71 +1000,6 @@ agx_syncobj_error(struct agx_device *dev, uint32_t syncobj)
    return status;
 }
 
-int
-agx_export_sync_file(struct agx_device *dev, struct agx_bo *bo)
-{
-   struct dma_buf_export_sync_file export_sync_file_ioctl = {
-      .flags = DMA_BUF_SYNC_RW,
-      .fd = -1,
-   };
-
-   assert(bo->prime_fd != -1);
-
-   int ret = drmIoctl(bo->prime_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE,
-                      &export_sync_file_ioctl);
-   assert(ret >= 0);
-   assert(export_sync_file_ioctl.fd >= 0);
-
-   return ret >= 0 ? export_sync_file_ioctl.fd : ret;
-}
-
-void
-agx_debug_fault(struct agx_device *dev, uint64_t addr)
-{
-   pthread_mutex_lock(&dev->bo_map_lock);
-
-   struct agx_bo *best = NULL;
-
-   for (uint32_t handle = 0; handle < dev->max_handle; handle++) {
-      struct agx_bo *bo = agx_lookup_bo(dev, handle);
-      if (!bo->va)
-         continue;
-
-      uint64_t bo_addr = bo->va->addr;
-      if (bo->flags & AGX_BO_LOW_VA)
-         bo_addr += dev->shader_base;
-
-      if (!bo->size || bo_addr > addr)
-         continue;
-
-      if (!best || bo_addr > best->va->addr)
-         best = bo;
-   }
-
-   if (!best) {
-      mesa_logw("Address 0x%" PRIx64 " is unknown\n", addr);
-   } else {
-      uint64_t start = best->va->addr;
-      uint64_t end = best->va->addr + best->size;
-      if (addr > (end + 1024 * 1024 * 1024)) {
-         /* 1GiB max as a sanity check */
-         mesa_logw("Address 0x%" PRIx64 " is unknown\n", addr);
-      } else if (addr > end) {
-         mesa_logw("Address 0x%" PRIx64 " is 0x%" PRIx64
-                   " bytes beyond an object at 0x%" PRIx64 "..0x%" PRIx64
-                   " (%s)\n",
-                   addr, addr - end, start, end - 1, best->label);
-      } else {
-         mesa_logw("Address 0x%" PRIx64 " is 0x%" PRIx64
-                   " bytes into an object at 0x%" PRIx64 "..0x%" PRIx64
-                   " (%s)\n",
-                   addr, addr - start, start, end - 1, best->label);
-      }
-   }
-
-   pthread_mutex_unlock(&dev->bo_map_lock);
-}
-
 uint64_t
 agx_get_gpu_timestamp(struct agx_device *dev)
 {
@@ -1107,39 +1041,4 @@ agx_get_device_uuid(const struct agx_device *dev, void *uuid)
 
    assert(BLAKE3_KEY_LEN >= UUID_SIZE);
    memcpy(uuid, blake3, UUID_SIZE);
-}
-
-void
-agx_get_driver_uuid(void *uuid)
-{
-   const char *driver_id = PACKAGE_VERSION MESA_GIT_SHA1;
-
-   /* The driver UUID is used for determining sharability of images and memory
-    * between two Vulkan instances in separate processes, but also to
-    * determining memory objects and sharability between Vulkan and OpenGL
-    * driver. People who want to share memory need to also check the device
-    * UUID.
-    */
-   blake3_hasher blake3_ctx;
-   _mesa_blake3_init(&blake3_ctx);
-
-   _mesa_blake3_update(&blake3_ctx, driver_id, strlen(driver_id));
-
-   uint8_t blake3[BLAKE3_KEY_LEN];
-   _mesa_blake3_final(&blake3_ctx, blake3);
-
-   assert(BLAKE3_KEY_LEN >= UUID_SIZE);
-   memcpy(uuid, blake3, UUID_SIZE);
-}
-
-unsigned
-agx_get_num_cores(const struct agx_device *dev)
-{
-   unsigned n = 0;
-
-   for (unsigned cl = 0; cl < dev->params.num_clusters_total; cl++) {
-      n += util_bitcount(dev->params.core_masks[cl]);
-   }
-
-   return n;
 }

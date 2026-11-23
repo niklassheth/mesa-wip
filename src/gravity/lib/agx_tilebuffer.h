@@ -53,9 +53,6 @@ struct agx_tilebuffer_layout {
 
    /* Selected tile size in pixels. Either 32*32, 32*16, or 16*16. */
    uint16_t tile_size;
-
-   /* USC word corresponding to this configuration of the tilebuffer */
-   struct agx_usc_shared_packed usc;
 };
 
 static inline void
@@ -64,19 +61,6 @@ agx_tilebuffer_set_drm_cmd(struct drm_asahi_cmd_render *c,
 {
    c->utile_width_px = layout->tile_size >= 32 * 16 ? 32 : 16;
    c->utile_height_px = layout->tile_size <= 32 * 16 ? 16 : 32;
-}
-
-/*
- * _offset_B is undefined for non-spilled render targets. This safe accessor
- * asserts that render targets are not spilled rather than returning garbage.
- */
-static inline uint8_t
-agx_tilebuffer_offset_B(struct agx_tilebuffer_layout *layout, unsigned rt)
-{
-   assert(rt < AGX_MAX_RENDER_TARGETS);
-   assert(!layout->spilled[rt] && "precondition");
-
-   return layout->_offset_B[rt];
 }
 
 static inline bool
@@ -94,9 +78,6 @@ struct agx_tilebuffer_layout
 agx_build_tilebuffer_layout(const enum pipe_format *formats, uint8_t nr_cbufs,
                             uint8_t nr_samples, bool layered);
 
-void agx_tilebuffer_set_samples(struct agx_tilebuffer_layout *tib,
-                                unsigned nr_samples);
-
 bool agx_nir_lower_to_per_sample(struct nir_shader *shader);
 
 bool agx_nir_lower_monolithic_msaa(struct nir_shader *shader,
@@ -106,14 +87,6 @@ bool agx_nir_lower_sample_intrinsics(struct nir_shader *shader,
                                      bool ignore_sample_mask_without_msaa);
 
 uint32_t agx_tilebuffer_total_size(struct agx_tilebuffer_layout *tib);
-
-enum pipe_format
-agx_tilebuffer_physical_format(struct agx_tilebuffer_layout *tib, unsigned rt);
-
-bool agx_tilebuffer_supports_mask(struct agx_tilebuffer_layout *tib,
-                                  unsigned rt);
-
-void agx_tilebuffer_pack_usc(struct agx_tilebuffer_layout *tib);
 
 #ifdef __cplusplus
 } /* extern C */
