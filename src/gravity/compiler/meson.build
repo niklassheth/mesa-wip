@@ -38,6 +38,9 @@ libgravity_compiler_files = files(
   'agx_register_allocate.c',
   'agx_validate.c',
   'agx_validate_ra.c',
+  'apple9_ra_spill.c',
+  'apple9_ra_repair_ssa.c',
+  'apple9_ra_spill_coalesce.c',
 )
 
 gravity_opcodes_h = custom_target(
@@ -208,6 +211,7 @@ if with_tests
          'test/test-lower-spill.cpp',
          'test/test-repair-ssa.cpp',
          'test/test-spill-coalesce.cpp',
+         'test/test-apple9-ra-spill.cpp',
       ),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
