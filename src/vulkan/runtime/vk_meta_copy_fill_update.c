@@ -60,6 +60,7 @@ struct vk_meta_copy_image_view {
       struct {
          struct {
             VkFormat format;
+            VkImageAspectFlags aspects;
             nir_component_mask_t component_mask;
          } depth, stencil;
       };
@@ -299,6 +300,19 @@ copy_img_view_format_for_aspect(const struct vk_meta_copy_image_view *info,
    }
 }
 
+static VkImageAspectFlags
+copy_img_view_aspects(const struct vk_meta_copy_image_view *info,
+                     VkImageAspectFlagBits aspect)
+{
+   if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
+      return info->depth.aspects ?: vk_format_aspects(info->depth.format);
+
+   if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT)
+      return info->stencil.aspects ?: vk_format_aspects(info->stencil.format);
+
+   return aspect;
+}
+
 static bool
 copying_ds_with_color(const struct vk_meta_copy_image_view *view_info,
                       VkImageAspectFlags aspects)
@@ -339,6 +353,7 @@ depth_stencil_interleaved(const struct vk_meta_copy_image_view *view)
    return view->stencil.format != VK_FORMAT_UNDEFINED &&
           view->depth.format != VK_FORMAT_UNDEFINED &&
           view->stencil.format == view->depth.format &&
+          view->stencil.aspects == view->depth.aspects &&
           view->stencil.component_mask != 0 &&
           view->depth.component_mask != 0 &&
           (view->stencil.component_mask & view->depth.component_mask) == 0;
@@ -501,9 +516,7 @@ copy_create_src_image_view(struct vk_command_buffer *cmd,
    /* For multiplane, we only want the aspect for the plane rather than the
     * set of aspects for the full image.
     */
-   VkImageAspectFlags view_aspects =
-      aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ?
-      vk_format_aspects(format) : aspect;
+   VkImageAspectFlags view_aspects = copy_img_view_aspects(view_info, aspect);
 
    VkImageViewCreateInfo info = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -556,9 +569,7 @@ copy_create_dst_image_view(struct vk_command_buffer *cmd,
    /* For multiplane, we only want the aspect for the plane rather than the
     * set of aspects for the full image.
     */
-   VkImageAspectFlags view_aspects =
-      aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ?
-      vk_format_aspects(format) : aspect;
+   VkImageAspectFlags view_aspects = copy_img_view_aspects(view_info, aspect);
    const VkImageViewUsageCreateInfo usage = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
       .usage = bind_point == VK_PIPELINE_BIND_POINT_COMPUTE
@@ -1145,6 +1156,25 @@ build_buffer_to_image_fs(const struct vk_meta_device *meta,
 
    coords = nir_iadd(b, coords, img_offs);
 
+   /* Fragments outside the copied rectangle still run, as helper lanes of
+    * quads straddling its edges, and their loads are issued. Left of or above
+    * the rectangle the 32-bit buffer offset wraps, so the zero-extended
+    * address lands 4 GiB past the buffer. Point those lanes at the first
+    * texel of the region instead; their results are never written. The
+    * unsigned compare against the extent catches both edges.
+    */
+   nir_def *in_rect = nir_iand(b,
+      nir_ult(b, nir_channel(b, coords, 0),
+              load_info(b, struct vk_meta_copy_buffer_image_info,
+                        copy_id_range.end.x)),
+      nir_ult(b, nir_channel(b, coords, 1),
+              load_info(b, struct vk_meta_copy_buffer_image_info,
+                        copy_id_range.end.y)));
+   coords = nir_vec3(b,
+      nir_bcsel(b, in_rect, nir_channel(b, coords, 0), nir_imm_int(b, 0)),
+      nir_bcsel(b, in_rect, nir_channel(b, coords, 1), nir_imm_int(b, 0)),
+      nir_channel(b, coords, 2));
+
    nir_def *texel = nir_load_global(b,
       comp_count, comp_sz, copy_img_buf_addr(b, buf_pfmt, coords),
       .align_mul = 1 << (ffs(blk_sz) - 1));
@@ -1319,6 +1349,14 @@ copy_buffer_image_prepare_gfx_push_const(
          .y = -region->imageOffset.y,
          .z = 0,
       },
+      /* The fragment shader keeps lanes outside this rectangle in bounds.
+       * 1D arrays carry the layer in the second coordinate.
+       */
+      .copy_id_range.end = {
+         .x = region->imageExtent.width,
+         .y = key->img.view.type == VK_IMAGE_VIEW_TYPE_1D_ARRAY
+                 ? UINT32_MAX : region->imageExtent.height,
+      },
    };
 
    disp->CmdPushConstants(vk_command_buffer_to_handle(cmd), pipeline_layout,
@@ -1429,8 +1467,10 @@ img_copy_view_info(VkImageViewType view_type, VkImageAspectFlags aspects,
    }
 
    view.depth.format = img_props->depth.view_format;
+   view.depth.aspects = img_props->depth.view_aspects;
    view.depth.component_mask = img_props->depth.component_mask;
    view.stencil.format = img_props->stencil.view_format;
+   view.stencil.aspects = img_props->stencil.view_aspects;
    view.stencil.component_mask = img_props->stencil.component_mask;
 
    assert(view.depth.format == VK_FORMAT_UNDEFINED ||
@@ -2452,6 +2492,17 @@ vk_meta_copy_image(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
       region.dstOffset = vk_image_offset_to_elements(dst_img, region.dstOffset);
 
       if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+         /* Converting the source extent to elements sanitizes depth to one
+          * for a 2D array. Restore the slice count when rendering into a 3D
+          * image, whose destination subresource has only one array layer.
+          * The compute path similarly derives its Z range from source layers.
+          */
+         if (src_img->image_type == VK_IMAGE_TYPE_2D &&
+             dst_img->image_type == VK_IMAGE_TYPE_3D) {
+            region.extent.depth = vk_image_subresource_layer_count(
+               src_img, &region.srcSubresource);
+         }
+
          copy_image_region_gfx(cmd, meta, src_img, info->srcImageLayout,
                                src_props, dst_img, info->dstImageLayout,
                                dst_props, &region);
