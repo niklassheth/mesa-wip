@@ -607,11 +607,15 @@ agx_apple9_texture_native_offset(const nir_tex_instr *tex, uint16_t *bits)
        (tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
         tex->sampler_dim != GLSL_SAMPLER_DIM_3D) ||
        /* Minimum-LOD + offset is native for non-shadow 2D tex/txb/txd
-        * (0x02c1 / 0x0249) and 2D-array tex/txb (0x67db). */
+        * (0x02c1 / 0x0249), non-shadow 2D-array tex/txb (0x67db), and
+        * bindless shadow 2D-array tex (0x64ad -> 0x0361). */
        (has_min_lod &&
-        (tex->is_shadow || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
-         (tex->op != nir_texop_tex && tex->op != nir_texop_txb &&
-          (tex->op != nir_texop_txd || tex->is_array)))))
+        (tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+         (tex->is_shadow
+             ? (!tex->is_array || tex->op != nir_texop_tex ||
+                nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle) < 0)
+             : (tex->op != nir_texop_tex && tex->op != nir_texop_txb &&
+                (tex->op != nir_texop_txd || tex->is_array))))))
       return false;
    unsigned dims = tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 3 : 2;
    nir_src src = tex->src[offset].src;

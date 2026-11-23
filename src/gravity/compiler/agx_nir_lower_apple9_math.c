@@ -517,9 +517,6 @@ math_filter(const nir_instr *instr, UNUSED const void *data)
    if (instr->type != nir_instr_type_alu)
       return false;
    const nir_alu_instr *alu = nir_instr_as_alu(instr);
-   if (alu->op == nir_op_f2u8 || alu->op == nir_op_f2u16 ||
-       alu->op == nir_op_f2i8 || alu->op == nir_op_f2i16)
-      return true;
    if (alu->op == nir_op_b2f16 || alu->op == nir_op_f2f16_rtz ||
        (alu->op == nir_op_ldexp && alu->def.bit_size == 16))
       return true;
@@ -554,14 +551,7 @@ lower_math(nir_builder *b, nir_instr *instr, UNUSED void *data)
    nir_def *components[NIR_MAX_VEC_COMPONENTS];
    for (unsigned i = 0; i < alu->def.num_components; ++i) {
       nir_def *x = nir_channel(b, source, i);
-      if (alu->op == nir_op_f2u8 || alu->op == nir_op_f2u16) {
-         /* Narrow integer results come from the FP32 conversion. */
-         components[i] = nir_u2uN(b, nir_f2u32(b, nir_f2fN(b, x, 32)),
-                                  alu->def.bit_size);
-      } else if (alu->op == nir_op_f2i8 || alu->op == nir_op_f2i16) {
-         components[i] = nir_i2iN(b, nir_f2i32(b, nir_f2fN(b, x, 32)),
-                                  alu->def.bit_size);
-      } else if (alu->op == nir_op_b2f16) {
+      if (alu->op == nir_op_b2f16) {
          components[i] = nir_bcsel(b, x, nir_imm_float16(b, 1.0f),
                                    nir_imm_float16(b, 0.0f));
       } else if (alu->op == nir_op_ldexp) {
