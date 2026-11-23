@@ -1082,7 +1082,7 @@ TEST(Apple9SharedRa, SubgroupAluUnlocksAndCompactImageStoreAllocateAndPack)
       ASSERT_TRUE(agx_apple9_pack_vir_instruction(I, p.phys, &packed, &reason))
          << "instr " << i << " op=" << I->op << ": " << (reason ?: "");
       if (I->encoding == AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS_2D) {
-         EXPECT_EQ(packed.length, 60u);
+         EXPECT_EQ(packed.length, 24u);
       }
    }
    EXPECT_EQ(compact_2d_params, 1u);

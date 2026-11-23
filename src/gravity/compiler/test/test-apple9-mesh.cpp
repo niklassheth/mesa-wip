@@ -1578,7 +1578,7 @@ TEST(Apple9MemEncoding, NativeImageWrite3DCube16BitFragmentAndFences)
       uint8_t phys[] = {40, 2, 3, 4, 5};
       ASSERT_TRUE(agx_apple9_pack_vir_instruction(&p16, phys, &packed, &reason))
          << (reason ?: "");
-      EXPECT_EQ(packed.length, 40u);
+      EXPECT_EQ(packed.length, 16u);
       phys[0] = 48;
       EXPECT_FALSE(agx_apple9_pack_vir_instruction(&p16, phys, &packed, &reason));
    }
@@ -1831,7 +1831,7 @@ TEST(Apple9MemEncoding, FullDimensionMinLodClampModes)
       pphys[params->dest + i] = i;
    ASSERT_TRUE(agx_apple9_pack_vir_instruction(params, pphys, &packed, &reason))
       << (reason ?: "");
-   EXPECT_EQ(packed.length, 100u);
+   EXPECT_EQ(packed.length, 40u);
    agx_apple9_vir_finish(&p);
 }
 
@@ -2521,12 +2521,12 @@ TEST(Apple9MemEncoding, Tier2TextureModesAndCompact2DImageWrite)
    const uint8_t p2d_phys[] = {8, 10, 11, 12, 13, 14, 15};
    ASSERT_TRUE(agx_apple9_pack_vir_instruction(&p2d, p2d_phys, &packed, &reason))
       << (reason ?: "");
-   ASSERT_EQ(packed.length, 60u);
+   ASSERT_EQ(packed.length, 24u);
    /* Verify destinations are cr8, cr9, cr10, cr11, cr14, cr15 (skipping cr12/13). */
    const unsigned exp_pub[6] = {8, 9, 10, 11, 14, 15};
    for (unsigned c = 0; c < 6; ++c) {
-      unsigned dst_pub = ((packed.bytes[10 * c + 0] >> 4) & 0xf) |
-                         (((packed.bytes[10 * c + 4] >> 4) & 0x3) << 4);
+      unsigned dst_pub = ((packed.bytes[4 * c + 0] >> 4) & 0xf) |
+                         (((packed.bytes[4 * c + 2] >> 6) & 0x3) << 4);
       EXPECT_EQ(dst_pub, exp_pub[c]);
    }
 }

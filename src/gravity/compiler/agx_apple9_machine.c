@@ -1683,7 +1683,7 @@ static const struct agx_apple9_encoding_info encodings[] = {
    [AGX_APPLE9_ENC_BLOCK_STORE_PARAMS] =
       {
          .name = "block_store_params",
-         .length = 30,
+         .length = 12,
          .operand_count = 4,
          .allocator_safe = true,
          .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
@@ -1703,7 +1703,7 @@ static const struct agx_apple9_encoding_info encodings[] = {
    [AGX_APPLE9_ENC_BLOCK_STORE_EXTENDED_PARAMS] =
       {
          .name = "block_store_extended_params",
-         .length = 40,
+         .length = 16,
          .operand_count = 5,
          .allocator_safe = true,
          .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
@@ -1724,7 +1724,7 @@ static const struct agx_apple9_encoding_info encodings[] = {
                           AGX_APPLE9_EVIDENCE_HARDWARE)},
       },
    [AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS] = {
-      .name = "image_write_params", .length = 80,
+      .name = "image_write_params", .length = 32,
       .operand_count = 9, .allocator_safe = true,
       .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
       .operands = {
@@ -1749,7 +1749,7 @@ static const struct agx_apple9_encoding_info encodings[] = {
       },
    },
    [AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS_16] = {
-      .name = "image_write_params_16", .length = 40,
+      .name = "image_write_params_16", .length = 16,
       .operand_count = 5, .allocator_safe = true,
       .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
       .operands = {
@@ -1766,9 +1766,9 @@ static const struct agx_apple9_encoding_info encodings[] = {
       },
    },
    /* Compact 2D 32-bit image-write parameter tuple: publishes {x, y, r, g, b, a}
-    * into publication offsets {0, 1, 2, 3, 6, 7}, omitting unused cr4/cr5 (-20B). */
+    * into publication offsets {0, 1, 2, 3, 6, 7}, omitting unused cr4/cr5. */
    [AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS_2D] = {
-      .name = "image_write_params_2d", .length = 60,
+      .name = "image_write_params_2d", .length = 24,
       .operand_count = 7, .allocator_safe = true,
       .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
       .operands = {
@@ -1873,7 +1873,7 @@ static const struct agx_apple9_encoding_info encodings[] = {
    [AGX_APPLE9_ENC_TEXTURE_LOD_PARAMS] =
       {
          .name = "texture_lod_params",
-         .length = 30,
+         .length = 12,
          .operand_count = 4,
          .allocator_safe = true,
          .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
@@ -1893,7 +1893,7 @@ static const struct agx_apple9_encoding_info encodings[] = {
    [AGX_APPLE9_ENC_TEXTURE_VOLUME_PARAMS] =
       {
          .name = "texture_volume_params",
-         .length = 40,
+         .length = 16,
          .operand_count = 5,
          .allocator_safe = true,
          .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
@@ -1939,7 +1939,7 @@ static const struct agx_apple9_encoding_info encodings[] = {
    [AGX_APPLE9_ENC_TEXTURE_GRAD_PARAMS] =
       {
          .name = "texture_grad_params",
-         .length = 60,
+         .length = 24,
          .operand_count = 7,
          .allocator_safe = true,
          .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
@@ -1970,7 +1970,7 @@ static const struct agx_apple9_encoding_info encodings[] = {
       },
    [AGX_APPLE9_ENC_TEXTURE_GRAD_ARRAY_PARAMS] = {
       .name = "texture_grad_array_params",
-      .length = 80,
+      .length = 32,
       .operand_count = 9,
       .allocator_safe = true,
       .evidence = AGX_APPLE9_EVIDENCE_BYTE_DIFF,
@@ -1997,7 +1997,7 @@ static const struct agx_apple9_encoding_info encodings[] = {
    },
    [AGX_APPLE9_ENC_TEXTURE_GRAD_VOLUME_PARAMS] = {
       .name = "texture_grad_volume_params",
-      .length = 90,
+      .length = 36,
       .operand_count = 10,
       .allocator_safe = true,
       .evidence = AGX_APPLE9_EVIDENCE_BYTE_DIFF,
@@ -2026,7 +2026,7 @@ static const struct agx_apple9_encoding_info encodings[] = {
    },
    [AGX_APPLE9_ENC_TEXTURE_GRAD_VOLUME_MIN_LOD_PARAMS] = {
       .name = "texture_grad_volume_min_lod_params",
-      .length = 100,
+      .length = 40,
       .operand_count = 11,
       .allocator_safe = true,
       .evidence = AGX_APPLE9_EVIDENCE_BYTE_DIFF,

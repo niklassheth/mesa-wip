@@ -2402,7 +2402,9 @@ TEST(Apple9Packer, RawMoveImmediatePacksSixBitDestination)
 
 TEST(Apple9Packer, ExtendedLogicCarriesSourceLiveness)
 {
-   uint8_t phys[] = {4, 2, 3};
+   /* Compact 4B XOR for r0..r63 carries source cache/discard bits; high-GPR
+    * (r64+) or wait-bearing forms fall back to 10B extended logic. */
+   uint8_t phys_low[] = {4, 2, 3};
    agx_apple9_vir_instr logic = {
       .op = AGX_APPLE9_VIR_IXOR,
       .encoding = AGX_APPLE9_ENC_LOGIC_EXTENDED,
@@ -2413,24 +2415,38 @@ TEST(Apple9Packer, ExtendedLogicCarriesSourceLiveness)
 
    static const struct {
       uint8_t mask;
-      uint8_t bytes[10];
+      uint8_t bytes4[4];
+      uint8_t bytes10[10];
    } cases[] = {
-      {0x0, {0x4b, 0x05, 0x1e, 0x07, 0x02, 0x08, 0x00, 0x00, 0x00, 0x00}},
-      {0x1, {0x4b, 0x85, 0x16, 0x07, 0x02, 0x08, 0x00, 0x00, 0x00, 0x00}},
-      {0x2, {0x4b, 0x05, 0x2e, 0x87, 0x02, 0x08, 0x00, 0x00, 0x00, 0x00}},
-      {0x3, {0x4b, 0x85, 0x26, 0x87, 0x02, 0x08, 0x00, 0x00, 0x00, 0x00}},
+      {0x0, {0x4b, 0x05, 0x3b, 0x07},
+            {0x4b, 0x05, 0x1e, 0x07, 0x02, 0x28, 0x00, 0x00, 0x00, 0x00}},
+      {0x1, {0x4b, 0x85, 0x33, 0x07},
+            {0x4b, 0x85, 0x16, 0x07, 0x02, 0x28, 0x00, 0x00, 0x00, 0x00}},
+      {0x2, {0x4b, 0x05, 0x2b, 0x87},
+            {0x4b, 0x05, 0x2e, 0x87, 0x02, 0x28, 0x00, 0x00, 0x00, 0x00}},
+      {0x3, {0x4b, 0x85, 0x23, 0x87},
+            {0x4b, 0x85, 0x26, 0x87, 0x02, 0x28, 0x00, 0x00, 0x00, 0x00}},
    };
 
    const char *reason = nullptr;
    for (const auto &test : cases) {
       logic.live_after_mask = test.mask;
+      logic.scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_NONE;
       agx_apple9_packed_instruction packed = {};
       ASSERT_TRUE(
-         agx_apple9_pack_vir_instruction(&logic, phys, &packed, &reason))
+         agx_apple9_pack_vir_instruction(&logic, phys_low, &packed, &reason))
          << reason;
-      ASSERT_EQ(packed.length, sizeof(test.bytes));
-      EXPECT_EQ(memcmp(packed.bytes, test.bytes, sizeof(test.bytes)), 0)
-         << "live_after_mask=" << unsigned(test.mask);
+      ASSERT_EQ(packed.length, sizeof(test.bytes4));
+      EXPECT_EQ(memcmp(packed.bytes, test.bytes4, sizeof(test.bytes4)), 0)
+         << "4B live_after_mask=" << unsigned(test.mask);
+
+      logic.scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1;
+      ASSERT_TRUE(
+         agx_apple9_pack_vir_instruction(&logic, phys_low, &packed, &reason))
+         << reason;
+      ASSERT_EQ(packed.length, sizeof(test.bytes10));
+      EXPECT_EQ(memcmp(packed.bytes, test.bytes10, sizeof(test.bytes10)), 0)
+         << "10B live_after_mask=" << unsigned(test.mask);
    }
 }
 
@@ -2454,11 +2470,15 @@ TEST(Apple9Packer, ExtendedLogicUsesOneHotPendingSlotMask)
          ASSERT_TRUE(
             agx_apple9_pack_vir_instruction(&logic, phys, &packed, &reason))
             << reason;
-         ASSERT_EQ(packed.length, 10u);
-         const unsigned mask = ((packed.bytes[5] >> 5) & 0x7) |
-                               (((packed.bytes[7] >> 5) & 0x7) << 3);
-         EXPECT_EQ(mask, slot == 0 ? 0u : 1u << (slot - 1))
-            << "op=" << unsigned(op) << " slot=" << slot;
+         if (slot == 0) {
+            ASSERT_EQ(packed.length, 4u);
+         } else {
+            ASSERT_EQ(packed.length, 10u);
+            const unsigned mask = ((packed.bytes[5] >> 5) & 0x7) |
+                                  (((packed.bytes[7] >> 5) & 0x7) << 3);
+            EXPECT_EQ(mask, 1u << (slot - 1))
+               << "op=" << unsigned(op) << " slot=" << slot;
+         }
       }
    }
 }
@@ -10024,11 +10044,11 @@ TEST(Apple9Encoding, LodPublicationsDoNotIntroduceUnrequestedWaits)
       agx_apple9_packed_instruction packed;
       const char *reason = nullptr;
       ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
-      ASSERT_EQ(packed.length, 30u);
-      for (unsigned offset : {0u, 10u, 20u}) {
-         EXPECT_EQ(packed.bytes[offset + 5] & 0xe0, 0);
-         EXPECT_EQ(packed.bytes[offset + 7] & 0xe0, 0);
+      ASSERT_EQ(packed.length, 12u);
+      for (unsigned offset : {0u, 4u, 8u}) {
+         EXPECT_EQ(packed.bytes[offset + 3] & 0xe0, 0);
          EXPECT_NE(packed.bytes[offset + 2] & 0x20, 0);
+         EXPECT_NE(packed.bytes[offset + 3] & 0x04, 0);
       }
    }
 }
@@ -13382,17 +13402,23 @@ TEST(Apple9Compiler, PreambleUsesAllWordsAfterThePaddedComputeRoots)
                 2 * (resources + 1));
       EXPECT_EQ(agx_apple9_compute_preamble_base(profile.resource_binding_count), base);
 
-      /* Decode COPY-to-uniform destinations in the compiled setup. UBO
-       * values feed invocation-dependent XORs, so every transferred word
-       * remains live and none can be replaced by a constant or shared result. */
+      /* Decode COPY-to-uniform destinations in the compiled setup (4B MOV for
+       * u0..u63, 10B STORE_UNIFORM for u64..u255). UBO values feed
+       * invocation-dependent XORs, so every transferred word remains live. */
       const uint8_t *code = (const uint8_t *)compiled.binary +
                             compiled.info.apple9_preamble_offset;
       std::vector<bool> written(AGX_APPLE9_UNIFORM_COUNT, false);
-      for (unsigned at = 0; at + 10 <= compiled.info.apple9_preamble_size; at += 2) {
+      for (unsigned at = 0; at + 4 <= compiled.info.apple9_preamble_size; at += 2) {
          const uint8_t *p = code + at;
-         if (p[0] == 0x9f && p[1] == 1 && (p[2] & 0xfd) == 0x54 &&
+         if (at + 10 <= compiled.info.apple9_preamble_size &&
+             p[0] == 0x9f && p[1] == 1 && (p[2] & 0xfd) == 0x54 &&
              (p[4] & 0xfe) == 0 && p[7] == 0xa8 && p[9] == 1) {
             unsigned word = (p[3] >> 1) | ((p[4] & 1) << 7);
+            EXPECT_GE(word, base);
+            written[word] = true;
+         } else if ((p[0] & 0x0f) == 0x0b && (p[1] & 0x01) == 0 &&
+                    (p[2] & 0x37) == 0x01 && (p[3] & 0x0f) == 0x04) {
+            unsigned word = (p[0] >> 4) | ((p[2] >> 6) << 4);
             EXPECT_GE(word, base);
             written[word] = true;
          }
@@ -13432,11 +13458,16 @@ TEST(Apple9Compiler, ConstantPromotionUsesMoreThanSixtyFourFreeWords)
    const uint8_t *code = (const uint8_t *)compiled.binary +
                          compiled.info.apple9_preamble_offset;
    std::vector<bool> written(AGX_APPLE9_UNIFORM_COUNT, false);
-   for (unsigned at = 0; at + 10 <= compiled.info.apple9_preamble_size; at += 2) {
+   for (unsigned at = 0; at + 4 <= compiled.info.apple9_preamble_size; at += 2) {
       const uint8_t *p = code + at;
-      if (p[0] == 0x9f && p[1] == 1 && (p[2] & 0xfd) == 0x54 &&
+      if (at + 10 <= compiled.info.apple9_preamble_size &&
+          p[0] == 0x9f && p[1] == 1 && (p[2] & 0xfd) == 0x54 &&
           (p[4] & 0xfe) == 0 && p[7] == 0xa8 && p[9] == 1) {
          unsigned word = (p[3] >> 1) | ((p[4] & 1) << 7);
+         written[word] = true;
+      } else if ((p[0] & 0x0f) == 0x0b && (p[1] & 0x01) == 0 &&
+                 (p[2] & 0x37) == 0x01 && (p[3] & 0x0f) == 0x04) {
+         unsigned word = (p[0] >> 4) | ((p[2] >> 6) << 4);
          written[word] = true;
       }
    }
@@ -18711,5 +18742,281 @@ TEST(Apple9Compiler, ImageLoadApple9OrderingAndCoherentU32x3)
       EXPECT_EQ(non_coh_stores, 0u);
       free(compiled.binary);
       ralloc_free(b.shader);
+   }
+}
+
+TEST(Apple9CompactIsa, GoldenMovZeroBitwiseAndInPlaceFma)
+{
+   const char *reason = nullptr;
+   agx_apple9_packed_instruction packed = {};
+
+   /* 1. 4B MOV r->r with inline 3-bit wait: 1b8001c0 = mov r1, r0.cache, wait 5 (slot 6). */
+   {
+      uint8_t phys[] = {1, 0};
+      agx_apple9_vir_instr ins = {
+         .op = AGX_APPLE9_VIR_IOR,
+         .encoding = AGX_APPLE9_ENC_LOGIC_EXTENDED,
+         .dest = 0,
+         .src = {1, 1},
+         .nr_srcs = 2,
+         .live_after_mask = 3,
+         .scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_6,
+      };
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason))
+         << (reason ?: "");
+      const uint8_t exp[4] = {0x1b, 0x80, 0x01, 0xc0};
+      ASSERT_EQ(packed.length, 4u);
+      EXPECT_EQ(memcmp(packed.bytes, exp, 4), 0);
+
+      /* All 6 wait slots + boundary src r95 -> r63 compact to 4B; dst r64 falls back to 10B. */
+      uint8_t phys_hi_src[] = {63, 95};
+      for (unsigned slot = 0; slot <= 6; ++slot) {
+         ins.scoreboard_slot = slot;
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys_hi_src, &packed, &reason));
+         ASSERT_EQ(packed.length, 4u);
+         EXPECT_EQ((packed.bytes[3] >> 5) & 7u, slot);
+         EXPECT_EQ((packed.bytes[3] >> 4) & 1u, 1u);
+      }
+      uint8_t phys_hi_dst[] = {64, 5};
+      ins.scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_3;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys_hi_dst, &packed, &reason));
+      EXPECT_EQ(packed.length, 10u);
+   }
+
+   /* 2. 4B MOV u->r: 5b224108 = mov r21, u17. */
+   {
+      uint8_t phys[] = {21};
+      agx_apple9_vir_instr ins = {
+         .op = AGX_APPLE9_VIR_IOR_UNIFORM,
+         .encoding = AGX_APPLE9_ENC_UNIFORM_MOVE,
+         .dest = 0,
+         .immediate = 17,
+      };
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+      const uint8_t exp[4] = {0x5b, 0x22, 0x41, 0x08};
+      ASSERT_EQ(packed.length, 4u);
+      EXPECT_EQ(memcmp(packed.bytes, exp, 4), 0);
+   }
+
+   /* 3. 4B MOV r->u (STORE_UNIFORM u0..u63, wait slots 0..6, src up to r95). */
+   {
+      struct {
+         unsigned u_dst, r_src;
+         uint8_t wait_slot;
+         uint8_t exp[4];
+      } ucases[] = {
+         {6, 16, AGX_APPLE9_SCOREBOARD_SLOT_1, {0x6b, 0x20, 0x09, 0x24}},
+         {21, 0, AGX_APPLE9_SCOREBOARD_SLOT_6, {0x5b, 0x00, 0x49, 0xc4}},
+         {16, 88, AGX_APPLE9_SCOREBOARD_SLOT_5, {0x0b, 0x30, 0x49, 0xb4}},
+      };
+      for (const auto &tc : ucases) {
+         uint8_t phys[] = {(uint8_t)tc.r_src};
+         agx_apple9_vir_instr ins = {
+            .op = AGX_APPLE9_VIR_STORE_UNIFORM,
+            .encoding = AGX_APPLE9_ENC_STORE_UNIFORM,
+            .dest = AGX_APPLE9_VREG_INVALID,
+            .src = {0},
+            .immediate = tc.u_dst,
+            .nr_srcs = 1,
+            .scoreboard_slot = tc.wait_slot,
+         };
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+         ASSERT_EQ(packed.length, 4u);
+         EXPECT_EQ(memcmp(packed.bytes, tc.exp, 4), 0);
+      }
+      uint8_t phys[] = {7};
+      agx_apple9_vir_instr ins = {
+         .op = AGX_APPLE9_VIR_STORE_UNIFORM,
+         .encoding = AGX_APPLE9_ENC_STORE_UNIFORM,
+         .dest = AGX_APPLE9_VREG_INVALID,
+         .src = {0},
+         .immediate = 63,
+         .nr_srcs = 1,
+         .scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_2,
+      };
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+      EXPECT_EQ(packed.length, 4u);
+      ins.immediate = 64;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+      EXPECT_EQ(packed.length, 10u);
+      ins.immediate = 255;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+      EXPECT_EQ(packed.length, 10u);
+   }
+
+   /* 4. 4B MOV r->cr (LOGIC_EXPORT group 0); group >= 1 or cr64+ stays 10B. */
+   {
+      struct {
+         unsigned cr, r;
+         uint8_t live, wait_slot;
+         uint8_t exp[4];
+      } crcases[] = {
+         {16, 6, 3, AGX_APPLE9_SCOREBOARD_SLOT_NONE, {0x0b, 0x8c, 0x61, 0x04}},
+         {0, 0, 0, AGX_APPLE9_SCOREBOARD_SLOT_6, {0x0b, 0x00, 0x29, 0xc4}},
+         {4, 0, 3, AGX_APPLE9_SCOREBOARD_SLOT_NONE, {0x4b, 0x80, 0x21, 0x04}},
+      };
+      for (const auto &tc : crcases) {
+         uint8_t phys[] = {(uint8_t)tc.cr, (uint8_t)tc.r};
+         agx_apple9_vir_instr ins = {
+            .op = AGX_APPLE9_VIR_IOR,
+            .encoding = AGX_APPLE9_ENC_LOGIC_EXPORT,
+            .dest = 0,
+            .src = {1, 1},
+            .nr_srcs = 2,
+            .producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1,
+            .live_after_mask = tc.live,
+            .scoreboard_slot = tc.wait_slot,
+         };
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+         ASSERT_EQ(packed.length, 4u);
+         EXPECT_EQ(memcmp(packed.bytes, tc.exp, 4), 0);
+      }
+      uint8_t phys_g1[] = {10, 0};
+      agx_apple9_vir_instr ins_g1 = {
+         .op = AGX_APPLE9_VIR_IOR,
+         .encoding = AGX_APPLE9_ENC_LOGIC_EXPORT,
+         .dest = 0,
+         .src = {1, 1},
+         .nr_srcs = 2,
+         .producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_2,
+      };
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins_g1, phys_g1, &packed, &reason));
+      EXPECT_EQ(packed.length, 10u);
+      uint8_t phys_cr64[] = {64, 0};
+      ins_g1.producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins_g1, phys_cr64, &packed, &reason));
+      EXPECT_EQ(packed.length, 10u);
+   }
+
+   /* 5. 4B ZERO for MOV_IMM32(0) on r16..r63; 2B MOV_IMM_COMPACT kept on r0..r15. */
+   {
+      uint8_t phys_lo[] = {11};
+      agx_apple9_vir_instr imm_compact = {
+         .op = AGX_APPLE9_VIR_IMM,
+         .encoding = AGX_APPLE9_ENC_MOV_IMM_COMPACT,
+         .dest = 0,
+         .immediate = 0,
+      };
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&imm_compact, phys_lo, &packed, &reason));
+      EXPECT_EQ(packed.length, 2u);
+
+      agx_apple9_vir_instr imm32_zero = {
+         .op = AGX_APPLE9_VIR_IMM,
+         .encoding = AGX_APPLE9_ENC_MOV_IMM32,
+         .dest = 0,
+         .immediate = 0,
+      };
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&imm32_zero, phys_lo, &packed, &reason));
+      const uint8_t exp_r11[4] = {0xbb, 0x00, 0x00, 0x00};
+      ASSERT_EQ(packed.length, 4u);
+      EXPECT_EQ(memcmp(packed.bytes, exp_r11, 4), 0);
+
+      uint8_t phys_r63[] = {63};
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&imm32_zero, phys_r63, &packed, &reason));
+      const uint8_t exp_r63[4] = {0xfb, 0x00, 0xc0, 0x00};
+      ASSERT_EQ(packed.length, 4u);
+      EXPECT_EQ(memcmp(packed.bytes, exp_r63, 4), 0);
+   }
+
+   /* 6. 4B bitwise AND/OR/XOR matching Metal probe hex vectors. */
+   {
+      struct {
+         agx_apple9_vir_opcode op;
+         uint8_t dst, s0, s1, live;
+         uint8_t exp[4];
+      } bcases[] = {
+         {AGX_APPLE9_VIR_IAND, 2, 10, 8, 3, {0x2b, 0x95, 0x22, 0x91}},
+         {AGX_APPLE9_VIR_IOR, 9, 10, 8, 3, {0x9b, 0x95, 0x24, 0x91}},
+         {AGX_APPLE9_VIR_IXOR, 2, 9, 2, 0, {0x2b, 0x13, 0x3b, 0x05}},
+         {AGX_APPLE9_VIR_IOR, 0, 4, 0, 0, {0x0b, 0x09, 0x3c, 0x01}},
+         {AGX_APPLE9_VIR_IXOR, 62, 63, 62, 0, {0xeb, 0x7f, 0xfb, 0x7d}},
+         {AGX_APPLE9_VIR_IAND, 0, 4, 0, 0, {0x0b, 0x09, 0x3a, 0x01}},
+      };
+      for (const auto &tc : bcases) {
+         uint8_t phys[] = {tc.dst, tc.s0, tc.s1};
+         agx_apple9_vir_instr ins = {
+            .op = tc.op,
+            .encoding = AGX_APPLE9_ENC_LOGIC_EXTENDED,
+            .dest = 0,
+            .src = {1, 2},
+            .nr_srcs = 2,
+            .live_after_mask = tc.live,
+         };
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+         ASSERT_EQ(packed.length, 4u);
+         EXPECT_EQ(memcmp(packed.bytes, tc.exp, 4), 0);
+      }
+      uint8_t phys_hi[] = {64, 1, 2};
+      agx_apple9_vir_instr ins_hi = {
+         .op = AGX_APPLE9_VIR_IXOR,
+         .encoding = AGX_APPLE9_ENC_LOGIC_EXTENDED,
+         .dest = 0,
+         .src = {1, 2},
+         .nr_srcs = 2,
+      };
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins_hi, phys_hi, &packed, &reason));
+      EXPECT_EQ(packed.length, 10u);
+   }
+
+   /* 7. 4B in-place FFMA/HFMA matching Metal probe hex vectors (op=2 & op=3). */
+   {
+      struct {
+         agx_apple9_vir_opcode op;
+         agx_apple9_encoding enc;
+         uint8_t dst, s0, s1, s2, live;
+         uint8_t exp[4];
+      } fcases[] = {
+         {AGX_APPLE9_VIR_FMA, AGX_APPLE9_ENC_FLOAT3_EXTENDED, 5, 3, 4, 5, 7,
+          {0x59, 0x87, 0x22, 0x89}},
+         {AGX_APPLE9_VIR_FMA, AGX_APPLE9_ENC_FLOAT3_EXTENDED, 10, 12, 11, 10, 5,
+          {0xa9, 0x99, 0x32, 0x17}},
+         {AGX_APPLE9_VIR_FMA, AGX_APPLE9_ENC_FLOAT3_EXTENDED, 0, 4, 5, 0, 0,
+          {0x09, 0x09, 0x3a, 0x0b}},
+         {AGX_APPLE9_VIR_FMA, AGX_APPLE9_ENC_FLOAT3_EXTENDED, 19, 2, 19, 18, 7,
+          {0x39, 0x85, 0x63, 0xa4}},
+         {AGX_APPLE9_VIR_FMA, AGX_APPLE9_ENC_FLOAT3_EXTENDED, 5, 4, 5, 0, 7,
+          {0x59, 0x89, 0x23, 0x80}},
+         {AGX_APPLE9_VIR_FMA, AGX_APPLE9_ENC_FLOAT3_EXTENDED, 4, 3, 4, 5, 3,
+          {0x49, 0x87, 0x33, 0x0a}},
+         {AGX_APPLE9_VIR_FMA, AGX_APPLE9_ENC_FLOAT3_EXTENDED, 5, 5, 4, 0, 7,
+          {0x59, 0x89, 0x23, 0x80}},
+         {AGX_APPLE9_VIR_HFMA, AGX_APPLE9_ENC_HALF3, 2, 1, 3, 2, 7,
+          {0x20, 0x82, 0x22, 0x86}},
+         {AGX_APPLE9_VIR_HFMA, AGX_APPLE9_ENC_HALF3, 1, 3, 1, 2, 3,
+          {0x10, 0x86, 0x33, 0x04}},
+      };
+      for (const auto &tc : fcases) {
+         uint8_t phys[] = {tc.dst, tc.s0, tc.s1, tc.s2};
+         agx_apple9_vir_instr ins = {
+            .op = tc.op,
+            .encoding = tc.enc,
+            .dest = 0,
+            .src = {1, 2, 3},
+            .nr_srcs = 3,
+            .live_after_mask = tc.live,
+         };
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+         ASSERT_EQ(packed.length, 4u);
+         EXPECT_EQ(memcmp(packed.bytes, tc.exp, 4), 0);
+      }
+      uint8_t phys[] = {5, 3, 4, 5};
+      agx_apple9_vir_instr ins = {
+         .op = AGX_APPLE9_VIR_FMA,
+         .encoding = AGX_APPLE9_ENC_FLOAT3_EXTENDED,
+         .dest = 0,
+         .src = {1, 2, 3},
+         .nr_srcs = 3,
+         .scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1,
+      };
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+      EXPECT_EQ(packed.length, 8u);
+      ins.scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_NONE;
+      ins.src_neg_mask = 1;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+      EXPECT_EQ(packed.length, 8u);
+      ins.src_neg_mask = 0;
+      uint8_t phys_hi[] = {64, 3, 4, 64};
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys_hi, &packed, &reason));
+      EXPECT_EQ(packed.length, 8u);
    }
 }

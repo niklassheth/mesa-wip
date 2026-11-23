@@ -104,6 +104,126 @@ agx_apple9_encode_exec_pop(uint8_t out[6], unsigned depth)
    return true;
 }
 
+/* Unified 4-byte Apple9 32-bit MOV / ZERO (opcode 0x0b).
+ * - is_zero=true  (op=0): writes 0 to r0..r63 or cr0..cr63 (group 0).
+ * - is_zero=false (op=1):
+ *     src_is_uniform=false: copies r0..r127 to r0..r63, u0..u63, or cr0..cr63
+ *                           (group 0), with inline 3-bit wait slot (0..6).
+ *     src_is_uniform=true : copies u0..u255 to r0..r63. */
+static inline bool
+agx_apple9_encode_mov4(uint8_t out[4], unsigned dst, unsigned src,
+                       bool is_zero, bool dst_is_uniform_or_cr,
+                       bool src_is_uniform, bool dst_cache,
+                       bool src_cache, bool src_discard, uint8_t wait_slot)
+{
+   if (!out || dst >= 64 || wait_slot > 6)
+      return false;
+   if (is_zero) {
+      if (src != 0 || src_is_uniform || src_cache || src_discard ||
+          wait_slot != 0)
+         return false;
+   } else if (src_is_uniform) {
+      if (src >= 256 || dst_is_uniform_or_cr || src_cache || src_discard ||
+          wait_slot != 0)
+         return false;
+   } else {
+      if (src >= 128 || (src_cache && src_discard))
+         return false;
+   }
+   uint32_t word = 0x0bu;
+   word |= (dst & 0xfu) << 4;
+   if (!is_zero) {
+      word |= (src & 0x3fu) << 9;
+      if (!src_is_uniform)
+         word |= (uint32_t)src_cache << 15;
+      word |= 1u << 16;
+      word |= (src_is_uniform ? ((src >> 6) & 1u) : (uint32_t)src_discard)
+              << 19;
+      word |= (src_is_uniform ? ((src >> 7) & 1u) : ((src >> 6) & 1u)) << 28;
+   }
+   word |= (uint32_t)dst_cache << 21;
+   word |= ((dst >> 4) & 3u) << 22;
+   word |= (uint32_t)dst_is_uniform_or_cr << 26;
+   word |= (uint32_t)src_is_uniform << 27;
+   word |= (uint32_t)wait_slot << 29;
+   out[0] = (uint8_t)(word & 0xffu);
+   out[1] = (uint8_t)((word >> 8) & 0xffu);
+   out[2] = (uint8_t)((word >> 16) & 0xffu);
+   out[3] = (uint8_t)((word >> 24) & 0xffu);
+   return true;
+}
+
+/* 4-byte Apple9 32-bit bitwise AND (op=2), XOR (op=3), OR (op=4) on r0..r63.
+ * Cannot carry scoreboard waits, uniforms, immediates, or r64..r95. */
+static inline bool
+agx_apple9_encode_bitop4(uint8_t out[4], unsigned dst, unsigned src0,
+                         unsigned src1, unsigned op, bool dst_cache,
+                         bool src0_cache, bool src0_discard,
+                         bool src1_cache, bool src1_discard)
+{
+   if (!out || dst >= 64 || src0 >= 64 || src1 >= 64 ||
+       (op != 2 && op != 3 && op != 4) ||
+       (src0_cache && src0_discard) || (src1_cache && src1_discard))
+      return false;
+   uint32_t word = 0x0bu;
+   word |= (dst & 0xfu) << 4;
+   word |= 1u << 8;
+   word |= (src0 & 0x3fu) << 9;
+   word |= (uint32_t)src0_cache << 15;
+   word |= (op & 7u) << 16;
+   word |= (uint32_t)src0_discard << 19;
+   word |= (uint32_t)src1_discard << 20;
+   word |= (uint32_t)dst_cache << 21;
+   word |= ((dst >> 4) & 3u) << 22;
+   word |= 1u << 24;
+   word |= (src1 & 0x3fu) << 25;
+   word |= (uint32_t)src1_cache << 31;
+   out[0] = (uint8_t)(word & 0xffu);
+   out[1] = (uint8_t)((word >> 8) & 0xffu);
+   out[2] = (uint8_t)((word >> 16) & 0xffu);
+   out[3] = (uint8_t)((word >> 24) & 0xffu);
+   return true;
+}
+
+/* 4-byte Apple9 in-place FFMA / HFMA on r0..r63 (no waits or modifiers).
+ * - op=2: dst = src_a * src_b + dst  (accumulator in dst)
+ * - op=3: dst = src_a * dst   + src_b (multiplicand in dst; FP32 bit 24 = 0) */
+static inline bool
+agx_apple9_encode_fma4(uint8_t out[4], unsigned dst, unsigned src_a,
+                       unsigned src_b, unsigned op, bool is_half,
+                       bool dst_hi, bool src_a_hi, bool src_b_hi,
+                       bool dst_cache, bool src_a_cache, bool src_a_discard,
+                       bool src_b_cache, bool src_b_discard)
+{
+   if (!out || dst >= 64 || src_a >= 64 || src_b >= 64 ||
+       (op != 2 && op != 3) ||
+       (!is_half && (dst_hi || src_a_hi || src_b_hi)) ||
+       (src_a_cache && src_a_discard) || (src_b_cache && src_b_discard))
+      return false;
+   uint32_t word = is_half ? (dst_hi ? 0x08u : 0x00u) : 0x09u;
+   word |= (dst & 0xfu) << 4;
+   if (is_half)
+      word |= ((src_a << 1) | (uint32_t)src_a_hi) << 8;
+   else
+      word |= (1u << 8) | ((src_a & 0x3fu) << 9);
+   word |= (uint32_t)src_a_cache << 15;
+   word |= (op & 7u) << 16;
+   word |= (uint32_t)src_a_discard << 19;
+   word |= (uint32_t)src_b_discard << 20;
+   word |= (uint32_t)dst_cache << 21;
+   word |= ((dst >> 4) & 3u) << 22;
+   if (is_half)
+      word |= ((src_b << 1) | (uint32_t)src_b_hi) << 24;
+   else
+      word |= ((op == 2 ? 1u : 0u) << 24) | ((src_b & 0x3fu) << 25);
+   word |= (uint32_t)src_b_cache << 31;
+   out[0] = (uint8_t)(word & 0xffu);
+   out[1] = (uint8_t)((word >> 8) & 0xffu);
+   out[2] = (uint8_t)((word >> 16) & 0xffu);
+   out[3] = (uint8_t)((word >> 24) & 0xffu);
+   return true;
+}
+
 /* Transfer one pending word to the main's argument window. A first transfer
  * waits for the table-load group on slot 2; subsequent transfers reuse it.
  * Argument word 2*i is the low half of pointer i, word 2*i+1 its high half. */
@@ -113,12 +233,8 @@ agx_apple9_encode_argument_word(uint8_t out[4], unsigned dst,
 {
    if (dst >= 64 || src >= 64)
       return false;
-   const uint8_t bytes[4] = {
-      ((dst & 15) << 4) | 0x0b, (src << 1) & 0x7f,
-      9 | ((dst >> 4) << 6), 4 | (wait ? 0x40 : 0),
-   };
-   memcpy(out, bytes, sizeof(bytes));
-   return true;
+   return agx_apple9_encode_mov4(out, dst, src, false, true, false, false,
+                                 false, true, wait ? 2 : 0);
 }
 
 #endif
