@@ -787,10 +787,39 @@ drop_zero_load_index(struct agx_apple9_vir_instr *I, const bool *constant,
  * into 20B TEXTURE_SAMPLE (bit 71 / bit 72) and even zero-extended uniform
  * pairs (u0..u126 with u+1 == 0) into 16B IMAGE_WRITE (byte 14/15 = 09/01),
  * eliminating pinned IOR_UNIFORM GPRs across shaders. */
+struct uniform_facts {
+   uint16_t *word;
+   uint32_t *gen;
+   uint32_t cur_gen;
+   unsigned count;
+};
+
+static inline uint16_t
+uniform_facts_get(const struct uniform_facts *uf, uint32_t v)
+{
+   return uf->gen[v] == uf->cur_gen ? uf->word[v] : 0;
+}
+
+static inline void
+uniform_facts_set(struct uniform_facts *uf, uint32_t v, uint16_t val)
+{
+   uf->word[v] = val;
+   uf->gen[v] = uf->cur_gen;
+}
+
+static inline void
+uniform_facts_clear(struct uniform_facts *uf)
+{
+   if (++uf->cur_gen == 0) {
+      memset(uf->gen, 0, uf->count * sizeof(*uf->gen));
+      uf->cur_gen = 1;
+   }
+}
+
 static void
 inline_texture_image_uniforms(struct agx_apple9_vir_instr *I,
                               struct agx_apple9_vir_instr **definitions,
-                              const uint16_t *uniform_read,
+                              const struct uniform_facts *uf,
                               const bool *constant, const uint32_t *values,
                               const struct agx_apple9_uniform_constants *constants)
 {
@@ -799,8 +828,9 @@ inline_texture_image_uniforms(struct agx_apple9_vir_instr *I,
          return;
       if (I->sampler_bindless && I->nr_srcs >= 1) {
          uint32_t s_vreg = I->src[I->nr_srcs - 1];
-         if (uniform_read[s_vreg] && (uniform_read[s_vreg] - 1u) < 128u) {
-            I->sampler_index = (uint8_t)(uniform_read[s_vreg] - 1u);
+         uint16_t s_u = uniform_facts_get(uf, s_vreg);
+         if (s_u && (s_u - 1u) < 128u) {
+            I->sampler_index = (uint8_t)(s_u - 1u);
             I->sampler_bindless = false;
             I->sampler_uniform_bindless = true;
             --I->nr_srcs;
@@ -809,8 +839,9 @@ inline_texture_image_uniforms(struct agx_apple9_vir_instr *I,
       if (I->texture_bindless && I->nr_srcs >= 1u + I->sampler_bindless) {
          unsigned tex_pos = I->nr_srcs - 1u - I->sampler_bindless;
          uint32_t t_vreg = I->src[tex_pos];
-         if (uniform_read[t_vreg] && (uniform_read[t_vreg] - 1u) < 128u) {
-            I->texture_index = (uint8_t)(uniform_read[t_vreg] - 1u);
+         uint16_t t_u = uniform_facts_get(uf, t_vreg);
+         if (t_u && (t_u - 1u) < 128u) {
+            I->texture_index = (uint8_t)(t_u - 1u);
             I->texture_bindless = false;
             I->texture_uniform_bindless = true;
             if (I->sampler_bindless)
@@ -831,12 +862,13 @@ inline_texture_image_uniforms(struct agx_apple9_vir_instr *I,
                                 I->src[9] == I->src[8] + 1;
       uint32_t lo_v = from_collect ? cdef->src[0] : I->src[8];
       uint32_t hi_v = from_collect ? cdef->src[1] : I->src[9];
-      if (!uniform_read[lo_v])
+      uint16_t lo_u = uniform_facts_get(uf, lo_v);
+      if (!lo_u)
          return;
-      unsigned u = uniform_read[lo_v] - 1u;
+      unsigned u = lo_u - 1u;
       if ((u & 1u) || u >= 128u)
          return;
-      bool hi_ok = uniform_read[hi_v] == u + 2u;
+      bool hi_ok = uniform_facts_get(uf, hi_v) == u + 2u;
       if (!hi_ok && constant[hi_v] && values[hi_v] == 0 && constants &&
           u + 1u >= constants->base &&
           u + 1u < constants->base + constants->count &&
@@ -851,8 +883,9 @@ inline_texture_image_uniforms(struct agx_apple9_vir_instr *I,
 }
 
 static void
-inline_alu_sources(struct agx_apple9_vir_instr *I, const uint16_t *uniform_read,
-                      const bool *constant, const uint32_t *values)
+inline_alu_sources(struct agx_apple9_vir_instr *I,
+                   const struct uniform_facts *uf,
+                   const bool *constant, const uint32_t *values)
 {
    bool special = I->encoding == AGX_APPLE9_ENC_FLOAT_SPECIAL &&
                   agx_apple9_supports_special_uniform(I->op);
@@ -919,9 +952,10 @@ inline_alu_sources(struct agx_apple9_vir_instr *I, const uint16_t *uniform_read,
             continue;
          }
       }
-      if (uniform_read[reg[s]]) {
+      uint16_t uword = uniform_facts_get(uf, reg[s]);
+      if (uword) {
          file[s] = AGX_APPLE9_FILE_UNIFORM;
-         value[s] = uniform_read[reg[s]] - 1;
+         value[s] = uword - 1;
       }
    }
    /* Floating min/max takes a literal only as operand B. They commute for
@@ -940,9 +974,10 @@ inline_alu_sources(struct agx_apple9_vir_instr *I, const uint16_t *uniform_read,
       I->src_neg_mask = ((I->src_neg_mask & 1) << 1) | ((I->src_neg_mask & 2) >> 1);
    }
    if (minmax_float && file[0] == AGX_APPLE9_FILE_IMMEDIATE) {
-      if (!file[1] && uniform_read[reg[0]]) {
+      uint16_t u0 = uniform_facts_get(uf, reg[0]);
+      if (!file[1] && u0) {
          file[0] = AGX_APPLE9_FILE_UNIFORM;
-         value[0] = uniform_read[reg[0]] - 1;
+         value[0] = u0 - 1;
       } else {
          file[0] = 0;
       }
@@ -1001,9 +1036,10 @@ inline_alu_sources(struct agx_apple9_vir_instr *I, const uint16_t *uniform_read,
     * fall back to a constant-table uniform if available, otherwise
     * materialization. Fixed integer operands are independent. */
    if (fma && file[0] == AGX_APPLE9_FILE_IMMEDIATE) {
-      if (uniform_read[reg[0]]) {
+      uint16_t u0 = uniform_facts_get(uf, reg[0]);
+      if (u0) {
          file[0] = AGX_APPLE9_FILE_UNIFORM;
-         value[0] = uniform_read[reg[0]] - 1;
+         value[0] = u0 - 1;
       } else {
          file[0] = 0;
       }
@@ -1225,7 +1261,8 @@ register_slot(const struct agx_apple9_vir_instr *I, unsigned source)
 /* Whether register source `source` of I is the constant `value`: a literal
  * move, or a uniform word the constant table names. */
 static bool
-source_is_constant(const struct agx_apple9_vir_program *p,
+source_is_constant(struct agx_apple9_vir_instr *const *defs,
+                   unsigned value_count,
                    const struct agx_apple9_uniform_constants *constants,
                    const struct agx_apple9_vir_instr *I, unsigned slot,
                    uint32_t value)
@@ -1241,7 +1278,8 @@ source_is_constant(const struct agx_apple9_vir_program *p,
    int source = 0;
    for (unsigned s = 0; s < slot; ++s)
       source += !((I->alu_src_uniform_mask | I->alu_src_immediate_mask) & BITFIELD_BIT(s));
-   const struct agx_apple9_vir_instr *D = agx_apple9_definition(p, I->src[source]);
+   uint32_t v = I->src[source];
+   const struct agx_apple9_vir_instr *D = v < value_count ? defs[v] : NULL;
    return D && D->op == AGX_APPLE9_VIR_IMM && D->immediate == value;
 }
 
@@ -1249,7 +1287,7 @@ source_is_constant(const struct agx_apple9_vir_program *p,
  * x >> 16 (logical or arithmetic), and (x << 16) >> 16 written as a shift or
  * a multiply by 0x10000. */
 static bool
-half_extract(const struct agx_apple9_vir_program *p,
+half_extract(struct agx_apple9_vir_instr *const *defs, unsigned value_count,
              const struct agx_apple9_uniform_constants *constants,
              const struct agx_apple9_vir_instr *D, uint32_t *x, bool *hi,
              bool *sext)
@@ -1265,7 +1303,7 @@ half_extract(const struct agx_apple9_vir_program *p,
    }
    if (D->op == AGX_APPLE9_VIR_IAND && D->encoding == AGX_APPLE9_ENC_LOGIC_EXTENDED) {
       for (unsigned s = 0; s < 2; ++s) {
-         if (!source_is_constant(p, constants, D, s, 0xffff))
+         if (!source_is_constant(defs, value_count, constants, D, s, 0xffff))
             continue;
          for (unsigned k = 0; k < D->nr_srcs; ++k) {
             if (register_slot(D, k) != (int)(1 - s))
@@ -1281,7 +1319,8 @@ half_extract(const struct agx_apple9_vir_program *p,
    const bool shift = D->op == AGX_APPLE9_VIR_USHR || D->op == AGX_APPLE9_VIR_ISHR;
    if (!shift || D->nr_srcs != 1 || D->alu_src_uniform_mask || D->immediate != 16)
       return false;
-   const struct agx_apple9_vir_instr *Y = agx_apple9_definition(p, D->src[0]);
+   const struct agx_apple9_vir_instr *Y =
+      D->src[0] < value_count ? defs[D->src[0]] : NULL;
    if (D->op == AGX_APPLE9_VIR_ISHR && Y && Y->dest_components == 1 &&
        !Y->src_half_mask && !Y->alu_src_uniform_mask) {
       if (Y->op == AGX_APPLE9_VIR_ISHL && Y->nr_srcs == 1 && Y->immediate == 16) {
@@ -1292,11 +1331,11 @@ half_extract(const struct agx_apple9_vir_program *p,
       }
       if (Y->op == AGX_APPLE9_VIR_IMAD && !Y->immediate &&
           Y->encoding == AGX_APPLE9_ENC_INT_MAD_EXTENDED &&
-          source_is_constant(p, constants, Y, 2, 0)) {
+          source_is_constant(defs, value_count, constants, Y, 2, 0)) {
          for (unsigned s = 0; s < 2; ++s) {
             int reg = register_slot(Y, 0) == (int)(1 - s) ? 0
                     : register_slot(Y, 1) == (int)(1 - s) ? 1 : -1;
-            if (reg < 0 || !source_is_constant(p, constants, Y, s, 0x10000))
+            if (reg < 0 || !source_is_constant(defs, value_count, constants, Y, s, 0x10000))
                continue;
             *x = Y->src[reg];
             *hi = false;
@@ -1311,36 +1350,103 @@ half_extract(const struct agx_apple9_vir_program *p,
    return true;
 }
 
+struct half_use_node {
+   struct agx_apple9_vir_instr *instruction;
+   uint32_t source;
+   uint32_t next;
+};
+
 /* Integer add/subtract and multiply-add read 16-bit halves of a register
  * directly, zero- or sign-extended (Metal's encodings of our own kernels).
  * Fold a recognized extract into every reader when all of them can take
  * it, so the extract and its mask constant disappear without extending any
- * other register's lifetime. */
+ * other register's lifetime. Uses O(1) tail-appended local use chains so
+ * rewriting many readers of the same base register stays linear. */
 static bool
 fold_half_sources(struct agx_apple9_vir_program *p,
                   const struct agx_apple9_uniform_constants *constants)
 {
-   if (!agx_apple9_analyze_uses(p))
-      return false;
+   bool has_candidate = false;
+   unsigned total_uses = 0;
+   for (unsigned i = 0; i < p->instruction_count; ++i) {
+      const struct agx_apple9_vir_instr *I = p->instructions[i];
+      total_uses += agx_apple9_vir_nr_srcs(I);
+      if (I->op == AGX_APPLE9_VIR_UNPACK_HALF ||
+          I->op == AGX_APPLE9_VIR_IAND ||
+          I->op == AGX_APPLE9_VIR_USHR ||
+          I->op == AGX_APPLE9_VIR_ISHR)
+         has_candidate = true;
+   }
+   if (!has_candidate || !total_uses)
+      return true;
 
+   const unsigned vcount = p->value_count;
+   struct agx_apple9_vir_instr **defs = calloc(vcount, sizeof(*defs));
+   uint32_t *use_head = malloc(vcount * sizeof(*use_head));
+   uint32_t *use_tail = malloc(vcount * sizeof(*use_tail));
+   struct half_use_node *nodes = malloc(total_uses * sizeof(*nodes));
+   bool *is_live_out = calloc(vcount, sizeof(*is_live_out));
+   bool ok = defs && use_head && use_tail && nodes && is_live_out;
+   if (!ok)
+      goto cleanup;
+
+   memset(use_head, 0xff, vcount * sizeof(*use_head));
+   memset(use_tail, 0xff, vcount * sizeof(*use_tail));
+   if (p->output < vcount)
+      is_live_out[p->output] = true;
+   for (unsigned l = 0; l < p->live_out_count; ++l) {
+      if (p->live_out[l] < vcount)
+         is_live_out[p->live_out[l]] = true;
+   }
+
+   unsigned next_node = 0;
+   for (unsigned i = 0; i < p->instruction_count; ++i) {
+      struct agx_apple9_vir_instr *I = p->instructions[i];
+      if (I->dest != AGX_APPLE9_VREG_INVALID) {
+         for (unsigned c = 0; c < I->dest_components; ++c) {
+            if (I->dest + c < vcount)
+               defs[I->dest + c] = I;
+         }
+      }
+      unsigned nr_srcs = agx_apple9_vir_nr_srcs(I);
+      for (unsigned s = 0; s < nr_srcs; ++s) {
+         uint32_t v = agx_apple9_vir_src(I, s);
+         if (v >= vcount)
+            continue;
+         uint32_t idx = next_node++;
+         nodes[idx] = (struct half_use_node){
+            .instruction = I,
+            .source = s,
+            .next = UINT32_MAX,
+         };
+         if (use_tail[v] == UINT32_MAX)
+            use_head[v] = idx;
+         else
+            nodes[use_tail[v]].next = idx;
+         use_tail[v] = idx;
+      }
+   }
+
+   bool modified = false;
    for (unsigned i = 0; i < p->instruction_count; ++i) {
       struct agx_apple9_vir_instr *D = p->instructions[i];
       uint32_t x;
       bool hi, sext;
-      if (D->dest == AGX_APPLE9_VREG_INVALID ||
-          !half_extract(p, constants, D, &x, &hi, &sext))
+      if (D->dest == AGX_APPLE9_VREG_INVALID || D->dest >= vcount ||
+          !half_extract(defs, vcount, constants, D, &x, &hi, &sext))
          continue;
-      bool live_out = p->output == D->dest;
-      for (unsigned l = 0; l < p->live_out_count; ++l)
-         live_out |= p->live_out[l] == D->dest;
-      const struct agx_apple9_use *uses = agx_apple9_uses(p, D->dest);
-      if (live_out || !uses)
+      if (is_live_out[D->dest] || use_head[D->dest] == UINT32_MAX)
          continue;
       const bool fp16 = D->op == AGX_APPLE9_VIR_UNPACK_HALF;
       bool all = true;
-      for (const struct agx_apple9_use *u = uses; u && all; u = u->next) {
-         const struct agx_apple9_vir_instr *R = u->instruction;
-         const int slot = register_slot(R, u->source);
+      for (uint32_t u = use_head[D->dest]; u != UINT32_MAX && all;
+           u = nodes[u].next) {
+         struct agx_apple9_vir_instr *R = nodes[u].instruction;
+         /* An earlier FMA multiplicand swap can relocate src[1] to src[0]. */
+         if (R->op == AGX_APPLE9_VIR_FMA && nodes[u].source == 1 &&
+             R->nr_srcs >= 2 && R->src[1] != D->dest && R->src[0] == D->dest)
+            nodes[u].source = 0;
+         const int slot = register_slot(R, nodes[u].source);
          const bool add = R->op == AGX_APPLE9_VIR_IADD || R->op == AGX_APPLE9_VIR_ISUB;
          const bool mad = R->op == AGX_APPLE9_VIR_IMAD && !R->immediate;
          const bool float2 = (R->op == AGX_APPLE9_VIR_FADD || R->op == AGX_APPLE9_VIR_FSUB ||
@@ -1351,40 +1457,36 @@ fold_half_sources(struct agx_apple9_vir_program *p,
                               R->encoding == AGX_APPLE9_ENC_FLOAT2_ABS_EXTENDED ||
                               R->encoding == AGX_APPLE9_ENC_FLOAT2_MUL_ABS_EXTENDED);
          const bool fma = R->op == AGX_APPLE9_VIR_FMA;
-         bool ok;
+         bool reader_ok;
          /* FMA's multiplicands commute: a half in A moves to B, which takes
           * a low half, when B is an ordinary register. */
          const bool fma_swap = fma && slot == 0 && !hi && R->nr_srcs >= 2 &&
             !((R->alu_src_uniform_mask | R->alu_src_immediate_mask | R->src_half_mask) & 3) &&
             R->src[1] != D->dest;
          if (fp16)
-            ok = (float2 && slot < 2) ||
-                 (fma && (slot == 2 || (slot == 1 && !hi) || fma_swap));
+            reader_ok = (float2 && slot < 2) ||
+                        (fma && (slot == 2 || (slot == 1 && !hi) || fma_swap));
          else
-            ok = (add && !R->saturate && !R->immediate &&
-                  R->encoding == AGX_APPLE9_ENC_INT_ADD_EXTENDED && slot < 2) ||
-                 (mad && R->encoding == AGX_APPLE9_ENC_INT_MAD_EXTENDED &&
-                  (!sext || slot == 0));
-         all = slot >= 0 && ok && !(R->src_half_mask & BITFIELD_BIT(slot)) &&
+            reader_ok = (add && !R->saturate && !R->immediate &&
+                         R->encoding == AGX_APPLE9_ENC_INT_ADD_EXTENDED && slot < 2) ||
+                        (mad && R->encoding == AGX_APPLE9_ENC_INT_MAD_EXTENDED &&
+                         (!sext || slot == 0));
+         all = slot >= 0 && reader_ok && !(R->src_half_mask & BITFIELD_BIT(slot)) &&
                agx_apple9_instr_block(R) == agx_apple9_instr_block(D);
       }
       if (!all)
          continue;
-      /* Rewriting moves each use off this chain; walk a snapshot. */
-      unsigned count = 0;
-      for (const struct agx_apple9_use *u = uses; u; u = u->next)
-         ++count;
-      struct agx_apple9_use *readers = malloc(count * sizeof(*readers));
-      if (!readers)
-         return false;
-      count = 0;
-      for (const struct agx_apple9_use *u = uses; u; u = u->next)
-         readers[count++] = *u;
-      for (unsigned r = 0; r < count; ++r) {
-         struct agx_apple9_vir_instr *R = readers[r].instruction;
-         unsigned source = readers[r].source;
+
+      modified = true;
+      uint32_t cur = use_head[D->dest];
+      use_head[D->dest] = UINT32_MAX;
+      use_tail[D->dest] = UINT32_MAX;
+      while (cur != UINT32_MAX) {
+         uint32_t next = nodes[cur].next;
+         struct agx_apple9_vir_instr *R = nodes[cur].instruction;
+         unsigned source = nodes[cur].source;
          if (fp16 && R->op == AGX_APPLE9_VIR_FMA && register_slot(R, source) == 0) {
-            agx_apple9_vir_set_source(p, R, 0, R->src[1]);
+            R->src[0] = R->src[1];
             R->src_abs_mask = (R->src_abs_mask & ~3u) |
                ((R->src_abs_mask & 1) << 1) | ((R->src_abs_mask & 2) >> 1);
             R->src_neg_mask = (R->src_neg_mask & ~3u) |
@@ -1392,14 +1494,33 @@ fold_half_sources(struct agx_apple9_vir_program *p,
             source = 1;
          }
          const unsigned bit = BITFIELD_BIT(register_slot(R, source));
-         agx_apple9_vir_set_source(p, R, source, x);
+         R->src[source] = x;
          R->src_half_mask |= bit;
          if (hi) R->src_hi_mask |= bit;
          if (sext) R->src_sext_mask |= bit;
+         if (x < vcount) {
+            nodes[cur].source = source;
+            nodes[cur].next = UINT32_MAX;
+            if (use_tail[x] == UINT32_MAX)
+               use_head[x] = cur;
+            else
+               nodes[use_tail[x]].next = cur;
+            use_tail[x] = cur;
+         }
+         cur = next;
       }
-      free(readers);
    }
-   return true;
+
+   if (modified)
+      agx_apple9_invalidate_uses(p);
+
+cleanup:
+   free(is_live_out);
+   free(nodes);
+   free(use_tail);
+   free(use_head);
+   free(defs);
+   return ok;
 }
 
 bool
@@ -1414,14 +1535,21 @@ agx_apple9_optimize_vir_with_constants(
    uint32_t *replacement = MALLOC(p->value_count * sizeof(*replacement));
    uint32_t *values = CALLOC(p->value_count, sizeof(*values));
    bool *constant = CALLOC(p->value_count, sizeof(*constant));
-   uint16_t *uniform_read = CALLOC(p->value_count, sizeof(*uniform_read));
+   uint16_t *uniform_word = MALLOC(p->value_count * sizeof(*uniform_word));
+   uint32_t *uniform_gen = CALLOC(p->value_count, sizeof(*uniform_gen));
+   struct uniform_facts uf = {
+      .word = uniform_word,
+      .gen = uniform_gen,
+      .cur_gen = 1,
+      .count = p->value_count,
+   };
    struct expression *keys = CALLOC(p->value_count, sizeof(*keys));
    struct agx_apple9_vir_instr **definitions =
       CALLOC(p->value_count, sizeof(*definitions));
    struct hash_table *expressions =
       _mesa_hash_table_create(NULL, expression_hash, expression_equal);
    struct hash_table_u64 *constant_words = NULL;
-   bool success = replacement && values && constant && uniform_read && keys && definitions && expressions;
+   bool success = replacement && values && constant && uniform_word && uniform_gen && keys && definitions && expressions;
    if (!success)
       goto cleanup;
    for (unsigned v = 0; v < p->value_count; ++v)
@@ -1452,7 +1580,7 @@ agx_apple9_optimize_vir_with_constants(
          block = agx_apple9_instr_block(I);
          _mesa_hash_table_clear(expressions, NULL);
          if (uniform_writes)
-            memset(uniform_read, 0, p->value_count * sizeof(*uniform_read));
+            uniform_facts_clear(&uf);
       }
       unsigned nr_srcs = agx_apple9_vir_nr_srcs(I);
       for (unsigned s = 0; s < nr_srcs; ++s) {
@@ -1465,7 +1593,7 @@ agx_apple9_optimize_vir_with_constants(
          /* Uniform reads are reusable only while their argument window is
           * unchanged. Setup may publish another value to the same word. */
          _mesa_hash_table_clear(expressions, NULL);
-         memset(uniform_read, 0, p->value_count * sizeof(*uniform_read));
+         uniform_facts_clear(&uf);
          break;
       case AGX_APPLE9_VIR_OBJECT_CALL:
       case AGX_APPLE9_VIR_OBJECT_RETURN:
@@ -1482,7 +1610,7 @@ agx_apple9_optimize_vir_with_constants(
           * produced under its old active lanes need not cover the new ones. */
          _mesa_hash_table_clear(expressions, NULL);
          if (uniform_writes)
-            memset(uniform_read, 0, p->value_count * sizeof(*uniform_read));
+            uniform_facts_clear(&uf);
          break;
       default:
          break;
@@ -1497,9 +1625,9 @@ agx_apple9_optimize_vir_with_constants(
           * value, but its explicit operands may still read uniforms. */
          if (I->op == AGX_APPLE9_VIR_PREDICATE_COMPARE) {
             inline_compare_literal(I, constant, values);
-            inline_alu_sources(I, uniform_read, constant, values);
+            inline_alu_sources(I, &uf, constant, values);
          }
-         inline_texture_image_uniforms(I, definitions, uniform_read, constant,
+         inline_texture_image_uniforms(I, definitions, &uf, constant,
                                        values, uniform_writes ? NULL : constants);
          drop_zero_load_index(I, constant, values);
          continue;
@@ -1520,21 +1648,23 @@ agx_apple9_optimize_vir_with_constants(
                               uniform_writes ? NULL : constants);
          inline_integer_immediates(I, constant, values);
          inline_compare_literal(I, constant, values);
-         inline_alu_sources(I, uniform_read, constant, values);
+         inline_alu_sources(I, &uf, constant, values);
       }
       for (unsigned c = 0; c < I->dest_components; ++c)
          definitions[I->dest + c] = I;
       if (I->op == AGX_APPLE9_VIR_IMM) {
          constant[I->dest] = true;
          values[I->dest] = I->immediate;
-         uniform_read[I->dest] = (uintptr_t)_mesa_hash_table_u64_search(
+         uint16_t cw = (uintptr_t)_mesa_hash_table_u64_search(
             constant_words, I->immediate);
+         if (cw)
+            uniform_facts_set(&uf, I->dest, cw);
       }
       if (I->op == AGX_APPLE9_VIR_IOR_UNIFORM &&
           I->immediate < AGX_APPLE9_UNIFORM_COUNT &&
           (I->nr_srcs == 0 ||
            (I->nr_srcs == 1 && constant[I->src[0]] && !values[I->src[0]])))
-         uniform_read[I->dest] = I->immediate + 1;
+         uniform_facts_set(&uf, I->dest, I->immediate + 1);
       struct expression *key = &keys[I->dest];
       *key = (struct expression){
          .op = I->op, .encoding = I->encoding,
@@ -1587,7 +1717,8 @@ agx_apple9_optimize_vir_with_constants(
 cleanup:
    if (constant_words)
       _mesa_hash_table_u64_destroy(constant_words);
-   free(uniform_read);
+   free(uniform_gen);
+   free(uniform_word);
    agx_apple9_invalidate_uses(p);
    if (expressions)
       _mesa_hash_table_destroy(expressions, NULL);

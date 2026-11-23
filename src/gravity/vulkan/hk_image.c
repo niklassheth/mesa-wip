@@ -1853,6 +1853,16 @@ hk_CopyImageToMemoryEXT(VkDevice _device,
    return VK_SUCCESS;
 }
 
+size_t hk_host_copy_temp_tile_size(uint32_t block_width, uint32_t block_height,
+                                   uint32_t block_B, uint32_t extent_height);
+
+size_t
+hk_host_copy_temp_tile_size(uint32_t block_width, uint32_t block_height,
+                            uint32_t block_B, uint32_t extent_height)
+{
+   return (size_t)block_width * block_B * MIN2(block_height, extent_height);
+}
+
 static VkResult
 hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
                            struct hk_image *dst_image, const VkImageCopy2 *info,
@@ -1981,7 +1991,10 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
          }
 
          size_t temp_pitch = (size_t)block_width * src_block_B;
-         size_t temp_tile_size = temp_pitch * MIN2(block_height, extent.height);
+         size_t temp_tile_size = hk_host_copy_temp_tile_size(
+            block_width, block_height, src_block_B, extent.height);
+         if (!temp_tile_size || !extent.width)
+            goto out;
 
          /* Work tile-by-tile, holding the unswizzled tile in a temporary
           * buffer.

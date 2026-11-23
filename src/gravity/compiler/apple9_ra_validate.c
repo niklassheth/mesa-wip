@@ -1100,41 +1100,47 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                    unsigned mem_slots, struct agx_apple9_block *b,
                    struct reg_slot *cur, bool check_errors,
                    const BITSET_WORD *block_live_out, unsigned live_words,
+                   BITSET_WORD *live_scratch,
                    struct apple9_ra_validate_error *err)
 {
-   /* When check_errors is true, precompute per-instruction live_after sets by
-    * walking the block once in reverse, or record instruction list. */
+   static_assert(AGX_APPLE9_MAX_VIR_SRCS <= 16,
+                 "per-instruction source live-after mask fits in uint16_t");
+
+   /* When check_errors is true, walk the block once in reverse using a single
+    * scratch live bitset and record only the per-instruction 16-bit mask of
+    * inline sources that remain live after the instruction. */
    unsigned nr_insns = 0;
    for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(b); ins;
         ins = agx_apple9_instr_next(ins))
       ++nr_insns;
 
-   BITSET_WORD *live_after_table = NULL;
+   uint16_t *src_live_after = NULL;
    if (check_errors && nr_insns > 0) {
-      live_after_table =
-         calloc((size_t)nr_insns * live_words, sizeof(BITSET_WORD));
-      if (!live_after_table) {
-         set_err(err, b->index, UINT_MAX, "OOM allocating live_after table");
+      src_live_after = calloc(nr_insns, sizeof(*src_live_after));
+      if (!src_live_after) {
+         set_err(err, b->index, UINT_MAX, "OOM allocating live_after mask");
          return false;
       }
 
-      BITSET_WORD *live = malloc(live_words * sizeof(BITSET_WORD));
-      if (!live) {
-         free(live_after_table);
-         set_err(err, b->index, UINT_MAX, "OOM allocating live bitset");
-         return false;
-      }
-      memcpy(live, block_live_out, live_words * sizeof(BITSET_WORD));
+      memcpy(live_scratch, block_live_out, live_words * sizeof(BITSET_WORD));
 
       unsigned idx = nr_insns;
       for (struct agx_apple9_vir_instr *ins = agx_apple9_block_last_instr(b);
            ins; ins = agx_apple9_instr_prev(ins)) {
          --idx;
-         memcpy(&live_after_table[(size_t)idx * live_words], live,
-                live_words * sizeof(BITSET_WORD));
 
          if (ins->op == AGX_APPLE9_VIR_PHI || is_phys_op(program, ins))
             continue;
+
+         uint16_t mask = 0;
+         unsigned nr_inline =
+            MIN2((unsigned)ins->nr_srcs, AGX_APPLE9_MAX_VIR_SRCS);
+         for (unsigned s = 0; s < nr_inline; ++s) {
+            uint32_t v = ins->src[s];
+            if (v < program->value_count && BITSET_TEST(live_scratch, v))
+               mask |= (uint16_t)(1u << s);
+         }
+         src_live_after[idx] = mask;
 
          unsigned comps = vir_dest_components(ins);
          for (unsigned c = 0; c < comps; ++c) {
@@ -1143,14 +1149,14 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                continue;
             uint32_t v = ins->dest + c;
             if (v < program->value_count)
-               BITSET_CLEAR(live, v);
+               BITSET_CLEAR(live_scratch, v);
          }
 
          if (ins->op == AGX_APPLE9_VIR_ABI_RETURN) {
             for (unsigned k = 0; k < program->live_out_count; ++k) {
                uint32_t v = program->live_out[k];
                if (v < program->value_count && !is_publication_val(program, v))
-                  BITSET_SET(live, v);
+                  BITSET_SET(live_scratch, v);
             }
          }
 
@@ -1161,7 +1167,7 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                   continue;
                if (s0 + c < program->value_count &&
                    !is_publication_val(program, s0 + c))
-                  BITSET_SET(live, s0 + c);
+                  BITSET_SET(live_scratch, s0 + c);
             }
             continue;
          }
@@ -1170,12 +1176,12 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
          for (unsigned s = 0; s < nr_srcs; ++s) {
             uint32_t v = agx_apple9_vir_src(ins, s);
             if (v < program->value_count && !is_publication_val(program, v))
-               BITSET_SET(live, v);
+               BITSET_SET(live_scratch, v);
          }
       }
-      free(live);
    }
 
+   bool ok = false;
    unsigned pos = 0;
    for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(b); ins;
         ins = agx_apple9_instr_next(ins), ++pos) {
@@ -1187,8 +1193,7 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                   set_err(err, b->index, pos,
                           "physical VIR_MOV operand out of GPR range (r%u <- r%u)",
                           ins->dest, ins->nr_srcs ? ins->src[0] : UINT_MAX);
-               free(live_after_table);
-               return false;
+               goto out;
             }
             cur[ins->dest] = cur[ins->src[0]];
          } else if (ins->op == AGX_APPLE9_VIR_SWAP) {
@@ -1197,8 +1202,7 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                if (check_errors)
                   set_err(err, b->index, pos,
                           "VIR_SWAP operand out of GPR range");
-               free(live_after_table);
-               return false;
+               goto out;
             }
             struct reg_slot tmp = cur[ins->src[0]];
             cur[ins->src[0]] = cur[ins->src[1]];
@@ -1209,15 +1213,12 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                   set_err(err, b->index, pos,
                           "physical VIR_IMM dest r%u out of GPR range",
                           ins->dest);
-               free(live_after_table);
-               return false;
+               goto out;
             }
             if (check_errors &&
                 !validate_encoding_constraints(program, assign, mem_slots, ins,
-                                               b->index, pos, err)) {
-               free(live_after_table);
-               return false;
-            }
+                                               b->index, pos, err))
+               goto out;
             cur[ins->dest] = slot_const(ins->immediate);
          } else if (ins->op == AGX_APPLE9_VIR_SPILL_LOAD) {
             if (ins->dest >= AGX_APPLE9_GPR_COUNT ||
@@ -1226,8 +1227,7 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                   set_err(err, b->index, pos,
                           "VIR_SPILL_LOAD out of bounds (r%u <- m%u, max_mem=%u)",
                           ins->dest, ins->immediate, mem_slots);
-               free(live_after_table);
-               return false;
+               goto out;
             }
             cur[ins->dest] = cur[AGX_APPLE9_GPR_COUNT + ins->immediate];
          } else if (ins->op == AGX_APPLE9_VIR_SPILL_STORE) {
@@ -1238,8 +1238,7 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                           "VIR_SPILL_STORE out of bounds (m%u <- r%u, max_mem=%u)",
                           ins->immediate,
                           ins->nr_srcs ? ins->src[0] : UINT_MAX, mem_slots);
-               free(live_after_table);
-               return false;
+               goto out;
             }
             cur[AGX_APPLE9_GPR_COUNT + ins->immediate] = cur[ins->src[0]];
          }
@@ -1257,8 +1256,7 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                   if (check_errors)
                      set_err(err, b->index, pos,
                              "VIR_PHI dest v%u has invalid assignment", dv);
-                  free(live_after_table);
-                  return false;
+                  goto out;
                }
                *file_slot(cur, dloc) = slot_ssa(dv);
             }
@@ -1266,18 +1264,15 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
          continue;
       }
 
-      const BITSET_WORD *live_after =
-         live_after_table ? &live_after_table[(size_t)pos * live_words] : NULL;
+      const uint16_t live_after_mask = src_live_after ? src_live_after[pos] : 0;
 
       /* Check encoding constraints on final pass. */
       if (check_errors &&
           !validate_encoding_constraints(program, assign, mem_slots, ins,
-                                         b->index, pos, err)) {
-         free(live_after_table);
-         return false;
-      }
+                                         b->index, pos, err))
+         goto out;
 
-      /* Validate kill_mask bounds and accuracy against live_after. */
+      /* Validate kill_mask bounds and accuracy against live_after_mask. */
       if (check_errors) {
          unsigned nr_srcs = agx_apple9_vir_nr_srcs(ins);
          unsigned valid_mask =
@@ -1288,8 +1283,7 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
             set_err(err, b->index, pos,
                     "kill_mask 0x%x sets bits beyond nr_srcs=%u",
                     ins->kill_mask, nr_srcs);
-            free(live_after_table);
-            return false;
+            goto out;
          }
 
          for (unsigned s = 0; s < nr_srcs && s < AGX_APPLE9_MAX_VIR_SRCS; ++s) {
@@ -1298,12 +1292,11 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
             uint32_t v = ins->src[s];
             if (is_publication_val(program, v))
                continue;
-            if (v < program->value_count && BITSET_TEST(live_after, v)) {
+            if (live_after_mask & (1u << s)) {
                set_err(err, b->index, pos,
                        "bad kill_mask: src[%u] v%u marked killed but is still live after instruction",
                        s, v);
-               free(live_after_table);
-               return false;
+               goto out;
             }
          }
       }
@@ -1323,8 +1316,7 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                if (!get_val_loc(program, assign, mem_slots, sv, &sloc)) {
                   set_err(err, b->index, pos,
                           "VIR_SPLIT src v%u+%u has invalid assignment", s0, c);
-                  free(live_after_table);
-                  return false;
+                  goto out;
                }
                struct reg_slot actual = *file_slot(cur, sloc);
                if (actual.state != SLOT_SSA || actual.value != sv) {
@@ -1336,8 +1328,7 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                           : actual.state == SLOT_CONST ? "const"
                                                        : "undef",
                           actual.value);
-                  free(live_after_table);
-                  return false;
+                  goto out;
                }
             }
          } else if (ins->op == AGX_APPLE9_VIR_MOV && ins->dest_components > 1 &&
@@ -1351,8 +1342,7 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                if (!get_val_loc(program, assign, mem_slots, sv, &sloc)) {
                   set_err(err, b->index, pos,
                           "VIR_MOV src v%u+%u has invalid assignment", s0, c);
-                  free(live_after_table);
-                  return false;
+                  goto out;
                }
                struct reg_slot actual = *file_slot(cur, sloc);
                if (actual.state != SLOT_SSA || actual.value != sv) {
@@ -1364,8 +1354,7 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                           : actual.state == SLOT_CONST ? "const"
                                                        : "undef",
                           actual.value);
-                  free(live_after_table);
-                  return false;
+                  goto out;
                }
             }
          } else {
@@ -1378,8 +1367,7 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                if (!get_val_loc(program, assign, mem_slots, sv, &sloc)) {
                   set_err(err, b->index, pos,
                           "src[%u] v%u has invalid assignment", s, sv);
-                  free(live_after_table);
-                  return false;
+                  goto out;
                }
                struct reg_slot actual = *file_slot(cur, sloc);
                if (actual.state != SLOT_SSA || actual.value != sv) {
@@ -1391,8 +1379,7 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                           : actual.state == SLOT_CONST ? "const"
                                                        : "undef",
                           actual.value);
-                  free(live_after_table);
-                  return false;
+                  goto out;
                }
             }
          }
@@ -1407,16 +1394,14 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                   set_err(err, b->index, pos,
                           "ABI_RETURN live_out[%u] v%u has invalid assignment",
                           k, v);
-                  free(live_after_table);
-                  return false;
+                  goto out;
                }
                struct reg_slot actual = *file_slot(cur, loc);
                if (actual.state != SLOT_SSA || actual.value != v) {
                   set_err(err, b->index, pos,
                           "clobbered ABI_RETURN live_out[%u] v%u in %c%u", k, v,
                           loc.kind == APPLE9_RA_LOC_MEM ? 'm' : 'r', loc.value);
-                  free(live_after_table);
-                  return false;
+                  goto out;
                }
             }
          }
@@ -1432,12 +1417,12 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                uint32_t sv = ins->src[s + c];
                if (is_publication_val(program, sv))
                   continue;
-               if (check_errors && BITSET_TEST(live_after, sv)) {
+               if (check_errors && s + c < AGX_APPLE9_MAX_VIR_SRCS &&
+                   (live_after_mask & (1u << (s + c)))) {
                   set_err(err, b->index, pos,
                           "clobbered operand src[%u] v%u is still live after instruction",
                           s + c, sv);
-                  free(live_after_table);
-                  return false;
+                  goto out;
                }
                struct apple9_ra_loc sloc;
                if (get_val_loc(program, assign, mem_slots, sv, &sloc))
@@ -1470,22 +1455,20 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                      set_err(err, b->index, pos,
                              "illegal reuse_killed: dest r%u overlaps src[%u] r%u on instruction that forbids source reuse",
                              dloc.value, s, sloc.value);
-                     free(live_after_table);
-                     return false;
+                     goto out;
                   }
-                  if (BITSET_TEST(live_after, sv)) {
+                  if (s < AGX_APPLE9_MAX_VIR_SRCS &&
+                      (live_after_mask & (1u << s))) {
                      set_err(err, b->index, pos,
                              "clobbered live GPR: dest v%u (r%u) overwrites still-live src[%u] v%u",
                              ins->dest, dloc.value, s, sv);
-                     free(live_after_table);
-                     return false;
+                     goto out;
                   }
                   if ((ins->retain_mask >> s) & 1u) {
                      set_err(err, b->index, pos,
                              "illegal reuse_killed: dest r%u overwrites retained src[%u] v%u",
                              dloc.value, s, sv);
-                     free(live_after_table);
-                     return false;
+                     goto out;
                   }
                }
             }
@@ -1505,15 +1488,16 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
             if (check_errors)
                set_err(err, b->index, pos, "dest v%u has invalid assignment",
                        dv);
-            free(live_after_table);
-            return false;
+            goto out;
          }
          *file_slot(cur, dloc) = slot_ssa(dv);
       }
    }
 
-   free(live_after_table);
-   return true;
+   ok = true;
+out:
+   free(src_live_after);
+   return ok;
 }
 
 bool
@@ -1608,6 +1592,7 @@ apple9_ra_validate_post_ra(const struct agx_apple9_vir_program *program,
       calloc((size_t)num_blocks * live_words, sizeof(BITSET_WORD));
    BITSET_WORD *live_out =
       calloc((size_t)num_blocks * live_words, sizeof(BITSET_WORD));
+   BITSET_WORD *live_scratch = malloc(live_words * sizeof(BITSET_WORD));
 
    unsigned total_slots = AGX_APPLE9_GPR_COUNT + mem_slots;
    struct reg_slot *entry_files =
@@ -1617,8 +1602,8 @@ apple9_ra_validate_post_ra(const struct agx_apple9_vir_program *program,
    struct reg_slot *cur = calloc(total_slots, sizeof(struct reg_slot));
    bool *visited = calloc(num_blocks, sizeof(bool));
 
-   if (!has_def || !live_in || !live_out || !entry_files || !exit_files ||
-       !cur || !visited) {
+   if (!has_def || !live_in || !live_out || !live_scratch || !entry_files ||
+       !exit_files || !cur || !visited) {
       set_err(err, UINT_MAX, UINT_MAX, "OOM in post-RA validator");
       goto fail;
    }
@@ -1709,12 +1694,12 @@ apple9_ra_validate_post_ra(const struct agx_apple9_vir_program *program,
 
          memcpy(cur, entry, total_slots * sizeof(struct reg_slot));
          if (!step_block_regfile(program, assign, mem_slots, b, cur, false,
-                                 NULL, 0, err)) {
+                                 NULL, 0, NULL, err)) {
             /* Re-run with check_errors=true to produce crisp diagnostic. */
             memcpy(cur, entry, total_slots * sizeof(struct reg_slot));
             step_block_regfile(program, assign, mem_slots, b, cur, true,
                                &live_out[(size_t)bi * live_words], live_words,
-                               err);
+                               live_scratch, err);
             goto fail;
          }
 
@@ -1736,7 +1721,7 @@ apple9_ra_validate_post_ra(const struct agx_apple9_vir_program *program,
 
       if (!step_block_regfile(program, assign, mem_slots, b, cur, true,
                               &live_out[(size_t)bi * live_words], live_words,
-                              err))
+                              live_scratch, err))
          goto fail;
 
       /* Verify shader exit outputs (program->output and non-ABI-return
@@ -1880,6 +1865,7 @@ apple9_ra_validate_post_ra(const struct agx_apple9_vir_program *program,
    free(has_def);
    free(live_in);
    free(live_out);
+   free(live_scratch);
    free(entry_files);
    free(exit_files);
    free(cur);
@@ -1891,6 +1877,7 @@ fail:
    free(has_def);
    free(live_in);
    free(live_out);
+   free(live_scratch);
    free(entry_files);
    free(exit_files);
    free(cur);

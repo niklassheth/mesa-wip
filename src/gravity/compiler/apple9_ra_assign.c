@@ -3858,22 +3858,22 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
       res->error = res->validate_err.message;
       goto cleanup;
    }
+   /* Step 3 & 4a: Pressure/latency DAG scheduling + CFG liveness. When the
+    * scheduler runs, receive its post-schedule liveness directly instead of
+    * freeing and immediately recomputing it. */
    if (!opts.skip_schedule) {
       struct apple9_ra_sched_options sched_opts = {
          .latency = opts.latency_schedule,
          .pressure_slack = opts.pressure_slack,
          .auto_tier_slack = opts.auto_tier_slack,
          .rejected_pressure_increase = 0,
+         .liveness_out = &liveness,
       };
       if (!apple9_ra_pressure_schedule_opts(program, &sched_opts)) {
          res->error = "pressure/latency scheduler failed";
          goto cleanup;
       }
-   }
-
-   /* Step 4: Liveness, demand check, and Braun-Hack spilling + DSATUR spill
-    * slot coloring if GPR demand exceeds target/limit. */
-   if (!apple9_ra_liveness(program, &liveness)) {
+   } else if (!apple9_ra_liveness(program, &liveness)) {
       res->error = "liveness analysis failed";
       goto cleanup;
    }

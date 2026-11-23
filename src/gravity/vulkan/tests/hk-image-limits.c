@@ -73,5 +73,18 @@ int main(void)
       CHECK(count == (types[t] == VK_IMAGE_TYPE_2D ? 1 : 0));
    }
    puts("Sparse residency format queries report 2D only");
+
+   /* Host image copy scratch sizing uses size_t math and caps rows at
+    * MIN2(block_height, extent_height) rather than src_offset.y + extent.height. */
+   extern size_t hk_host_copy_temp_tile_size(uint32_t block_width,
+                                             uint32_t block_height,
+                                             uint32_t block_B,
+                                             uint32_t extent_height);
+   CHECK(hk_host_copy_temp_tile_size(64, 64, 16, 1) == (size_t)64 * 16 * 1);
+   CHECK(hk_host_copy_temp_tile_size(64, 64, 16, 4096) == (size_t)64 * 16 * 64);
+   CHECK(hk_host_copy_temp_tile_size(64, 64, 16, 0) == 0);
+   CHECK(hk_host_copy_temp_tile_size(65536, 65536, 16, 65536) ==
+         (size_t)65536 * 16 * 65536);
+   puts("Host image copy scratch sizing stays bounded in size_t");
    return 0;
 }

@@ -4,14 +4,16 @@
 #pragma once
 #include "hk_descriptor_memory.h"
 
-/* Immutable shader and image-view state at stable USC addresses. Slabs remain
- * until device destruction; allocations return when their owner is destroyed.
- * Caller serializes access. */
+/* Immutable shader and image-view state at stable USC addresses. Allocations
+ * return when their owner is destroyed; excess empty slabs are released
+ * immediately while keeping at most one warm standard-sized slab. Caller
+ * serializes access. */
 #define HK_USC_HEAP_SLAB_SIZE (64 * 1024)
 struct hk_usc_heap {
    struct list_head slabs;
    const struct hk_descriptor_memory_ops *ops;
    void *data;
+   unsigned empty_slabs;
 };
 
 #ifdef __cplusplus

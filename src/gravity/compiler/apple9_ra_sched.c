@@ -1923,24 +1923,115 @@ bank_limits_respected(int32_t new_64, int32_t new_16,
 }
 
 static void
+refresh_block_liveness_and_kills(const struct agx_apple9_vir_program *p,
+                                 struct agx_apple9_vir_instr *const *defs,
+                                 const BITSET_WORD *pub_defs,
+                                 struct apple9_ra_liveness_info *liveness,
+                                 struct agx_apple9_block *blk, void *scratch_ctx)
+{
+   unsigned b = blk->cfg_index;
+   struct u_sparse_bitset live;
+   u_sparse_bitset_dup_with_ctx(&live, &liveness->live_out[b], scratch_ctx);
+   unsigned cur = u_sparse_bitset_count(&live);
+   unsigned block_peak = cur;
+
+   for (struct agx_apple9_vir_instr *I = agx_apple9_block_last_instr(blk);
+        I; I = agx_apple9_instr_prev(I)) {
+      if (I->op == AGX_APPLE9_VIR_PHI) {
+         I->kill_mask = 0;
+         continue;
+      }
+      unsigned cur_after = cur;
+      unsigned unlive_defs = liveness_ins_update_internal(
+         p, defs, pub_defs, &live, I, true, &cur);
+      block_peak = MAX2(block_peak, cur_after + unlive_defs);
+      block_peak = MAX2(block_peak, cur);
+   }
+
+   liveness->block_peak_gprs[b] = block_peak;
+   u_sparse_bitset_free(&live);
+}
+
+static bool
 apply_vir_schedule(struct agx_apple9_vir_program *p,
                    struct agx_apple9_block *blk,
                    struct agx_apple9_vir_instr *last_pinned_entry,
                    struct agx_apple9_vir_instr *const *bottom_up_order,
-                   unsigned count)
+                   unsigned count, struct agx_apple9_vir_instr *const *defs,
+                   const BITSET_WORD *pub_defs,
+                   struct apple9_ra_liveness_info *liveness, void *blk_ctx)
 {
-   struct agx_apple9_vir_instr *anchor = last_pinned_entry;
-   for (unsigned k = count; k-- > 0;) {
-      struct agx_apple9_vir_instr *ins = bottom_up_order[k];
-      if (!anchor) {
-         if (agx_apple9_block_first_instr(blk) != ins)
-            agx_apple9_vir_move_to_block_start(p, ins, blk);
-      } else {
-         if (agx_apple9_instr_next(anchor) != ins)
-            agx_apple9_vir_move_after(p, ins, anchor);
+   if (count <= 1)
+      return false;
+
+   struct agx_apple9_vir_instr *first_body =
+      last_pinned_entry ? agx_apple9_instr_next(last_pinned_entry)
+                        : agx_apple9_block_first_instr(blk);
+   bool changed = false;
+   struct agx_apple9_vir_instr *slot = first_body;
+   for (unsigned i = 0; i < count; ++i, slot = agx_apple9_instr_next(slot)) {
+      if (slot != bottom_up_order[count - 1 - i]) {
+         changed = true;
+         break;
       }
-      anchor = ins;
    }
+   if (!changed)
+      return false;
+
+   /* Bulk-reorder the body's list_head nodes in blk->instructions in O(count)
+    * while preserving instruction pointer identity, deferring the single
+    * agx_apple9_vir_reindex() to the end of scheduling instead of reindexing
+    * the entire program on every moved instruction. */
+   struct list_head **body_links =
+      ralloc_array(blk_ctx, struct list_head *, count);
+   if (body_links) {
+      struct list_head *cur_link = blk->instructions.next;
+      struct agx_apple9_vir_instr *cur_ins = agx_apple9_block_first_instr(blk);
+      while (cur_ins && cur_ins != first_body) {
+         cur_link = cur_link->next;
+         cur_ins = agx_apple9_instr_next(cur_ins);
+      }
+      assert(cur_ins == first_body && cur_link != &blk->instructions);
+      struct list_head *anchor_link = cur_link->prev;
+      const unsigned base_pos = agx_apple9_instr_position(first_body);
+      for (unsigned i = 0; i < count; ++i) {
+         assert(cur_ins && agx_apple9_instr_position(cur_ins) == base_pos + i);
+         body_links[i] = cur_link;
+         cur_link = cur_link->next;
+         cur_ins = agx_apple9_instr_next(cur_ins);
+      }
+
+      struct list_head *prev = anchor_link;
+      for (unsigned k = count; k-- > 0;) {
+         struct agx_apple9_vir_instr *ins = bottom_up_order[k];
+         unsigned orig_off = agx_apple9_instr_position(ins) - base_pos;
+         assert(orig_off < count);
+         struct list_head *lnk = body_links[orig_off];
+         if (prev->next != lnk) {
+            list_del(lnk);
+            list_add(lnk, prev);
+         }
+         prev = lnk;
+      }
+   } else {
+      struct agx_apple9_vir_instr *anchor = last_pinned_entry;
+      for (unsigned k = count; k-- > 0;) {
+         struct agx_apple9_vir_instr *ins = bottom_up_order[k];
+         if (!anchor) {
+            if (agx_apple9_block_first_instr(blk) != ins)
+               agx_apple9_vir_move_to_block_start(p, ins, blk);
+         } else {
+            if (agx_apple9_instr_next(anchor) != ins)
+               agx_apple9_vir_move_after(p, ins, anchor);
+         }
+         anchor = ins;
+      }
+   }
+
+   /* Intra-block reordering preserves live_in/live_out; refresh this block's
+    * kill_mask and peak pressure directly from its unchanged live_out set. */
+   refresh_block_liveness_and_kills(p, defs, pub_defs, liveness, blk, blk_ctx);
+   return true;
 }
 
 static bool
@@ -2696,7 +2787,10 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
       return false;
 
    if (liveness.num_cfg_blocks == 0) {
-      apple9_ra_liveness_finish(&liveness);
+      if (cfg->liveness_out)
+         *cfg->liveness_out = liveness;
+      else
+         apple9_ra_liveness_finish(&liveness);
       return true;
    }
 
@@ -2734,6 +2828,11 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
       apple9_ra_liveness_finish(&liveness);
       return false;
    }
+
+   /* Ensure instruction positions are contiguous within each block so
+    * apply_vir_schedule can bulk-reorder nodes in O(count) without calling
+    * agx_apple9_vir_reindex per moved instruction. */
+   agx_apple9_vir_reindex(p);
 
    bool any_reordered = false;
 
@@ -2934,13 +3033,15 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
          }
 
          if (accept_lat) {
-            apply_vir_schedule(p, blk, last_entry, lat.order, lat.count);
+            any_reordered |= apply_vir_schedule(p, blk, last_entry, lat.order,
+                                                lat.count, defs, pub_defs,
+                                                &liveness, blk_ctx);
             committed = true;
-            any_reordered = true;
          } else if (have_pres) {
-            apply_vir_schedule(p, blk, last_entry, pres.order, pres.count);
+            any_reordered |= apply_vir_schedule(p, blk, last_entry, pres.order,
+                                                pres.count, defs, pub_defs,
+                                                &liveness, blk_ctx);
             committed = true;
-            any_reordered = true;
          }
 
          ralloc_free(lat_ctx);
@@ -2989,17 +3090,20 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                    pressure_strictly_better(pres.max_all, pres.max_64,
                                             pres.max_16, lat.max_all,
                                             lat.max_64, lat.max_16)) {
-                  apply_vir_schedule(p, blk, last_entry, pres.order, pres.count);
+                  any_reordered |= apply_vir_schedule(p, blk, last_entry,
+                                                      pres.order, pres.count,
+                                                      defs, pub_defs, &liveness,
+                                                      blk_ctx);
                   committed = true;
-                  any_reordered = true;
                   overridden_by_pressure = true;
                }
                ralloc_free(pres_ctx);
             }
             if (!overridden_by_pressure) {
-               apply_vir_schedule(p, blk, last_entry, lat.order, lat.count);
+               any_reordered |= apply_vir_schedule(p, blk, last_entry,
+                                                   lat.order, lat.count, defs,
+                                                   pub_defs, &liveness, blk_ctx);
                committed = true;
-               any_reordered = true;
             }
          }
          ralloc_free(lat_ctx);
@@ -3021,8 +3125,9 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
              bank_limits_respected(pres.max_64, pres.max_16, orig_64, orig_16) &&
              pressure_strictly_better(pres.max_all, pres.max_64, pres.max_16,
                                       orig_all, orig_64, orig_16)) {
-            apply_vir_schedule(p, blk, last_entry, pres.order, pres.count);
-            any_reordered = true;
+            any_reordered |= apply_vir_schedule(p, blk, last_entry, pres.order,
+                                                pres.count, defs, pub_defs,
+                                                &liveness, blk_ctx);
          }
          ralloc_free(pres_ctx);
       }
@@ -3031,11 +3136,20 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
    }
 
    ralloc_free(mem_ctx);
-   apple9_ra_liveness_finish(&liveness);
 
-   /* Refresh kill_mask and peak_live_gprs if any block was reordered. */
-   if (any_reordered)
-      return apple9_ra_liveness(p, NULL);
+   if (any_reordered) {
+      agx_apple9_vir_reindex(p);
+      unsigned global_peak = 0;
+      for (unsigned b = 0; b < liveness.num_cfg_blocks; ++b)
+         global_peak = MAX2(global_peak, liveness.block_peak_gprs[b]);
+      liveness.peak_live_gprs = global_peak;
+      p->peak_live_gprs = global_peak;
+   }
+
+   if (cfg->liveness_out)
+      *cfg->liveness_out = liveness;
+   else
+      apple9_ra_liveness_finish(&liveness);
    return true;
 }
 

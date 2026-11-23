@@ -696,7 +696,8 @@ struct apple9_scalar_load {
    nir_scalar index;
    nir_def *address;
    unsigned argument;
-   unsigned component;
+   nir_component_mask_t read_mask;
+   uint8_t read_count;
    uint8_t index_shift;
    int16_t byte_offset;
    unsigned bit_size;
@@ -1231,6 +1232,10 @@ struct apple9_dag_lower {
    /* Immutable resource ledger; selected values live only in ssa_to_vreg. */
    struct apple9_scalar_load *loads;
    unsigned load_count;
+   struct apple9_scalar_load **load_by_def;
+   unsigned load_by_def_count;
+   unsigned *block_load_count;
+   unsigned num_nir_blocks;
    struct apple9_buffer_atomic *atomics;
    unsigned atomic_count;
    unsigned argument_base;
@@ -3574,15 +3579,11 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
                      nir_intrinsic_load_ubo ||
                   nir_def_as_intrinsic(scalar.def)->intrinsic ==
                      nir_intrinsic_load_global_2x32)) {
-         struct apple9_scalar_load *load = NULL;
-         for (unsigned i = 0; i < lower->load_count; ++i) {
-            if (&lower->loads[i].intr->def == scalar.def &&
-                lower->loads[i].component == scalar.comp) {
-               load = &lower->loads[i];
-               break;
-            }
-         }
-         if (load == NULL) {
+         struct apple9_scalar_load *load =
+            lower->load_by_def && scalar.def->index < lower->load_by_def_count
+               ? lower->load_by_def[scalar.def->index]
+               : NULL;
+         if (load == NULL || !(load->read_mask & BITFIELD_BIT(scalar.comp))) {
             lower->reason =
                "Apple9 DAG load is absent from the resource ledger";
             return AGX_APPLE9_VREG_INVALID;
@@ -3609,9 +3610,7 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
              address == AGX_APPLE9_VREG_INVALID)
             return address;
 
-         unsigned read_count = 0;
-         for (unsigned i = 0; i < lower->load_count; ++i)
-            read_count += lower->loads[i].intr == load->intr;
+         unsigned read_count = load->read_count;
 
          /* Preserve the semantic vector extent with one result tuple. Index
           * scale and byte displacement do not depend on that extent. */
@@ -3691,7 +3690,7 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
             memory->memory_global = uniform_base;
             memory->memory_bits = load->bit_size;
             memory->memory_index_shift = load->index_shift;
-            memory->memory_offset = load->byte_offset + load->component * (load->bit_size / 8);
+            memory->memory_offset = load->byte_offset + scalar.comp * (load->bit_size / 8);
             memory->memory_coherent =
                nir_intrinsic_has_access(load->intr) &&
                (nir_intrinsic_access(load->intr) &
@@ -4813,18 +4812,15 @@ apple9_find_buffer_dag(nir_shader *nir, const struct apple9_buffer_map *map,
                (nir_intrinsic_access(intr) & ACCESS_VOLATILE)
                   ? BITFIELD_MASK(intr->def.num_components)
                   : nir_def_components_read(&intr->def);
-            for (unsigned component = 0; component < intr->def.num_components;
-                 ++component) {
-               if (!(read_mask & BITFIELD_BIT(component)))
-                  continue;
-
+            if (read_mask) {
                struct apple9_scalar_load load = {
                   .intr = intr,
                   .block = block,
                   .index = index,
                   .address = address,
                   .argument = argument,
-                  .component = component,
+                  .read_mask = read_mask,
+                  .read_count = util_bitcount(read_mask),
                   .index_shift = index_shift,
                   .byte_offset = byte_offset,
                   .bit_size = intr->def.bit_size,
@@ -5078,17 +5074,9 @@ static unsigned
 apple9_load_instruction_count_in_block(const struct apple9_dag_lower *lower,
                                        nir_block *block)
 {
-   unsigned count = 0;
-   for (unsigned i = 0; i < lower->load_count; ++i) {
-      if (lower->loads[i].block != block)
-         continue;
-
-      bool first_component = true;
-      for (unsigned earlier = 0; earlier < i; ++earlier)
-         first_component &= lower->loads[earlier].intr != lower->loads[i].intr;
-      count += first_component;
-   }
-   return count;
+   return lower->block_load_count && block->index < lower->num_nir_blocks
+             ? lower->block_load_count[block->index]
+             : 0;
 }
 
 static struct apple9_buffer_store *
@@ -8881,11 +8869,25 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
          }
       }
    }
-   for (unsigned i = 0; i < lower.load_count; ++i) {
-      bool first = true;
-      for (unsigned earlier = 0; earlier < i; ++earlier)
-         first &= lower.loads[earlier].intr != lower.loads[i].intr;
-      lower.load_instruction_count += first;
+   lower.load_instruction_count = lower.load_count;
+   lower.load_by_def_count = impl->ssa_alloc;
+   lower.num_nir_blocks = impl->num_blocks;
+   if (lower.load_count) {
+      lower.load_by_def =
+         calloc(MAX2(lower.load_by_def_count, 1u), sizeof(*lower.load_by_def));
+      lower.block_load_count =
+         calloc(MAX2(lower.num_nir_blocks, 1u), sizeof(*lower.block_load_count));
+      if (!lower.load_by_def || !lower.block_load_count) {
+         *reason = "out of memory indexing Apple9 buffer loads";
+         goto fail;
+      }
+      for (unsigned i = 0; i < lower.load_count; ++i) {
+         struct apple9_scalar_load *l = &lower.loads[i];
+         assert(l->intr->def.index < lower.load_by_def_count);
+         lower.load_by_def[l->intr->def.index] = l;
+         assert(l->block->index < lower.num_nir_blocks);
+         lower.block_load_count[l->block->index]++;
+      }
    }
    agx_apple9_vir_init(&lower.program);
    memset(lower.entry_vreg, 0xff, sizeof(lower.entry_vreg));
@@ -9508,6 +9510,8 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
          profile->local_size[d] = nir->info.workgroup_size[d];
    }
 
+   free(lower.load_by_def);
+   free(lower.block_load_count);
    free(lower.nir_blocks);
    free(lower.ssa_to_vreg);
    agx_apple9_vir_finish(&lower.program);
@@ -9517,6 +9521,8 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
    return true;
 
 fail:
+   free(lower.load_by_def);
+   free(lower.block_load_count);
    free(lower.nir_blocks);
    free(lower.ssa_to_vreg);
    agx_apple9_vir_finish(&lower.program);

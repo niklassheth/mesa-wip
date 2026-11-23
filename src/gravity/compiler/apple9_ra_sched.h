@@ -53,6 +53,10 @@ struct apple9_ra_sched_options {
    bool auto_tier_slack;
    /* Output: largest peak 32-bit GPR pressure increase rejected across blocks. */
    unsigned rejected_pressure_increase;
+   /* Optional output: when non-NULL, transfers ownership of the post-schedule
+    * CFG liveness info to the caller (initialized on success; destroy with
+    * apple9_ra_liveness_finish) instead of freeing and recomputing it. */
+   struct apple9_ra_liveness_info *liveness_out;
 };
 
 void apple9_ra_liveness_init(struct apple9_ra_liveness_info *info);

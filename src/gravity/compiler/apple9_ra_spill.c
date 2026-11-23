@@ -775,15 +775,21 @@ loop_contains(const unsigned *loop_end, unsigned header, unsigned blk)
    return loop_end[header] != UINT_MAX && header <= blk && blk <= loop_end[header];
 }
 
-static unsigned
-loops_exited(unsigned num_blocks, const unsigned *loop_end,
+struct spill_loop_interval {
+   unsigned start;
+   unsigned end;
+};
+
+static inline unsigned
+loops_exited(const struct spill_loop_interval *loops, unsigned num_loops,
              const struct agx_apple9_block *pred,
              const struct agx_apple9_block *succ)
 {
    unsigned exits = 0;
-   for (unsigned h = 0; h <= pred->cfg_index && h < num_blocks; ++h) {
-      if (loop_contains(loop_end, h, pred->cfg_index) &&
-          !loop_contains(loop_end, h, succ->cfg_index))
+   const unsigned pi = pred->cfg_index;
+   const unsigned si = succ->cfg_index;
+   for (unsigned l = 0; l < num_loops && loops[l].start <= pi; ++l) {
+      if (pi <= loops[l].end && !(loops[l].start <= si && si <= loops[l].end))
          ++exits;
    }
    return exits;
@@ -1943,7 +1949,7 @@ cleanup:
  * Global next-use distance dataflow
  * ------------------------------------------------------------------------- */
 
-static void
+static bool
 global_next_use_distances(struct agx_apple9_vir_program *program,
                           struct agx_apple9_block **cfg_blocks,
                           unsigned num_blocks,
@@ -1955,6 +1961,25 @@ global_next_use_distances(struct agx_apple9_vir_program *program,
                           const unsigned *loop_end)
 {
    unsigned n = program->value_count;
+   unsigned num_loops = 0;
+   for (unsigned bi = 0; bi < num_blocks; ++bi) {
+      if (loop_end[bi] != UINT_MAX)
+         ++num_loops;
+   }
+   struct spill_loop_interval *loops = NULL;
+   if (num_loops) {
+      loops = ralloc_array(memctx, struct spill_loop_interval, num_loops);
+      if (!loops)
+         return false;
+      unsigned idx = 0;
+      for (unsigned bi = 0; bi < num_blocks; ++bi) {
+         if (loop_end[bi] != UINT_MAX) {
+            loops[idx].start = bi;
+            loops[idx].end = loop_end[bi];
+            ++idx;
+         }
+      }
+   }
    u_worklist worklist;
    u_worklist_init(&worklist, num_blocks, NULL);
 
@@ -2112,7 +2137,7 @@ global_next_use_distances(struct agx_apple9_vir_program *program,
                set_next_use(&dists, phi->dest, DIST_INFINITY);
          }
 
-         unsigned exits = loops_exited(num_blocks, loop_end, pred, blk);
+         unsigned exits = loops_exited(loops, num_loops, pred, blk);
          if (exits) {
             clear_next_uses(&far);
             foreach_next_use(&dists, node, dist) {
@@ -2137,6 +2162,7 @@ global_next_use_distances(struct agx_apple9_vir_program *program,
    u_worklist_fini(&worklist);
    destroy_next_uses(&dists);
    destroy_next_uses(&far);
+   return true;
 }
 
 static void
@@ -2555,8 +2581,12 @@ apple9_ra_spill(struct agx_apple9_vir_program *program,
       ralloc_free(memctx);
       return false;
    }
-   global_next_use_distances(program, cfg_blocks, num_blocks, is_pub,
-                             direct_lanes, has_abi_ret, memctx, blocks, loop_end);
+   if (!global_next_use_distances(program, cfg_blocks, num_blocks, is_pub,
+                                  direct_lanes, has_abi_ret, memctx, blocks,
+                                  loop_end)) {
+      ralloc_free(memctx);
+      return false;
+   }
    validate_next_use_info(cfg_blocks, num_blocks, n, blocks);
 
    /* Reserve a shadow RA_MEM SSA value (n + v) for every original value v. */

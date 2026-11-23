@@ -7,6 +7,14 @@
 #include "util/macros.h"
 #include "util/u_math.h"
 
+struct hk_usc_slab {
+   struct list_head link;
+   struct hk_descriptor_backing backing;
+   struct util_vma_heap heap;
+   unsigned live_allocs;
+   bool warm_empty;
+};
+
 void
 hk_usc_heap_init(struct hk_usc_heap *table,
                  const struct hk_descriptor_memory_ops *ops, void *data)
@@ -16,12 +24,19 @@ hk_usc_heap_init(struct hk_usc_heap *table,
 }
 
 static bool
-alloc_from_slab(struct hk_descriptor_chunk *slab, uint64_t size,
-                unsigned alignment, struct hk_descriptor_allocation *out)
+alloc_from_slab(struct hk_usc_heap *table, struct hk_usc_slab *slab,
+                uint64_t size, unsigned alignment,
+                struct hk_descriptor_allocation *out)
 {
    uint64_t addr = util_vma_heap_alloc(&slab->heap, size, alignment);
    if (!addr)
       return false;
+   if (slab->warm_empty) {
+      assert(table->empty_slabs > 0);
+      --table->empty_slabs;
+      slab->warm_empty = false;
+   }
+   ++slab->live_allocs;
    *out = (struct hk_descriptor_allocation){
       .addr = addr,
       .size = size,
@@ -37,11 +52,11 @@ hk_usc_heap_alloc(struct hk_usc_heap *table, uint64_t size, unsigned alignment,
    if (!size)
       return false;
    assert(util_is_power_of_two_nonzero(alignment));
-   list_for_each_entry(struct hk_descriptor_chunk, slab, &table->slabs, link) {
-      if (alloc_from_slab(slab, size, alignment, out))
+   list_for_each_entry(struct hk_usc_slab, slab, &table->slabs, link) {
+      if (alloc_from_slab(table, slab, size, alignment, out))
          return true;
    }
-   struct hk_descriptor_chunk *slab = calloc(1, sizeof(*slab));
+   struct hk_usc_slab *slab = calloc(1, sizeof(*slab));
    if (!slab)
       return false;
    if (!table->ops->create(table->data, MAX2(size, HK_USC_HEAP_SLAB_SIZE), 0,
@@ -52,7 +67,7 @@ hk_usc_heap_alloc(struct hk_usc_heap *table, uint64_t size, unsigned alignment,
    assert(slab->backing.addr && slab->backing.size >= size);
    util_vma_heap_init(&slab->heap, slab->backing.addr, slab->backing.size);
    list_addtail(&slab->link, &table->slabs);
-   ASSERTED bool ok = alloc_from_slab(slab, size, alignment, out);
+   ASSERTED bool ok = alloc_from_slab(table, slab, size, alignment, out);
    assert(ok);
    return true;
 }
@@ -63,13 +78,26 @@ hk_usc_heap_free(struct hk_usc_heap *table,
 {
    if (!alloc->size)
       return;
-   list_for_each_entry(struct hk_descriptor_chunk, slab, &table->slabs, link) {
+   list_for_each_entry(struct hk_usc_slab, slab, &table->slabs, link) {
       if (alloc->addr >= slab->backing.addr &&
           alloc->addr < slab->backing.addr + slab->backing.size) {
          assert(alloc->addr + alloc->size <=
                 slab->backing.addr + slab->backing.size);
+         assert(slab->live_allocs > 0);
          util_vma_heap_free(&slab->heap, alloc->addr, alloc->size);
          *alloc = (struct hk_descriptor_allocation){0};
+         if (--slab->live_allocs == 0) {
+            if (slab->backing.size > HK_USC_HEAP_SLAB_SIZE ||
+                table->empty_slabs >= 1) {
+               util_vma_heap_finish(&slab->heap);
+               table->ops->destroy(table->data, &slab->backing);
+               list_del(&slab->link);
+               free(slab);
+            } else {
+               slab->warm_empty = true;
+               ++table->empty_slabs;
+            }
+         }
          return;
       }
    }
@@ -79,11 +107,11 @@ hk_usc_heap_free(struct hk_usc_heap *table,
 void
 hk_usc_heap_finish(struct hk_usc_heap *table)
 {
-   list_for_each_entry_safe(struct hk_descriptor_chunk, slab, &table->slabs,
-                            link) {
+   list_for_each_entry_safe(struct hk_usc_slab, slab, &table->slabs, link) {
       util_vma_heap_finish(&slab->heap);
       table->ops->destroy(table->data, &slab->backing);
       list_del(&slab->link);
       free(slab);
    }
+   table->empty_slabs = 0;
 }

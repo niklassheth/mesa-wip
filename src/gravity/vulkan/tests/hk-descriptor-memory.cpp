@@ -278,3 +278,51 @@ TEST(HkUscHeap, MixedObjectSizesAlignmentAndLifetime)
    hk_usc_heap_finish(&heap);
    EXPECT_TRUE(dev.live.empty());
 }
+
+TEST(HkUscHeap, ReclaimsExcessEmptySlabsAndOversizedSlabs)
+{
+   FakeDevice dev;
+   hk_usc_heap heap;
+   hk_usc_heap_init(&heap, &fake_ops, &dev);
+
+   hk_descriptor_allocation s1{}, s2{}, s3{}, big{};
+   ASSERT_TRUE(hk_usc_heap_alloc(&heap, HK_USC_HEAP_SLAB_SIZE, 64, &s1));
+   ASSERT_TRUE(hk_usc_heap_alloc(&heap, HK_USC_HEAP_SLAB_SIZE, 64, &s2));
+   ASSERT_TRUE(hk_usc_heap_alloc(&heap, HK_USC_HEAP_SLAB_SIZE, 64, &s3));
+   ASSERT_TRUE(hk_usc_heap_alloc(&heap, 2 * HK_USC_HEAP_SLAB_SIZE, 64, &big));
+   EXPECT_EQ(dev.live.size(), 4u);
+
+   /* Oversized empty slab is destroyed immediately instead of held warm. */
+   hk_usc_heap_free(&heap, &big);
+   EXPECT_EQ(dev.live.size(), 3u);
+   EXPECT_EQ(heap.empty_slabs, 0u);
+
+   /* First empty standard slab is retained warm; subsequent empty slabs are
+    * destroyed immediately. */
+   hk_usc_heap_free(&heap, &s1);
+   EXPECT_EQ(dev.live.size(), 3u);
+   EXPECT_EQ(heap.empty_slabs, 1u);
+
+   hk_usc_heap_free(&heap, &s2);
+   EXPECT_EQ(dev.live.size(), 2u);
+   EXPECT_EQ(heap.empty_slabs, 1u);
+
+   hk_usc_heap_free(&heap, &s3);
+   EXPECT_EQ(dev.live.size(), 1u);
+   EXPECT_EQ(heap.empty_slabs, 1u);
+
+   /* Reusing the single warm slab consumes no new BO and resets empty_slabs. */
+   hk_descriptor_allocation reuse{};
+   ASSERT_TRUE(hk_usc_heap_alloc(&heap, 64, 64, &reuse));
+   EXPECT_EQ(dev.creates, 4u);
+   EXPECT_EQ(dev.live.size(), 1u);
+   EXPECT_EQ(heap.empty_slabs, 0u);
+
+   hk_usc_heap_free(&heap, &reuse);
+   EXPECT_EQ(dev.live.size(), 1u);
+   EXPECT_EQ(heap.empty_slabs, 1u);
+
+   hk_usc_heap_finish(&heap);
+   EXPECT_TRUE(dev.live.empty());
+   EXPECT_EQ(heap.empty_slabs, 0u);
+}
