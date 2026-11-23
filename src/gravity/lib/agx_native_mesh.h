@@ -21,6 +21,11 @@ agx_native_mesh_parse(const char *text, size_t size, const char *classes);
 struct agx_native_mesh_support
 agx_native_mesh_probe(int drm_fd, const char *classes);
 
+/* True when the kernel's asahi_native_mesh sysfs attribute explicitly reports
+ * profile=none (native mesh decoding disabled in kernel). */
+bool agx_native_mesh_parse_disabled(const char *text, size_t size);
+bool agx_native_mesh_probe_disabled(int drm_fd);
+
 static inline bool
 agx_native_mesh_same_qualification(struct agx_native_mesh_support before,
                                    struct agx_native_mesh_support after)

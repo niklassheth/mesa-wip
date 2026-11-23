@@ -5,6 +5,8 @@
 #include "hk_physical_device.h"
 #include "hk_device.h"
 #include "hk_apple9_native_index_classes.h"
+#include "gravity/lib/agx_native_mesh.h"
+#include "util/simple_mtx.h"
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
 #include <string.h>
@@ -164,15 +166,53 @@ hk_apple9_native_mesh_available(const struct hk_physical_device *pdev)
    return hk_apple9_native_mesh_enabled() || hk_apple9_native_index_enabled(pdev);
 }
 
+static bool
+native_mesh_kernel_disabled(const struct hk_device *dev)
+{
+   if (!dev || dev->dev.native_mesh_qualified || dev->dev.fd < 0)
+      return false;
+   /* Real DRM VMs latch their native-mesh profile for the VM lifetime; cache
+    * per (dev, fd, vm_id) to avoid per-draw sysfs open/read syscalls. */
+   if (!dev->dev.vm_id)
+      return agx_native_mesh_probe_disabled(dev->dev.fd);
+   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
+   static const struct hk_device *cached_dev;
+   static int cached_fd = -1;
+   static uint32_t cached_vm_id;
+   static bool cached_disabled;
+   simple_mtx_lock(&lock);
+   if (cached_dev != dev || cached_fd != dev->dev.fd ||
+       cached_vm_id != dev->dev.vm_id) {
+      cached_dev = dev;
+      cached_fd = dev->dev.fd;
+      cached_vm_id = dev->dev.vm_id;
+      cached_disabled = agx_native_mesh_probe_disabled(dev->dev.fd);
+   }
+   bool disabled = cached_disabled;
+   simple_mtx_unlock(&lock);
+   return disabled;
+}
+
 bool
 hk_apple9_native_mesh_available_device(struct hk_device *dev)
 {
    /* The discovery VM partitions physical-device compiler/cache policy. It
     * cannot authorize a distinct logical VM: recording also needs that VM's
-    * own immutable qualification. Research keeps its explicit pairing. */
-   return hk_apple9_native_mesh_enabled() ||
-          (dev->dev.native_mesh_qualified &&
-           hk_apple9_native_index_enabled(hk_device_physical(dev)));
+    * own immutable qualification. Research keeps its explicit pairing, unless
+    * the kernel explicitly advertises profile=none (decoding disabled). */
+   if (hk_apple9_native_mesh_enabled()) {
+      if (native_mesh_kernel_disabled(dev)) {
+         static bool warned_disabled;
+         if (!p_atomic_xchg(&warned_disabled, true))
+            fprintf(stderr,
+                    "HK_APPLE9_NATIVE_MESH: kernel reports profile=none; "
+                    "refusing native mesh submission\n");
+         return false;
+      }
+      return true;
+   }
+   return dev->dev.native_mesh_qualified &&
+          hk_apple9_native_index_enabled(hk_device_physical(dev));
 }
 
 uint8_t
@@ -206,9 +246,9 @@ hk_apple9_native_stage_available_device(struct hk_device *dev,
                                         mesa_shader_stage stage)
 {
    if (stage == MESA_SHADER_GEOMETRY && hk_apple9_native_gs_enabled())
-      return true;
+      return !native_mesh_kernel_disabled(dev);
    if (stage == MESA_SHADER_TESS_EVAL && hk_apple9_native_tess_enabled())
-      return true;
+      return !native_mesh_kernel_disabled(dev);
    unsigned bit = stage == MESA_SHADER_GEOMETRY ? HK_APPLE9_NATIVE_GS_BIT
                 : stage == MESA_SHADER_TESS_EVAL ? HK_APPLE9_NATIVE_TES_BIT : 0;
    return dev->dev.native_mesh_qualified &&

@@ -109,6 +109,13 @@ int main(void)
    snprintf(changed, sizeof(changed), "asahi-native-mesh v1 generation=17 profile=qualified classes=%s\n", hash);
    strcpy(wrong, yes); wrong[strlen(wrong)-2] ^= 1;
    const char *none = "asahi-native-mesh v1 generation=15 profile=none classes=-\n";
+   const char *research = "asahi-native-mesh v1 generation=15 profile=research classes=-\n";
+   CHECK(agx_native_mesh_parse_disabled(none, strlen(none)));
+   CHECK(!agx_native_mesh_parse_disabled(yes, strlen(yes)));
+   CHECK(!agx_native_mesh_parse_disabled(research, strlen(research)));
+   CHECK(!agx_native_mesh_parse_disabled("", 0));
+   CHECK(!agx_native_mesh_parse_disabled(NULL, 0));
+   CHECK(!agx_native_mesh_parse_disabled("asahi-native-mesh v2 generation=1 profile=none classes=-\n", 56));
    uint64_t positive = check(16, yes, yes, true, false);
    uint64_t negative = check(16, none, none, false, false);
    CHECK((positive ^ negative) == (1ull << 60));

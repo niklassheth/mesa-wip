@@ -176,3 +176,27 @@ agx_native_blocks_probe(int drm_fd)
    size_t size = read_attribute(drm_fd, "asahi_native_blocks", text, sizeof(text));
    return size ? agx_native_blocks_parse(text, size) : no;
 }
+
+bool
+agx_native_mesh_parse_disabled(const char *text, size_t size)
+{
+   if (!text || !size || size > AGX_NATIVE_MESH_ADVERTISEMENT_MAX ||
+       text[size - 1] != '\n')
+      return false;
+   size_t pos = 0, end = size - 1;
+   uint64_t generation;
+   if (!parse_literal(text, end, &pos, "asahi-native-mesh v1 generation=") ||
+       !parse_decimal(text, end, &pos, AGX_NATIVE_MESH_GENERATION_MAX, &generation))
+      return false;
+   return parse_literal(text, end, &pos, " profile=none ");
+}
+
+bool
+agx_native_mesh_probe_disabled(int drm_fd)
+{
+   if (drm_fd < 0)
+      return false;
+   char text[AGX_NATIVE_MESH_ADVERTISEMENT_MAX + 1];
+   size_t size = read_attribute(drm_fd, "asahi_native_mesh", text, sizeof(text));
+   return size ? agx_native_mesh_parse_disabled(text, size) : false;
+}
