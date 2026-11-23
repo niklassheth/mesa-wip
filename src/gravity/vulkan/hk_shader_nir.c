@@ -1090,16 +1090,70 @@ hk_first_use_index(nir_intrinsic_instr *load)
 /* Largest merged robust load, in bytes. */
 #define HK_APPLE9_ROBUST_MERGE_BYTES 16
 
-/* Peak number of live 32-bit words in a shader, from NIR liveness: a
- * backward walk of each block from its live-out set. 16-bit values count as
- * half a word; constants and undefs are free (immediates).
+/* Peak number of live 32-bit GPR words in a shader, from NIR liveness:
+ * a backward walk of each block from its live-out set. 16-bit values count as
+ * half a word; constants, undefs, and top-level non-divergent values that
+ * nir_opt_preamble hoists into uniform registers are free.
  */
-static unsigned
-hk_def_halves(const nir_def *def)
+static bool
+hk_src_is_preamble_eligible(nir_src *src, void *data)
 {
-   nir_instr *instr = nir_def_instr((nir_def *)def);
+   return ((const bool *)data)[src->ssa->index];
+}
+
+/* Compute preamble eligibility in a single forward SSA pass (zero recursion),
+ * matching the backend's top-level straight-line preamble subset and
+ * reorderability requirement. */
+static bool
+hk_instr_preamble_eligible(nir_instr *instr, const nir_def *def,
+                           const bool *preamble_eligible)
+{
    if (instr->type == nir_instr_type_load_const ||
        instr->type == nir_instr_type_undef)
+      return true;
+   if (def->divergent || !instr->block ||
+       instr->block->cf_node.parent->type != nir_cf_node_function)
+      return false;
+
+   switch (instr->type) {
+   case nir_instr_type_alu:
+      return nir_foreach_src(instr, hk_src_is_preamble_eligible,
+                             (void *)preamble_eligible);
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      switch (intr->intrinsic) {
+      case nir_intrinsic_load_ubo:
+      case nir_intrinsic_load_preamble:
+      case nir_intrinsic_load_uniform:
+      case nir_intrinsic_load_push_constant:
+      case nir_intrinsic_load_constant_agx:
+      case nir_intrinsic_load_global_constant:
+      case nir_intrinsic_load_ro_sink_address_poly:
+         return nir_foreach_src(instr, hk_src_is_preamble_eligible,
+                                (void *)preamble_eligible);
+      case nir_intrinsic_load_global:
+      case nir_intrinsic_load_global_2x32:
+      case nir_intrinsic_load_global_bounded:
+      case nir_intrinsic_load_ssbo: {
+         enum gl_access_qualifier access = nir_intrinsic_access(intr);
+         return !(access & ACCESS_VOLATILE) &&
+                ((access & ACCESS_CAN_REORDER) != 0) &&
+                nir_foreach_src(instr, hk_src_is_preamble_eligible,
+                                (void *)preamble_eligible);
+      }
+      default:
+         return false;
+      }
+   }
+   default:
+      return false;
+   }
+}
+
+static unsigned
+hk_def_halves(const nir_def *def, const bool *preamble_eligible)
+{
+   if (preamble_eligible[def->index])
       return 0;
    return def->num_components * MAX2(def->bit_size, 16) / 16;
 }
@@ -1113,6 +1167,7 @@ hk_index_def(nir_def *def, void *data)
 
 struct hk_live_walk {
    bool *live;
+   const bool *preamble_eligible;
    unsigned *halves;
 };
 
@@ -1122,7 +1177,7 @@ hk_add_live_src(nir_src *src, void *data)
    struct hk_live_walk *walk = data;
    if (!walk->live[src->ssa->index]) {
       walk->live[src->ssa->index] = true;
-      *walk->halves += hk_def_halves(src->ssa);
+      *walk->halves += hk_def_halves(src->ssa, walk->preamble_eligible);
    }
    return true;
 }
@@ -1130,19 +1185,28 @@ hk_add_live_src(nir_src *src, void *data)
 static unsigned
 hk_apple9_peak_live_words(nir_shader *nir)
 {
+   nir_divergence_analysis(nir);
    unsigned peak = 0;
    nir_foreach_function_impl(impl, nir) {
       nir_metadata_require(impl, nir_metadata_block_index | nir_metadata_live_defs);
       nir_def **defs = calloc(impl->ssa_alloc, sizeof(*defs));
       bool *live = calloc(impl->ssa_alloc, sizeof(*live));
-      if (!defs || !live) {
+      bool *preamble_eligible = calloc(impl->ssa_alloc, sizeof(*preamble_eligible));
+      if (!defs || !live || !preamble_eligible) {
+         free(preamble_eligible);
          free(live);
          free(defs);
          continue;
       }
       nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block)
+         nir_foreach_instr(instr, block) {
             nir_foreach_def(instr, hk_index_def, defs);
+            nir_def *def = nir_instr_def(instr);
+            if (def) {
+               preamble_eligible[def->index] =
+                  hk_instr_preamble_eligible(instr, def, preamble_eligible);
+            }
+         }
       }
       nir_foreach_block(block, impl) {
          memset(live, 0, impl->ssa_alloc * sizeof(*live));
@@ -1150,7 +1214,7 @@ hk_apple9_peak_live_words(nir_shader *nir)
          U_SPARSE_BITSET_FOREACH_SET(&block->live_out, i) {
             live[i] = true;
             if (defs[i])
-               halves += hk_def_halves(defs[i]);
+               halves += hk_def_halves(defs[i], preamble_eligible);
          }
          peak = MAX2(peak, halves);
          nir_foreach_instr_reverse(instr, block) {
@@ -1159,13 +1223,14 @@ hk_apple9_peak_live_words(nir_shader *nir)
             nir_def *def = nir_instr_def(instr);
             if (def && live[def->index]) {
                live[def->index] = false;
-               halves -= hk_def_halves(def);
+               halves -= hk_def_halves(def, preamble_eligible);
             }
-            struct hk_live_walk walk = {live, &halves};
+            struct hk_live_walk walk = {live, preamble_eligible, &halves};
             nir_foreach_src(instr, hk_add_live_src, &walk);
             peak = MAX2(peak, halves);
          }
       }
+      free(preamble_eligible);
       free(live);
       free(defs);
    }
@@ -1206,13 +1271,16 @@ hk_apple9_vectorized_peak(const nir_shader *nir, bool windowed, bool soft_fault)
                                    .callback = hk_apple9_vectorize_cb,
                                    .cb_data = &policy,
                                 });
+   nir_opt_dce(clone);
    unsigned peak = hk_apple9_peak_live_words(clone);
    ralloc_free(clone);
    return peak;
 }
 
-/* Below this peak of live 32-bit words, loads merge without windows. */
-#define HK_APPLE9_VECTORIZE_PRESSURE_BUDGET 96
+/* Above this divergent live-word peak, unwindowed merging is only allowed if
+ * it does not increase peak live words (e.g. by eliminating CSE'd +4/+8/+12
+ * address offsets). */
+#define HK_APPLE9_VECTORIZE_PRESSURE_BUDGET 80
 
 /* Compute the proven power-of-two stride modulo 2^32 and constant remainder of
  * a 32-bit offset expression (returning 0 when the offset is constant). Only
@@ -3299,14 +3367,18 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    const bool soft_fault = agx_has_soft_fault(&dev->dev);
    unsigned peak = hk_apple9_peak_live_words(nir);
    struct hk_vectorize_policy policy = {
-      .windowed = peak > HK_APPLE9_VECTORIZE_PRESSURE_BUDGET,
+      .windowed = peak > 2 * HK_APPLE9_VECTORIZE_PRESSURE_BUDGET,
       .soft_fault = soft_fault,
    };
    unsigned peak_windowed = 0, peak_free = 0;
    if (!policy.windowed) {
       peak_windowed = hk_apple9_vectorized_peak(nir, true, soft_fault);
       peak_free = hk_apple9_vectorized_peak(nir, false, soft_fault);
-      policy.windowed = peak_free > peak_windowed;
+      /* Keep windowed merging if unwindowed merging still exceeds the pressure
+       * budget (unless it strictly reduces peak live words below windowed, e.g.
+       * by eliminating dozens of CSE'd +4/+8/+12 offsets). */
+      policy.windowed = peak_free > HK_APPLE9_VECTORIZE_PRESSURE_BUDGET &&
+                        !(peak_free + 8u <= peak_windowed && peak_free <= 88u);
    }
    if (agx_apple9_debug_enabled(AGX_A9_DBG_PRESSURE))
       fprintf(stderr,

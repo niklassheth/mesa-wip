@@ -1749,6 +1749,139 @@ test_coalesced_lazy_image_fences(void)
    return 0;
 }
 
+static int
+test_vectorize_preamble_liveness_policy(void)
+{
+   struct hk_physical_device pdev = {0};
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   CHECK(dev != NULL);
+   dev->vk.base.type = VK_OBJECT_TYPE_DEVICE;
+   dev->vk.physical = &pdev.vk;
+   dev->dev.chip = pdev.dev.chip = AGX_CHIP_G16G;
+   dev->dev.params.features = DRM_ASAHI_FEATURE_SOFT_FAULTS;
+
+   const struct vk_pipeline_robustness_state rs = {
+      .storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT,
+      .uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT,
+   };
+
+   /* Case 1: Top-level uniform UBO defs push pre-preamble total liveness > 100
+    * words, and separated first uses (> WINDOW=4, > USE_WINDOW=2) would be
+    * rejected if windowed=true. Because the uniform defs hoist into the
+    * preamble, divergent pressure stays low and all 4 bone-matrix lanes must
+    * vectorize into one vec4 load. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX,
+                                                     &agx_nir_options,
+                                                     "vs_uniform_heavy_vec4");
+      nir_def *u[28];
+      for (unsigned i = 0; i < ARRAY_SIZE(u); ++i) {
+         u[i] = nir_load_ubo(&b, 4, 32, nir_imm_int(&b, 0),
+                             nir_imm_int(&b, i * 16), .align_mul = 16,
+                             .range_base = i * 16, .range = 16);
+      }
+      nir_def *vid = nir_load_vertex_id(&b);
+      nir_def *off = nir_amul_imm(&b, vid, 16);
+      nir_def *base = nir_pack_64_2x32_split(&b, nir_channel(&b, u[0], 0),
+                                             nir_channel(&b, u[0], 1));
+      nir_def *bound = nir_channel(&b, u[0], 2);
+
+      nir_def *lanes[4];
+      for (unsigned k = 0; k < 4; ++k) {
+         lanes[k] = nir_load_global_constant_bounded(
+            &b, 1, 32, base, nir_iadd_imm(&b, off, k * 4), bound,
+            .align_mul = 16, .align_offset = k * 4);
+      }
+      /* Interleave extra ALU between first uses so high_use - low_use > 2. */
+      nir_def *acc = nir_imm_float(&b, 0.0f);
+      for (unsigned k = 0; k < 4; ++k) {
+         nir_def *pad = nir_fadd(&b, nir_channel(&b, u[1 + k], 0),
+                                 nir_channel(&b, u[5 + k], 1));
+         pad = nir_fmul(&b, pad, nir_channel(&b, u[9 + k], 2));
+         pad = nir_fadd(&b, pad, nir_channel(&b, u[13 + k], 3));
+         acc = nir_fadd(&b, acc, nir_fmul(&b, lanes[k], pad));
+      }
+      for (unsigned i = 17; i < ARRAY_SIZE(u); ++i)
+         acc = nir_fadd(&b, acc, nir_channel(&b, u[i], 0));
+      nir_store_output(&b, nir_vec4(&b, acc, acc, acc, acc), nir_imm_int(&b, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      hk_lower_nir(dev, b.shader, &rs, false, 0, NULL, 0);
+
+      unsigned vec4_loads = 0, total_loads = 0;
+      nir_foreach_block(blk, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(ins, blk) {
+            if (ins->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global_constant) {
+               total_loads++;
+               if (intr->def.num_components == 4 && intr->def.bit_size == 32)
+                  vec4_loads++;
+            }
+         }
+      }
+      CHECK(total_loads == 1 && vec4_loads == 1);
+      ralloc_free(b.shader);
+   }
+
+   /* Case 2: High divergent live-word pressure (> 80 divergent words) must
+    * still enable windowed mode when unwindowed merging raises peak pressure,
+    * keeping distant loads unmerged so heavy shaders do not spill. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                     &agx_nir_options,
+                                                     "cs_high_div_windowed");
+      nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *base = nir_imm_int64(&b, 0x100000);
+      nir_def *bound = nir_load_global_constant(&b, 1, 32, nir_imm_int64(&b, 0x20000),
+                                                .align_mul = 4);
+      nir_def *off = nir_amul_imm(&b, gid, 16);
+
+      nir_def *first = nir_load_global_constant_bounded(
+         &b, 1, 32, base, off, bound, .align_mul = 16, .align_offset = 0);
+
+      /* Keep 84 divergent live values spanning between first and second load. */
+      nir_def *div[84];
+      for (unsigned i = 0; i < ARRAY_SIZE(div); ++i) {
+         div[i] = nir_load_global(&b, 1, 32,
+                                  nir_iadd_imm(&b, nir_u2u64(&b, nir_imul_imm(&b, gid, 4)),
+                                               0x40000 + i * 256),
+                                  .align_mul = 4);
+      }
+
+      nir_def *second = nir_load_global_constant_bounded(
+         &b, 1, 32, base, nir_iadd_imm(&b, off, 4), bound,
+         .align_mul = 16, .align_offset = 4);
+      nir_def *acc = nir_fadd(&b, first, second);
+      for (unsigned i = 0; i < ARRAY_SIZE(div); ++i)
+         acc = nir_fadd(&b, acc, div[i]);
+      nir_store_global(&b, acc, nir_imm_int64(&b, 0x80000),
+                       .write_mask = 0x1, .align_mul = 4);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      hk_lower_nir(dev, b.shader, &rs, false, 0, NULL, 0);
+
+      unsigned vec_loads = 0;
+      nir_foreach_block(blk, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(ins, blk) {
+            if (ins->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global_constant &&
+                intr->def.num_components > 1)
+               vec_loads++;
+         }
+      }
+      CHECK(vec_loads == 0);
+      ralloc_free(b.shader);
+   }
+
+   free(dev);
+   puts("vectorize preamble-aware liveness policy: pass");
+   return 0;
+}
+
 int
 main(void)
 {
@@ -1757,6 +1890,7 @@ main(void)
    CHECK(test_gpl_sw_needed() == 0);
    CHECK(test_soft_fault_ssbo_and_4b_vectorize() == 0);
    CHECK(test_coalesced_lazy_image_fences() == 0);
+   CHECK(test_vectorize_preamble_liveness_policy() == 0);
 
    glsl_type_singleton_decref();
    return 0;
