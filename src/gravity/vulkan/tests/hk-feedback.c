@@ -9,6 +9,8 @@
 #include "../hk_image.h"
 #include "../hk_image_view.h"
 #include "../hk_sync.h"
+#include "vk_framebuffer.h"
+#include "vk_render_pass.h"
 #include "gravity/lib/agx_tilebuffer.h"
 #include "libagx_shaders.h"
 
@@ -674,6 +676,89 @@ main(void)
    CHECK(cb_ro.state.gfx.render.store_none_color_mask == 1);
    CHECK(cb_ro.state.gfx.render.no_store_color_mask == 1);
    CHECK(cb_ro.feedback_ops.size == 0);
+
+   /* Secondary command buffers inherit a render-pass subpass via
+    * VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT and record exclusively
+    * into vk.cmd_queue. Beginning/ending a secondary CB with a compressed
+    * feedback-loop attachment must NOT invoke hk_CmdBeginRendering(), enqueue
+    * meta self-blit commands, emit control streams, or record feedback_ops.
+    */
+   struct vk_render_pass_attachment sec_rp_att = {
+      .format = VK_FORMAT_R8G8B8A8_UNORM,
+      .aspects = VK_IMAGE_ASPECT_COLOR_BIT,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .load_op = VK_ATTACHMENT_LOAD_OP_LOAD,
+      .store_op = VK_ATTACHMENT_STORE_OP_STORE,
+   };
+   struct vk_subpass_attachment sec_sp_att = {
+      .attachment = 0,
+      .aspects = VK_IMAGE_ASPECT_COLOR_BIT,
+      .layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+   };
+   struct vk_subpass sec_sp = {
+      .color_count = 1,
+      .color_attachments = &sec_sp_att,
+      .view_mask = 1,
+   };
+   struct vk_render_pass sec_rp = {
+      .view_mask = 1,
+      .attachment_count = 1,
+      .attachments = &sec_rp_att,
+      .subpass_count = 1,
+      .subpasses = &sec_sp,
+   };
+   vk_object_base_init(&dev_a.vk, &sec_rp.base, VK_OBJECT_TYPE_RENDER_PASS);
+   struct {
+      struct vk_framebuffer fb;
+      VkImageView att[1];
+   } sec_fb_wrap = {
+      .fb = {
+         .width = 64,
+         .height = 64,
+         .layers = 1,
+         .attachment_count = 1,
+      },
+      .att = { hk_image_view_to_handle(&iv_img) },
+   };
+   vk_object_base_init(&dev_a.vk, &sec_fb_wrap.fb.base,
+                       VK_OBJECT_TYPE_FRAMEBUFFER);
+   const VkCommandBufferInheritanceInfo sec_inh = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO,
+      .renderPass = vk_render_pass_to_handle(&sec_rp),
+      .subpass = 0,
+      .framebuffer = vk_framebuffer_to_handle(&sec_fb_wrap.fb),
+   };
+   const VkCommandBufferBeginInfo sec_begin = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT,
+      .pInheritanceInfo = &sec_inh,
+   };
+   /* Confirm the inheritance info genuinely yields a feedback-loop resume. */
+   char sec_gcbiar[VK_GCBIARR_DATA_SIZE(HK_MAX_RTS)];
+   const VkRenderingInfo *sec_resume =
+      vk_get_command_buffer_inheritance_as_rendering_resume(
+         VK_COMMAND_BUFFER_LEVEL_SECONDARY, &sec_begin, sec_gcbiar);
+   CHECK(sec_resume && sec_resume->colorAttachmentCount == 1);
+   CHECK(sec_resume->pColorAttachments[0].imageLayout ==
+         VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT);
+
+   struct hk_cmd_buffer cb_sec = {0};
+   vk_object_base_init(&dev_a.vk, &cb_sec.vk.base,
+                       VK_OBJECT_TYPE_COMMAND_BUFFER);
+   cb_sec.vk.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+   cb_sec.vk.state = MESA_VK_COMMAND_BUFFER_STATE_INITIAL;
+   list_inithead(&cb_sec.vk.cmd_queue.cmds);
+   list_inithead(&cb_sec.control_streams);
+   unsigned precomp_before_sec = precomp_dispatches;
+   CHECK(hk_BeginCommandBuffer(hk_cmd_buffer_to_handle(&cb_sec), &sec_begin) ==
+         VK_SUCCESS);
+   CHECK(hk_EndCommandBuffer(hk_cmd_buffer_to_handle(&cb_sec)) == VK_SUCCESS);
+   CHECK(list_is_empty(&cb_sec.vk.cmd_queue.cmds));
+   CHECK(list_is_empty(&cb_sec.control_streams));
+   CHECK(cb_sec.feedback_ops.size == 0);
+   CHECK(cb_sec.feedback_raw.size == 0);
+   CHECK(!cb_sec.rendering);
+   CHECK(precomp_dispatches == precomp_before_sec);
 
    /* Clean up active raw image links and dynamically allocated streams. */
    hk_feedback_image_destroy(&img);

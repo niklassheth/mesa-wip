@@ -444,6 +444,16 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
 
    perf_debug(cmd, "Begin command buffer");
+   /* Secondary command buffers only enqueue commands into vk.cmd_queue via
+    * vk_cmd_enqueue_unless_primary and replay into the primary command buffer
+    * during vkCmdExecuteCommands. Running primary graphics/render setup here
+    * would allocate unused streams and, for compressed feedback attachments,
+    * dispatch vk_meta_blit_image() through the device dispatch table into
+    * vk.cmd_queue, replaying a nested render pass inside the primary subpass.
+    */
+   if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)
+      return VK_SUCCESS;
+
    hk_cmd_buffer_begin_compute(cmd, pBeginInfo);
    hk_cmd_buffer_begin_graphics(cmd, pBeginInfo);
 
@@ -524,6 +534,12 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
     * recording error without trying to finish or merge that stream. */
    if (vk_command_buffer_has_error(&cmd->vk))
       return vk_command_buffer_end(&cmd->vk);
+
+   if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+      assert(list_is_empty(&cmd->control_streams) &&
+             "secondary command buffers only enqueue commands");
+      return vk_command_buffer_end(&cmd->vk);
+   }
 
 
    hk_cmd_render_merge_flush(cmd);

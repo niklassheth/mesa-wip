@@ -89,54 +89,9 @@ hk_cmd_buffer_dirty_render_pass(struct hk_cmd_buffer *cmd)
 
 void
 hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
-                             const VkCommandBufferBeginInfo *pBeginInfo)
+                             UNUSED const VkCommandBufferBeginInfo *pBeginInfo)
 {
-   if (cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
-       (pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT)) {
-      char gcbiar_data[VK_GCBIARR_DATA_SIZE(HK_MAX_RTS)];
-      const VkRenderingInfo *resume_info =
-         vk_get_command_buffer_inheritance_as_rendering_resume(
-            cmd->vk.level, pBeginInfo, gcbiar_data);
-      if (resume_info) {
-         hk_CmdBeginRendering(hk_cmd_buffer_to_handle(cmd), resume_info);
-      } else {
-         const VkCommandBufferInheritanceRenderingInfo *inheritance_info =
-            vk_get_command_buffer_inheritance_rendering_info(cmd->vk.level,
-                                                             pBeginInfo);
-         assert(inheritance_info);
-
-         struct hk_rendering_state *render = &cmd->state.gfx.render;
-         render->flags = inheritance_info->flags;
-         render->area = (VkRect2D){};
-         render->layer_count = 0;
-         render->view_mask = inheritance_info->viewMask;
-         render->tilebuffer.nr_samples = inheritance_info->rasterizationSamples;
-
-         render->color_att_count = inheritance_info->colorAttachmentCount;
-         for (uint32_t i = 0; i < render->color_att_count; i++) {
-            render->color_att[i].vk_format =
-               inheritance_info->pColorAttachmentFormats[i];
-         }
-         render->depth_att.vk_format = inheritance_info->depthAttachmentFormat;
-         render->stencil_att.vk_format =
-            inheritance_info->stencilAttachmentFormat;
-
-         const VkRenderingAttachmentLocationInfoKHR att_loc_info_default = {
-            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR,
-            .colorAttachmentCount = inheritance_info->colorAttachmentCount,
-         };
-         const VkRenderingAttachmentLocationInfoKHR *att_loc_info =
-            vk_get_command_buffer_rendering_attachment_location_info(
-               cmd->vk.level, pBeginInfo);
-         if (att_loc_info == NULL)
-            att_loc_info = &att_loc_info_default;
-
-         vk_cmd_set_rendering_attachment_locations(&cmd->vk, att_loc_info);
-
-         hk_cmd_buffer_dirty_render_pass(cmd);
-      }
-   }
-
+   assert(cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY);
    hk_cmd_buffer_dirty_all(cmd);
 
    /* If multiview is disabled, always read 0. If multiview is enabled,
@@ -1261,6 +1216,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                      const VkRenderingInfo *pRenderingInfo)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   assert(cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY);
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
 
