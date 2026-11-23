@@ -1156,12 +1156,15 @@ TEST(Apple9SharedRa, AsyncImageStoresOverlapSixTuplesZeroJoinsAndDrainAtFence)
 
       unsigned stores = 0, waits_before_fence = 0, waits_at_fence = 0;
       unsigned tuple_mask = 0, slot_mask = 0;
+      uint8_t fence_mask = 0;
       bool saw_fence = false;
       for (unsigned i = 0; i < p.instruction_count; ++i) {
          const auto *I = p.instructions[i];
          if (I->op == AGX_APPLE9_VIR_DEVICE_FENCE &&
-             I->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE)
+             I->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE) {
             saw_fence = true;
+            fence_mask = I->fence_slot_mask;
+         }
          if (I->op == AGX_APPLE9_VIR_WAIT) {
             if (!saw_fence && stores < count)
                ++waits_before_fence;
@@ -1181,10 +1184,17 @@ TEST(Apple9SharedRa, AsyncImageStoresOverlapSixTuplesZeroJoinsAndDrainAtFence)
          agx_apple9_packed_instruction packed;
          ASSERT_TRUE(agx_apple9_pack_vir_instruction(I, p.phys, &packed, &reason))
             << (reason ?: "");
+         if (I->op == AGX_APPLE9_VIR_DEVICE_FENCE &&
+             I->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE) {
+            const uint8_t exp_all6[] = {0x07, 0xf4, 0x57, 0x50, 0x06, 0x00};
+            ASSERT_EQ(packed.length, 6u);
+            EXPECT_EQ(memcmp(packed.bytes, exp_all6, sizeof(exp_all6)), 0);
+         }
       }
       EXPECT_EQ(stores, count);
       EXPECT_EQ(tuple_mask, BITFIELD_MASK(6)); /* All 6 tuples p0..p40 used. */
       EXPECT_EQ(slot_mask, BITFIELD_MASK(6));  /* All 6 slots 1..6 used. */
+      EXPECT_EQ(fence_mask, BITFIELD_MASK(6)); /* FENCE_IMAGE_WRITE drains all 6 slots. */
       /* 6 back-to-back stores issue with ZERO waits between them; the 7th
        * waits once when reusing p0..p7. All pending stores drain before 0x0650. */
       EXPECT_EQ(waits_before_fence, count == 6 ? 0u : 1u);

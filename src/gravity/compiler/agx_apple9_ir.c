@@ -8170,16 +8170,24 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
        * the form Metal places at the end of a raster order group critical
        * section, before the fragment's tile release.
        *
-       * FENCE_IMAGE_WRITE (0x0650, waiting on slot 1) drains native PBE image
-       * writes to memory; FENCE_TEX_INVALIDATE (0x06d0) invalidates the
-       * texture cache so subsequent texture loads observe the written memory.
-       * Fragment PBE drain uses byte 2 = 0x64; workgroup texture barriers use
+       * FENCE_IMAGE_WRITE (0x0650) drains native PBE image writes to memory,
+       * encoding a 6-bit scoreboard slot wait mask in bits 12..17
+       * (byte 1 = 0x04 | ((mask & 0xf) << 4), byte 2 |= (mask >> 4) & 0x3);
+       * FENCE_TEX_INVALIDATE (0x06d0) invalidates the texture cache so
+       * subsequent texture loads observe the written memory. Fragment PBE
+       * drain uses byte 2 base 0x64; workgroup texture barriers use
        * 0x0e51 / 0x0ed1. */
       if (instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE ||
           instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS) {
+         const uint8_t mask = (instruction->fence_slot_mask & 0x3fu)
+                                 ? (instruction->fence_slot_mask & 0x3fu)
+                                 : 0x01u;
+         const uint8_t base2 =
+            instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS ? 0x64u : 0x54u;
          const uint8_t bytes[] = {
-            0x07, 0x14,
-            instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS ? 0x64 : 0x54,
+            0x07,
+            (uint8_t)(0x04u | ((mask & 0x0fu) << 4)),
+            (uint8_t)(base2 | ((mask >> 4) & 0x03u)),
             0x50, 0x06, 0};
          packed_init(packed, bytes, sizeof(bytes));
          return true;
@@ -8190,7 +8198,14 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
          return true;
       }
       if (instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP) {
-         const uint8_t bytes[] = {0x07, 0x14, 0x54, 0x51, 0x0e, 0};
+         const uint8_t mask = (instruction->fence_slot_mask & 0x3fu)
+                                 ? (instruction->fence_slot_mask & 0x3fu)
+                                 : 0x01u;
+         const uint8_t bytes[] = {
+            0x07,
+            (uint8_t)(0x04u | ((mask & 0x0fu) << 4)),
+            (uint8_t)(0x54u | ((mask >> 4) & 0x03u)),
+            0x51, 0x0e, 0};
          packed_init(packed, bytes, sizeof(bytes));
          return true;
       }

@@ -1581,14 +1581,21 @@ TEST(Apple9MemEncoding, NativeImageWrite3DCube16BitFragmentAndFences)
       EXPECT_FALSE(agx_apple9_pack_vir_instruction(&p16, phys, &packed, &reason));
    }
 
-   /* Fragment and workgroup texture fences. */
+   /* Fragment, workgroup, and multi-slot texture fences (bits 12..17). */
    const struct {
       enum agx_apple9_fence_mode mode;
+      uint8_t slot_mask;
       uint8_t expected[6];
    } fences[] = {
-      {AGX_APPLE9_FENCE_IMAGE_WRITE_FS, {0x07, 0x14, 0x64, 0x50, 0x06, 0x00}},
-      {AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP, {0x07, 0x14, 0x54, 0x51, 0x0e, 0x00}},
-      {AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP, {0x07, 0x04, 0x54, 0xd1, 0x0e, 0x00}},
+      {AGX_APPLE9_FENCE_IMAGE_WRITE, 0x00, {0x07, 0x14, 0x54, 0x50, 0x06, 0x00}},
+      {AGX_APPLE9_FENCE_IMAGE_WRITE, 0x03, {0x07, 0x34, 0x54, 0x50, 0x06, 0x00}},
+      {AGX_APPLE9_FENCE_IMAGE_WRITE, 0x1e, {0x07, 0xe4, 0x55, 0x50, 0x06, 0x00}},
+      {AGX_APPLE9_FENCE_IMAGE_WRITE, 0x3f, {0x07, 0xf4, 0x57, 0x50, 0x06, 0x00}},
+      {AGX_APPLE9_FENCE_IMAGE_WRITE_FS, 0x00, {0x07, 0x14, 0x64, 0x50, 0x06, 0x00}},
+      {AGX_APPLE9_FENCE_IMAGE_WRITE_FS, 0x02, {0x07, 0x24, 0x64, 0x50, 0x06, 0x00}},
+      {AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP, 0x00, {0x07, 0x14, 0x54, 0x51, 0x0e, 0x00}},
+      {AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP, 0x06, {0x07, 0x64, 0x54, 0x51, 0x0e, 0x00}},
+      {AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP, 0x00, {0x07, 0x04, 0x54, 0xd1, 0x0e, 0x00}},
    };
    const uint8_t zero_phys[] = {0};
    for (const auto &f : fences) {
@@ -1597,6 +1604,7 @@ TEST(Apple9MemEncoding, NativeImageWrite3DCube16BitFragmentAndFences)
       I.encoding = AGX_APPLE9_ENC_DEVICE_FENCE;
       I.dest = AGX_APPLE9_VREG_INVALID;
       I.immediate = f.mode;
+      I.fence_slot_mask = f.slot_mask;
       ASSERT_TRUE(agx_apple9_pack_vir_instruction(&I, zero_phys, &packed, &reason))
          << (reason ?: "");
       ASSERT_EQ(packed.length, 6u);

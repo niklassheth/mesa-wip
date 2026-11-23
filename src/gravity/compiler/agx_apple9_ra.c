@@ -1021,6 +1021,9 @@ struct apple9_pending {
  * stored once, under the slot selected by its machine descriptor. */
 struct apple9_completion {
    struct apple9_pending pending[7];
+   /* Scoreboard slots of IMAGE_STORE instructions issued since the last
+    * FENCE_IMAGE_WRITE (WAIT retires register reuse, not PBE write drain). */
+   uint8_t unfenced_img_slots;
 };
 
 /* Scalar export producers complete asynchronously in the publication namespace.
@@ -1568,6 +1571,7 @@ apple9_merge_pending(struct apple9_completion *to_state,
 {
    struct apple9_pending *to = to_state->pending;
    const struct apple9_pending *from = from_state->pending;
+   to_state->unfenced_img_slots |= from_state->unfenced_img_slots;
    for (unsigned slot = 1; slot <= 6; ++slot) {
       struct apple9_pending *t = &to[slot];
       const struct apple9_pending *f = &from[slot];
@@ -1859,6 +1863,11 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
          }
 
          ins.scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_NONE;
+         const bool is_img_fence =
+            ins.op == AGX_APPLE9_VIR_DEVICE_FENCE &&
+            (ins.immediate == AGX_APPLE9_FENCE_IMAGE_WRITE ||
+             ins.immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS ||
+             ins.immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP);
          const bool barrier = apple9_completion_barrier(&ins, drain);
          unsigned fold = 0, retire = 0;
          for (unsigned slot = 1; slot <= 6; ++slot) {
@@ -1875,6 +1884,10 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
                fold = slot;
             else
                retire |= BITFIELD_BIT(slot - 1);
+         }
+         if (is_img_fence) {
+            ins.fence_slot_mask = state.unfenced_img_slots;
+            state.unfenced_img_slots = 0;
          }
          if (!apple9_retire(&out, &state, retire))
             goto cleanup;
@@ -1956,6 +1969,8 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
                                apple9_conflicting_slots(&state, reservations)))
                goto cleanup;
             ins.producer_scoreboard_slot = slot;
+            if (ins.op == AGX_APPLE9_VIR_IMAGE_STORE)
+               state.unfenced_img_slots |= (uint8_t)BITFIELD_BIT(slot - 1);
             if (ins.op == AGX_APPLE9_VIR_DEVICE_LOAD) {
                const uint16_t tokens[] = {
                   AGX_APPLE9_DEVICE_LOAD_TOKEN_1100, AGX_APPLE9_DEVICE_LOAD_TOKEN_5100,
@@ -1998,6 +2013,28 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
             if (succ[i] && !repeated)
                apple9_merge_pending(&entry[succ[i]->index], &state);
          }
+      }
+   }
+   /* If a FENCE_IMAGE_WRITE had no pending IMAGE_STORE slots at its point of
+    * issue (e.g. already retired across a prior barrier or CFG edge), drain
+    * the union of all IMAGE_STORE scoreboard slots in the program. */
+   unsigned all_img_store_slots = 0;
+   for (unsigned i = 0; i < out.instruction_count; ++i) {
+      const struct agx_apple9_vir_instr *ins = out.instructions[i];
+      if (ins->op == AGX_APPLE9_VIR_IMAGE_STORE &&
+          ins->producer_scoreboard_slot >= 1 &&
+          ins->producer_scoreboard_slot <= 6)
+         all_img_store_slots |= BITFIELD_BIT(ins->producer_scoreboard_slot - 1);
+   }
+   if (all_img_store_slots) {
+      for (unsigned i = 0; i < out.instruction_count; ++i) {
+         struct agx_apple9_vir_instr *ins = out.instructions[i];
+         if (ins->op == AGX_APPLE9_VIR_DEVICE_FENCE &&
+             !ins->fence_slot_mask &&
+             (ins->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE ||
+              ins->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS ||
+              ins->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP))
+            ins->fence_slot_mask = (uint8_t)all_img_store_slots;
       }
    }
    agx_apple9_vir_reindex(&out);

@@ -258,7 +258,7 @@ compile_lowered_fragment(nir_shader *nir, bool use_epilog)
       fprintf(stderr, "fragment compile failed: %s\n", reason ?: "unknown");
    if (ok) {
       const uint8_t *bytes = out.binary;
-      const uint8_t fs_fence[] = {0x07, 0x14, 0x64, 0x50, 0x06, 0x00};
+      const uint8_t fs_fence[] = {0x07, 0x24, 0x64, 0x50, 0x06, 0x00};
       const uint8_t tex_inv[] = {0x07, 0x04, 0x54, 0xd0, 0x06, 0x00};
       const uint8_t tile_600[] = {0x87, 0x02, 0x54, 0x00, 0x06, 0x00};
       bool has_fs_fence = false, has_tex_inv = false, has_600 = false;

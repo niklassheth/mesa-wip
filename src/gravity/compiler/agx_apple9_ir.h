@@ -519,6 +519,9 @@ struct agx_apple9_vir_instr {
     * this at NONE. AUTO is resolved by the scheduled
     * scoreboard pass and is never serialized. */
    uint8_t producer_scoreboard_slot;
+   /* 6-bit scoreboard slot drain mask for FENCE_IMAGE_WRITE (bits 12..17);
+    * zero defaults to slot 1 (0x01). */
+   uint8_t fence_slot_mask;
    bool producer_scoreboard_assigned, scoreboard_assigned;
 
    /* A scratch store has no register result. Its completion is consumed by
