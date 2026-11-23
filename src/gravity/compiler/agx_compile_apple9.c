@@ -924,8 +924,7 @@ apple9_texture_supported(const nir_tex_instr *tex)
             ? (tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array)
             : (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
                tex->sampler_dim == GLSL_SAMPLER_DIM_3D ||
-               (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
-                (!tex->is_array || cube_as_array)));
+               (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && cube_as_array));
       } else if (tex->op == nir_texop_tex) {
          ok &= tex->is_shadow
             ? (tex->sampler_dim == GLSL_SAMPLER_DIM_2D)
@@ -2780,7 +2779,7 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
                   AGX_APPLE9_ENC_LOGIC_EXTENDED, fields, 2, 0);
                /* A biased 2D-array sample takes its minimum LOD (Q6 << 16) in
                 * word 2 and (bias << 16 | layer) in word 3; with offset it uses
-                * mode 0x67db, without offset mode 0x040c. */
+                * mode 0x03c1, without offset mode 0x040c. */
                coords[2] = min_word;
                result = has_offset
                   ? agx_apple9_vir_emit_texture_volume_min_lod(
@@ -2798,7 +2797,8 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
                   &lower->program, c3, word3, texture, sampler, 0, true, false);
             } else {
                uint32_t word3 = min_word;
-               if (dimension == 4 || (dimension == 2 && tex->is_shadow)) {
+               if (dimension == 1 || dimension == 4 ||
+                   (dimension == 2 && tex->is_shadow)) {
                   uint32_t fields[] = {min_word, layer_or_face};
                   word3 = apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR,
                      AGX_APPLE9_ENC_LOGIC_EXTENDED, fields, 2, 0);
@@ -10542,9 +10542,9 @@ apple9_native_min_lod_grad(const nir_tex_instr *tex)
 }
 
 /* Native hardware min_lod_clamp for fragment implicit and biased samples:
- * 2D (0x0804 / 0x02c1), 2D-array (0x040c / 0x67db), 3D (0x2180 / 0x2190),
- * Cube (0x0810 / 0x0814), bindless Cube-array (0x6553), Depth2D (0x0820 /
- * 0x0824), and bindless Depth2D-array (0x64ad). */
+ * 2D (0x0804 / 0x02c1), 2D-array (0x040c / 0x03c1), 3D (0x2180 / 0x2190),
+ * Cube implicit (0x0810), bindless Cube-array implicit (0x0c10), Depth2D
+ * (0x0820 / 0x0824), and bindless Depth2D-array implicit (0x0c20 / 0x0361). */
 static bool
 apple9_native_min_lod_sample(const nir_tex_instr *tex, mesa_shader_stage stage)
 {
@@ -10572,7 +10572,7 @@ apple9_native_min_lod_sample(const nir_tex_instr *tex, mesa_shader_stage stage)
        tex->sampler_dim == GLSL_SAMPLER_DIM_3D || cube_as_array)
       return true;
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
-      return !tex->is_array || (tex->op == nir_texop_tex && bindless_sampler);
+      return tex->op == nir_texop_tex && (!tex->is_array || bindless_sampler);
    return false;
 }
 
@@ -10600,7 +10600,7 @@ apple9_offset_form_encodable(const nir_tex_instr *tex)
          return false;
       if (tex->is_shadow)
          return dimension == 2 && tex->op == nir_texop_tex && bindless_sampler;
-      /* 2D-array bias+min_lod+offset uses explicit mode 0x67db. */
+      /* 2D-array bias+min_lod+offset uses explicit mode 0x03c1. */
       if (dimension == 2)
          return tex->op == nir_texop_tex || tex->op == nir_texop_txb;
    }
@@ -12158,7 +12158,7 @@ apple9_lower_min_lod(nir_builder *b, nir_instr *instr, UNUSED void *data)
    if (native_grad || native_sample) {
       const bool cube_as_array =
          !!(tex->backend_flags & AGX_APPLE9_TEXTURE_CUBE_AS_ARRAY);
-      /* 2D (0x0804 / 0x02c1) and 2D-array (0x040c / 0x67db) use the biased
+      /* 2D (0x0804 / 0x02c1) and 2D-array (0x040c / 0x03c1) use the biased
        * form for implicit samples; 3D, Cube, Cube-array, Depth2D, and
        * Depth2D-array have dedicated implicit min_lod encodings. */
       if (native_sample && tex->op == nir_texop_tex && !tex->is_shadow &&
@@ -12173,9 +12173,13 @@ apple9_lower_min_lod(nir_builder *b, nir_instr *instr, UNUSED void *data)
                                   nir_imm_float(b, 2047.0f / 64.0f));
       nir_def *fixed = nir_f2u32(b, nir_ffloor(b, nir_fmul_imm(b, clamped, 64.0f)));
       b->fp_math_ctrl = fp_math_ctrl;
+      /* Q6 min_lod occupies bits 16..27 (word 3, or word 2 for 2D-array txb)
+       * in every native mode except non-array biased samples (2D 0x0804/0x02c1,
+       * 3D 0x2190, Depth2D 0x0824), where bias takes bits 16..27 and min_lod
+       * occupies bits 0..11. */
       bool shift_high =
-         (native_grad && tex->sampler_dim == GLSL_SAMPLER_DIM_2D) ||
-         (native_sample && (tex->is_array || cube_as_array));
+         native_grad || tex->op != nir_texop_txb || tex->is_array ||
+         cube_as_array;
       nir_tex_instr_add_src(tex, nir_tex_src_backend2,
                             shift_high ? nir_ishl_imm(b, fixed, 16) : fixed);
       return true;

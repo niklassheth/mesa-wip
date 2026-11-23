@@ -16410,6 +16410,20 @@ TEST(Apple9Compiler, FullDimNativeMinLodClampEndToEnd)
       }
       return false;
    };
+   auto has_lit32 = [](const agx_shader_part &out, uint32_t val) {
+      agx_apple9_packed_instruction ref = {};
+      if (!agx_apple9_pack_mov_imm32(0, val, &ref) || ref.length != 8)
+         return false;
+      const uint8_t *bytes = static_cast<const uint8_t *>(out.binary);
+      for (size_t i = 0; i + 8 <= out.info.binary_size; i += 2) {
+         if ((bytes[i] & 0x0f) == 0x0c && bytes[i + 1] == ref.bytes[1] &&
+             (bytes[i + 2] & 0x3f) == 0x02 && bytes[i + 3] == ref.bytes[3] &&
+             bytes[i + 4] == ref.bytes[4] && bytes[i + 5] == ref.bytes[5] &&
+             bytes[i + 6] == ref.bytes[6] && bytes[i + 7] == ref.bytes[7])
+            return true;
+      }
+      return false;
+   };
 
    struct {
       const char *name;
@@ -16420,19 +16434,20 @@ TEST(Apple9Compiler, FullDimNativeMinLodClampEndToEnd)
       bool offset;
       bool bindless;
       uint16_t expected_mode;
+      bool expect_shifted_min_lod;
    } cases[] = {
-      {"3d_imp",         nir_texop_tex, GLSL_SAMPLER_DIM_3D,   false, false, false, true,  0x2180},
-      {"3d_bias",        nir_texop_txb, GLSL_SAMPLER_DIM_3D,   false, false, false, true,  0x2190},
-      {"3d_grad",        nir_texop_txd, GLSL_SAMPLER_DIM_3D,   false, false, false, false, 0x219c},
-      {"cube_imp",       nir_texop_tex, GLSL_SAMPLER_DIM_CUBE, false, false, false, true,  0x0810},
-      {"cube_bias",      nir_texop_txb, GLSL_SAMPLER_DIM_CUBE, false, false, false, true,  0x0814},
-      {"cube_arr_imp",   nir_texop_tex, GLSL_SAMPLER_DIM_CUBE, true,  false, false, true,  0x6553},
-      {"cmp2d_imp",      nir_texop_tex, GLSL_SAMPLER_DIM_2D,   false, true,  false, true,  0x0820},
-      {"cmp2d_bias",     nir_texop_txb, GLSL_SAMPLER_DIM_2D,   false, true,  false, true,  0x0824},
-      {"cmp2da_imp",     nir_texop_tex, GLSL_SAMPLER_DIM_2D,   true,  true,  false, true,  0x64ad},
-      {"2d_bias_ofs",    nir_texop_txb, GLSL_SAMPLER_DIM_2D,   false, false, true,  false, 0x02c1},
-      {"2d_grad_ofs",    nir_texop_txd, GLSL_SAMPLER_DIM_2D,   false, false, true,  false, 0x0249},
-      {"2da_bias_ofs",   nir_texop_txb, GLSL_SAMPLER_DIM_2D,   true,  false, true,  false, 0x67db},
+      {"3d_imp",         nir_texop_tex, GLSL_SAMPLER_DIM_3D,   false, false, false, true,  0x2180, true},
+      {"3d_bias",        nir_texop_txb, GLSL_SAMPLER_DIM_3D,   false, false, false, true,  0x2190, false},
+      {"3d_grad",        nir_texop_txd, GLSL_SAMPLER_DIM_3D,   false, false, false, false, 0x219c, true},
+      {"cube_imp",       nir_texop_tex, GLSL_SAMPLER_DIM_CUBE, false, false, false, true,  0x0810, true},
+      {"cube_bias",      nir_texop_txb, GLSL_SAMPLER_DIM_CUBE, false, false, false, true,  0x0300, false},
+      {"cube_arr_imp",   nir_texop_tex, GLSL_SAMPLER_DIM_CUBE, true,  false, false, true,  0x0c10, true},
+      {"cmp2d_imp",      nir_texop_tex, GLSL_SAMPLER_DIM_2D,   false, true,  false, true,  0x0820, true},
+      {"cmp2d_bias",     nir_texop_txb, GLSL_SAMPLER_DIM_2D,   false, true,  false, true,  0x0824, false},
+      {"cmp2da_imp",     nir_texop_tex, GLSL_SAMPLER_DIM_2D,   true,  true,  false, true,  0x0c20, true},
+      {"2d_bias_ofs",    nir_texop_txb, GLSL_SAMPLER_DIM_2D,   false, false, true,  false, 0x02c1, false},
+      {"2d_grad_ofs",    nir_texop_txd, GLSL_SAMPLER_DIM_2D,   false, false, true,  false, 0x0249, true},
+      {"2da_bias_ofs",   nir_texop_txb, GLSL_SAMPLER_DIM_2D,   true,  false, true,  false, 0x03c1, true},
    };
 
    for (const auto &c : cases) {
@@ -16491,6 +16506,12 @@ TEST(Apple9Compiler, FullDimNativeMinLodClampEndToEnd)
       ASSERT_TRUE(agx_compile_apple9_fragment(b.shader, &compiled, &reason))
          << (reason ?: "");
       EXPECT_TRUE(has_tex_mode(compiled, c.expected_mode));
+      if (c.expect_shifted_min_lod) {
+         EXPECT_TRUE(has_lit32(compiled, 0x00600000u));
+      }
+      if (c.dim == GLSL_SAMPLER_DIM_CUBE && c.op == nir_texop_txb) {
+         EXPECT_FALSE(has_tex_mode(compiled, 0x0814));
+      }
       free(compiled.binary);
       ralloc_free(b.shader);
    }

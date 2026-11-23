@@ -6729,8 +6729,8 @@ agx_apple9_texture_mode(bool explicit_lod, bool gradient, bool bias,
             b7 = 0x08;
             shadow_applied = true;
          } else if (shadow && dimension == 2 && !bias) {
-            b6 = 0xad;
-            b7 = 0x64;
+            b6 = 0x20;
+            b7 = 0x0c;
             shadow_applied = true;
          } else if (!shadow && dimension == 0 && bias) {
             b6 = 0x04;
@@ -6742,8 +6742,8 @@ agx_apple9_texture_mode(bool explicit_lod, bool gradient, bool bias,
             b6 = bias ? 0x90 : 0x80;
             b7 = 0x21;
          } else if (!shadow && dimension == 4 && !bias) {
-            b6 = 0x53;
-            b7 = 0x65;
+            b6 = 0x10;
+            b7 = 0x0c;
          } else {
             b6 |= 0x10;
          }
@@ -6781,7 +6781,7 @@ agx_apple9_texture_offset_mode(uint16_t mode, uint16_t *offset_mode)
       {0x0124, 0x0229}, /* compare, gradient */
       {0x0420, 0x0321}, /* 2D array compare, implicit LOD / gather */
       {0x042c, 0x03a1}, /* 2D array compare, dynamic bias */
-      {0x64ad, 0x0361}, /* 2D array compare, minimum LOD */
+      {0x0c20, 0x0361}, /* 2D array compare, minimum LOD */
       {0x0180, 0x0291}, /* 3D, implicit LOD */
       {0x0190, 0x0299}, /* 3D, bias */
       {0x2188, 0x0219}, /* 3D, explicit LOD */
@@ -9224,9 +9224,9 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
                   shadow_mode_explicit = true;
                } else if (instruction->texture_dimension == 2 &&
                           !instruction->immediate) {
-                  /* Depth2D-array compare + min_lod: 0x64ad. */
-                  bytes[6] = 0xad;
-                  bytes[7] = 0x64;
+                  /* Depth2D-array compare + min_lod: 0x0c20 (+offset 0x0361). */
+                  bytes[6] = 0x20;
+                  bytes[7] = 0x0c;
                   shadow_mode_explicit = true;
                } else {
                   return false;
@@ -9239,9 +9239,9 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
             } else if (instruction->texture_dimension == 2 &&
                        instruction->immediate &&
                        instruction->texture_has_offset) {
-               /* 2D-array bias + min_lod + offset: 0x67db. */
-               bytes[6] = 0xdb;
-               bytes[7] = 0x67;
+               /* 2D-array bias + min_lod + offset: 0x03c1. */
+               bytes[6] = 0xc1;
+               bytes[7] = 0x03;
                offset_mode_explicit = true;
             } else if (instruction->texture_dimension == 3) {
                /* 3D min_lod: 0x2180 (implicit) / 0x2190 (bias). */
@@ -9253,9 +9253,9 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
                bytes[7] = 0x08;
             } else if (instruction->texture_dimension == 4 &&
                        !instruction->immediate) {
-               /* Cube-array min_lod: 0x6553. */
-               bytes[6] = 0x53;
-               bytes[7] = 0x65;
+               /* Cube-array min_lod: 0x0c10. */
+               bytes[6] = 0x10;
+               bytes[7] = 0x0c;
             } else {
                return false;
             }

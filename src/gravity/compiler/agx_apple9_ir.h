@@ -1152,14 +1152,15 @@ uint32_t agx_apple9_vir_emit_texture_volume(
    bool bias, bool shadow);
 
 /* Volume / cube / array / shadow sample with native min_lod_clamp in word 3
- * (packed Q6 min_lod or bias<<16 | min_lod):
+ * (packed Q6 min_lod << 16 for implicit forms, or bias<<16 | min_lod for
+ * non-array biased forms):
  * - 2D (0): !shadow bias=true (0x0804, +offset 0x02c1);
  *           shadow bias=false (0x0820), bias=true (0x0824)
  * - Cube (1): !shadow bias=false (0x0810), bias=true (0x0814)
- * - 2D-array (2): !shadow bias=true (+offset 0x67db);
- *                 shadow bias=false (0x64ad)
+ * - 2D-array (2): !shadow bias=true (+offset 0x03c1);
+ *                 shadow bias=false (0x0c20, +offset 0x0361)
  * - 3D (3): !shadow bias=false (0x2180), bias=true (0x2190)
- * - Cube-array (4): !shadow bias=false (0x6553) */
+ * - Cube-array (4): !shadow bias=false (0x0c10) */
 uint32_t agx_apple9_vir_emit_texture_volume_min_lod(
    struct agx_apple9_vir_program *program, const uint32_t coords[3],
    uint32_t packed_min_lod, unsigned texture, unsigned sampler,

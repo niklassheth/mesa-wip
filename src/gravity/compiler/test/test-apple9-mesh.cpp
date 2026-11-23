@@ -1628,12 +1628,12 @@ TEST(Apple9MemEncoding, FullDimensionMinLodClampModes)
       {true,  3, false, false, false, 0x219c}, /* 3D grad+min_lod */
       {false, 1, false, false, false, 0x0810}, /* Cube min_lod */
       {false, 1, true,  false, false, 0x0814}, /* Cube bias+min_lod */
-      {false, 4, false, false, false, 0x6553}, /* Cube-array min_lod */
+      {false, 4, false, false, false, 0x0c10}, /* Cube-array min_lod */
       {false, 0, false, true,  false, 0x0820}, /* Depth2D compare min_lod */
       {false, 0, true,  true,  false, 0x0824}, /* Depth2D compare bias+min_lod */
-      {false, 2, false, true,  false, 0x64ad}, /* Depth2D-array compare min_lod */
+      {false, 2, false, true,  false, 0x0c20}, /* Depth2D-array compare min_lod */
       {false, 0, true,  false, true,  0x02c1}, /* 2D bias+min_lod+offset */
-      {false, 2, true,  false, true,  0x67db}, /* 2D-array bias+min_lod+offset */
+      {false, 2, true,  false, true,  0x03c1}, /* 2D-array bias+min_lod+offset */
    };
 
    for (const auto &c : cases) {

@@ -607,8 +607,8 @@ agx_apple9_texture_native_offset(const nir_tex_instr *tex, uint16_t *bits)
        (tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
         tex->sampler_dim != GLSL_SAMPLER_DIM_3D) ||
        /* Minimum-LOD + offset is native for non-shadow 2D tex/txb/txd
-        * (0x02c1 / 0x0249), non-shadow 2D-array tex/txb (0x67db), and
-        * bindless shadow 2D-array tex (0x64ad -> 0x0361). */
+        * (0x02c1 / 0x0249), non-shadow 2D-array tex/txb (0x03c1), and
+        * bindless shadow 2D-array tex (0x0c20 -> 0x0361). */
        (has_min_lod &&
         (tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
          (tex->is_shadow
