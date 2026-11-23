@@ -107,34 +107,89 @@ poly_gs_index_size(enum poly_gs_shape shape)
    }
 }
 
-/* Heap to allocate from. */
+/* Heap to allocate from.
+ *
+ * bottom counts allocated POLY_HEAP_UNIT_B units, including allocations that
+ * did not fit: after the heap's users have run, it holds what they needed, and
+ * 32 bits of units do not wrap below 64 GiB, however many allocations fail
+ * concurrently. high_water is the largest bottom before a poly_heap_reset, so
+ * that a driver can size the heap for later work. size is in bytes, and every
+ * heap reserves POLY_HEAP_SINK_B more bytes after it, which allocations that
+ * cannot fail before writing (tessellator domain points) use when they do.
+ */
 struct poly_heap {
    DEVICE(uchar) base;
    uint32_t bottom, size;
+   uint32_t high_water, pad;
 } PACKED;
-static_assert(sizeof(struct poly_heap) == 4 * 4,
-              "struct poly_heap must be 4 words");
+static_assert(sizeof(struct poly_heap) == 6 * 4,
+              "struct poly_heap must be 6 words");
+
+#define POLY_HEAP_UNIT_B 16
+
+/* The domain points of the largest patch: 65 x 65 points of 8 bytes. */
+#define POLY_HEAP_SINK_B (64 * 1024)
+
+/* Bytes a heap needed so far, from the CPU: the largest of high_water and the
+ * current bottom. */
+static inline uint64_t
+poly_heap_needed_B(const struct poly_heap *heap)
+{
+   uint32_t units =
+      heap->bottom > heap->high_water ? heap->bottom : heap->high_water;
+   return (uint64_t)units * POLY_HEAP_UNIT_B;
+}
 
 #ifdef __OPENCL_VERSION__
+/* Allocate size_B bytes, returning their offset in *offs_B, or return false
+ * when the heap is exhausted. A failed allocation still counts in bottom.
+ */
+static inline bool
+poly_heap_try_alloc_offs(global struct poly_heap *heap, uint size_B,
+                         uint *offs_B)
+{
+   uint units = (size_B / POLY_HEAP_UNIT_B) + ((size_B % POLY_HEAP_UNIT_B) != 0);
+   uint first =
+      atomic_fetch_add((volatile atomic_uint *)(&heap->bottom), units);
+
+   if (((uint64_t)first + units) * POLY_HEAP_UNIT_B > heap->size)
+      return false;
+
+   *offs_B = first * POLY_HEAP_UNIT_B;
+   return true;
+}
+
+/* As poly_heap_try_alloc_offs, returning the allocation or zero. */
+static inline global void *
+poly_heap_try_alloc(global struct poly_heap *heap, uint size_B)
+{
+   uint offs_B;
+   if (!poly_heap_try_alloc_offs(heap, size_B, &offs_B))
+      return 0;
+
+   return heap->base + offs_B;
+}
+
+/* For allocations that cannot fail, aborting when the heap is exhausted. */
 static inline uint
 poly_heap_alloc_offs(global struct poly_heap *heap, uint size_B, uint align_B)
 {
-   /* We need to overallocate in order to leave room to align the allocation
-    * regardless of the alignment of the heap bottom */
-   uint offs = atomic_fetch_add((volatile atomic_uint *)(&heap->bottom),
-                                size_B + align_B);
-   offs = align(offs, align_B);
+   /* Overallocate when alignment exceeds the 16-byte heap unit. */
+   uint alloc_B = align_B > POLY_HEAP_UNIT_B ? size_B + align_B : size_B;
+   uint offs_B;
 
    /* Use printf+abort because assert is stripped from release builds. */
-   if (heap->bottom >= heap->size) {
-      printf(
-         "FATAL: GPU heap overflow, allocating size %u, at offset %u, heap size %u!",
-         size_B, offs, heap->size);
+   if (!poly_heap_try_alloc_offs(heap, alloc_B, &offs_B)) {
+      printf("FATAL: GPU heap overflow, allocating size %u, heap size %u!",
+             alloc_B, heap->size);
 
       abort();
    }
 
-   return offs;
+   if (align_B > POLY_HEAP_UNIT_B)
+      offs_B = align(offs_B, align_B);
+
+   return offs_B;
 }
 
 static inline global void *
@@ -144,6 +199,15 @@ poly_heap_alloc(global struct poly_heap *heap, uint size_B, uint align_B)
       return NULL;
 
    return heap->base + poly_heap_alloc_offs(heap, size_B, align_B);
+}
+
+/* Free every allocation, keeping what they needed in high_water. Run by a
+ * single invocation, ordered after every user of the heap. */
+static inline void
+poly_heap_reset(global struct poly_heap *heap)
+{
+   heap->high_water = max(heap->high_water, heap->bottom);
+   heap->bottom = 0;
 }
 
 uint64_t nir_load_ro_sink_address_poly(void);
@@ -259,6 +323,10 @@ struct poly_geometry_params {
    /* Address of the primitives generated counters */
    DEVICE(uint) prims_generated_counter[POLY_MAX_VERTEX_STREAMS];
    DEVICE(uint) xfb_prims_generated_counter[POLY_MAX_VERTEX_STREAMS];
+
+   /* Optional counters of primitives generated queries, incremented with
+    * prims_generated_counter when non-null. */
+   DEVICE(uint) pg_query_counter[POLY_MAX_VERTEX_STREAMS];
    DEVICE(uint) xfb_overflow[POLY_MAX_VERTEX_STREAMS];
    DEVICE(uint) xfb_any_overflow;
 
@@ -278,6 +346,11 @@ struct poly_geometry_params {
 
    /* Location-indexed mask of flat outputs, used for lowering GL edge flags. */
    uint64_t flat_outputs;
+
+   /* Tessellation parameters (struct poly_tess_params) when the geometry
+    * shader's input primitives come from the tessellator, otherwise zero.
+    */
+   uint64_t tess_params;
 
    uint32_t xfb_size[POLY_MAX_SO_BUFFERS];
 
@@ -319,8 +392,8 @@ struct poly_geometry_params {
     */
    uint32_t input_topology;
 } PACKED;
-static_assert(sizeof(struct poly_geometry_params) == 79 * 4,
-              "struct poly_geometry_params must be 79 words");
+static_assert(sizeof(struct poly_geometry_params) == 89 * 4,
+              "struct poly_geometry_params must be 89 words");
 
 static inline void
 poly_geometry_params_init(struct poly_geometry_params *p,
@@ -379,6 +452,82 @@ static inline uint
 poly_tcs_in_size(uint32_t vertices_in_patch, uint64_t crosslane_vs_out_mask)
 {
    return vertices_in_patch * util_bitcount64(crosslane_vs_out_mask) * 16;
+}
+
+/*
+ * Indirect draws allocate their software-stage buffers from the heap on the
+ * GPU, sized from arbitrary 32-bit draw counts. Products of those counts wrap
+ * in 32-bit arithmetic, which would allocate a small block that the vertex
+ * shader then writes past. These check, in 64-bit arithmetic, that every
+ * allocation of the indirect setup fits in limit_B heap bytes. A draw that
+ * does not fit cannot be executed and is dropped by its setup kernel.
+ */
+static inline bool
+poly_gs_indirect_fits(enum mesa_prim prim, enum poly_gs_shape shape,
+                      uint32_t max_indices, bool prefix_sum,
+                      uint32_t count_stride_B, uint32_t vertex_count,
+                      uint32_t instance_count, uint64_t vs_outputs,
+                      uint32_t limit_B)
+{
+   uint64_t vertex_B = util_bitcount64(vs_outputs) * 16;
+   uint64_t vertices = (uint64_t)vertex_count * instance_count;
+
+   if (vertex_B && vertices > limit_B / vertex_B)
+      return false;
+
+   uint64_t total_B = vertices * vertex_B;
+   bool counts = prefix_sum && count_stride_B;
+   bool indices = shape == POLY_GS_SHAPE_DYNAMIC_INDEXED && max_indices;
+
+   if (counts || indices) {
+      /* u_decomposed_prims_for_vertices takes a signed vertex count. */
+      if (vertex_count > INT32_MAX)
+         return false;
+
+      uint64_t prims =
+         (uint64_t)u_decomposed_prims_for_vertices(prim, vertex_count) *
+         instance_count;
+
+      if (counts) {
+         if (prims > limit_B / count_stride_B)
+            return false;
+
+         total_B += prims * count_stride_B;
+      }
+
+      if (indices) {
+         uint64_t prim_B = (uint64_t)max_indices * 4;
+
+         if (prims > limit_B / prim_B)
+            return false;
+
+         total_B += prims * prim_B;
+      }
+   }
+
+   return total_B <= limit_B;
+}
+
+static inline bool
+poly_tess_indirect_fits(uint32_t vertex_count, uint32_t instance_count,
+                        uint32_t input_patch_size, uint32_t tcs_stride_el,
+                        uint64_t vs_outputs, uint32_t limit_B)
+{
+   uint64_t vertex_B = util_bitcount64(vs_outputs) * 16;
+   uint64_t vertices = (uint64_t)vertex_count * instance_count;
+
+   if (vertex_B && vertices > limit_B / vertex_B)
+      return false;
+
+   /* TCS outputs, patch coordinates and counts, per unrolled patch. */
+   uint64_t patch_B = (uint64_t)tcs_stride_el * 4 + 8;
+   uint64_t patches =
+      (uint64_t)(vertex_count / input_patch_size) * instance_count;
+
+   if (patches > limit_B / patch_B)
+      return false;
+
+   return vertices * vertex_B + patches * patch_B <= limit_B;
 }
 
 /*
@@ -617,6 +766,16 @@ poly_gs_setup_indirect_inner(uint64_t index_buffer, uint vertex_count,
                              int is_prefix_summing, uint max_indices,
                              enum poly_gs_shape shape)
 {
+   /* A draw whose buffers cannot be allocated is dropped: with zero counts,
+    * every grid and the rasterization draw below are empty.
+    */
+   if (!poly_gs_indirect_fits(prim, shape, max_indices, is_prefix_summing,
+                              p->count_buffer_stride, vertex_count,
+                              instance_count, vs_outputs, heap->size)) {
+      vertex_count = 0;
+      instance_count = 0;
+   }
+
    poly_vertex_params_set_draw(vp, vertex_count, instance_count);
    poly_geometry_params_set_draw(p, prim, shape, max_indices,
                                  vertex_count, instance_count);
@@ -637,21 +796,31 @@ poly_gs_setup_indirect_inner(uint64_t index_buffer, uint vertex_count,
    /* We need to allocate VS and GS count buffers, do so now */
    uint vertex_buffer_size =
       poly_tcs_in_size(vertex_count * instance_count, vs_outputs);
+   bool fits = true;
 
    if (is_prefix_summing) {
-      p->count_buffer = poly_heap_alloc(
-         heap, p->input_primitives * p->count_buffer_stride, 16);
+      p->count_buffer = poly_heap_try_alloc(
+         heap, p->input_primitives * p->count_buffer_stride);
+      fits &= p->count_buffer != 0;
    }
 
-   vp->output_buffer = (uintptr_t)poly_heap_alloc(heap, vertex_buffer_size, 16);
+   vp->output_buffer = (uintptr_t)poly_heap_try_alloc(heap, vertex_buffer_size);
+   fits &= vp->output_buffer != 0;
 
    vp->outputs = vs_outputs;
 
    if (shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
-      const uint32_t index_offset =
-         poly_heap_alloc_offs(heap, p->draw.index_count * 4, 16);
+      uint32_t index_offset = 0;
+      fits &= poly_heap_try_alloc_offs(heap, p->draw.index_count * 4,
+                                       &index_offset);
       p->draw.first_index = index_offset / 4;
       p->output_index_buffer = (global uint *)(heap->base + index_offset);
+   }
+
+   /* An exhausted heap drops the draw like one that cannot fit at all. */
+   if (!fits) {
+      poly_vertex_params_set_draw(vp, 0, 0);
+      poly_geometry_params_set_draw(p, prim, shape, max_indices, 0, 0);
    }
 }
 
