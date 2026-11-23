@@ -435,7 +435,11 @@ hk_make_feature_key(const struct vk_features *feats)
           ((!feats || feats->pipelineStatisticsQuery)
               ? HK_FEAT_PIPELINE_STATS : 0) |
           ((!feats || feats->primitivesGeneratedQuery)
-              ? HK_FEAT_PRIMS_GENERATED : 0);
+              ? HK_FEAT_PRIMS_GENERATED : 0) |
+          ((!feats || feats->pipelineRobustness)
+              ? HK_FEAT_PIPELINE_ROBUSTNESS : 0) |
+          ((!feats || feats->graphicsPipelineLibrary)
+              ? HK_FEAT_GPL : 0);
 }
 
 static void

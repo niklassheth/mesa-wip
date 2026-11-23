@@ -38,6 +38,10 @@ enum hk_feature_key {
    HK_FEAT_PIPELINE_STATS = BITFIELD_BIT(4),
    /* Primitives-generated queries require SW VS/TES variants for passthrough GS. */
    HK_FEAT_PRIMS_GENERATED = BITFIELD_BIT(5),
+   /* Pipeline robustness may be attached to a separate VERTEX_INPUT_INTERFACE
+    * graphics pipeline library and not propagated onto the VS stage. */
+   HK_FEAT_PIPELINE_ROBUSTNESS = BITFIELD_BIT(6),
+   HK_FEAT_GPL = BITFIELD_BIT(7),
 };
 
 
