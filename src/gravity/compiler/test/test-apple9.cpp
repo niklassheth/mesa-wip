@@ -15658,8 +15658,9 @@ TEST(Apple9Compiler, LazyFragmentTileLockPlacement)
    const uint8_t tile_001[6] = {0x87, 0x02, 0x54, 0x01, 0x00, 0x00};
    const uint8_t fence_20c[6] = {0x07, 0x02, 0x54, 0x0c, 0x02, 0x00};
 
-   /* 1. Monolithic FS: texture + discard (COVERAGE) + color store.
-    * 0x600 and 0x80c must be deferred past both TEXTURE_SAMPLE and COVERAGE. */
+   /* 1. Monolithic FS: texture + discard (test-triggering COVERAGE) + color store.
+    * 0x600 is deferred past TEXTURE_SAMPLE and placed before 0x001 + COVERAGE;
+    * 0x80c is deferred past both TEXTURE_SAMPLE and COVERAGE. */
    {
       nir_builder b = nir_builder_init_simple_shader(
          MESA_SHADER_FRAGMENT, &agx_nir_options, "lazy_mono_tex_discard");
@@ -15675,27 +15676,31 @@ TEST(Apple9Compiler, LazyFragmentTileLockPlacement)
       ASSERT_TRUE(agx_compile_apple9_fragment_inputs(b.shader, nullptr, &out,
                                                      &reason))
          << (reason ?: "");
-      unsigned n600 = 0, n80c = 0, n20c = 0, ncov = 0;
+      unsigned n600 = 0, n001 = 0, n80c = 0, n20c = 0, ncov = 0;
       size_t off_tex = apple9_find_tex_sample(out);
       size_t off_cov = apple9_find_coverage(out, &ncov);
       size_t off_600 = apple9_find_bytes(out, tile_600, sizeof(tile_600), &n600);
+      size_t off_001 = apple9_find_bytes(out, tile_001, sizeof(tile_001), &n001);
       size_t off_80c = apple9_find_bytes(out, tile_80c, sizeof(tile_80c), &n80c);
       size_t off_20c = apple9_find_bytes(out, fence_20c, sizeof(fence_20c), &n20c);
       EXPECT_EQ(n600, 1u);
+      EXPECT_EQ(n001, 1u);
       EXPECT_EQ(n80c, 1u);
       EXPECT_EQ(n20c, 1u);
       EXPECT_GE(ncov, 1u);
       EXPECT_NE(off_tex, SIZE_MAX);
-      EXPECT_LT(off_tex, off_cov);
-      EXPECT_LT(off_cov, off_600);
-      EXPECT_LT(off_600, off_80c);
+      EXPECT_LT(off_tex, off_600);
+      EXPECT_LT(off_600, off_001);
+      EXPECT_LT(off_001, off_cov);
+      EXPECT_LT(off_cov, off_80c);
       EXPECT_LT(off_80c, off_20c);
       free(out.binary);
       ralloc_free(b.shader);
    }
 
    /* 2. Epilog-split FS (99% case): textured + discard fs_main emits ZERO
-    * 0x600 / 0x80c / 0x020c; fs_epilog emits 0x600 + 0x80c AFTER COVERAGE. */
+    * 0x600 / 0x80c / 0x020c; fs_epilog emits 0x600 BEFORE test-triggering
+    * 0x001 + COVERAGE, then 0x80c + color store + 0x020c. */
    {
       nir_builder b = nir_builder_init_simple_shader(
          MESA_SHADER_FRAGMENT, &agx_nir_options, "lazy_epilog_tex_discard");
@@ -15731,17 +15736,20 @@ TEST(Apple9Compiler, LazyFragmentTileLockPlacement)
       ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
                                                          &reason))
          << (reason ?: "");
-      unsigned n600 = 0, n80c = 0, n20c = 0, ncov = 0;
+      unsigned n600 = 0, n001 = 0, n80c = 0, n20c = 0, ncov = 0;
       size_t off_cov = apple9_find_coverage(ep_out, &ncov);
       size_t off_600 = apple9_find_bytes(ep_out, tile_600, sizeof(tile_600), &n600);
+      size_t off_001 = apple9_find_bytes(ep_out, tile_001, sizeof(tile_001), &n001);
       size_t off_80c = apple9_find_bytes(ep_out, tile_80c, sizeof(tile_80c), &n80c);
       size_t off_20c = apple9_find_bytes(ep_out, fence_20c, sizeof(fence_20c), &n20c);
       EXPECT_EQ(n600, 1u);
+      EXPECT_EQ(n001, 1u);
       EXPECT_EQ(n80c, 1u);
       EXPECT_EQ(n20c, 1u);
       EXPECT_GE(ncov, 1u);
-      EXPECT_LT(off_cov, off_600);
-      EXPECT_LT(off_600, off_80c);
+      EXPECT_LT(off_600, off_001);
+      EXPECT_LT(off_001, off_cov);
+      EXPECT_LT(off_cov, off_80c);
       EXPECT_LT(off_80c, off_20c);
       free(ep_out.binary);
       free(main_out.binary);
@@ -16011,7 +16019,9 @@ TEST(Apple9Compiler, LazyFragmentTileLockPlacement)
    }
 
    /* 7. Texture-only SSBO-writing fragment shader with NO color stores:
-    * Zero 0x600 / 0x80c / 0x020c in both monolithic and epilog modes. */
+    * Zero 0x600 / 0x80c / 0x020c in fs_main (and monolithic); epilog with
+    * deferred late-Z test emits 0x600 before 0x001 + COVERAGE, with zero
+    * 0x80c / 0x020c. */
    for (bool use_epilog : {false, true}) {
       SCOPED_TRACE(use_epilog);
       nir_builder b = nir_builder_init_simple_shader(
@@ -16041,7 +16051,15 @@ TEST(Apple9Compiler, LazyFragmentTileLockPlacement)
          ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
                                                             &reason))
             << (reason ?: "");
-         EXPECT_FALSE(apple9_binary_contains(ep_out, tile_600, sizeof(tile_600)));
+         unsigned ep_n600 = 0, ep_n001 = 0, ep_ncov = 0;
+         size_t off_600 = apple9_find_bytes(ep_out, tile_600, sizeof(tile_600), &ep_n600);
+         size_t off_001 = apple9_find_bytes(ep_out, tile_001, sizeof(tile_001), &ep_n001);
+         size_t off_cov = apple9_find_coverage(ep_out, &ep_ncov);
+         EXPECT_EQ(ep_n600, 1u);
+         EXPECT_EQ(ep_n001, 1u);
+         EXPECT_GE(ep_ncov, 1u);
+         EXPECT_LT(off_600, off_001);
+         EXPECT_LT(off_001, off_cov);
          EXPECT_FALSE(apple9_binary_contains(ep_out, tile_80c, sizeof(tile_80c)));
          EXPECT_FALSE(apple9_binary_contains(ep_out, fence_20c, sizeof(fence_20c)));
          free(ep_out.binary);
@@ -16117,6 +16135,64 @@ TEST(Apple9Compiler, LazyFragmentTileLockPlacement)
          EXPECT_LT(off_600, off_80c);
          EXPECT_LT(off_80c, off_20c);
       }
+      free(main_out.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* 9. Late-Z writes_memory (no early_fragment_tests) + color output:
+    * fs_main defers depth/stencil test to fs_epilog without emitting 0x600;
+    * fs_epilog must acquire 0x600 BEFORE 0x001 + COVERAGE, then 0x80c + 0x020c. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "lazy_late_zs_writes_memory");
+      b.shader->info.writes_memory = true;
+      nir_store_ssbo(&b, nir_imm_int(&b, 1), nir_imm_int(&b, 0),
+                     nir_imm_int(&b, 0), .write_mask = 1, .align_mul = 4);
+      nir_store_output(&b, nir_imm_vec4(&b, 1, 1, 0, 1), nir_imm_int(&b, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+      b.shader->info.io_lowered = true;
+      agx_apple9_blend blend = {.use_epilog = 1, .dynamic_samples = 1};
+      agx_shader_part main_out = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                  &main_out, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(main_out.info.apple9_fs_epilog.main_defers_zs_test);
+      EXPECT_FALSE(main_out.info.apple9_fs_epilog.has_tile_preamble);
+      EXPECT_FALSE(main_out.info.apple9_fs_epilog.has_tile_lock);
+      EXPECT_FALSE(apple9_binary_contains(main_out, tile_600, sizeof(tile_600)));
+
+      agx_apple9_fs_epilog_key ekey = {};
+      ekey.iface = main_out.info.apple9_fs_epilog;
+      ekey.nr_targets = 1;
+      ekey.blend[0].format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      ekey.blend[0].samples = 1;
+      ekey.blend[0].colormask = 0xf;
+      ekey.blend[0].rgb_src = ekey.blend[0].alpha_src = PIPE_BLENDFACTOR_ONE;
+      ekey.blend[0].rgb_dst = ekey.blend[0].alpha_dst = PIPE_BLENDFACTOR_ZERO;
+      ekey.blend[0].rgb_func = ekey.blend[0].alpha_func = PIPE_BLEND_ADD;
+      agx_shader_part ep_out = {};
+      ASSERT_TRUE(agx_compile_apple9_fragment_epilog_key(&ekey, &ep_out,
+                                                         &reason))
+         << (reason ?: "");
+      unsigned n600 = 0, n001 = 0, n80c = 0, n20c = 0, ncov = 0;
+      size_t off_cov = apple9_find_coverage(ep_out, &ncov);
+      size_t off_600 = apple9_find_bytes(ep_out, tile_600, sizeof(tile_600), &n600);
+      size_t off_001 = apple9_find_bytes(ep_out, tile_001, sizeof(tile_001), &n001);
+      size_t off_80c = apple9_find_bytes(ep_out, tile_80c, sizeof(tile_80c), &n80c);
+      size_t off_20c = apple9_find_bytes(ep_out, fence_20c, sizeof(fence_20c), &n20c);
+      EXPECT_EQ(n600, 1u);
+      EXPECT_EQ(n001, 1u);
+      EXPECT_EQ(n80c, 1u);
+      EXPECT_EQ(n20c, 1u);
+      EXPECT_GE(ncov, 1u);
+      EXPECT_LT(off_600, off_001);
+      EXPECT_LT(off_001, off_cov);
+      EXPECT_LT(off_cov, off_80c);
+      EXPECT_LT(off_80c, off_20c);
+      free(ep_out.binary);
       free(main_out.binary);
       ralloc_free(b.shader);
    }

@@ -1309,19 +1309,30 @@ apple9_cf_node_needs_tile_lock(nir_cf_node *node)
 }
 
 static bool
+apple9_sample_mask_tests(const nir_intrinsic_instr *intr)
+{
+   /* sample_mask_agx with live == 0 only records killed samples; any non-zero
+    * live mask triggers depth/stencil testing (TILE_ACCESS 0x001 + COVERAGE). */
+   return !(nir_src_is_const(intr->src[1]) && !nir_src_as_uint(intr->src[1]));
+}
+
+static bool
 apple9_cf_node_needs_tile_preamble(nir_cf_node *node)
 {
    nir_foreach_block_in_cf_node(block, node) {
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
             continue;
-         nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         nir_intrinsic_op op = intr->intrinsic;
          if (op == nir_intrinsic_load_local_pixel_agx ||
              op == nir_intrinsic_store_local_pixel_agx ||
              op == nir_intrinsic_begin_invocation_interlock ||
              op == nir_intrinsic_store_zs_agx ||
              op == nir_intrinsic_image_store_apple9_agx ||
-             op == nir_intrinsic_image_store_block_agx)
+             op == nir_intrinsic_image_store_block_agx ||
+             (op == nir_intrinsic_sample_mask_agx &&
+              apple9_sample_mask_tests(intr)))
             return true;
       }
    }
@@ -5030,6 +5041,7 @@ apple9_emit_coverage(struct apple9_dag_lower *lower, uint32_t affected,
    control = apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR,
       AGX_APPLE9_ENC_LOGIC_EXPORT, publish, 2, 0);
    return control != AGX_APPLE9_VREG_INVALID &&
+      (!tests || apple9_acquire_tile_preamble(lower)) &&
       (!tests || agx_apple9_vir_emit_side_effect(&lower->program,
          AGX_APPLE9_VIR_TILE_ACCESS, AGX_APPLE9_ENC_TILE_ACCESS, NULL, 0, 1)) &&
       agx_apple9_vir_emit_side_effect(&lower->program,
@@ -5626,11 +5638,7 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
                nir_get_scalar(intr->src[0].ssa, 0));
             uint32_t live = apple9_lower_dag_scalar(lower,
                nir_get_scalar(intr->src[1].ssa, 0));
-            /* sample_mask_agx with live == 0 only records killed samples; any
-             * non-zero live mask triggers depth/stencil testing (including the
-             * fallback arm of apple9_clamp_early_depth alongside store_zs_agx). */
-            bool tests =
-               !(nir_src_is_const(intr->src[1]) && !nir_src_as_uint(intr->src[1]));
+            bool tests = apple9_sample_mask_tests(intr);
             if (lower->nir->info.stage != MESA_SHADER_FRAGMENT ||
                 affected == AGX_APPLE9_VREG_INVALID || live == AGX_APPLE9_VREG_INVALID ||
                 !apple9_emit_coverage(lower, affected, live, tests))
@@ -7647,12 +7655,13 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
       preamble ? APPLE9_TILE_NORMAL : resources->tile_mode;
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       bool reads = false, writes = false, has_store_zs = false,
-           has_image_write = false;
+           has_image_write = false, has_test_coverage = false;
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
                continue;
-            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            nir_intrinsic_op op = intr->intrinsic;
             reads |= op == nir_intrinsic_load_local_pixel_agx ||
                      op == nir_intrinsic_load_tile_pixel_agx;
             lower.tile_coords |= op == nir_intrinsic_load_tile_pixel_agx;
@@ -7660,6 +7669,8 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
             lower.interlock |= op == nir_intrinsic_begin_invocation_interlock;
             has_store_zs |= op == nir_intrinsic_store_zs_agx;
             has_image_write |= op == nir_intrinsic_image_store_apple9_agx;
+            has_test_coverage |= op == nir_intrinsic_sample_mask_agx &&
+                                 apple9_sample_mask_tests(intr);
          }
       }
       if (lower.interlock && lower.tile_coords) {
@@ -7689,7 +7700,7 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
              * store_zs_agx or fragment IMAGE_WRITE), without 0x80c. */
             lower.tile_access = true;
          } else if (reads || writes || image_mask || lower.interlock ||
-                    has_store_zs || has_image_write) {
+                    has_store_zs || has_image_write || has_test_coverage) {
             lower.tile_preamble_needed = true;
             lower.tile_preamble_imm =
                image_mask ? 0x700 : lower.tile_coords ? 0xf00 : 0x600;
