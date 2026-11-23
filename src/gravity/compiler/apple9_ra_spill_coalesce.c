@@ -556,6 +556,7 @@ apple9_ra_spill_coalesce_color(const struct agx_apple9_vir_program *program,
             if (v == AGX_APPLE9_VREG_INVALID || I->dest_components == 0 ||
                 v >= program->value_count ||
                 !apple9_ra_value_is_mem(state, v) ||
+                apple9_ra_value_is_imm(state, v) ||
                 mem_slot[v] != UINT32_MAX)
                continue;
             any_mem = true;

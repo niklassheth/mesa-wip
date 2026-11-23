@@ -1463,3 +1463,123 @@ TEST(Apple9RaSpillCoalesce, DeadPhiMixedWidthsLoopAndDenseBitset)
    }
 }
 
+TEST(Apple9RaSpill, SpilledPhiConstantStaysImmAndLiteralRematSurvivesStoreUniform)
+{
+   /* 1. Spilled phi whose predecessor supplies a scalar VIR_IMM must mark that
+    *    value as is_imm rather than spilling it to a real scratch slot. */
+   {
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      nir_block nA, nB, nC, nD;
+      agx_apple9_block *A = make_cfg_block(&p, &nA);
+      agx_apple9_block *B = make_cfg_block(&p, &nB);
+      agx_apple9_block *C = make_cfg_block(&p, &nC);
+      agx_apple9_block *D = make_cfg_block(&p, &nD);
+      nA.successors[0] = &nB;
+      nA.successors[1] = &nC;
+      nB.successors[0] = &nD;
+      nC.successors[0] = &nD;
+
+      agx_apple9_block_begin(&p, A);
+      uint32_t live_a[8];
+      for (unsigned i = 0; i < 8; ++i)
+         live_a[i] = emit_get_sr(&p, i);
+
+      agx_apple9_block_begin(&p, B);
+      uint32_t b_val = emit_iadd(&p, live_a[0], live_a[1]);
+      /* Force b_val to spill in B before joining at D. */
+      uint32_t b_extra[6];
+      for (unsigned i = 0; i < 6; ++i)
+         b_extra[i] = emit_get_sr(&p, 10 + i);
+      uint32_t b_keep = b_extra[0];
+      for (unsigned i = 1; i < 6; ++i)
+         b_keep = emit_iadd(&p, b_keep, b_extra[i]);
+
+      agx_apple9_block_begin(&p, C);
+      uint32_t c_const = emit_imm32(&p, 0x3f800000u);
+      uint32_t c_keep = emit_get_sr(&p, 20);
+
+      agx_apple9_block_begin(&p, D);
+      uint32_t phi = agx_apple9_vir_emit_phi_canonical(&p, D, 2);
+      agx_apple9_vir_instr *phi_ins = p.instructions[p.instruction_count - 1];
+      uint32_t phi_k = agx_apple9_vir_emit_phi_canonical(&p, D, 2);
+      agx_apple9_vir_instr *phi_k_ins = p.instructions[p.instruction_count - 1];
+      uint32_t acc = live_a[0];
+      for (unsigned i = 1; i < 8; ++i)
+         acc = emit_iadd(&p, acc, live_a[i]);
+      acc = emit_iadd(&p, acc, phi_k);
+      p.output = emit_iadd(&p, acc, phi);
+
+      ASSERT_TRUE(agx_apple9_vir_build_logical_cfg(&p));
+      *agx_apple9_vir_src_ptr(phi_ins, agx_apple9_block_pred_index(D, B)) = b_val;
+      *agx_apple9_vir_src_ptr(phi_ins, agx_apple9_block_pred_index(D, C)) = c_const;
+      *agx_apple9_vir_src_ptr(phi_k_ins, agx_apple9_block_pred_index(D, B)) = b_keep;
+      *agx_apple9_vir_src_ptr(phi_k_ins, agx_apple9_block_pred_index(D, C)) = c_keep;
+
+      apple9_ra_spill_state state;
+      apple9_ra_spill_state_init(&state);
+      apple9_ra_spill_options opts = apple9_ra_spill_default_options();
+      opts.max_gprs = 9;
+      opts.spill_reserved_gprs = 5;
+      ASSERT_TRUE(apple9_ra_spill(&p, &state, &opts));
+      verify_vir_ssa_and_classes(&p, &state);
+
+      /* Any is_imm value must be skipped by spill coalescing (no scratch word). */
+      std::vector<uint32_t> mem_slot(p.value_count, UINT32_MAX);
+      unsigned frame_words = 0;
+      ASSERT_TRUE(apple9_ra_spill_coalesce_color(&p, &state, mem_slot.data(),
+                                                 &frame_words));
+      unsigned imm_count = 0;
+      for (uint32_t v = 0; v < p.value_count; ++v) {
+         if (apple9_ra_value_is_imm(&state, v)) {
+            ++imm_count;
+            EXPECT_EQ(mem_slot[v], UINT32_MAX);
+            EXPECT_EQ(state.imm_val[v], 0x3f800000u);
+         }
+      }
+      EXPECT_GT(imm_count, 0u);
+
+      apple9_ra_spill_state_finish(&state);
+      agx_apple9_vir_finish(&p);
+   }
+
+   /* 2. STORE_UNIFORM must NOT block rematerialization of literal-only VIR_IMM
+    *    chains (only uniform-reading recipes depend on STORE_UNIFORM). */
+   {
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      nir_block nb;
+      agx_apple9_block *b0 = make_cfg_block(&p, &nb);
+      agx_apple9_block_begin(&p, b0);
+
+      /* Emit a STORE_UNIFORM (preamble shader -> mutable uniforms). */
+      uint32_t w = emit_imm32(&p, 7);
+      ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+         &p, AGX_APPLE9_VIR_STORE_UNIFORM, AGX_APPLE9_ENC_STORE_UNIFORM,
+         &w, 1, 0));
+
+      uint32_t lits[12];
+      for (unsigned i = 0; i < 12; ++i)
+         lits[i] = emit_imm32(&p, 0x10000000u + i);
+
+      uint32_t acc = lits[11];
+      for (int i = 10; i >= 0; --i)
+         acc = emit_iadd(&p, acc, lits[i]);
+      p.output = acc;
+
+      apple9_ra_spill_state state;
+      apple9_ra_spill_state_init(&state);
+      apple9_ra_spill_options opts = apple9_ra_spill_default_options();
+      opts.max_gprs = 6;
+      opts.remat_only = true;
+      opts.reserved_gprs = 0;
+      ASSERT_TRUE(apple9_ra_spill(&p, &state, &opts));
+      EXPECT_FALSE(state.has_spills);
+      EXPECT_FALSE(state.uniform_remat_used);
+      EXPECT_LE(apple9_ra_spill_calc_gpr_demand(&p, &state), 6u);
+
+      apple9_ra_spill_state_finish(&state);
+      agx_apple9_vir_finish(&p);
+   }
+}
+

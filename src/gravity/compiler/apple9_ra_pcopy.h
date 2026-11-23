@@ -112,6 +112,10 @@ struct apple9_ra_assignment {
    const uint8_t *gpr;
    /* Optional bitset [BITSET_WORDS(program->value_count)] marking RA_MEM. */
    const BITSET_WORD *is_mem;
+   /* Optional bitset + value table marking rematerializable immediate phi
+    * sources carried directly into phi-edge lowering (never allocated a slot). */
+   const BITSET_WORD *is_imm;
+   const uint32_t *imm_val;
    /* Optional 32-bit spill word slot [0..max_mem_slots-1] when is_mem is set. */
    const uint16_t *mem_slot;
    /* Upper bound on spill slots (0 if no spills). */

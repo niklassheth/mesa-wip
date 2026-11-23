@@ -4,6 +4,7 @@
  */
 
 #include "apple9_ra_sched.h"
+#include "agx_compile.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -976,18 +977,28 @@ struct vir_sched_state {
    int32_t cur_16;
 };
 
+/* Edge data distinguishes true SSA data dependencies (1) from pure resource or
+ * control-order edges (0) so producer latency is only scored on data edges. */
 static inline void
-add_dep(struct vir_sched_node *a, struct vir_sched_node *b)
+add_data_dep(struct vir_sched_node *a, struct vir_sched_node *b)
 {
    assert(a != b && "no self-dependencies");
    if (a && b)
-      dag_add_edge(&a->dag, &b->dag, 0);
+      dag_add_edge_max_data(&a->dag, &b->dag, 1);
+}
+
+static inline void
+add_order_dep(struct vir_sched_node *a, struct vir_sched_node *b)
+{
+   assert(a != b && "no self-dependencies");
+   if (a && b)
+      dag_add_edge_max_data(&a->dag, &b->dag, 0);
 }
 
 static inline void
 serialize_node(struct vir_sched_node *a, struct vir_sched_node **b)
 {
-   add_dep(a, *b);
+   add_order_dep(a, *b);
    *b = a;
 }
 
@@ -1116,14 +1127,14 @@ create_vir_dag(const struct agx_apple9_vir_program *p,
          unsigned w = split_src_tuple_width(p, defs, I);
          for (unsigned c = 0; c < w; ++c) {
             if (src0 + c < p->value_count)
-               add_dep(node, last_write[src0 + c]);
+               add_data_dep(node, last_write[src0 + c]);
          }
       } else {
          const unsigned nr_srcs = agx_apple9_vir_nr_srcs(I);
          for (unsigned s = 0; s < nr_srcs; ++s) {
             uint32_t v = agx_apple9_vir_src(I, s);
             if (v < p->value_count)
-               add_dep(node, last_write[v]);
+               add_data_dep(node, last_write[v]);
          }
       }
 
@@ -1137,18 +1148,18 @@ create_vir_dag(const struct agx_apple9_vir_program *p,
       if (is_pinned_entry(I))
          serialize_node(node, &preload);
       else
-         add_dep(node, preload);
+         add_order_dep(node, preload);
 
       /* Implicit hardware resource hazards (memory, barriers, publications,
        * interpolation, tile, mesh, execution state). */
       uint32_t reads = 0, writes = 0;
       apple9_ra_schedule_resources(I, &reads, &writes);
       u_foreach_bit(r, reads | writes) {
-         add_dep(node, resource_writer[r]);
+         add_order_dep(node, resource_writer[r]);
          if (writes & BITFIELD_BIT(r)) {
             for (struct vir_resource_reader *rr = resource_readers[r]; rr;
                  rr = rr->next) {
-               add_dep(node, rr->node);
+               add_order_dep(node, rr->node);
             }
             resource_readers[r] = NULL;
             resource_writer[r] = node;
@@ -1215,6 +1226,8 @@ choose_vir_instr(struct vir_sched_state *s)
       unsigned dependency = 0;
       if (s->latency) {
          util_dynarray_foreach(&n->dag.edges, struct dag_edge, edge) {
+            if (!edge->data)
+               continue;
             struct vir_sched_node *producer =
                (struct vir_sched_node *)edge->child;
             dependency = MAX2(dependency,
@@ -1330,7 +1343,7 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
       for (unsigned i = 0; i < count; ++i) {
          dep_start[i] = pos;
          util_dynarray_foreach(&orig[i]->dag.edges, struct dag_edge, edge) {
-            if (edge->child)
+            if (edge->child && edge->data)
                dep_pool[pos++] = (struct vir_sched_node *)edge->child;
          }
       }
@@ -1383,9 +1396,9 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
          util_dynarray_foreach(&node->dag.edges, struct dag_edge, edge) {
             struct vir_sched_node *producer =
                (struct vir_sched_node *)edge->child;
-            producer->ready = MAX2(producer->ready,
-                                   s.position +
-                                      apple9_ra_dependency_delay(producer->instr));
+            unsigned delay =
+               edge->data ? apple9_ra_dependency_delay(producer->instr) : 1u;
+            producer->ready = MAX2(producer->ready, s.position + delay);
          }
          ++s.position;
       }
@@ -1497,6 +1510,17 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
 
    bool any_reordered = false;
 
+   /* Derive the shader's occupancy-tier ceiling from exact post-DCE CFG
+    * liveness (leaving 1 GPR headroom below the tier boundary so latency
+    * hiding does not drop occupancy tier or induce spilling). */
+   unsigned shader_peak = MIN2(MAX2(liveness.peak_live_gprs, 6u),
+                               (unsigned)AGX_APPLE9_GPR_COUNT);
+   unsigned shader_tier_gprs =
+      agx_occupancy_for_register_count(2u * shader_peak).max_registers / 2u;
+   shader_tier_gprs = MIN2(shader_tier_gprs, (unsigned)AGX_APPLE9_GPR_COUNT);
+   unsigned safe_tier_gprs =
+      shader_tier_gprs > 1u ? shader_tier_gprs - 1u : shader_tier_gprs;
+
    for (struct agx_apple9_block *blk = p->blocks; blk; blk = blk->next) {
       if (!blk->cfg_active)
          continue;
@@ -1591,6 +1615,12 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
             break;
       }
 
+      unsigned blk_slack = cfg->pressure_slack;
+      if (cfg->auto_tier_slack && orig_all < (int32_t)safe_tier_gprs) {
+         unsigned tier_slack = MIN2(8u, (unsigned)(safe_tier_gprs - orig_all));
+         blk_slack = MAX2(blk_slack, tier_slack);
+      }
+
       bool committed = false;
 
       if (cfg->latency) {
@@ -1603,7 +1633,7 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
 
          bool accept_lat = false;
          if (lat.valid) {
-            int32_t limit = orig_all + (int32_t)cfg->pressure_slack;
+            int32_t limit = orig_all + (int32_t)blk_slack;
             if (lat.max_all > limit) {
                cfg->rejected_pressure_increase = MAX2(
                   cfg->rejected_pressure_increase,
@@ -1620,7 +1650,7 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
 
          if (accept_lat) {
             bool overridden_by_pressure = false;
-            if (cfg->pressure_slack == 0 && lat.max_all > base_all) {
+            if (blk_slack == 0 && lat.max_all > base_all) {
                void *pres_ctx = ralloc_context(blk_ctx);
                struct vir_sched_result pres = run_block_schedule_attempt(
                   p, defs, pub_defs, val_max_gpr, first_body, first_tail,
@@ -1632,10 +1662,25 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                    pressure_strictly_better(pres.max_all, pres.max_64,
                                             pres.max_16, lat.max_all,
                                             lat.max_64, lat.max_16)) {
-                  apply_vir_schedule(p, blk, last_entry, pres.order, pres.count);
-                  committed = true;
-                  any_reordered = true;
-                  overridden_by_pressure = true;
+                  bool worth_override = true;
+                  if (cfg->auto_tier_slack && lat.stalls < orig_stalls &&
+                      lat.max_all <= (int32_t)AGX_APPLE9_GPR_COUNT) {
+                     unsigned lat_threads = agx_occupancy_for_register_count(
+                                               2u * MAX2((unsigned)lat.max_all, 1u))
+                                               .max_threads;
+                     unsigned pres_threads = agx_occupancy_for_register_count(
+                                                2u * MAX2((unsigned)pres.max_all, 1u))
+                                                .max_threads;
+                     /* Do not discard a lower-stall latency schedule for an
+                      * intra-tier GPR reduction that yields no occupancy win. */
+                     worth_override = pres_threads > lat_threads;
+                  }
+                  if (worth_override) {
+                     apply_vir_schedule(p, blk, last_entry, pres.order, pres.count);
+                     committed = true;
+                     any_reordered = true;
+                     overridden_by_pressure = true;
+                  }
                }
                ralloc_free(pres_ctx);
             }
@@ -1652,7 +1697,7 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
        * zero slack is requested, or when pressure exceeds the register file
        * (avoiding undoing latency hiding in low-pressure blocks where the
        * caller explicitly granted occupancy-tier pressure slack). */
-      if (!committed && (!cfg->latency || cfg->pressure_slack == 0 ||
+      if (!committed && (!cfg->latency || blk_slack == 0 ||
                          orig_all > (int32_t)AGX_APPLE9_GPR_COUNT)) {
          void *pres_ctx = ralloc_context(blk_ctx);
          struct vir_sched_result pres = run_block_schedule_attempt(
@@ -1664,8 +1709,21 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
              bank_limits_respected(pres.max_64, pres.max_16, orig_64, orig_16) &&
              pressure_strictly_better(pres.max_all, pres.max_64, pres.max_16,
                                       orig_all, orig_64, orig_16)) {
-            apply_vir_schedule(p, blk, last_entry, pres.order, pres.count);
-            any_reordered = true;
+            bool worth_pres = true;
+            if (cfg->latency && cfg->auto_tier_slack &&
+                orig_all <= (int32_t)AGX_APPLE9_GPR_COUNT) {
+               unsigned orig_threads = agx_occupancy_for_register_count(
+                                          2u * MAX2((unsigned)orig_all, 1u))
+                                          .max_threads;
+               unsigned pres_threads = agx_occupancy_for_register_count(
+                                          2u * MAX2((unsigned)pres.max_all, 1u))
+                                          .max_threads;
+               worth_pres = pres_threads > orig_threads;
+            }
+            if (worth_pres) {
+               apply_vir_schedule(p, blk, last_entry, pres.order, pres.count);
+               any_reordered = true;
+            }
          }
          ralloc_free(pres_ctx);
       }

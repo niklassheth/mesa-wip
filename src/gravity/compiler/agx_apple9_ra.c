@@ -1582,6 +1582,7 @@ apple9_run_native_candidate(struct agx_apple9_vir_program *program,
       opts.cost_register_constraints = cost_constraints;
       opts.latency_schedule = latency;
       opts.pressure_slack = slack;
+      opts.auto_tier_slack = latency;
       opts.disable_uniform_remat = !uniform_remat;
       const uint64_t dbg = agx_get_compiler_debug();
       opts.skip_physical_schedule = true;

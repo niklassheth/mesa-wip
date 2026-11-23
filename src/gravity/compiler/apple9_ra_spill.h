@@ -30,6 +30,11 @@ struct apple9_ra_spill_state {
    /* Bit v is set iff SSA value v resides in RA_MEM (32-bit spill frame words
     * 0..8191), clear iff it resides in RA_GPR (32-bit GPR units 0..95). */
    BITSET_WORD *is_mem;
+   /* Bit v is set iff SSA value v is a rematerializable scalar immediate
+    * carried directly into phi-edge lowering (never allocated a scratch word;
+    * also marked in is_mem so GPR liveness and assignment skip it). */
+   BITSET_WORD *is_imm;
+   uint32_t *imm_val;
    unsigned is_mem_capacity;
 
    /* Tuple width in 32-bit GPR/word units for each SSA value (1 for scalar,
@@ -103,6 +108,13 @@ apple9_ra_value_is_mem(const struct apple9_ra_spill_state *state, uint32_t v)
 {
    return state && state->is_mem && v < state->is_mem_capacity &&
           BITSET_TEST(state->is_mem, v);
+}
+
+static inline bool
+apple9_ra_value_is_imm(const struct apple9_ra_spill_state *state, uint32_t v)
+{
+   return state && state->is_imm && v < state->is_mem_capacity &&
+          BITSET_TEST(state->is_imm, v);
 }
 
 static inline unsigned

@@ -1080,3 +1080,51 @@ TEST(Apple9RaPressureSchedule, LatencySlackDoesNotExceedR0R15BankCeiling)
    verify_ssa_def_before_use_in_block(&p, b0);
    agx_apple9_vir_finish(&p);
 }
+
+TEST(Apple9RaPressureSchedule, AutoTierSlackOverlapsLoadsWithoutDroppingTier)
+{
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   ASSERT_NE(b0, nullptr);
+   agx_apple9_block_begin(&p, b0);
+
+   /* With auto_tier_slack = true, two independent DEVICE_LOAD + consumer pairs
+    * inside a low-pressure block (well below the 52-GPR 1024-thread tier) must
+    * overlap their loads instead of snapping each consumer to dist=1 behind
+    * its load for a 1-GPR intra-tier pressure savings. */
+   uint32_t idx = agx_apple9_vir_input(&p, 0);
+   uint32_t c0 = agx_apple9_vir_input(&p, 1);
+
+   uint32_t l0 = emit_dev_load(&p, 0, idx, 1);
+   agx_apple9_vir_instr *l0_ins = p.instructions[p.instruction_count - 1];
+   uint32_t u0 = emit_iadd(&p, l0, c0);
+   agx_apple9_vir_instr *u0_ins = p.instructions[p.instruction_count - 1];
+
+   uint32_t l1 = emit_dev_load(&p, 1, idx, 1);
+   agx_apple9_vir_instr *l1_ins = p.instructions[p.instruction_count - 1];
+   uint32_t u1 = emit_iadd(&p, l1, c0);
+   agx_apple9_vir_instr *u1_ins = p.instructions[p.instruction_count - 1];
+
+   uint32_t sum = emit_iadd(&p, u0, u1);
+   ASSERT_TRUE(emit_dev_store(&p, 2, idx, sum));
+
+   apple9_ra_sched_options opts = {
+      .latency = true,
+      .pressure_slack = 0,
+      .auto_tier_slack = true,
+      .rejected_pressure_increase = 0,
+   };
+   ASSERT_TRUE(apple9_ra_pressure_schedule_opts(&p, &opts));
+
+   unsigned p_l0 = instr_pos_in_block(b0, l0_ins);
+   unsigned p_u0 = instr_pos_in_block(b0, u0_ins);
+   unsigned p_l1 = instr_pos_in_block(b0, l1_ins);
+   unsigned p_u1 = instr_pos_in_block(b0, u1_ins);
+   bool overlapped = std::max(p_l0, p_l1) < std::min(p_u0, p_u1);
+   EXPECT_TRUE(overlapped);
+
+   verify_ssa_def_before_use_in_block(&p, b0);
+   agx_apple9_vir_finish(&p);
+}

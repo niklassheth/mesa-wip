@@ -1415,3 +1415,49 @@ TEST_F(Apple9RaPcopyTest, ValidatePostRaRejectsClobberedProgramOutput)
    gpr[clobber_v] = 5;
    EXPECT_TRUE(apple9_ra_validate_post_ra(&p, &assign, &err)) << err.message;
 }
+
+TEST(Apple9RaPcopy, MemFanOutReusesSingleFillAndRotatesStagingGprs)
+{
+   /* 1) 4-way MEM[1..4] <- MEM[0] fan-out must emit exactly 1 GPR<-MEM fill
+    *    and 4 MEM<-GPR stores (instead of 4 redundant fills).
+    * 2) 4-way MEM[10..13] <- IMM(0) fan-out must emit exactly 1 MOV_IMM and
+    *    4 MEM<-GPR stores.
+    * 3) Two distinct MEM <- IMM transfers rotate between scratch_gpr (r3) and
+    *    scratch_gpr2 (r4) to avoid immediate WAR WAITs. */
+   apple9_ra_pcopy_opts opts = make_opts(~0ull, ~0ull, 3, 4);
+
+   std::vector<apple9_ra_copy> copies = {
+      {apple9_ra_loc_mem(1), apple9_ra_loc_mem(0), 1},
+      {apple9_ra_loc_mem(2), apple9_ra_loc_mem(0), 1},
+      {apple9_ra_loc_mem(3), apple9_ra_loc_mem(0), 1},
+      {apple9_ra_loc_mem(4), apple9_ra_loc_mem(0), 1},
+      {apple9_ra_loc_mem(10), apple9_ra_loc_imm(0), 1},
+      {apple9_ra_loc_mem(11), apple9_ra_loc_imm(0), 1},
+      {apple9_ra_loc_mem(12), apple9_ra_loc_imm(0), 1},
+      {apple9_ra_loc_mem(13), apple9_ra_loc_imm(0), 1},
+      {apple9_ra_loc_mem(20), apple9_ra_loc_imm(0x3f800000u), 1},
+   };
+
+   std::vector<apple9_ra_pcopy_op> ops;
+   verify_parallel_copy(copies, opts, 64, &ops);
+
+   unsigned fills = 0, stores = 0, imms = 0;
+   std::vector<unsigned> imm_regs;
+   for (const auto &op : ops) {
+      if (op.kind == APPLE9_RA_PCOPY_MOV &&
+          op.dst.kind == APPLE9_RA_LOC_GPR && op.src.kind == APPLE9_RA_LOC_MEM)
+         fills++;
+      if (op.kind == APPLE9_RA_PCOPY_MOV &&
+          op.dst.kind == APPLE9_RA_LOC_MEM && op.src.kind == APPLE9_RA_LOC_GPR)
+         stores++;
+      if (op.kind == APPLE9_RA_PCOPY_MOV_IMM) {
+         imms++;
+         imm_regs.push_back(op.dst.value);
+      }
+   }
+   EXPECT_EQ(fills, 1u);
+   EXPECT_EQ(stores, 9u);
+   EXPECT_EQ(imms, 2u);
+   ASSERT_EQ(imm_regs.size(), 2u);
+   EXPECT_NE(imm_regs[0], imm_regs[1]);
+}

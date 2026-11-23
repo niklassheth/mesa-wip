@@ -34,6 +34,7 @@ struct pcopy_state {
 
    uint8_t scratch_gpr;
    uint8_t scratch_gpr2;
+   uint8_t last_temp_gpr;
    uint8_t max_temp_gpr;
    uint8_t mov_imm_max_gpr;
    bool prefer_swap_2cycle;
@@ -117,32 +118,60 @@ gpr_usable_as_temp(const struct pcopy_state *st, unsigned r, unsigned max_gpr,
 
 /* Select a safe temporary GPR strictly below `max_gpr`.
  * When `persistent` is false, the temp is consumed immediately within a single
- * 2-op lowered transfer (e.g. MEM<-MEM, MEM<-IMM, GPR(>=64)<-IMM), so even an
- * unblocked pending destination GPR whose old value is dead may be borrowed. */
+ * lowered transfer (e.g. MEM<-MEM, MEM<-IMM, GPR(>=64)<-IMM), so even an
+ * unblocked pending destination GPR whose old value is dead may be borrowed.
+ * Prefer rotating away from `last_temp_gpr` to avoid back-to-back WAR WAITs on
+ * consecutive SPILL_STOREs. */
 static unsigned
-find_temp_gpr(const struct pcopy_state *st, unsigned max_gpr, bool persistent)
+find_temp_gpr(struct pcopy_state *st, unsigned max_gpr, bool persistent)
 {
-   if (st->scratch_gpr != AGX_APPLE9_PHYS_INVALID &&
-       gpr_usable_as_temp(st, st->scratch_gpr, max_gpr, persistent))
-      return st->scratch_gpr;
+   unsigned fallback = AGX_APPLE9_PHYS_INVALID;
+   unsigned avoid = persistent ? AGX_APPLE9_PHYS_INVALID : st->last_temp_gpr;
 
-   if (st->scratch_gpr2 != AGX_APPLE9_PHYS_INVALID &&
-       gpr_usable_as_temp(st, st->scratch_gpr2, max_gpr, persistent))
-      return st->scratch_gpr2;
+   for (unsigned pass = 0; pass < 2; ++pass) {
+      if (pass == 1) {
+         if (fallback != AGX_APPLE9_PHYS_INVALID)
+            return fallback;
+         break;
+      }
+      if (st->scratch_gpr != AGX_APPLE9_PHYS_INVALID &&
+          gpr_usable_as_temp(st, st->scratch_gpr, max_gpr, persistent)) {
+         if (st->scratch_gpr != avoid)
+            return st->scratch_gpr;
+         if (fallback == AGX_APPLE9_PHYS_INVALID)
+            fallback = st->scratch_gpr;
+      }
 
-   unsigned free_limit = MIN2(max_gpr, st->max_temp_gpr);
-   for (unsigned r = 0; r < free_limit; ++r) {
-      if (!gpr_bit_test(st->live_gprs, r) &&
-          !gpr_bit_test(st->gpr_pending_dest, r) &&
-          gpr_usable_as_temp(st, r, free_limit, persistent))
-         return r;
-   }
+      if (st->scratch_gpr2 != AGX_APPLE9_PHYS_INVALID &&
+          gpr_usable_as_temp(st, st->scratch_gpr2, max_gpr, persistent)) {
+         if (st->scratch_gpr2 != avoid)
+            return st->scratch_gpr2;
+         if (fallback == AGX_APPLE9_PHYS_INVALID)
+            fallback = st->scratch_gpr2;
+      }
 
-   if (!persistent) {
-      for (unsigned r = 0; r < max_gpr && r < AGX_APPLE9_GPR_COUNT; ++r) {
-         if (gpr_bit_test(st->gpr_pending_dest, r) &&
-             gpr_usable_as_temp(st, r, max_gpr, false))
-            return r;
+      unsigned free_limit = MIN2(max_gpr, st->max_temp_gpr);
+      for (unsigned r = 0; r < free_limit; ++r) {
+         if (!gpr_bit_test(st->live_gprs, r) &&
+             !gpr_bit_test(st->gpr_pending_dest, r) &&
+             gpr_usable_as_temp(st, r, free_limit, persistent)) {
+            if (r != avoid)
+               return r;
+            if (fallback == AGX_APPLE9_PHYS_INVALID)
+               fallback = r;
+         }
+      }
+
+      if (!persistent) {
+         for (unsigned r = 0; r < max_gpr && r < AGX_APPLE9_GPR_COUNT; ++r) {
+            if (gpr_bit_test(st->gpr_pending_dest, r) &&
+                gpr_usable_as_temp(st, r, max_gpr, false)) {
+               if (r != avoid)
+                  return r;
+               if (fallback == AGX_APPLE9_PHYS_INVALID)
+                  fallback = r;
+            }
+         }
       }
    }
 
@@ -272,15 +301,56 @@ drain_acyclic(struct pcopy_state *st, bool *ok)
          }
       }
 
-      /* Pass 2: unblocked bridge copies (MEM<-MEM, MEM<-IMM, GPR>=64<-IMM). */
+      /* Pass 2: unblocked bridge copies (MEM<-MEM, MEM<-IMM, GPR>=64<-IMM).
+       * Group all unblocked bridge copies sharing the same source (MEM slot or
+       * immediate) so we load/materialize the source into `tmp` once and fan
+       * out all stores without redundant SPILL_LOADs or WAR WAITs. */
       for (unsigned i = 0; i < st->nr_pending; ) {
          struct pcopy_entry *e = &st->pending[i];
          if (needs_bridge_temp(st, e) && loc_use_count(st, e->dst) == 0) {
-            if (!drain_entry(st, i)) {
+            struct apple9_ra_loc src = e->src;
+            unsigned max_gpr = (src.kind == APPLE9_RA_LOC_IMM)
+                                  ? st->mov_imm_max_gpr
+                                  : AGX_APPLE9_GPR_COUNT;
+            unsigned tmp = find_temp_gpr(st, max_gpr, false);
+            if (tmp == AGX_APPLE9_PHYS_INVALID) {
                *ok = false;
                return false;
             }
+            bool loaded = (src.kind == APPLE9_RA_LOC_IMM)
+                             ? emit_mov_imm(st, tmp, src.value)
+                             : emit_mov(st, apple9_ra_loc_gpr(tmp), src);
+            if (!loaded) {
+               *ok = false;
+               return false;
+            }
+            st->last_temp_gpr = (uint8_t)tmp;
+
+            bool drained_any = false;
+            for (unsigned j = 0; j < st->nr_pending; ) {
+               struct pcopy_entry *ej = &st->pending[j];
+               if (needs_bridge_temp(st, ej) && loc_equal(ej->src, src) &&
+                   loc_use_count(st, ej->dst) == 0 &&
+                   !(ej->dst.kind == APPLE9_RA_LOC_GPR && ej->dst.value == tmp)) {
+                  struct pcopy_entry copy = *ej;
+                  if (!emit_mov(st, copy.dst, apple9_ra_loc_gpr(tmp))) {
+                     *ok = false;
+                     return false;
+                  }
+                  loc_use_dec(st, copy.src);
+                  if (copy.dst.kind == APPLE9_RA_LOC_GPR) {
+                     gpr_bit_clear(st->gpr_pending_dest, copy.dst.value);
+                     gpr_bit_set(st->gpr_written, copy.dst.value);
+                  }
+                  st->pending[j] = st->pending[--st->nr_pending];
+                  drained_any = true;
+               } else {
+                  ++j;
+               }
+            }
+            assert(drained_any);
             progress = any = true;
+            i = 0;
          } else {
             ++i;
          }
@@ -535,6 +605,7 @@ apple9_ra_lower_parallel_copies(const struct apple9_ra_copy *copies,
       .mem_count = mem_count,
       .scratch_gpr = opts ? opts->scratch_gpr : AGX_APPLE9_PHYS_INVALID,
       .scratch_gpr2 = opts ? opts->scratch_gpr2 : AGX_APPLE9_PHYS_INVALID,
+      .last_temp_gpr = AGX_APPLE9_PHYS_INVALID,
       .max_temp_gpr =
          (opts && opts->max_temp_gpr) ? MIN2(opts->max_temp_gpr, AGX_APPLE9_GPR_COUNT)
                                       : AGX_APPLE9_GPR_COUNT,
@@ -778,6 +849,11 @@ value_to_loc(const struct agx_apple9_vir_program *program,
    }
    if (val >= program->value_count)
       return false;
+
+   if (assign && assign->is_imm && BITSET_TEST(assign->is_imm, val)) {
+      *out = apple9_ra_loc_imm(assign->imm_val[val]);
+      return true;
+   }
 
    if (assign && assign->is_mem && BITSET_TEST(assign->is_mem, val)) {
       if (!assign->mem_slot)

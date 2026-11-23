@@ -40,6 +40,9 @@ struct apple9_ra_assign_options {
     * latency_schedule is enabled; 0 enforces strict minimum pressure. */
    unsigned pressure_slack;
 
+   /* Derive per-block occupancy-tier slack from exact post-DCE CFG liveness. */
+   bool auto_tier_slack;
+
    /* Disable immutable-uniform pure-ALU rematerialization when spilling. */
    bool disable_uniform_remat;
 
@@ -101,6 +104,7 @@ apple9_ra_assign_default_options(void)
    opts.cost_register_constraints = false;
    opts.latency_schedule = false;
    opts.pressure_slack = 0;
+   opts.auto_tier_slack = false;
    opts.disable_uniform_remat = false;
    opts.validate = false;
    opts.keep_ssa_ir = false;

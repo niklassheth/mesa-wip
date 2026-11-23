@@ -59,6 +59,8 @@ apple9_ra_spill_state_finish(struct apple9_ra_spill_state *state)
    if (!state)
       return;
    free(state->is_mem);
+   free(state->is_imm);
+   free(state->imm_val);
    free(state->value_width);
    free(state->spill_home);
    memset(state, 0, sizeof(*state));
@@ -84,6 +86,20 @@ apple9_ra_spill_state_ensure(struct apple9_ra_spill_state *state,
    if (new_words > old_words)
       memset(new_mem + old_words, 0, (new_words - old_words) * sizeof(BITSET_WORD));
    state->is_mem = new_mem;
+
+   BITSET_WORD *new_imm = realloc(state->is_imm, new_words * sizeof(BITSET_WORD));
+   if (!new_imm)
+      return false;
+   if (new_words > old_words)
+      memset(new_imm + old_words, 0, (new_words - old_words) * sizeof(BITSET_WORD));
+   state->is_imm = new_imm;
+
+   uint32_t *new_imm_val = realloc(state->imm_val, new_cap * sizeof(uint32_t));
+   if (!new_imm_val)
+      return false;
+   memset(new_imm_val + state->is_mem_capacity, 0,
+          (new_cap - state->is_mem_capacity) * sizeof(uint32_t));
+   state->imm_val = new_imm_val;
 
    uint8_t *new_width = realloc(state->value_width, new_cap * sizeof(uint8_t));
    if (!new_width)
@@ -911,21 +927,24 @@ find_apple9_remat(struct agx_apple9_vir_program *program,
                   struct agx_apple9_vir_instr **remat, void *memctx,
                   unsigned n, unsigned max_extra)
 {
-   if (opts->disable_uniform_remat)
-      return 0;
-
-   /* Preamble writes make uniforms mutable; treat the whole shader part
-    * conservatively. The main shader's uniform file is immutable. */
-   for (unsigned bi = 0; bi < num_blocks; ++bi) {
+   /* Preamble writes make uniforms mutable, so forbid uniform-reading recipes
+    * while still discovering pure literal-only ALU chains. */
+   bool allow_uniform_remat = !opts->disable_uniform_remat;
+   for (unsigned bi = 0; bi < num_blocks && allow_uniform_remat; ++bi) {
       for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(cfg_blocks[bi]);
            I; I = agx_apple9_instr_next(I)) {
-         if (I->op == AGX_APPLE9_VIR_STORE_UNIFORM)
-            return 0;
+         if (I->op == AGX_APPLE9_VIR_STORE_UNIFORM) {
+            allow_uniform_remat = false;
+            break;
+         }
       }
    }
 
    uint8_t *cost = rzalloc_array(memctx, uint8_t, MAX2(n, 1u));
    unsigned *peak = rzalloc_array(memctx, unsigned, MAX2(n, 1u));
+   bool *uses_uniform = rzalloc_array(memctx, bool, MAX2(n, 1u));
+   if (!cost || !peak || !uses_uniform)
+      return 0;
 
    for (unsigned bi = 0; bi < num_blocks; ++bi) {
       for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(cfg_blocks[bi]);
@@ -947,7 +966,14 @@ find_apple9_remat(struct agx_apple9_vir_program *program,
             if (!apple9_vir_remat_alu(I, is_pub, n) || cost[I->dest])
                continue;
 
+            bool reads_uniform =
+               (I->op == AGX_APPLE9_VIR_IOR_UNIFORM) ||
+               (I->alu_src_uniform_mask != 0);
+            if (reads_uniform && !allow_uniform_remat)
+               continue;
+
             unsigned total = 1, held = 0, demand = 0;
+            bool chain_uniform = reads_uniform;
             unsigned nr_srcs = agx_apple9_vir_nr_srcs(I);
             for (unsigned s = 0; s < nr_srcs; ++s) {
                uint32_t sv = agx_apple9_vir_src(I, s);
@@ -955,12 +981,13 @@ find_apple9_remat(struct agx_apple9_vir_program *program,
                   total = 5;
                   break;
                }
+               chain_uniform |= uses_uniform[sv];
                total += cost[sv];
                demand = MAX2(demand, held + peak[sv]);
                held += util_next_power_of_two(widths[sv]);
             }
 
-            if (total <= 4) {
+            if (total <= 4 && (!chain_uniform || allow_uniform_remat)) {
                unsigned width = util_next_power_of_two(widths[I->dest]);
                demand = MAX2(demand, held + width);
                if (demand - width > max_extra)
@@ -968,8 +995,10 @@ find_apple9_remat(struct agx_apple9_vir_program *program,
                peak[I->dest] = demand;
                extra = MAX2(extra, demand - width);
                cost[I->dest] = total;
+               uses_uniform[I->dest] = chain_uniform;
                remat[I->dest] = I;
-               state->uniform_remat_used = true;
+               if (chain_uniform)
+                  state->uniform_remat_used = true;
                progress = true;
             }
          }
@@ -1784,6 +1813,19 @@ insert_coupling_code(struct spill_ctx *ctx, struct agx_apple9_block *pred,
       if (sv == AGX_APPLE9_VREG_INVALID || sv >= ctx->n ||
           BITSET_TEST(ctx->is_pub, sv))
          continue;
+
+      if (ctx->remat[sv] && ctx->remat[sv]->op == AGX_APPLE9_VIR_IMM &&
+          ctx->widths[sv] == 1) {
+         /* Carry scalar literal phi sources directly as APPLE9_RA_LOC_IMM into
+          * phi-edge lowering instead of spilling constants at shader entry and
+          * fanning out MEM<-MEM scratch copies. */
+         uint32_t imm_sv = ctx->spill_base + sv;
+         mark_mem_tuple(ctx->state, imm_sv, 1);
+         BITSET_SET(ctx->state->is_imm, imm_sv);
+         ctx->state->imm_val[imm_sv] = ctx->remat[sv]->immediate;
+         *agx_apple9_vir_src_ptr(phi, pred_idx) = imm_sv;
+         continue;
+      }
 
       if (ctx->remat[sv]) {
          /* Rematerializable phi source entering a spilled phi: materialize

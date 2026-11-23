@@ -47,6 +47,10 @@ struct apple9_ra_sched_options {
    /* Maximum allowed peak 32-bit GPR pressure increase (in 32-bit GPR units)
     * when hiding latency stalls. Ignored when !latency. */
    unsigned pressure_slack;
+   /* Automatically derive per-block occupancy-tier slack from exact post-DCE
+    * CFG liveness and avoid overriding lower-stall schedules for intra-tier
+    * 1-GPR savings. */
+   bool auto_tier_slack;
    /* Output: largest peak 32-bit GPR pressure increase rejected across blocks. */
    unsigned rejected_pressure_increase;
 };

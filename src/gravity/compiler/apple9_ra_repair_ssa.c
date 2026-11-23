@@ -537,15 +537,22 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
    }
 
    BITSET_WORD *new_mem = NULL;
+   BITSET_WORD *new_imm = NULL;
+   uint32_t *new_imm_val = NULL;
    uint8_t *new_width = NULL;
    uint32_t *new_homes = NULL;
    if (state) {
       new_mem = calloc(BITSET_WORDS(alloc_count), sizeof(BITSET_WORD));
+      new_imm = calloc(BITSET_WORDS(alloc_count), sizeof(BITSET_WORD));
+      new_imm_val = calloc(alloc_count, sizeof(uint32_t));
       new_width = malloc(alloc_count * sizeof(uint8_t));
       if (homes)
          new_homes = calloc(alloc_count, sizeof(uint32_t));
-      if (!new_mem || !new_width || (homes && !new_homes)) {
+      if (!new_mem || !new_imm || !new_imm_val || !new_width ||
+          (homes && !new_homes)) {
          free(new_mem);
+         free(new_imm);
+         free(new_imm_val);
          free(new_width);
          free(new_homes);
          free(new_phys);
@@ -600,7 +607,10 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
       if (state) {
          if (apple9_ra_value_is_mem(state, v)) {
             BITSET_SET(new_mem, nv);
-            if (new_homes) {
+            if (apple9_ra_value_is_imm(state, v)) {
+               BITSET_SET(new_imm, nv);
+               new_imm_val[nv] = state->imm_val[v];
+            } else if (new_homes) {
                void *ent = _mesa_hash_table_u64_search(homes, v);
                new_homes[nv] = (uint32_t)(uintptr_t)ent;
             }
@@ -628,9 +638,13 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
 
    if (state) {
       free(state->is_mem);
+      free(state->is_imm);
+      free(state->imm_val);
       free(state->value_width);
       free(state->spill_home);
       state->is_mem = new_mem;
+      state->is_imm = new_imm;
+      state->imm_val = new_imm_val;
       state->value_width = new_width;
       state->is_mem_capacity = alloc_count;
       state->spill_home = new_homes;
