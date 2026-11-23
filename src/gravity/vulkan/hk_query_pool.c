@@ -123,6 +123,7 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
     * dEQP-VK.query_pool.occlusion_query.get_results_conservative_size_64_wait_query_without_availability_draw_triangles_discard
     */
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
    hk_cdm_cache_flush(dev, cs);
 
    perf_debug(cmd, "Queued writes");
@@ -166,6 +167,7 @@ hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
     * dEQP-VK.query_pool.occlusion_query.get_results_conservative_size_64_wait_query_without_availability_draw_triangles_discard
     */
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
    hk_cdm_cache_flush(dev, cs);
 
    perf_debug(cmd, "Queued write");
@@ -186,6 +188,7 @@ hk_flush_query_writes(struct hk_cmd_buffer *cmd)
          hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.cs, true, HK_SYNC_ALL);
       if (cs) {
          /* The segments were written by rendering that has to complete. */
+         hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
          hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
          uint64_t params = hk_pool_upload(cmd, cmd->occlusion_accum.data,
                                           cmd->occlusion_accum.size, 16);
@@ -211,6 +214,7 @@ hk_flush_query_writes(struct hk_cmd_buffer *cmd)
       if (cs) {
          /* Results must be visible system-wide once marked available, as in
           * hk_dispatch_imm_writes. */
+         hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
          hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
          uint64_t params = hk_pool_upload(cmd, cmd->query_writes.data,
                                           cmd->query_writes.size, 16);

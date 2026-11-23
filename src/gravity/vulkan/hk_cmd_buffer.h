@@ -1063,6 +1063,11 @@ void hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 void hk_cmd_sync_work(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                       unsigned stages);
 bool hk_cmd_sync_before_gfx(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void hk_cmd_sync_barrier_group(struct hk_cmd_buffer *cmd,
+                               VkPipelineStageFlags2 src,
+                               VkPipelineStageFlags2 dst,
+                               VkAccessFlags2 src_access,
+                               VkAccessFlags2 dst_access, uint32_t group);
 void hk_cmd_sync_barrier(struct hk_cmd_buffer *cmd,
                          VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst,
                          VkAccessFlags2 src_access, VkAccessFlags2 dst_access);

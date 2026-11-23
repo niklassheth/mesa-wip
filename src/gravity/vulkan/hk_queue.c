@@ -408,9 +408,9 @@ queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
 
    uint64_t out_syncs =
       submit->syncs + sizeof(struct drm_asahi_sync) * submit->in_sync_count;
+   bool seen_vdm = false, seen_cdm = false;
 
    while (commands_remaining) {
-      bool first = commands_remaining == command_count;
       bool last = commands_remaining <= max_commands_per_submit(dev);
 
       unsigned count = MIN2(commands_remaining, max_commands_per_submit(dev));
@@ -420,16 +420,27 @@ queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
       assert(count > 0);
 
       unsigned base_offs = offs;
+      bool slice_has_vdm = false, slice_has_cdm = false;
 
       /* Headers already contain slice-relative barriers. */
       for (unsigned i = 0; i < count; ++i) {
          struct drm_asahi_cmd_header *cmd = (void *)(cmdbuf + offs);
+         if (cmd->cmd_type == DRM_ASAHI_CMD_RENDER)
+            slice_has_vdm = true;
+         else if (cmd->cmd_type == DRM_ASAHI_CMD_COMPUTE)
+            slice_has_cdm = true;
          offs += sizeof(*cmd) + cmd->size;
-
       }
 
-
-      bool has_in_syncs = first;
+      /* Attach in_syncs to the first slice that touches each subqueue so an
+       * independent command on the other engine in a later slice cannot start
+       * before the submission's wait semaphores signal.
+       */
+      bool has_in_syncs = submit->in_sync_count > 0 &&
+                          ((slice_has_vdm && !seen_vdm) ||
+                           (slice_has_cdm && !seen_cdm));
+      seen_vdm |= slice_has_vdm;
+      seen_cdm |= slice_has_cdm;
       bool has_out_syncs = last;
 
       struct drm_asahi_submit submit_ioctl = {
@@ -1239,7 +1250,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    return result;
 }
 
-static VkResult
+VkResult
 hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
    struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);

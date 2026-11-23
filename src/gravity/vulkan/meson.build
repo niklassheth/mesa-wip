@@ -558,6 +558,20 @@ if with_tests
     suite : ['gravity'],
   )
   test(
+    'gravity_barrier_fixes',
+    executable(
+      'gravity_barrier_fixes',
+      'tests/hk-barrier-fixes.c',
+      c_args : gravity_diagnostic_c_args,
+      include_directories : [inc_gallium, inc_gallium_aux, inc_include,
+                             inc_src, inc_gravity],
+      dependencies : [gravity_vk_deps],
+      link_with : [libgravity_vk],
+      link_args : ['-Wl,--wrap=hk_dispatch_precomp'],
+    ),
+    suite : ['gravity'],
+  )
+  test(
     'gravity_texel_encode',
     executable(
       'gravity_texel_encode',

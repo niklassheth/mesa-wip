@@ -52,4 +52,7 @@ VkResult hk_queue_init(struct hk_device *dev,
                        const VkDeviceQueueCreateInfo *pCreateInfo,
                        uint32_t index_in_family);
 
+VkResult hk_queue_submit(struct vk_queue *vk_queue,
+                         struct vk_queue_submit *submit);
+
 void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
