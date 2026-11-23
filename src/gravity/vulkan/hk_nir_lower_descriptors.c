@@ -656,6 +656,16 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       return false;
    }
 
+   /* Input attachment lowering records the attachment index in texture_index
+    * and any dynamic array offset in texture_offset. Our bindless handle
+    * already addresses the attachment array deref directly. */
+   if (tex->input_attachment_index) {
+      nir_steal_tex_src(tex, nir_tex_src_texture_offset);
+      tex->texture_index = 0;
+      tex->texture_array_size = 0;
+      tex->input_attachment_index = false;
+   }
+
    nir_def *plane_ssa = nir_steal_tex_src(tex, nir_tex_src_plane);
    const uint32_t plane =
       plane_ssa ? nir_src_as_uint(nir_src_for_ssa(plane_ssa)) : 0;
