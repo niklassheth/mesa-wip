@@ -6,6 +6,8 @@
 #ifndef AGX_APPLE9_IR_H
 #define AGX_APPLE9_IR_H
 
+#include <assert.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -140,6 +142,12 @@ enum agx_apple9_vir_opcode {
    AGX_APPLE9_VIR_DERIVATIVE,
    AGX_APPLE9_VIR_SELECT,
    AGX_APPLE9_VIR_COLLECT,
+   /* Pre-physical SSA RA pseudos: SPLIT extracts scalar SSA lanes from a
+    * contiguous tuple, MOV copies an SSA/register/spill value, and SWAP
+    * exchanges two registers during parallel-copy lowering. */
+   AGX_APPLE9_VIR_SPLIT,
+   AGX_APPLE9_VIR_MOV,
+   AGX_APPLE9_VIR_SWAP,
    AGX_APPLE9_VIR_PHI,
    AGX_APPLE9_VIR_PHI_SRC,
    AGX_APPLE9_VIR_PREDICATE_COMPARE,
@@ -475,6 +483,13 @@ struct agx_apple9_vir_instr {
    /* Phi declaration and incoming edge uses remain SSA until packing. */
    struct agx_apple9_block *phi_block;
    struct agx_apple9_vir_instr *phi_edge;
+   /* Sideband source array for canonical variable-arity VIR_PHI with more than
+    * AGX_APPLE9_MAX_VIR_SRCS predecessors. When non-NULL, holds `phi_src_count`
+    * SSA values indexed by logical predecessor index; otherwise inline
+    * `src[0..nr_srcs-1]` is used. Access via agx_apple9_vir_nr_srcs() /
+    * agx_apple9_vir_src() / agx_apple9_vir_src_ptr(). */
+   uint32_t *phi_srcs;
+   uint32_t phi_src_count;
    uint8_t nr_srcs;
 
    /* Floating source modifiers apply absolute value before negation. */
@@ -520,9 +535,14 @@ struct agx_apple9_vir_instr {
 
    /* Bit s is set when src[s] has another consumer after this instruction. */
    uint16_t live_after_mask;
+   /* Bit s is set when src[s] is killed (last use) at this instruction.
+    * Populated by native VIR liveness for pre-physical SSA RA. */
+   uint16_t kill_mask;
    /* Sources whose registers other live values share (a reused tuple's
     * components); allocation never releases them at this use. */
    uint16_t retain_mask;
+   /* Bit c is set when component c of a multi-dest pseudo (VIR_SPLIT) is dead. */
+   uint8_t dead_dest_mask;
 
    /*
     * The one pending-result slot consumed by this instruction, or NONE.
@@ -548,6 +568,43 @@ struct agx_apple9_vir_instr {
     * slot and are kept on the use until the graphics compiler is generalized.
     */
 };
+
+static inline unsigned
+agx_apple9_vir_nr_srcs(const struct agx_apple9_vir_instr *I)
+{
+   return I->phi_srcs ? I->phi_src_count : I->nr_srcs;
+}
+
+static inline uint32_t
+agx_apple9_vir_src(const struct agx_apple9_vir_instr *I, unsigned s)
+{
+   assert(s < agx_apple9_vir_nr_srcs(I));
+   return I->phi_srcs ? I->phi_srcs[s] : I->src[s];
+}
+
+static inline uint32_t *
+agx_apple9_vir_src_ptr(struct agx_apple9_vir_instr *I, unsigned s)
+{
+   assert(s < agx_apple9_vir_nr_srcs(I));
+   return I->phi_srcs ? &I->phi_srcs[s] : &I->src[s];
+}
+
+static inline bool
+agx_apple9_vir_src_killed(const struct agx_apple9_vir_instr *I, unsigned s)
+{
+   return s < AGX_APPLE9_MAX_VIR_SRCS && ((I->kill_mask >> s) & 1u);
+}
+
+static inline void
+agx_apple9_vir_set_src_killed(struct agx_apple9_vir_instr *I, unsigned s,
+                              bool killed)
+{
+   assert(s < AGX_APPLE9_MAX_VIR_SRCS);
+   if (killed)
+      I->kill_mask |= (uint16_t)(1u << s);
+   else
+      I->kill_mask &= (uint16_t)~(1u << s);
+}
 
 static inline unsigned
 agx_apple9_inline_source_file(const struct agx_apple9_vir_instr *I,
@@ -580,6 +637,15 @@ struct agx_apple9_block {
    /* A closed NIR call region may contain structured masks selected into this
     * same logical block. Its last NIR block owns the outgoing caller edges. */
    struct nir_block *nir_exit;
+   /* Logical SSA CFG built by agx_apple9_vir_build_logical_cfg(). Synthetic
+    * loop-mask restoration blocks (!nir && block != program->blocks) have
+    * cfg_active == false and carry no logical SSA edges. */
+   struct agx_apple9_block *cfg_succs[2];
+   struct agx_apple9_block **cfg_preds;
+   unsigned num_cfg_preds;
+   unsigned cfg_index;
+   bool cfg_active;
+   bool loop_header;
    struct list_head instructions;
    bool placed;
    unsigned index;
@@ -588,6 +654,24 @@ struct agx_apple9_block {
    unsigned start_index; /* Derived analysis position, never a branch identity. */
    unsigned offset;
 };
+
+static inline unsigned
+agx_apple9_block_pred_index(const struct agx_apple9_block *block,
+                            const struct agx_apple9_block *pred)
+{
+   for (unsigned i = 0; i < block->num_cfg_preds; ++i) {
+      if (block->cfg_preds[i] == pred)
+         return i;
+   }
+   return UINT_MAX;
+}
+
+static inline bool
+agx_apple9_block_has_pred(const struct agx_apple9_block *block,
+                          const struct agx_apple9_block *pred)
+{
+   return agx_apple9_block_pred_index(block, pred) != UINT_MAX;
+}
 
 /* Uses are ordered by machine layout. agx_apple9_vir_set_source keeps them
  * current; other operand edits must invalidate. Pointers remain valid only
@@ -607,6 +691,7 @@ struct agx_apple9_vir_program {
    bool dependencies_finalized;
    unsigned instruction_count;
    unsigned instruction_capacity;
+   unsigned num_cfg_blocks;
    unsigned value_count;
    uint32_t output;
    /* Fragment execution can update depth/stencil without explicit stores. */
@@ -669,12 +754,33 @@ bool agx_apple9_vir_key(const struct agx_apple9_vir_program *program,
 struct agx_apple9_block *agx_apple9_block_create(struct agx_apple9_vir_program *program);
 void agx_apple9_block_begin(struct agx_apple9_vir_program *program,
                           struct agx_apple9_block *block);
+/* Build logical SSA CFG (cfg_succs, cfg_preds, num_cfg_preds, cfg_index,
+ * cfg_active, loop_header) from NIR block links, pruning unreachable
+ * post-infinite-loop edges while keeping physical next/prev layout intact. */
+bool agx_apple9_vir_build_logical_cfg(struct agx_apple9_vir_program *program);
 /* Layout position, as of the last reindex. */
 unsigned agx_apple9_instr_position(const struct agx_apple9_vir_instr *instr);
 struct agx_apple9_block *agx_apple9_instr_block(const struct agx_apple9_vir_instr *instr);
+struct agx_apple9_vir_instr *
+agx_apple9_block_first_instr(const struct agx_apple9_block *block);
+struct agx_apple9_vir_instr *
+agx_apple9_block_last_instr(const struct agx_apple9_block *block);
+struct agx_apple9_vir_instr *
+agx_apple9_instr_next(const struct agx_apple9_vir_instr *instr);
+struct agx_apple9_vir_instr *
+agx_apple9_instr_prev(const struct agx_apple9_vir_instr *instr);
 void agx_apple9_vir_move_before(struct agx_apple9_vir_program *program,
                               struct agx_apple9_vir_instr *instr,
                               struct agx_apple9_vir_instr *before);
+void agx_apple9_vir_move_after(struct agx_apple9_vir_program *program,
+                             struct agx_apple9_vir_instr *instr,
+                             struct agx_apple9_vir_instr *after);
+void agx_apple9_vir_move_to_block_start(struct agx_apple9_vir_program *program,
+                                        struct agx_apple9_vir_instr *instr,
+                                        struct agx_apple9_block *block);
+void agx_apple9_vir_move_to_block_end(struct agx_apple9_vir_program *program,
+                                      struct agx_apple9_vir_instr *instr,
+                                      struct agx_apple9_block *block);
 void agx_apple9_vir_remove(struct agx_apple9_vir_program *program,
                           struct agx_apple9_vir_instr *instruction);
 void agx_apple9_vir_remove_many(struct agx_apple9_vir_program *program,
@@ -1073,14 +1179,31 @@ bool agx_apple9_vir_set_texture_sparse(struct agx_apple9_vir_program *program,
 
 uint32_t agx_apple9_vir_emit_collect(struct agx_apple9_vir_program *program,
                                      const uint32_t *src, unsigned components);
+uint32_t agx_apple9_vir_emit_split(struct agx_apple9_vir_program *program,
+                                   uint32_t src, unsigned components);
+uint32_t agx_apple9_vir_emit_mov(struct agx_apple9_vir_program *program,
+                                 uint32_t src);
+bool agx_apple9_vir_emit_swap(struct agx_apple9_vir_program *program,
+                              uint32_t a, uint32_t b);
 void agx_apple9_place_phis(struct agx_apple9_vir_program *program);
-/* Reuse the Apple8 physical parallel-copy scheduler. Indices are 32-bit GPRs. */
+/* Native 32-bit GPR parallel-copy scheduler (decoupled from agx_context). */
 bool agx_apple9_resolve_phi_edge(const struct agx_apple9_vir_program *program,
    const struct agx_apple9_vir_instr *edge,
    bool (*emit)(void *data, bool swap, unsigned dest, unsigned source), void *data);
 
 uint32_t agx_apple9_vir_emit_phi(struct agx_apple9_vir_program *program,
                                   struct agx_apple9_block *block);
+/* Allocate or resize a canonical VIR_PHI's predecessor operand array. Uses
+ * inline src[] for <= AGX_APPLE9_MAX_VIR_SRCS preds and sideband phi_srcs[]
+ * above that; initializes all entries to AGX_APPLE9_VREG_INVALID. */
+bool agx_apple9_vir_phi_alloc_srcs(struct agx_apple9_vir_instr *phi,
+                                   unsigned num_preds);
+uint32_t agx_apple9_vir_emit_phi_canonical(struct agx_apple9_vir_program *program,
+                                           struct agx_apple9_block *block,
+                                           unsigned num_preds);
+/* Convert VIR_PHI + VIR_PHI_SRC records into canonical variable-arity VIR_PHI
+ * nodes placed at logical block entry, indexed by block->cfg_preds[]. */
+bool agx_apple9_vir_canonicalize_phis(struct agx_apple9_vir_program *program);
 bool agx_apple9_vir_emit_phi_source(struct agx_apple9_vir_program *program,
                                      uint32_t target, uint32_t source);
 struct agx_apple9_vir_copy {

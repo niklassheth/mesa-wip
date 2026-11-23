@@ -17306,3 +17306,493 @@ TEST(Apple9Compiler, Tier2Native2DArrayImplicitAndOffsetTextures)
       ralloc_free(b.shader);
    }
 }
+
+TEST(Apple9Vir, LogicalCfgBuildsEdgesLoopHeadersAndPrunesUnreachable)
+{
+   agx_apple9_vir_program program;
+   agx_apple9_vir_init(&program);
+
+   nir_block n0 = {}, n0_exit = {}, n1 = {}, n2 = {}, n3 = {}, n4 = {};
+   nir_block n_dead1 = {}, n_dead2 = {};
+   n0_exit.successors[0] = &n1;
+   n1.successors[0] = &n2;
+   n1.successors[1] = &n3;
+   n2.successors[0] = &n1;
+   n3.successors[0] = &n4;
+   n4.successors[0] = &n4;
+   /* Unreachable dead cycle after an infinite loop. */
+   n_dead1.successors[0] = &n_dead2;
+   n_dead2.successors[0] = &n_dead1;
+
+   agx_apple9_block *b0 = agx_apple9_block_create(&program);
+   ASSERT_NE(b0, nullptr);
+   b0->nir = &n0;
+   b0->nir_exit = &n0_exit;
+   agx_apple9_block_begin(&program, b0);
+
+   agx_apple9_block *b1 = agx_apple9_block_create(&program);
+   agx_apple9_block *b2 = agx_apple9_block_create(&program);
+   agx_apple9_block *b_synth = agx_apple9_block_create(&program);
+   agx_apple9_block *b3 = agx_apple9_block_create(&program);
+   agx_apple9_block *b4 = agx_apple9_block_create(&program);
+   agx_apple9_block *b_dead1 = agx_apple9_block_create(&program);
+   agx_apple9_block *b_dead2 = agx_apple9_block_create(&program);
+   ASSERT_TRUE(b1 && b2 && b_synth && b3 && b4 && b_dead1 && b_dead2);
+
+   b1->nir = &n1;
+   b2->nir = &n2;
+   b_synth->nir = nullptr;
+   b3->nir = &n3;
+   b4->nir = &n4;
+   b_dead1->nir = &n_dead1;
+   b_dead2->nir = &n_dead2;
+
+   agx_apple9_block_begin(&program, b1);
+   agx_apple9_block_begin(&program, b2);
+   agx_apple9_block_begin(&program, b_synth);
+   agx_apple9_block_begin(&program, b3);
+   agx_apple9_block_begin(&program, b4);
+   agx_apple9_block_begin(&program, b_dead1);
+   agx_apple9_block_begin(&program, b_dead2);
+
+   ASSERT_TRUE(agx_apple9_vir_build_logical_cfg(&program));
+   EXPECT_EQ(program.num_cfg_blocks, 5u);
+
+   EXPECT_TRUE(b0->cfg_active);
+   EXPECT_TRUE(b1->cfg_active);
+   EXPECT_TRUE(b2->cfg_active);
+   EXPECT_TRUE(b3->cfg_active);
+   EXPECT_TRUE(b4->cfg_active);
+   EXPECT_FALSE(b_synth->cfg_active);
+   EXPECT_FALSE(b_dead1->cfg_active);
+   EXPECT_FALSE(b_dead2->cfg_active);
+
+   EXPECT_EQ(b0->cfg_index, 0u);
+   EXPECT_EQ(b1->cfg_index, 1u);
+   EXPECT_EQ(b2->cfg_index, 2u);
+   EXPECT_EQ(b3->cfg_index, 3u);
+   EXPECT_EQ(b4->cfg_index, 4u);
+   EXPECT_EQ(b_synth->cfg_index, UINT_MAX);
+   EXPECT_EQ(b_dead1->cfg_index, UINT_MAX);
+   EXPECT_EQ(b_dead2->cfg_index, UINT_MAX);
+
+   EXPECT_FALSE(b0->loop_header);
+   EXPECT_TRUE(b1->loop_header);
+   EXPECT_FALSE(b2->loop_header);
+   EXPECT_FALSE(b3->loop_header);
+   EXPECT_TRUE(b4->loop_header);
+   EXPECT_FALSE(b_dead1->loop_header);
+   EXPECT_FALSE(b_dead2->loop_header);
+
+   EXPECT_EQ(b0->cfg_succs[0], b1);
+   EXPECT_EQ(b0->cfg_succs[1], nullptr);
+   EXPECT_EQ(b1->num_cfg_preds, 2u);
+   EXPECT_TRUE(agx_apple9_block_has_pred(b1, b0));
+   EXPECT_TRUE(agx_apple9_block_has_pred(b1, b2));
+   EXPECT_FALSE(agx_apple9_block_has_pred(b1, b_dead1));
+   EXPECT_EQ(agx_apple9_block_pred_index(b1, b_dead1), UINT_MAX);
+   EXPECT_EQ(b_dead1->num_cfg_preds, 0u);
+   EXPECT_EQ(b_dead1->cfg_succs[0], nullptr);
+   EXPECT_EQ(b_dead2->num_cfg_preds, 0u);
+   EXPECT_EQ(b_dead2->cfg_succs[0], nullptr);
+
+   /* Physical block layout must remain completely intact. */
+   EXPECT_EQ(b0->next, b1);
+   EXPECT_EQ(b1->next, b2);
+   EXPECT_EQ(b2->next, b_synth);
+   EXPECT_EQ(b_synth->next, b3);
+   EXPECT_EQ(b3->next, b4);
+   EXPECT_EQ(b4->next, b_dead1);
+   EXPECT_EQ(b_dead1->next, b_dead2);
+   EXPECT_EQ(b_dead2->next, nullptr);
+
+   /* Rebuilding logical CFG must be idempotent. */
+   ASSERT_TRUE(agx_apple9_vir_build_logical_cfg(&program));
+   EXPECT_EQ(program.num_cfg_blocks, 5u);
+   EXPECT_EQ(b1->num_cfg_preds, 2u);
+
+   /* Clone and key must preserve logical CFG metadata. */
+   agx_apple9_vir_program copy;
+   ASSERT_TRUE(agx_apple9_vir_clone(&copy, &program));
+   EXPECT_EQ(copy.num_cfg_blocks, 5u);
+   EXPECT_TRUE(copy.blocks->next->loop_header);
+   EXPECT_EQ(copy.blocks->next->num_cfg_preds, 2u);
+
+   struct util_dynarray key_orig = UTIL_DYNARRAY_INIT;
+   struct util_dynarray key_copy = UTIL_DYNARRAY_INIT;
+   ASSERT_TRUE(agx_apple9_vir_key(&program, &key_orig));
+   ASSERT_TRUE(agx_apple9_vir_key(&copy, &key_copy));
+   EXPECT_EQ(key_orig.size, key_copy.size);
+   EXPECT_EQ(memcmp(key_orig.data, key_copy.data, key_orig.size), 0);
+
+   util_dynarray_fini(&key_orig);
+   util_dynarray_fini(&key_copy);
+   agx_apple9_vir_finish(&copy);
+   agx_apple9_vir_finish(&program);
+}
+
+TEST(Apple9Vir, PrePhysicalPseudoOpsKillMaskAndBlockNavigation)
+{
+   agx_apple9_vir_program program;
+   agx_apple9_vir_init(&program);
+
+   uint32_t v0 = agx_apple9_vir_input(&program, 0);
+   uint32_t v1 = agx_apple9_vir_input(&program, 1);
+   uint32_t v2 = agx_apple9_vir_input(&program, 2);
+   uint32_t elems[3] = {v0, v1, v2};
+   uint32_t tup = agx_apple9_vir_emit_collect(&program, elems, 3);
+   ASSERT_NE(tup, AGX_APPLE9_VREG_INVALID);
+
+   EXPECT_EQ(agx_apple9_vir_emit_split(&program, tup, 0),
+             AGX_APPLE9_VREG_INVALID);
+   EXPECT_EQ(agx_apple9_vir_emit_split(&program, tup, 6),
+             AGX_APPLE9_VREG_INVALID);
+   EXPECT_EQ(agx_apple9_vir_emit_mov(&program, program.value_count),
+             AGX_APPLE9_VREG_INVALID);
+   EXPECT_FALSE(agx_apple9_vir_emit_swap(&program, AGX_APPLE9_VREG_INVALID, v0));
+
+   uint32_t split = agx_apple9_vir_emit_split(&program, tup, 3);
+   ASSERT_NE(split, AGX_APPLE9_VREG_INVALID);
+   agx_apple9_vir_instr *split_ins =
+      program.instructions[program.instruction_count - 1];
+   EXPECT_EQ(split_ins->op, AGX_APPLE9_VIR_SPLIT);
+   EXPECT_EQ(split_ins->encoding, AGX_APPLE9_ENC_PSEUDO);
+   EXPECT_EQ(split_ins->dest_components, 3u);
+   split_ins->dead_dest_mask = 1u << 1;
+
+   uint32_t moved = agx_apple9_vir_emit_mov(&program, split + 0);
+   ASSERT_NE(moved, AGX_APPLE9_VREG_INVALID);
+   agx_apple9_vir_instr *mov_ins =
+      program.instructions[program.instruction_count - 1];
+   EXPECT_EQ(mov_ins->op, AGX_APPLE9_VIR_MOV);
+   EXPECT_EQ(mov_ins->encoding, AGX_APPLE9_ENC_PSEUDO);
+
+   ASSERT_TRUE(agx_apple9_vir_emit_swap(&program, moved, split + 2));
+   agx_apple9_vir_instr *swap_ins =
+      program.instructions[program.instruction_count - 1];
+   EXPECT_EQ(swap_ins->op, AGX_APPLE9_VIR_SWAP);
+   EXPECT_EQ(swap_ins->encoding, AGX_APPLE9_ENC_PSEUDO);
+   EXPECT_EQ(swap_ins->dest, AGX_APPLE9_VREG_INVALID);
+   EXPECT_EQ(agx_apple9_vir_nr_srcs(swap_ins), 2u);
+
+   EXPECT_FALSE(agx_apple9_vir_src_killed(swap_ins, 0));
+   EXPECT_FALSE(agx_apple9_vir_src_killed(swap_ins, 1));
+   agx_apple9_vir_set_src_killed(swap_ins, 0, true);
+   agx_apple9_vir_set_src_killed(swap_ins, 1, true);
+   EXPECT_TRUE(agx_apple9_vir_src_killed(swap_ins, 0));
+   EXPECT_TRUE(agx_apple9_vir_src_killed(swap_ins, 1));
+   agx_apple9_vir_set_src_killed(swap_ins, 0, false);
+   EXPECT_FALSE(agx_apple9_vir_src_killed(swap_ins, 0));
+   EXPECT_TRUE(agx_apple9_vir_src_killed(swap_ins, 1));
+
+   ASSERT_TRUE(agx_apple9_analyze_uses(&program));
+   EXPECT_EQ(agx_apple9_definition(&program, split + 0), split_ins);
+   EXPECT_EQ(agx_apple9_definition(&program, split + 1), nullptr);
+   EXPECT_EQ(agx_apple9_definition(&program, split + 2), split_ins);
+   EXPECT_EQ(agx_apple9_definition(&program, moved), mov_ins);
+
+   /* Packer must reject pre-physical RA pseudos. */
+   uint8_t phys[32] = {};
+   agx_apple9_packed_instruction packed = {};
+   const char *reason = nullptr;
+   EXPECT_FALSE(agx_apple9_pack_vir_instruction(split_ins, phys, &packed, &reason));
+   EXPECT_NE(reason, nullptr);
+   reason = nullptr;
+   EXPECT_FALSE(agx_apple9_pack_vir_instruction(mov_ins, phys, &packed, &reason));
+   EXPECT_NE(reason, nullptr);
+   reason = nullptr;
+   EXPECT_FALSE(agx_apple9_pack_vir_instruction(swap_ins, phys, &packed, &reason));
+   EXPECT_NE(reason, nullptr);
+
+   /* Block navigation and movement helpers across two blocks. */
+   agx_apple9_block *b0 = program.blocks;
+   agx_apple9_block *b1 = agx_apple9_block_create(&program);
+   ASSERT_NE(b1, nullptr);
+   agx_apple9_block_begin(&program, b1);
+   EXPECT_EQ(agx_apple9_block_first_instr(b1), nullptr);
+   EXPECT_EQ(agx_apple9_block_last_instr(b1), nullptr);
+
+   agx_apple9_vir_instr *collect_ins = agx_apple9_block_first_instr(b0);
+   ASSERT_EQ(collect_ins->op, AGX_APPLE9_VIR_COLLECT);
+   EXPECT_EQ(agx_apple9_instr_prev(collect_ins), nullptr);
+   EXPECT_EQ(agx_apple9_instr_next(collect_ins), split_ins);
+   EXPECT_EQ(agx_apple9_instr_next(split_ins), mov_ins);
+   EXPECT_EQ(agx_apple9_instr_next(mov_ins), swap_ins);
+   EXPECT_EQ(agx_apple9_instr_next(swap_ins), nullptr);
+   EXPECT_EQ(agx_apple9_block_last_instr(b0), swap_ins);
+
+   agx_apple9_vir_move_to_block_start(&program, swap_ins, b1);
+   EXPECT_EQ(agx_apple9_instr_block(swap_ins), b1);
+   EXPECT_EQ(agx_apple9_block_first_instr(b1), swap_ins);
+   EXPECT_EQ(agx_apple9_block_last_instr(b1), swap_ins);
+
+   agx_apple9_vir_move_to_block_end(&program, mov_ins, b1);
+   EXPECT_EQ(agx_apple9_block_first_instr(b1), swap_ins);
+   EXPECT_EQ(agx_apple9_block_last_instr(b1), mov_ins);
+
+   agx_apple9_vir_move_after(&program, split_ins, swap_ins);
+   EXPECT_EQ(agx_apple9_instr_block(split_ins), b1);
+   EXPECT_EQ(agx_apple9_instr_next(swap_ins), split_ins);
+   EXPECT_EQ(agx_apple9_instr_next(split_ins), mov_ins);
+   EXPECT_EQ(agx_apple9_instr_position(swap_ins), 1u);
+   EXPECT_EQ(agx_apple9_instr_position(split_ins), 2u);
+   EXPECT_EQ(agx_apple9_instr_position(mov_ins), 3u);
+
+   agx_apple9_vir_finish(&program);
+}
+
+TEST(Apple9Vir, CanonicalVariableArityPhiInlineAndSideband)
+{
+   agx_apple9_vir_program program;
+   agx_apple9_vir_init(&program);
+
+   /* Build a 16-leaf binary fan-out tree merging into b_merge so b_merge has
+    * 16 logical predecessors (> AGX_APPLE9_MAX_VIR_SRCS = 10). */
+   nir_block n_tree[31] = {};
+   nir_block n_merge = {}, n_dead = {};
+   agx_apple9_block *b_tree[31] = {};
+
+   b_tree[0] = agx_apple9_block_create(&program);
+   ASSERT_NE(b_tree[0], nullptr);
+   b_tree[0]->nir = &n_tree[0];
+   agx_apple9_block_begin(&program, b_tree[0]);
+   for (unsigned i = 1; i < 31; ++i) {
+      b_tree[i] = agx_apple9_block_create(&program);
+      ASSERT_NE(b_tree[i], nullptr);
+      b_tree[i]->nir = &n_tree[i];
+   }
+   for (unsigned i = 0; i < 15; ++i) {
+      n_tree[i].successors[0] = &n_tree[2 * i + 1];
+      n_tree[i].successors[1] = &n_tree[2 * i + 2];
+   }
+   for (unsigned i = 15; i < 31; ++i)
+      n_tree[i].successors[0] = &n_merge;
+
+   /* Also wire a 2-pred merge inside the tree via a separate inline-arity test
+    * block? We can test inline arity with agx_apple9_vir_emit_phi_canonical
+    * and a second small 2-pred block. */
+   agx_apple9_block *b_merge = agx_apple9_block_create(&program);
+   agx_apple9_block *b_dead = agx_apple9_block_create(&program);
+   ASSERT_TRUE(b_merge && b_dead);
+   b_merge->nir = &n_merge;
+   b_dead->nir = &n_dead;
+   n_dead.successors[0] = &n_merge;
+
+   uint32_t phi_v = agx_apple9_vir_emit_phi(&program, b_merge);
+   ASSERT_NE(phi_v, AGX_APPLE9_VREG_INVALID);
+
+   uint32_t leaf_val[16] = {};
+   for (unsigned i = 1; i < 15; ++i)
+      agx_apple9_block_begin(&program, b_tree[i]);
+   for (unsigned k = 0; k < 16; ++k) {
+      agx_apple9_block_begin(&program, b_tree[15 + k]);
+      leaf_val[k] = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IMM,
+                                        AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0,
+                                        100u + k);
+      ASSERT_NE(leaf_val[k], AGX_APPLE9_VREG_INVALID);
+      /* Intentionally leave leaf 15 without a PHI_SRC to exercise undef. */
+      if (k < 15) {
+         ASSERT_TRUE(agx_apple9_vir_emit_phi_source(&program, phi_v, leaf_val[k]));
+      }
+   }
+
+   /* Unreachable block with a PHI_SRC targeting phi_v must be dropped cleanly. */
+   agx_apple9_block_begin(&program, b_dead);
+   uint32_t dead_v = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IMM,
+                                         AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0,
+                                         999u);
+   ASSERT_TRUE(agx_apple9_vir_emit_phi_source(&program, phi_v, dead_v));
+
+   agx_apple9_block_begin(&program, b_merge);
+   ASSERT_TRUE(agx_apple9_vir_canonicalize_phis(&program));
+
+   EXPECT_EQ(b_merge->num_cfg_preds, 16u);
+   EXPECT_FALSE(b_dead->cfg_active);
+
+   /* Zero VIR_PHI_SRC instructions remain. */
+   agx_apple9_vir_instr *phi = nullptr;
+   for (unsigned i = 0; i < program.instruction_count; ++i) {
+      EXPECT_NE(program.instructions[i]->op, AGX_APPLE9_VIR_PHI_SRC);
+      if (program.instructions[i]->op == AGX_APPLE9_VIR_PHI)
+         phi = program.instructions[i];
+   }
+   ASSERT_NE(phi, nullptr);
+   EXPECT_EQ(agx_apple9_instr_block(phi), b_merge);
+   EXPECT_NE(phi->phi_srcs, nullptr);
+   EXPECT_EQ(phi->phi_src_count, 16u);
+   EXPECT_EQ(phi->nr_srcs, 0u);
+   EXPECT_EQ(agx_apple9_vir_nr_srcs(phi), 16u);
+
+   unsigned undef_slot = UINT_MAX;
+   unsigned slot0 = UINT_MAX;
+   for (unsigned k = 0; k < 16; ++k) {
+      unsigned pred_idx = agx_apple9_block_pred_index(b_merge, b_tree[15 + k]);
+      ASSERT_NE(pred_idx, UINT_MAX);
+      if (k < 15) {
+         EXPECT_EQ(agx_apple9_vir_src(phi, pred_idx), leaf_val[k]);
+         if (k == 0)
+            slot0 = pred_idx;
+      } else {
+         EXPECT_EQ(agx_apple9_vir_src(phi, pred_idx), AGX_APPLE9_VREG_INVALID);
+         undef_slot = pred_idx;
+      }
+   }
+   ASSERT_NE(undef_slot, UINT_MAX);
+   ASSERT_NE(slot0, UINT_MAX);
+
+   /* analyze_uses must handle sideband phi_srcs and undef slots cleanly. */
+   ASSERT_TRUE(agx_apple9_analyze_uses(&program));
+   const agx_apple9_use *u0 = agx_apple9_uses(&program, leaf_val[0]);
+   ASSERT_NE(u0, nullptr);
+   EXPECT_EQ(u0->instruction, phi);
+   EXPECT_EQ(u0->source, slot0);
+   EXPECT_EQ(u0->next, nullptr);
+
+   /* Incremental set_source on a sideband phi_srcs entry must update chains. */
+   agx_apple9_vir_set_source(&program, phi, slot0, leaf_val[1]);
+   EXPECT_EQ(agx_apple9_vir_src(phi, slot0), leaf_val[1]);
+   EXPECT_EQ(agx_apple9_uses(&program, leaf_val[0]), nullptr);
+   unsigned uses_of_1 = 0;
+   for (const agx_apple9_use *u = agx_apple9_uses(&program, leaf_val[1]); u;
+        u = u->next) {
+      EXPECT_EQ(u->instruction, phi);
+      ++uses_of_1;
+   }
+   EXPECT_EQ(uses_of_1, 2u);
+
+   /* Filling the undef slot must also work and rebuild uses cleanly. */
+   agx_apple9_vir_set_source(&program, phi, undef_slot, leaf_val[0]);
+   const agx_apple9_use *u0_new = agx_apple9_uses(&program, leaf_val[0]);
+   ASSERT_NE(u0_new, nullptr);
+   EXPECT_EQ(u0_new->instruction, phi);
+   EXPECT_EQ(u0_new->source, undef_slot);
+
+   /* Canonicalizing a second time must preserve existing canonical phi srcs. */
+   ASSERT_TRUE(agx_apple9_vir_canonicalize_phis(&program));
+   EXPECT_EQ(agx_apple9_vir_nr_srcs(phi), 16u);
+   EXPECT_EQ(agx_apple9_vir_src(phi, undef_slot), leaf_val[0]);
+
+   /* Clone and key must deep-copy and hash sideband phi_srcs. */
+   agx_apple9_vir_program copy;
+   ASSERT_TRUE(agx_apple9_vir_clone(&copy, &program));
+   agx_apple9_vir_instr *copy_phi = copy.instructions[agx_apple9_instr_position(phi)];
+   ASSERT_EQ(copy_phi->op, AGX_APPLE9_VIR_PHI);
+   EXPECT_NE(copy_phi->phi_srcs, nullptr);
+   EXPECT_NE(copy_phi->phi_srcs, phi->phi_srcs);
+   EXPECT_EQ(agx_apple9_vir_nr_srcs(copy_phi), 16u);
+   for (unsigned s = 0; s < 16; ++s)
+      EXPECT_EQ(agx_apple9_vir_src(copy_phi, s), agx_apple9_vir_src(phi, s));
+
+   struct util_dynarray key_a = UTIL_DYNARRAY_INIT;
+   struct util_dynarray key_b = UTIL_DYNARRAY_INIT;
+   ASSERT_TRUE(agx_apple9_vir_key(&program, &key_a));
+   ASSERT_TRUE(agx_apple9_vir_key(&copy, &key_b));
+   EXPECT_EQ(key_a.size, key_b.size);
+   EXPECT_EQ(memcmp(key_a.data, key_b.data, key_a.size), 0);
+
+   agx_apple9_vir_set_source(&copy, copy_phi, undef_slot, leaf_val[2]);
+   struct util_dynarray key_c = UTIL_DYNARRAY_INIT;
+   ASSERT_TRUE(agx_apple9_vir_key(&copy, &key_c));
+   EXPECT_NE(memcmp(key_a.data, key_c.data, MIN2(key_a.size, key_c.size)), 0);
+
+   /* Direct canonical phi emission: inline (<= 10) and sideband (> 10). */
+   uint32_t inline_phi_v = agx_apple9_vir_emit_phi_canonical(&program, b_merge, 3);
+   ASSERT_NE(inline_phi_v, AGX_APPLE9_VREG_INVALID);
+   agx_apple9_vir_instr *inline_phi =
+      program.instructions[program.instruction_count - 1];
+   EXPECT_EQ(inline_phi->phi_srcs, nullptr);
+   EXPECT_EQ(agx_apple9_vir_nr_srcs(inline_phi), 3u);
+   for (unsigned s = 0; s < 3; ++s)
+      EXPECT_EQ(agx_apple9_vir_src(inline_phi, s), AGX_APPLE9_VREG_INVALID);
+
+   uint32_t wide_phi_v = agx_apple9_vir_emit_phi_canonical(&program, b_merge, 12);
+   ASSERT_NE(wide_phi_v, AGX_APPLE9_VREG_INVALID);
+   agx_apple9_vir_instr *wide_phi =
+      program.instructions[program.instruction_count - 1];
+   EXPECT_NE(wide_phi->phi_srcs, nullptr);
+   EXPECT_EQ(agx_apple9_vir_nr_srcs(wide_phi), 12u);
+   agx_apple9_vir_remove(&program, wide_phi);
+
+   util_dynarray_fini(&key_a);
+   util_dynarray_fini(&key_b);
+   util_dynarray_fini(&key_c);
+   agx_apple9_vir_finish(&copy);
+   agx_apple9_vir_finish(&program);
+}
+
+TEST(Apple9Vir, ResolvePhiEdgeNativeCycleTreeAndErrors)
+{
+   agx_apple9_vir_program program;
+   agx_apple9_vir_init(&program);
+
+   /* 5-register cycle (r0<-r1, r1<-r2, r2<-r3, r3<-r4, r4<-r0),
+    * hanging tree (r5<-r0, r6<-r5), and self-copy (r7<-r7). */
+   uint32_t src_v[8], dst_v[8];
+   for (unsigned i = 0; i < 8; ++i) {
+      src_v[i] = agx_apple9_vir_input(&program, i);
+      dst_v[i] = agx_apple9_vir_emit_phi(&program, nullptr);
+   }
+   const unsigned map[8] = {1, 2, 3, 4, 0, 0, 5, 7};
+   agx_apple9_vir_copy copies[8];
+   for (unsigned i = 0; i < 8; ++i)
+      copies[i] = {dst_v[i], src_v[map[i]]};
+   ASSERT_TRUE(agx_apple9_vir_emit_phi_edge(&program, copies, 8));
+   agx_apple9_vir_instr *edge = program.instructions[program.instruction_count - 1];
+
+   program.phys = static_cast<uint8_t *>(calloc(program.value_count, 1));
+   program.phys_capacity = program.value_count;
+   for (unsigned i = 0; i < 8; ++i) {
+      program.phys[src_v[i]] = i;
+      program.phys[dst_v[i]] = i;
+   }
+
+   struct {
+      uint32_t regs[AGX_APPLE9_GPR_COUNT];
+      unsigned movs;
+      unsigned swaps;
+   } state = {};
+   for (unsigned i = 0; i < 8; ++i)
+      state.regs[i] = 0x100u + i;
+
+   ASSERT_TRUE(agx_apple9_resolve_phi_edge(
+      &program, edge,
+      [](void *data, bool swap, unsigned dest, unsigned source) {
+         auto *s = static_cast<decltype(state) *>(data);
+         if (swap) {
+            uint32_t tmp = s->regs[dest];
+            s->regs[dest] = s->regs[source];
+            s->regs[source] = tmp;
+            ++s->swaps;
+         } else {
+            s->regs[dest] = s->regs[source];
+            ++s->movs;
+         }
+         return true;
+      },
+      &state));
+
+   for (unsigned i = 0; i < 8; ++i)
+      EXPECT_EQ(state.regs[i], 0x100u + map[i]);
+   /* 2 tree moves + 4 swaps for 5-cycle; 0 ops for r7<-r7 self-copy. */
+   EXPECT_EQ(state.movs, 2u);
+   EXPECT_EQ(state.swaps, 4u);
+
+   /* Emit callback failure propagates false. */
+   EXPECT_FALSE(agx_apple9_resolve_phi_edge(
+      &program, edge, [](void *, bool, unsigned, unsigned) { return false; },
+      nullptr));
+
+   /* Duplicate physical destination must fail cleanly. */
+   program.phys[dst_v[1]] = 0;
+   EXPECT_FALSE(agx_apple9_resolve_phi_edge(
+      &program, edge, [](void *, bool, unsigned, unsigned) { return true; },
+      nullptr));
+
+   /* Out-of-range physical GPR must fail cleanly. */
+   program.phys[dst_v[1]] = AGX_APPLE9_GPR_COUNT;
+   EXPECT_FALSE(agx_apple9_resolve_phi_edge(
+      &program, edge, [](void *, bool, unsigned, unsigned) { return true; },
+      nullptr));
+
+   agx_apple9_vir_finish(&program);
+}
