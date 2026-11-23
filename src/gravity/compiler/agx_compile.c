@@ -14,7 +14,6 @@
 #include "util/macros.h"
 #include "util/u_debug.h"
 #include "util/u_dynarray.h"
-#include "agx_compiler.h"
 #include "agx_debug.h"
 #include "agx_nir.h"
 #include "glsl_types.h"
@@ -50,8 +49,6 @@ agx_apple9_trace_enabled(void)
    /* Any value, including an empty string or "0", enables tracing. */
    return agx_apple9_debug_enabled(AGX_A9_DBG_TRACE);
 }
-
-int agx_compiler_debug = 0;
 
 uint64_t
 agx_get_compiler_debug(void)
@@ -98,31 +95,6 @@ agx_max_registers_for_occupancy(unsigned occupancy)
 
    assert(max_regs > 0 && "Thread count must be less than the maximum");
    return max_regs;
-}
-
-void
-agx_block_add_successor(agx_block *block, agx_block *successor)
-{
-   assert(block != NULL && successor != NULL);
-
-   /* Cull impossible edges */
-   if (block->unconditional_jumps)
-      return;
-
-   for (unsigned i = 0; i < ARRAY_SIZE(block->successors); ++i) {
-      if (block->successors[i]) {
-         if (block->successors[i] == successor)
-            return;
-         else
-            continue;
-      }
-
-      block->successors[i] = successor;
-      util_dynarray_append(&successor->predecessors, block);
-      return;
-   }
-
-   UNREACHABLE("Too many successors");
 }
 
 static bool

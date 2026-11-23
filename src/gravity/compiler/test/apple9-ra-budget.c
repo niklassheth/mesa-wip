@@ -76,34 +76,29 @@ check_pressure(unsigned count, bool banks, bool latency, bool masks)
    CHECK(agx_apple9_assign_vir_scoreboard_slots(&p, &reason));
    agx_apple9_vir_reindex(&p);
    CHECK(agx_apple9_allocate_publications(&p, &reason));
-   struct agx_apple9_vir_program full, bounded;
+   struct agx_apple9_vir_program full, second;
    agx_apple9_vir_init(&full);
-   agx_apple9_vir_init(&bounded);
-   CHECK(apple9_allocate_candidate(&p, nir.shader, banks, latency, 0, true,
-                                   true, UINT64_MAX, &full, &reason, NULL));
+   agx_apple9_vir_init(&second);
+   bool copy_reg = true;
+   CHECK(apple9_run_native_candidate(&p, banks, latency, 0, true, &copy_reg,
+                                     &full, &reason, NULL));
    uint64_t cost = apple9_allocation_cost(&full).spills;
    CHECK(count <= 96 || cost > 0);
-   CHECK(apple9_allocate_candidate(&p, nir.shader, banks, latency, 0, true,
-                                   true, cost, &bounded, &reason, NULL));
-   CHECK(full.instruction_count == bounded.instruction_count);
+   CHECK(agx_apple9_validate_vir_allocation(&full, &reason));
+   copy_reg = true;
+   CHECK(apple9_run_native_candidate(&p, banks, latency, 0, true, &copy_reg,
+                                     &second, &reason, NULL));
+   CHECK(full.instruction_count == second.instruction_count);
    for (unsigned i = 0; i < full.instruction_count; ++i) {
       struct agx_apple9_packed_instruction a = {0}, b = {0};
       CHECK(agx_apple9_pack_vir_instruction(full.instructions[i], full.phys, &a,
                                             &reason));
-      CHECK(agx_apple9_pack_vir_instruction(bounded.instructions[i],
-                                            bounded.phys, &b, &reason));
+      CHECK(agx_apple9_pack_vir_instruction(second.instructions[i], second.phys,
+                                            &b, &reason));
       CHECK(a.length == b.length && !memcmp(a.bytes, b.bytes, a.length));
    }
-   agx_apple9_vir_finish(&bounded);
-   agx_apple9_vir_init(&bounded);
-   if (cost) {
-      CHECK(!apple9_allocate_candidate(&p, nir.shader, banks, latency, 0, true,
-                                       true, 0, &bounded, &reason, NULL));
-      CHECK(reason && strstr(reason, "spill budget"));
-      CHECK(!bounded.instruction_count);
-   }
    agx_apple9_vir_finish(&full);
-   agx_apple9_vir_finish(&bounded);
+   agx_apple9_vir_finish(&second);
    agx_apple9_vir_finish(&p);
    ralloc_free(nir.shader);
 }

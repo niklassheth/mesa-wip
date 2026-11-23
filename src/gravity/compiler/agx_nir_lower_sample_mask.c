@@ -5,7 +5,7 @@
 
 #include "compiler/list.h"
 #include "compiler/nir/nir_builder.h"
-#include "agx_compiler.h"
+#include "agx_compile.h"
 #include "nir.h"
 #include "nir_builder_opcodes.h"
 #include "nir_intrinsics.h"

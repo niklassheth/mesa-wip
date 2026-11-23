@@ -5,7 +5,7 @@
 
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
-#include "agx_compiler.h"
+#include "agx_compile.h"
 #include "nir_builder_opcodes.h"
 
 #define ALL_SAMPLES 0xFF

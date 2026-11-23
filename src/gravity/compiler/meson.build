@@ -13,14 +13,15 @@ libgravity_compiler_files = files(
   'apple9_ra_pcopy.c',
   'apple9_ra_validate.c',
   'apple9_ra_assign.c',
+  'apple9_ra_spill.c',
+  'apple9_ra_repair_ssa.c',
+  'apple9_ra_spill_coalesce.c',
   'agx_compile_apple9.c',
   'agx_nir_lower_apple9_mesh.c',
   'agx_nir_apple9_mesh_native.c',
   'agx_nir_lower_apple9_texture.c',
   'agx_nir_lower_apple9_math.c',
   'agx_nir_lower_apple9_preserve.c',
-  'agx_dce.c',
-  'agx_liveness.c',
   'agx_nir_lower_cull_distance.c',
   'agx_nir_lower_frag_sidefx.c',
   'agx_nir_lower_sample_mask.c',
@@ -29,64 +30,12 @@ libgravity_compiler_files = files(
   'agx_nir_lower_discard_zs_emit.c',
   'agx_nir_lower_interpolation.c',
   'agx_nir_lower_texture.c',
-  'agx_lower_parallel_copy.c',
-  'agx_lower_spill.c',
-  'agx_print.c',
-  'agx_pressure_schedule.c',
-  'agx_ir.c',
-  'agx_repair_ssa.c',
-  'agx_reindex_ssa.c',
-  'agx_spill.c',
-  'agx_spill_coalesce.c',
-  'agx_register_allocate.c',
-  'agx_validate.c',
-  'agx_validate_ra.c',
-  'apple9_ra_spill.c',
-  'apple9_ra_repair_ssa.c',
-  'apple9_ra_spill_coalesce.c',
-)
-
-gravity_opcodes_h = custom_target(
-  'gravity_opcodes_h',
-  input : ['agx_opcodes.h.py'],
-  output : 'agx_opcodes.h',
-  command : [prog_python, '@INPUT@'],
-  capture : true,
-  depend_files : files('agx_opcodes.py'),
-)
-
-idep_gravity_opcodes_h = declare_dependency(
-  sources : [gravity_opcodes_h],
-  include_directories : include_directories('.'),
-)
-
-gravity_opcodes_c = custom_target(
-  'gravity_opcodes_c',
-  input : ['agx_opcodes.c.py'],
-  output : 'agx_opcodes.c',
-  command : [prog_python, '@INPUT@'],
-  capture : true,
-  depend_files : files('agx_opcodes.py'),
-)
-
-gravity_builder_h = custom_target(
-  'gravity_builder_h',
-  input : ['agx_builder.h.py'],
-  output : 'agx_builder.h',
-  command : [prog_python, '@INPUT@'],
-  capture : true,
-  depend_files : files('agx_opcodes.py'),
-)
-
-idep_gravity_builder_h = declare_dependency(
-  sources : [gravity_builder_h],
-  include_directories : include_directories('.'),
 )
 
 libgravity_compiler = static_library(
   'gravity_compiler',
-  [libgravity_compiler_files, gravity_opcodes_c],
-  dependencies: [idep_gravity_debug, idep_nir, idep_gravity_opcodes_h, idep_gravity_builder_h, idep_mesautil, idep_gravity_cl, idep_libpoly],
+  libgravity_compiler_files,
+  dependencies: [idep_gravity_debug, idep_nir, idep_mesautil, idep_gravity_cl, idep_libpoly],
   c_args : [no_override_init_args, '-Wno-c2x-extensions'],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false,
@@ -209,18 +158,12 @@ if with_tests
          'test/test-apple9-ra-sched.cpp',
          'test/test-apple9-ra-pcopy.cpp',
          'test/test-apple9-shared-ra.cpp',
-         'test/test-pressure-schedule.cpp',
-         'test/test-minifloat.cpp',
-         'test/test-lower-parallel-copy.cpp',
-         'test/test-lower-spill.cpp',
-         'test/test-repair-ssa.cpp',
-         'test/test-spill-coalesce.cpp',
          'test/test-apple9-ra-spill.cpp',
          'test/test-apple9-ra-assign.cpp',
       ),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
-      dependencies: [idep_gtest, idep_nir, idep_gravity_opcodes_h, idep_gravity_builder_h, idep_mesautil],
+      dependencies: [idep_gtest, idep_nir, idep_mesautil],
       link_with : [libgravity_compiler],
     ),
     suite : ['gravity'],

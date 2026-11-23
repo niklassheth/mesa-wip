@@ -5,7 +5,7 @@
 
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
-#include "agx_compiler.h"
+#include "agx_nir.h"
 
 /* Fragment shaders with side effects require special handling to ensure the
  * side effects execute as intended. By default, they require late depth

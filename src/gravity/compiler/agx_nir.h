@@ -11,6 +11,7 @@ struct nir_shader;
 
 bool agx_nir_lower_sink_address(struct nir_shader *shader);
 bool agx_nir_lower_accurate_frcp(struct nir_shader *s);
+bool agx_nir_lower_frag_sidefx(struct nir_shader *s);
 
 bool agx_nir_lower_texture_early(struct nir_shader *s, bool support_lod_bias,
                                  bool software_buffer_bounds);
