@@ -1603,3 +1603,170 @@ TEST_F(Apple9RaAssignTest, MultiwordSpilledTupleAcrossDiamondValidatesAllLanes)
    EXPECT_TRUE(res.has_spills);
    EXPECT_GT(verify_binary_emission(&p), 0u);
 }
+
+/* =========================================================================
+ * 19. P0-C1: Non-commutative IANDN Must Never Swap Pending src[1] Into src[0]
+ * ========================================================================= */
+
+TEST_F(Apple9RaAssignTest, IandnPendingSrc1NeverCommutesInPhysicalScoreboard)
+{
+   auto *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block_begin(&p, b0);
+
+   agx_apple9_device_load_contract contract = {
+      .index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR,
+      .flags = 0,
+      .raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_1100,
+   };
+   uint32_t a = emit_imm(0x0f0f);
+   uint32_t idx = emit_imm(0);
+   uint32_t b = agx_apple9_vir_emit_device_load(&p, 0, idx, &contract);
+   ASSERT_NE(b, AGX_APPLE9_VREG_INVALID);
+   uint32_t srcs[2] = {a, b};
+   uint32_t c = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IANDN,
+                                    AGX_APPLE9_ENC_LOGIC_EXTENDED, srcs, 2, 0);
+   ASSERT_NE(c, AGX_APPLE9_VREG_INVALID);
+   p.output = c;
+
+   cfg_init(&p, {b0});
+   agx_apple9_vir_reindex(&p);
+
+   auto opts = validated_opts();
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+
+   /* Find DEVICE_LOAD and IANDN in the finalized physical stream: IANDN's
+    * src[1] MUST remain the DEVICE_LOAD's dest (never commuted to src[0]),
+    * and a standalone WAIT must retire the load before IANDN. */
+   unsigned load_reg = UINT_MAX;
+   unsigned load_slot = 0;
+   bool saw_wait = false;
+   bool saw_iandn = false;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      const auto *ins = p.instructions[i];
+      if (ins->op == AGX_APPLE9_VIR_DEVICE_LOAD) {
+         load_reg = ins->dest;
+         load_slot = ins->producer_scoreboard_slot;
+      } else if (ins->op == AGX_APPLE9_VIR_WAIT && load_slot &&
+                 (ins->immediate & BITFIELD_BIT(load_slot - 1))) {
+         saw_wait = true;
+      } else if (ins->op == AGX_APPLE9_VIR_IANDN) {
+         saw_iandn = true;
+         EXPECT_NE(ins->src[0], load_reg);
+         EXPECT_EQ(ins->src[1], load_reg);
+         EXPECT_EQ(ins->scoreboard_slot, AGX_APPLE9_SCOREBOARD_SLOT_NONE);
+         EXPECT_TRUE(saw_wait);
+      }
+   }
+   ASSERT_TRUE(saw_iandn);
+   EXPECT_GT(verify_binary_emission(&p), 0u);
+}
+
+/* =========================================================================
+ * 20. P0-C6: Prefix-Aware Phi Iteration Sees Phis After EXEC_MASK_ELSE
+ * ========================================================================= */
+
+TEST_F(Apple9RaAssignTest, PrefixEntryPhiLivenessPreservesPhiSource)
+{
+   auto *b0 = agx_apple9_block_create(&p);
+   auto *b1 = agx_apple9_block_create(&p);
+   auto *b2 = agx_apple9_block_create(&p);
+   auto *b3 = agx_apple9_block_create(&p);
+
+   agx_apple9_block_begin(&p, b0);
+   uint32_t v0 = emit_imm(7);
+
+   agx_apple9_block_begin(&p, b1);
+   uint32_t v_then = emit_imm(11);
+
+   agx_apple9_block_begin(&p, b2);
+   uint32_t v_else = emit_imm(23);
+
+   /* Place EXEC_MASK_ELSE BEFORE VIR_PHI in b3 (valid block-entry prefix). */
+   agx_apple9_block_begin(&p, b3);
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_EXEC_MASK_ELSE, AGX_APPLE9_ENC_EXEC_MASK_ELSE,
+      nullptr, 0, 0));
+   uint32_t phi = agx_apple9_vir_emit_phi_canonical(&p, b3, 2);
+   auto *phi_ins = p.instructions[p.instruction_count - 1];
+   uint32_t sum = emit_iadd(phi, v0);
+   p.output = sum;
+
+   cfg_init(&p, {b0, b1, b2, b3});
+   cfg_edge(b0, b1);
+   cfg_edge(b0, b2);
+   cfg_edge(b1, b3);
+   cfg_edge(b2, b3);
+
+   *agx_apple9_vir_src_ptr(phi_ins, 0) = v_then;
+   *agx_apple9_vir_src_ptr(phi_ins, 1) = v_else;
+   agx_apple9_vir_reindex(&p);
+
+   apple9_ra_liveness_info live = {};
+   ASSERT_TRUE(apple9_ra_liveness(&p, &live));
+   /* Both v_then (b1 live_out) and v_else (b2 live_out) MUST be live! */
+   EXPECT_TRUE(u_sparse_bitset_test(&live.live_out[b1->cfg_index], v_then));
+   EXPECT_TRUE(u_sparse_bitset_test(&live.live_out[b2->cfg_index], v_else));
+   EXPECT_FALSE(u_sparse_bitset_test(&live.live_out[b1->cfg_index], phi));
+   apple9_ra_liveness_finish(&live);
+
+   auto opts = validated_opts();
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+}
+
+/* =========================================================================
+ * 21. Codex MEDIUM #5: Uniform-Bindless TEXTURE_SAMPLE Unlocks r64..r95
+ * ========================================================================= */
+
+TEST_F(Apple9RaAssignTest, UniformBindlessTextureSampleUnlocksHighGprs)
+{
+   auto *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block_begin(&p, b0);
+
+   uint32_t x = emit_imm(0);
+   uint32_t y = emit_imm(0);
+   uint32_t one = emit_imm(0x3f800000u);
+   uint32_t coords[2] = {x, y};
+   uint32_t sample = agx_apple9_vir_emit_texture_sample(&p, coords, one, 0, 0);
+   ASSERT_NE(sample, AGX_APPLE9_VREG_INVALID);
+   auto *tex = p.instructions[p.instruction_count - 1];
+   ASSERT_EQ(tex->op, AGX_APPLE9_VIR_TEXTURE_SAMPLE);
+   tex->texture_uniform_bindless = true;
+   tex->texture_index = 4;
+   p.output = sample;
+
+   cfg_init(&p, {b0});
+   agx_apple9_vir_reindex(&p);
+
+   /* Assign destination tuple to r72..r75 (above r63): valid when
+    * texture_uniform_bindless is true, rejected when false. */
+   std::vector<uint8_t> gpr(p.value_count, 0);
+   gpr[x] = 2;
+   gpr[y] = 3;
+   gpr[one] = 4;
+   unsigned next_pub = 0;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      auto *ins = p.instructions[i];
+      if (ins == tex || ins->dest == AGX_APPLE9_VREG_INVALID)
+         continue;
+      if (ins->dest == x || ins->dest == y || ins->dest == one)
+         continue;
+      unsigned comps = ins->dest_components ? ins->dest_components : 1;
+      for (unsigned c = 0; c < comps; ++c)
+         gpr[ins->dest + c] = next_pub + c;
+      next_pub += comps;
+   }
+   for (unsigned c = 0; c < 4; ++c)
+      gpr[sample + c] = 72 + c;
+
+   apple9_ra_assignment assign = {};
+   assign.gpr = gpr.data();
+   apple9_ra_validate_error err = {};
+   EXPECT_TRUE(apple9_ra_validate_post_ra(&p, &assign, &err)) << err.message;
+
+   tex->texture_uniform_bindless = false;
+   EXPECT_FALSE(apple9_ra_validate_post_ra(&p, &assign, &err));
+}

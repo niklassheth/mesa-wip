@@ -1368,3 +1368,50 @@ TEST_F(Apple9RaPcopyTest, ThenArmTrailingExecMaskElsePlacesPhiCopiesBeforeElse)
    apple9_ra_validate_error err = {};
    EXPECT_TRUE(apple9_ra_validate_post_ra(&p, &assign, &err)) << err.message;
 }
+
+TEST(Apple9RaPcopy, IdentityDestinationNotClobberedAsCycleScratch)
+{
+   /* P0-C9: (r0<-r0, r1<-r2, r2<-r1) with r0 not marked live must NOT borrow
+    * identity destination r0 as cycle scratch. */
+   apple9_ra_pcopy_opts opts = {};
+   opts.scratch_gpr = AGX_APPLE9_PHYS_INVALID;
+   opts.scratch_gpr2 = AGX_APPLE9_PHYS_INVALID;
+   opts.max_temp_gpr = 64;
+   /* Only mark r1..r2 live; r0 is NOT in live_gprs so without marking identity
+    * destinations in gpr_written, find_temp_gpr() would clobber r0. */
+   opts.live_gprs[0] = (1ull << 1) | (1ull << 2);
+
+   std::vector<apple9_ra_copy> copies = {
+      {apple9_ra_loc_gpr(0), apple9_ra_loc_gpr(0), 1},
+      {apple9_ra_loc_gpr(1), apple9_ra_loc_gpr(2), 1},
+      {apple9_ra_loc_gpr(2), apple9_ra_loc_gpr(1), 1},
+   };
+   verify_parallel_copy(copies, opts, 0);
+}
+
+TEST_F(Apple9RaPcopyTest, ValidatePostRaRejectsClobberedProgramOutput)
+{
+   /* P0-C10: Post-RA validator must reject an allocation where a later
+    * instruction overwrites program.output's physical register before exit. */
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block_begin(&p, b0);
+   uint32_t out_v = emit_imm(42);
+   uint32_t clobber_v = emit_imm(99);
+   p.output = out_v;
+
+   cfg_set_active(&p, {b0});
+   agx_apple9_vir_reindex(&p);
+
+   std::vector<uint8_t> gpr(p.value_count, 0);
+   gpr[out_v] = 4;
+   gpr[clobber_v] = 4; /* Overwrites program.output in r4! */
+
+   apple9_ra_assignment assign = {};
+   assign.gpr = gpr.data();
+   apple9_ra_validate_error err = {};
+   EXPECT_FALSE(apple9_ra_validate_post_ra(&p, &assign, &err));
+   EXPECT_TRUE(err.failed);
+
+   gpr[clobber_v] = 5;
+   EXPECT_TRUE(apple9_ra_validate_post_ra(&p, &assign, &err)) << err.message;
+}

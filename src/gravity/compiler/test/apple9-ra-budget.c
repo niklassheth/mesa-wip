@@ -161,7 +161,7 @@ check_indexed_spill_hazard_and_cost(void)
       p.physical = true;
 
       const char *reason = NULL;
-      CHECK(apple9_schedule_physical(&p, &reason));
+      CHECK(agx_apple9_schedule_physical(&p, &reason));
 
       /* For compact SAVE (word < 2048) followed by reload (compact or indexed)
        * of the same word, the scheduler MUST emit or fold a wait on store_slot

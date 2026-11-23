@@ -608,19 +608,13 @@ apple9_ra_liveness(struct agx_apple9_vir_program *p,
          u_sparse_bitset_dup_with_ctx(&edge_live, &info->live_in[b],
                                       scratch_ctx);
 
-         for (struct agx_apple9_vir_instr *phi =
-                 agx_apple9_block_first_instr(blk);
-              phi && phi->op == AGX_APPLE9_VIR_PHI;
-              phi = agx_apple9_instr_next(phi)) {
+         agx_apple9_foreach_phi(blk, phi) {
             if (phi->dest != AGX_APPLE9_VREG_INVALID &&
                 is_valid_gpr(p, pub_defs, phi->dest))
                u_sparse_bitset_clear(&edge_live, phi->dest);
          }
 
-         for (struct agx_apple9_vir_instr *phi =
-                 agx_apple9_block_first_instr(blk);
-              phi && phi->op == AGX_APPLE9_VIR_PHI;
-              phi = agx_apple9_instr_next(phi)) {
+         agx_apple9_foreach_phi(blk, phi) {
             if (p_idx < agx_apple9_vir_nr_srcs(phi)) {
                uint32_t v = agx_apple9_vir_src(phi, p_idx);
                if (is_valid_gpr(p, pub_defs, v))
@@ -931,7 +925,9 @@ compute_value_max_gprs(const struct agx_apple9_vir_program *p, void *mem_ctx)
              dc->max_index < AGX_APPLE9_GPR_COUNT) {
             uint8_t dmax = dc->max_index;
             if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE &&
-                (ins->texture_bindless || ins->sampler_bindless))
+                (ins->texture_bindless || ins->sampler_bindless ||
+                 ins->texture_uniform_bindless ||
+                 ins->sampler_uniform_bindless))
                dmax = AGX_APPLE9_GPR_COUNT - 1;
             for (unsigned c = 0; c < ins->dest_components; ++c) {
                if (ins->dest + c < vcount)

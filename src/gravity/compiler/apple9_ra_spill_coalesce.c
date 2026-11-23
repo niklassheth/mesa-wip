@@ -237,15 +237,11 @@ apple9_ra_spill_coalesce_prepare(const struct agx_apple9_vir_program *program,
             continue;
          memcpy(edge_live, in, g->stride * sizeof(BITSET_WORD));
 
-         for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(blk);
-              phi && phi->op == AGX_APPLE9_VIR_PHI;
-              phi = agx_apple9_instr_next(phi)) {
+         agx_apple9_foreach_phi(blk, phi) {
             if (phi->dest < alloc && g->node[phi->dest] != UINT32_MAX)
                BITSET_CLEAR(edge_live, g->node[phi->dest]);
          }
-         for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(blk);
-              phi && phi->op == AGX_APPLE9_VIR_PHI;
-              phi = agx_apple9_instr_next(phi)) {
+         agx_apple9_foreach_phi(blk, phi) {
             if (p >= agx_apple9_vir_nr_srcs(phi))
                continue;
             uint32_t sv = agx_apple9_vir_src(phi, p);
@@ -299,9 +295,7 @@ apple9_ra_spill_coalesce_prepare(const struct agx_apple9_vir_program *program,
 
       /* Even a dead phi writes its destination and must not clobber another
        * RA_MEM value live at block entry. All phi dests are simultaneous. */
-      for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(block);
-           phi && phi->op == AGX_APPLE9_VIR_PHI;
-           phi = agx_apple9_instr_next(phi)) {
+      agx_apple9_foreach_phi(block, phi) {
          if (phi->dest < alloc && g->node[phi->dest] != UINT32_MAX)
             BITSET_SET(live, g->node[phi->dest]);
       }
@@ -440,6 +434,22 @@ dsatur_color_groups(struct apple9_ra_spill_interference *g, void *memctx,
    return true;
 }
 
+static void
+write_mem_slots(const struct apple9_ra_spill_interference *g,
+                const struct apple9_ra_spill_state *state,
+                const unsigned *group, const unsigned *color,
+                uint32_t *mem_slot)
+{
+   for (unsigned v = 0; v < g->alloc; ++v) {
+      if (g->node[v] != UINT32_MAX) {
+         unsigned base = color[group[g->node[v]]];
+         unsigned w = apple9_ra_value_width(state, v);
+         for (unsigned c = 0; c < w && v + c < g->alloc; ++c)
+            mem_slot[v + c] = base + c;
+      }
+   }
+}
+
 bool
 apple9_ra_spill_coalesce_apply(const struct agx_apple9_vir_program *program,
                                const struct apple9_ra_spill_state *state,
@@ -455,6 +465,10 @@ apple9_ra_spill_coalesce_apply(const struct agx_apple9_vir_program *program,
 
    void *memctx = ralloc_context(NULL);
    unsigned *old = ralloc_array(memctx, unsigned, g->n);
+   if (!old) {
+      ralloc_free(memctx);
+      return false;
+   }
    for (unsigned i = 0; i < g->n; ++i)
       old[i] = UINT32_MAX;
 
@@ -485,16 +499,15 @@ apple9_ra_spill_coalesce_apply(const struct agx_apple9_vir_program *program,
 
    unsigned *group = ralloc_array(memctx, unsigned, g->n);
    unsigned *color = ralloc_array(memctx, unsigned, g->n);
+   if (!group || !color)
+      goto out;
    unsigned high = base_words;
 
    if (!dsatur_color_groups(g, memctx, true, base_words, *frame_words,
                             group, color, &high))
       goto out;
 
-   for (unsigned v = 0; v < g->alloc; ++v) {
-      if (g->node[v] != UINT32_MAX)
-         mem_slot[v] = color[group[g->node[v]]];
-   }
+   write_mem_slots(g, state, group, color, mem_slot);
    *frame_words = high;
    success = true;
 
@@ -564,6 +577,11 @@ apple9_ra_spill_coalesce_color(const struct agx_apple9_vir_program *program,
    void *memctx = ralloc_context(NULL);
    unsigned *group = ralloc_array(memctx, unsigned, g->n);
    unsigned *color = ralloc_array(memctx, unsigned, g->n);
+   if (!group || !color) {
+      ralloc_free(memctx);
+      apple9_ra_spill_coalesce_destroy(g);
+      return false;
+   }
 
    /* Compute a tight upper bound on span to keep DSATUR bitsets compact. */
    unsigned worst_span = 0;
@@ -582,14 +600,7 @@ apple9_ra_spill_coalesce_color(const struct agx_apple9_vir_program *program,
    }
 
    if (ok) {
-      for (unsigned v = 0; v < g->alloc; ++v) {
-         if (g->node[v] != UINT32_MAX) {
-            unsigned base = color[group[g->node[v]]];
-            unsigned w = apple9_ra_value_width(state, v);
-            for (unsigned c = 0; c < w && v + c < g->alloc; ++c)
-               mem_slot[v + c] = base + c;
-         }
-      }
+      write_mem_slots(g, state, group, color, mem_slot);
       *frame_words = high;
    }
 

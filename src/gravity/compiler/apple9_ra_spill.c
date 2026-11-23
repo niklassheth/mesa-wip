@@ -328,7 +328,7 @@ vir_block_after_phis_anchor(struct agx_apple9_block *block)
 {
    for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(block); I;
         I = agx_apple9_instr_next(I)) {
-      if (I->op != AGX_APPLE9_VIR_PHI)
+      if (I->op != AGX_APPLE9_VIR_PHI && !agx_apple9_is_block_entry_prefix(I))
          return I;
    }
    return NULL;
@@ -409,14 +409,18 @@ vir_compute_liveness(struct agx_apple9_vir_program *program,
    for (unsigned bi = 0; bi < num_blocks; ++bi) {
       struct agx_apple9_block *b = cfg_blocks[bi];
       if (b->live_words < words || !b->live_in || !b->live_out) {
-         free(b->live_in);
-         free(b->live_out);
-         b->live_in = calloc(words, sizeof(BITSET_WORD));
-         b->live_out = calloc(words, sizeof(BITSET_WORD));
-         if (!b->live_in || !b->live_out) {
+         BITSET_WORD *new_in = calloc(words, sizeof(BITSET_WORD));
+         BITSET_WORD *new_out = calloc(words, sizeof(BITSET_WORD));
+         if (!new_in || !new_out) {
+            free(new_in);
+            free(new_out);
             u_worklist_fini(&worklist);
             return false;
          }
+         free(b->live_in);
+         free(b->live_out);
+         b->live_in = new_in;
+         b->live_out = new_out;
          b->live_words = words;
       } else {
          memset(b->live_in, 0, words * sizeof(BITSET_WORD));
@@ -502,15 +506,11 @@ vir_compute_liveness(struct agx_apple9_vir_program *program,
          memcpy(edge_live, blk->live_in, words * sizeof(BITSET_WORD));
 
          /* Phis logically execute in parallel on the incoming edge. */
-         for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(blk);
-              phi && phi->op == AGX_APPLE9_VIR_PHI;
-              phi = agx_apple9_instr_next(phi)) {
+         agx_apple9_foreach_phi(blk, phi) {
             if (phi->dest < n)
                BITSET_CLEAR(edge_live, phi->dest);
          }
-         for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(blk);
-              phi && phi->op == AGX_APPLE9_VIR_PHI;
-              phi = agx_apple9_instr_next(phi)) {
+         agx_apple9_foreach_phi(blk, phi) {
             if (p >= agx_apple9_vir_nr_srcs(phi))
                continue;
             uint32_t sv = agx_apple9_vir_src(phi, p);
@@ -1529,8 +1529,7 @@ static bool
 in_preheader_w_exit(struct spill_ctx *ctx, struct agx_apple9_block *header,
                     unsigned node)
 {
-   for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(header);
-        phi && phi->op == AGX_APPLE9_VIR_PHI; phi = agx_apple9_instr_next(phi)) {
+   agx_apple9_foreach_phi(header, phi) {
       if (phi->dest == node)
          return true;
    }
@@ -1565,6 +1564,10 @@ compute_w_entry_loop_header(struct spill_ctx *ctx)
       return;
 
    struct candidate *candidates = calloc(nP, sizeof(*candidates));
+   if (!candidates) {
+      ctx->failed = true;
+      return;
+   }
    unsigned j = 0;
    foreach_next_use(&sb->next_use_in, i, dist) {
       candidates[j++] = (struct candidate){.node = i, .dist = dist};
@@ -1577,13 +1580,18 @@ compute_w_entry_loop_header(struct spill_ctx *ctx)
    if (end != UINT_MAX) {
       BITSET_WORD *live = malloc(BITSET_BYTES(ctx->n));
       used = calloc(BITSET_WORDS(ctx->n), sizeof(BITSET_WORD));
+      if (!live || !used) {
+         free(live);
+         free(used);
+         free(candidates);
+         ctx->failed = true;
+         return;
+      }
       unsigned peak = 0;
       for (unsigned bi = block->cfg_index; bi <= end; ++bi) {
          struct agx_apple9_block *b = ctx->cfg_blocks[bi];
          peak = MAX2(peak, block_max_pressure(ctx, b, live, used));
-         for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(b);
-              phi && phi->op == AGX_APPLE9_VIR_PHI;
-              phi = agx_apple9_instr_next(phi)) {
+         agx_apple9_foreach_phi(b, phi) {
             unsigned nr_srcs = agx_apple9_vir_nr_srcs(phi);
             for (unsigned s = 0; s < nr_srcs && s < b->num_cfg_preds; ++s) {
                struct agx_apple9_block *pred = b->cfg_preds[s];
@@ -1671,8 +1679,7 @@ compute_w_entry(struct spill_ctx *ctx)
          freq[sp->W_exit[i]] = 0;
    }
 
-   for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(block);
-        phi && phi->op == AGX_APPLE9_VIR_PHI; phi = agx_apple9_instr_next(phi)) {
+   agx_apple9_foreach_phi(block, phi) {
       if (phi->dest >= ctx->n || BITSET_TEST(ctx->is_pub, phi->dest))
          continue;
 
@@ -1772,8 +1779,7 @@ insert_coupling_code(struct spill_ctx *ctx, struct agx_apple9_block *pred,
       BITSET_SET(ctx->W, sp->W_exit[i]);
 
    /* Pass 1: Spilled phis (phi->dest in RA_MEM). */
-   for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(succ);
-        phi && phi->op == AGX_APPLE9_VIR_PHI; phi = agx_apple9_instr_next(phi)) {
+   agx_apple9_foreach_phi(succ, phi) {
       if (!apple9_ra_value_is_mem(ctx->state, phi->dest))
          continue;
       if (pred_idx >= agx_apple9_vir_nr_srcs(phi))
@@ -1799,18 +1805,25 @@ insert_coupling_code(struct spill_ctx *ctx, struct agx_apple9_block *pred,
             }
             ctx->state->value_width[tmp] = 1;
             remat_to_at(ctx, entry, anchor, tmp, sv);
+            if (ctx->failed)
+               goto cleanup;
 
             uint32_t mem_v = ctx->spill_base + sv;
+            if (!vir_emit_mov_at(ctx->program, entry, anchor, mem_v, tmp,
+                                 ctx->widths[sv])) {
+               ctx->failed = true;
+               goto cleanup;
+            }
             mark_mem_tuple(ctx->state, mem_v, ctx->widths[sv]);
             ctx->state->has_spills = true;
-            vir_emit_mov_at(ctx->program, entry, anchor, mem_v, tmp,
-                            ctx->widths[sv]);
             BITSET_SET(ctx->remat_spilled, sv);
          }
       } else if (!BITSET_TEST(ctx->S, sv)) {
          struct agx_apple9_vir_instr *end_anchor =
             vir_block_logical_end_anchor(pred);
          insert_spill_at(ctx, pred, end_anchor, sv);
+         if (ctx->failed)
+            goto cleanup;
       }
 
       uint32_t mem_sv = ctx->spill_base + sv;
@@ -1819,8 +1832,7 @@ insert_coupling_code(struct spill_ctx *ctx, struct agx_apple9_block *pred,
    }
 
    /* Pass 2: Values in S_entry of succ must be spilled along the edge. */
-   for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(succ);
-        phi && phi->op == AGX_APPLE9_VIR_PHI; phi = agx_apple9_instr_next(phi)) {
+   agx_apple9_foreach_phi(succ, phi) {
       unsigned orig = chase_mem_index(phi->dest, ctx->spill_base);
       if (orig < ctx->n)
          BITSET_SET(ctx->S, orig);
@@ -1839,14 +1851,12 @@ insert_coupling_code(struct spill_ctx *ctx, struct agx_apple9_block *pred,
    /* Restore S to empty, then mark GPR phi dests in S to skip them in Pass 3. */
    for (unsigned i = 0; i < sp->nS_exit; ++i)
       BITSET_CLEAR(ctx->S, sp->S_exit[i]);
-   for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(succ);
-        phi && phi->op == AGX_APPLE9_VIR_PHI; phi = agx_apple9_instr_next(phi)) {
+   agx_apple9_foreach_phi(succ, phi) {
       unsigned orig = chase_mem_index(phi->dest, ctx->spill_base);
       if (orig < ctx->n)
          BITSET_CLEAR(ctx->S, orig);
    }
-   for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(succ);
-        phi && phi->op == AGX_APPLE9_VIR_PHI; phi = agx_apple9_instr_next(phi)) {
+   agx_apple9_foreach_phi(succ, phi) {
       if (!apple9_ra_value_is_mem(ctx->state, phi->dest) && phi->dest < ctx->n)
          BITSET_SET(ctx->S, phi->dest);
    }
@@ -1863,8 +1873,7 @@ insert_coupling_code(struct spill_ctx *ctx, struct agx_apple9_block *pred,
    }
 
    /* Pass 4: GPR phis must have their incoming source in GPR on the edge. */
-   for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(succ);
-        phi && phi->op == AGX_APPLE9_VIR_PHI; phi = agx_apple9_instr_next(phi)) {
+   agx_apple9_foreach_phi(succ, phi) {
       if (apple9_ra_value_is_mem(ctx->state, phi->dest))
          continue;
       if (pred_idx >= agx_apple9_vir_nr_srcs(phi))
@@ -1882,8 +1891,7 @@ insert_coupling_code(struct spill_ctx *ctx, struct agx_apple9_block *pred,
    }
 
 cleanup:
-   for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(succ);
-        phi && phi->op == AGX_APPLE9_VIR_PHI; phi = agx_apple9_instr_next(phi)) {
+   agx_apple9_foreach_phi(succ, phi) {
       unsigned orig = chase_mem_index(phi->dest, ctx->spill_base);
       if (orig < ctx->n)
          BITSET_CLEAR(ctx->S, orig);
@@ -2062,9 +2070,7 @@ global_next_use_distances(struct agx_apple9_vir_program *program,
 
          copy_next_uses(&dists, &sb->next_use_in);
 
-         for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(blk);
-              phi && phi->op == AGX_APPLE9_VIR_PHI;
-              phi = agx_apple9_instr_next(phi)) {
+         agx_apple9_foreach_phi(blk, phi) {
             if (phi->dest < n)
                set_next_use(&dists, phi->dest, DIST_INFINITY);
          }
@@ -2078,9 +2084,7 @@ global_next_use_distances(struct agx_apple9_vir_program *program,
             copy_next_uses(&dists, &far);
          }
 
-         for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(blk);
-              phi && phi->op == AGX_APPLE9_VIR_PHI;
-              phi = agx_apple9_instr_next(phi)) {
+         agx_apple9_foreach_phi(blk, phi) {
             if (p >= agx_apple9_vir_nr_srcs(phi))
                continue;
             uint32_t sv = agx_apple9_vir_src(phi, p);
@@ -2172,9 +2176,7 @@ hoist_loop_invariant_spills(struct agx_apple9_vir_program *program,
          BITSET_SET(available, sb->W_exit[i]);
       for (unsigned i = 0; i < sb->nS_exit; ++i)
          BITSET_SET(stored, sb->S_exit[i]);
-      for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(header);
-           phi && phi->op == AGX_APPLE9_VIR_PHI;
-           phi = agx_apple9_instr_next(phi)) {
+      agx_apple9_foreach_phi(header, phi) {
          unsigned orig = chase_mem_index(phi->dest, n);
          if (orig < n)
             BITSET_SET(header_phis, orig);
@@ -2200,8 +2202,9 @@ hoist_loop_invariant_spills(struct agx_apple9_vir_program *program,
             if (!BITSET_TEST(stored, v)) {
                struct agx_apple9_vir_instr *anchor =
                   vir_block_logical_end_anchor(preheader);
-               vir_emit_mov_at(program, preheader, anchor, I->dest, I->src[0],
-                               I->dest_components);
+               if (!vir_emit_mov_at(program, preheader, anchor, I->dest, I->src[0],
+                                    I->dest_components))
+                  continue;
                BITSET_SET(stored, v);
             }
             util_dynarray_append(&to_remove, I);
@@ -2400,6 +2403,10 @@ apple9_ra_spill(struct agx_apple9_vir_program *program,
    void *memctx = ralloc_context(NULL);
    struct agx_apple9_block **cfg_blocks =
       rzalloc_array(memctx, struct agx_apple9_block *, num_blocks);
+   if (!cfg_blocks) {
+      ralloc_free(memctx);
+      return false;
+   }
    for (struct agx_apple9_block *b = program->blocks; b; b = b->next) {
       if (b->cfg_active && b->cfg_index < num_blocks)
          cfg_blocks[b->cfg_index] = b;

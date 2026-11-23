@@ -77,16 +77,6 @@ apple9_after_logical_end(const struct agx_apple9_vir_instr *ins)
    }
 }
 
-/* The first physical block selected from a NIR block. */
-static struct agx_apple9_block *
-apple9_nir_block(struct hash_table *nir_blocks, nir_block *nir)
-{
-   struct hash_entry *entry =
-      nir ? _mesa_hash_table_search(nir_blocks, nir) : NULL;
-   return entry ? entry->data : NULL;
-}
-
-
 #define PUB_BASE AGX_APPLE9_GPR_COUNT
 
 static bool
@@ -167,6 +157,8 @@ struct apple9_pending {
    unsigned first_need;
    bool unknown;
    struct agx_apple9_vir_instr producer[APPLE9_PENDING_MERGE];
+   /* Unique input instruction index identifying each issued producer. */
+   unsigned issue_id[APPLE9_PENDING_MERGE];
    /* Whether a device fence has issued since the producer did. */
    bool fenced[APPLE9_PENDING_MERGE];
    /* The if/else arm (apple9_arms node) that issued each producer. */
@@ -279,6 +271,7 @@ apple9_complete(struct apple9_completion *state, unsigned mask)
       unsigned count = 0;
       for (unsigned i = 0; i < p->count; ++i) {
          if (!(apple9_producer_slots(&p->producer[i]) & mask)) {
+            p->issue_id[count] = p->issue_id[i];
             p->fenced[count] = p->fenced[i];
             p->arm[count] = p->arm[i];
             p->producer[count++] = p->producer[i];
@@ -393,6 +386,21 @@ apple9_can_fold_pending(const struct agx_apple9_vir_instr *ins,
 {
    if (p->unknown || !p->count)
       return false;
+   /* Hardware ilogic folded waits bind to source A only; non-commutative
+    * IANDN cannot swap src[1] into A, and an inline-uniform A cannot swap. */
+   if (ins->encoding == AGX_APPLE9_ENC_LOGIC_EXTENDED ||
+       ins->encoding == AGX_APPLE9_ENC_LOGIC_EXPORT) {
+      if (ins->nr_srcs == 2 &&
+          ins->op != AGX_APPLE9_VIR_IAND &&
+          ins->op != AGX_APPLE9_VIR_IOR &&
+          ins->op != AGX_APPLE9_VIR_IXOR &&
+          !apple9_pending_result(p, ins->src[0]) &&
+          apple9_pending_result(p, ins->src[1]))
+         return false;
+      if ((ins->alu_src_uniform_mask & 1u) && ins->nr_srcs == 1 &&
+          apple9_pending_result(p, ins->src[0]))
+         return false;
+   }
    for (unsigned i = 0; i < p->count; ++i) {
       if (!apple9_can_fold_wait(ins, &p->producer[i]))
          return false;
@@ -758,22 +766,6 @@ apple9_pending_hazard(const struct agx_apple9_vir_instr *ins,
    return false;
 }
 
-static bool
-apple9_same_producer(const struct agx_apple9_vir_instr *a,
-                     const struct agx_apple9_vir_instr *b)
-{
-   if (a->op != b->op || a->encoding != b->encoding || a->dest != b->dest ||
-       a->dest_components != b->dest_components || a->nr_srcs != b->nr_srcs ||
-       a->immediate != b->immediate ||
-       a->producer_scoreboard_slot != b->producer_scoreboard_slot)
-      return false;
-   for (unsigned s = 0; s < a->nr_srcs; ++s) {
-      if (a->src[s] != b->src[s])
-         return false;
-   }
-   return true;
-}
-
 /* Add one path's pending producers to a successor's entry state. */
 static void
 apple9_merge_pending(struct apple9_completion *to_state,
@@ -790,9 +782,10 @@ apple9_merge_pending(struct apple9_completion *to_state,
       for (unsigned i = 0; i < f->count; ++i) {
          bool present = false;
          for (unsigned j = 0; j < t->count; ++j) {
-            if (apple9_same_producer(&t->producer[j], &f->producer[i])) {
+            if (t->issue_id[j] == f->issue_id[i]) {
                t->fenced[j] |= f->fenced[i];
                present = true;
+               break;
             }
          }
          if (present)
@@ -800,6 +793,7 @@ apple9_merge_pending(struct apple9_completion *to_state,
          if (t->count == APPLE9_PENDING_MERGE) {
             t->unknown = true;
          } else {
+            t->issue_id[t->count] = f->issue_id[i];
             t->fenced[t->count] = f->fenced[i];
             t->arm[t->count] = f->arm[i];
             t->producer[t->count++] = f->producer[i];
@@ -962,9 +956,9 @@ apple9_select_compact_alu(struct agx_apple9_vir_instr *I)
  * jumps, as native Metal code keeps them; each successor starts from the
  * union of its predecessors' pending producers. Loop control, back edges and
  * entry to a loop header wait for everything outstanding. */
-static bool
-apple9_schedule_physical(struct agx_apple9_vir_program *program,
-                          const char **reason)
+bool
+agx_apple9_schedule_physical(struct agx_apple9_vir_program *program,
+                             const char **reason)
 {
    if (!program->blocks || !program->last_block ||
        program->instruction_count == 0) {
@@ -1137,9 +1131,12 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
          if (fold && !apple9_pending_active(&pending[fold]))
             fold = 0;
          if (fold) {
-            /* Logic's pending-result source is A. Its operators commute. */
+            /* Logic's pending-result source is A. Commutative ops may swap. */
             if ((ins.encoding == AGX_APPLE9_ENC_LOGIC_EXTENDED ||
                  ins.encoding == AGX_APPLE9_ENC_LOGIC_EXPORT) && ins.nr_srcs == 2 &&
+                (ins.op == AGX_APPLE9_VIR_IAND ||
+                 ins.op == AGX_APPLE9_VIR_IOR ||
+                 ins.op == AGX_APPLE9_VIR_IXOR) &&
                 !apple9_pending_result(&pending[fold], ins.src[0]) &&
                 apple9_pending_result(&pending[fold], ins.src[1])) {
                unsigned src = ins.src[0];
@@ -1220,6 +1217,7 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
             }
             if (joined) {
                struct apple9_pending *p = &pending[slot];
+               p->issue_id[p->count] = i;
                p->fenced[p->count] = false;
                p->arm[p->count] = arms.of[i];
                p->producer[p->count++] = ins;
@@ -1228,7 +1226,8 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
             } else {
                pending[slot] = (struct apple9_pending){
                   .count = 1, .latest_issue = out.instruction_count,
-                  .first_need = need, .producer = {ins}, .arm = {arms.of[i]}};
+                  .first_need = need, .producer = {ins}, .issue_id = {i},
+                  .arm = {arms.of[i]}};
             }
          }
          apple9_select_compact_alu(&ins);
@@ -1574,7 +1573,7 @@ apple9_run_native_candidate(struct agx_apple9_vir_program *program,
       if (apple9_ra_allocate_native(out, &opts, &res)) {
          if (remat_used)
             *remat_used = res.uniform_remat_used;
-         if (!apple9_schedule_physical(out, reason))
+         if (!agx_apple9_schedule_physical(out, reason))
             return false;
          return true;
       }

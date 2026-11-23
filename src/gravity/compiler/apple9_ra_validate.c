@@ -176,6 +176,13 @@ validate_logical_cfg(const struct agx_apple9_vir_program *program,
 
          unsigned succ_count_in_b =
             (b->cfg_succs[0] == succ) + (b->cfg_succs[1] == succ);
+         if (succ->num_cfg_preds > 0 && !succ->cfg_preds) {
+            set_err(err, succ->index, UINT_MAX,
+                    "block %u has num_cfg_preds=%u but NULL cfg_preds",
+                    succ->index, succ->num_cfg_preds);
+            free(blocks);
+            return false;
+         }
          unsigned b_count_in_succ = 0;
          for (unsigned p = 0; p < succ->num_cfg_preds; ++p) {
             if (succ->cfg_preds[p] == b)
@@ -996,7 +1003,9 @@ validate_encoding_constraints(const struct agx_apple9_vir_program *program,
             dc ? MAX2(dc->alignment_halves, 2u) / 2u : 1u;
 
          if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE) {
-            unsigned limit = (ins->texture_bindless || ins->sampler_bindless)
+            unsigned limit = (ins->texture_bindless || ins->sampler_bindless ||
+                              ins->texture_uniform_bindless ||
+                              ins->sampler_uniform_bindless)
                                 ? AGX_APPLE9_GPR_COUNT
                                 : 64u;
             max_gpr = limit - comps;
@@ -1150,6 +1159,34 @@ compute_liveness(const struct agx_apple9_vir_program *program,
    BITSET_WORD *tmp = calloc(live_words, sizeof(BITSET_WORD));
    if (!tmp)
       return false;
+
+   /* Seed live-out values on logical CFG exit blocks identically to
+    * apple9_ra_liveness(). */
+   for (unsigned bi = 0; bi < num_blocks; ++bi) {
+      struct agx_apple9_block *b = blocks[bi];
+      if (b->cfg_succs[0] || b->cfg_succs[1])
+         continue;
+      BITSET_WORD *out = &live_out[bi * live_words];
+      bool has_abi_ret = false;
+      for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(b);
+           ins; ins = agx_apple9_instr_next(ins)) {
+         if (ins->op == AGX_APPLE9_VIR_ABI_RETURN) {
+            has_abi_ret = true;
+            break;
+         }
+      }
+      if (program->output < program->value_count &&
+          !is_publication_val(program, program->output))
+         BITSET_SET(out, program->output);
+      for (unsigned k = 0; k < program->live_out_count; ++k) {
+         if (has_abi_ret &&
+             program->live_out_reg[k] != AGX_APPLE9_PHYS_INVALID)
+            continue;
+         uint32_t v = program->live_out[k];
+         if (v < program->value_count && !is_publication_val(program, v))
+            BITSET_SET(out, v);
+      }
+   }
 
    bool changed = true;
    while (changed) {
@@ -1897,6 +1934,63 @@ apple9_ra_validate_post_ra(const struct agx_apple9_vir_program *program,
                               &live_out[(size_t)bi * live_words], live_words,
                               err))
          goto fail;
+
+      /* Verify shader exit outputs (program->output and non-ABI-return
+       * live_out[]) are intact in their assigned slots at logical exits. */
+      if (!b->cfg_succs[0] && !b->cfg_succs[1]) {
+         bool has_abi_ret = false;
+         for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(b);
+              ins; ins = agx_apple9_instr_next(ins)) {
+            if (ins->op == AGX_APPLE9_VIR_ABI_RETURN) {
+               has_abi_ret = true;
+               break;
+            }
+         }
+         if (program->output < program->value_count &&
+             !is_publication_val(program, program->output)) {
+            struct apple9_ra_loc loc;
+            if (!get_val_loc(program, assign, mem_slots, program->output,
+                             &loc)) {
+               set_err(err, b->index, UINT_MAX,
+                       "program.output v%u has invalid assignment",
+                       program->output);
+               goto fail;
+            }
+            struct reg_slot actual = *file_slot(cur, loc);
+            if (actual.state != SLOT_SSA || actual.value != program->output) {
+               set_err(err, b->index, UINT_MAX,
+                       "clobbered program.output v%u in %c%u (found %s v%u)",
+                       program->output,
+                       loc.kind == APPLE9_RA_LOC_MEM ? 'm' : 'r', loc.value,
+                       actual.state == SLOT_SSA     ? "other SSA"
+                       : actual.state == SLOT_CONST ? "const"
+                                                    : "undef",
+                       actual.value);
+               goto fail;
+            }
+         }
+         for (unsigned k = 0; k < program->live_out_count; ++k) {
+            if (has_abi_ret &&
+                program->live_out_reg[k] != AGX_APPLE9_PHYS_INVALID)
+               continue;
+            uint32_t v = program->live_out[k];
+            if (v >= program->value_count || is_publication_val(program, v))
+               continue;
+            struct apple9_ra_loc loc;
+            if (!get_val_loc(program, assign, mem_slots, v, &loc)) {
+               set_err(err, b->index, UINT_MAX,
+                       "exit live_out[%u] v%u has invalid assignment", k, v);
+               goto fail;
+            }
+            struct reg_slot actual = *file_slot(cur, loc);
+            if (actual.state != SLOT_SSA || actual.value != v) {
+               set_err(err, b->index, UINT_MAX,
+                       "clobbered exit live_out[%u] v%u in %c%u", k, v,
+                       loc.kind == APPLE9_RA_LOC_MEM ? 'm' : 'r', loc.value);
+               goto fail;
+            }
+         }
+      }
 
       /* Validate outgoing CFG edges against successors' VIR_PHI sources. */
       for (unsigned s = 0; s < 2; ++s) {

@@ -811,6 +811,43 @@ struct agx_apple9_vir_instr *
 agx_apple9_instr_next(const struct agx_apple9_vir_instr *instr);
 struct agx_apple9_vir_instr *
 agx_apple9_instr_prev(const struct agx_apple9_vir_instr *instr);
+
+static inline bool
+agx_apple9_is_block_entry_prefix(const struct agx_apple9_vir_instr *ins)
+{
+   return ins->op == AGX_APPLE9_VIR_ENTRY_REG ||
+          (ins->op == AGX_APPLE9_VIR_EXEC_MASK_ELSE && !ins->local_control);
+}
+
+static inline struct agx_apple9_vir_instr *
+agx_apple9_block_first_phi(const struct agx_apple9_block *block)
+{
+   for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(block);
+        I; I = agx_apple9_instr_next(I)) {
+      if (I->op == AGX_APPLE9_VIR_PHI)
+         return I;
+      if (!agx_apple9_is_block_entry_prefix(I))
+         break;
+   }
+   return NULL;
+}
+
+static inline struct agx_apple9_vir_instr *
+agx_apple9_phi_next(const struct agx_apple9_vir_instr *phi)
+{
+   for (struct agx_apple9_vir_instr *I = agx_apple9_instr_next(phi);
+        I; I = agx_apple9_instr_next(I)) {
+      if (I->op == AGX_APPLE9_VIR_PHI)
+         return I;
+      if (!agx_apple9_is_block_entry_prefix(I))
+         break;
+   }
+   return NULL;
+}
+
+#define agx_apple9_foreach_phi(blk, phi)                                      \
+   for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_phi(blk);   \
+        phi; phi = agx_apple9_phi_next(phi))
 void agx_apple9_vir_move_before(struct agx_apple9_vir_program *program,
                               struct agx_apple9_vir_instr *instr,
                               struct agx_apple9_vir_instr *before);

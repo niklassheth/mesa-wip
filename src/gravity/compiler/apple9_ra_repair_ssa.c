@@ -147,7 +147,20 @@ emit_repair_phi(struct repair_ctx *ctx, struct agx_apple9_block *block,
    if (!is_mem && orig_var < ctx->n && ctx->program->max_phys)
       ctx->program->max_phys[val] = ctx->program->max_phys[orig_var];
 
-   agx_apple9_vir_move_to_block_start(ctx->program, phi, block);
+   struct agx_apple9_vir_instr *first_non_prefix = NULL;
+   for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(block);
+        I; I = agx_apple9_instr_next(I)) {
+      if (I == phi)
+         continue;
+      if (!agx_apple9_is_block_entry_prefix(I)) {
+         first_non_prefix = I;
+         break;
+      }
+   }
+   if (first_non_prefix)
+      agx_apple9_vir_move_before(ctx->program, phi, first_non_prefix);
+   else
+      agx_apple9_vir_move_to_block_start(ctx->program, phi, block);
    _mesa_hash_table_insert(ctx->created_phis, phi, phi);
    *val_out = val;
    return phi;
@@ -306,9 +319,7 @@ apple9_opt_trivial_phi(struct agx_apple9_vir_program *program,
 
    /* Collect leading phis at the start of every active block. */
    for (int bi = (int)num_blocks - 1; bi >= 0; --bi) {
-      for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(cfg_blocks[bi]);
-           phi && phi->op == AGX_APPLE9_VIR_PHI;
-           phi = agx_apple9_instr_next(phi)) {
+      agx_apple9_foreach_phi(cfg_blocks[bi], phi) {
          if (phi->dest < alloc)
             BITSET_SET(candidate, phi->dest);
       }
@@ -683,6 +694,11 @@ apple9_ra_repair_ssa(struct agx_apple9_vir_program *program,
    BITSET_WORD *direct_lanes =
       rzalloc_array(memctx, BITSET_WORD, BITSET_WORDS(MAX2(n, 1u)));
    uint32_t *def_base = malloc(MAX2(n, 1u) * sizeof(uint32_t));
+   if (!blocks || !created_phis || !direct_lanes || !def_base) {
+      free(def_base);
+      ralloc_free(memctx);
+      return false;
+   }
    for (unsigned i = 0; i < MAX2(n, 1u); ++i)
       def_base[i] = AGX_APPLE9_VREG_INVALID;
 
@@ -707,6 +723,14 @@ apple9_ra_repair_ssa(struct agx_apple9_vir_program *program,
          }
       }
    }
+   for (unsigned k = 0; k < program->live_out_count; ++k) {
+      uint32_t v = program->live_out[k];
+      if (v < n && def_base[v] != AGX_APPLE9_VREG_INVALID && v != def_base[v])
+         BITSET_SET(direct_lanes, def_base[v]);
+   }
+   if (program->output < n && def_base[program->output] != AGX_APPLE9_VREG_INVALID &&
+       program->output != def_base[program->output])
+      BITSET_SET(direct_lanes, def_base[program->output]);
    free(def_base);
 
    /* Identify variables defined more than once (and entry vir_inputs that get
@@ -929,9 +953,7 @@ apple9_ra_repair_ssa(struct agx_apple9_vir_program *program,
    /* Update pre-existing VIR_PHI sources (which read in their predecessors). */
    for (unsigned bi = 0; bi < num_blocks && !rctx.failed; ++bi) {
       struct agx_apple9_block *block = cfg_blocks[bi];
-      for (struct agx_apple9_vir_instr *phi = agx_apple9_block_first_instr(block);
-           phi && phi->op == AGX_APPLE9_VIR_PHI;
-           phi = agx_apple9_instr_next(phi)) {
+      agx_apple9_foreach_phi(block, phi) {
          phi->kill_mask = 0;
          if (_mesa_hash_table_search(created_phis, phi))
             continue;

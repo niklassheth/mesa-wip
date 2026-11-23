@@ -589,8 +589,11 @@ apple9_ra_lower_parallel_copies(const struct apple9_ra_copy *copies,
          else if (src.kind == APPLE9_RA_LOC_IMM && w > 0)
             src.value = 0;
 
-         if (loc_equal(dst, src))
+         if (loc_equal(dst, src)) {
+            if (dst.kind == APPLE9_RA_LOC_GPR)
+               gpr_bit_set(st.gpr_written, dst.value);
             continue;
+         }
 
          st.pending[st.nr_pending++] = (struct pcopy_entry){
             .dst = dst,

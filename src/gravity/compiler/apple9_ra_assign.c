@@ -85,13 +85,6 @@ gpr_set_range(uint64_t m[2], unsigned r, unsigned count)
       gpr_set(m, r + i);
 }
 
-static inline void
-gpr_clear_range(uint64_t m[2], unsigned r, unsigned count)
-{
-   for (unsigned i = 0; i < count; ++i)
-      gpr_clear(m, r + i);
-}
-
 static inline bool
 gpr_test_range(const uint64_t m[2], unsigned r, unsigned count)
 {
@@ -326,7 +319,9 @@ a9_dest_constraint(const struct agx_apple9_vir_program *program,
    unsigned align_gprs = dc ? MAX2(dc->alignment_halves, 2u) / 2u : 1u;
 
    if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE) {
-      unsigned limit = (ins->texture_bindless || ins->sampler_bindless)
+      unsigned limit = (ins->texture_bindless || ins->sampler_bindless ||
+                        ins->texture_uniform_bindless ||
+                        ins->sampler_uniform_bindless)
                           ? AGX_APPLE9_GPR_COUNT
                           : 64u;
       max_gpr = limit - comps;
@@ -3347,368 +3342,6 @@ a9_remove_empty_else(struct agx_apple9_vir_program *p)
    return true;
 }
 
-/* =========================================================================
- * Built-in Physical Scoreboard Finalizer (makes output directly packable and
- * passes agx_apple9_validate_vir_allocation())
- * ========================================================================= */
-
-struct a9_sb_slot {
-   bool active;
-   unsigned issue_idx;
-   struct agx_apple9_vir_instr producer;
-};
-
-static bool
-a9_sb_producer_writes(const struct agx_apple9_vir_instr *prod, unsigned reg)
-{
-   return prod->dest != AGX_APPLE9_VREG_INVALID &&
-          reg >= prod->dest && reg - prod->dest < prod->dest_components;
-}
-
-static bool
-a9_sb_can_fold(const struct agx_apple9_vir_instr *ins,
-               const struct agx_apple9_vir_instr *prod)
-{
-   if (ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC ||
-       ins->encoding == AGX_APPLE9_ENC_PSEUDO)
-      return false;
-   if (agx_apple9_encoding_info(ins->encoding)->dependency_layout ==
-       AGX_APPLE9_DEPENDENCY_NONE)
-      return false;
-   if (prod->op == AGX_APPLE9_VIR_SPILL_STORE)
-      return true;
-
-   bool reads = false;
-   for (unsigned s = 0; s < ins->nr_srcs; ++s)
-      reads |= a9_sb_producer_writes(prod, ins->src[s]);
-   if (!reads)
-      return ins->op != AGX_APPLE9_VIR_DEVICE_ATOMIC;
-
-   if (a9_scalar_publication(prod))
-      return (ins->op == AGX_APPLE9_VIR_VARY_STORE ||
-              ins->op == AGX_APPLE9_VIR_OBJECT_GRID_EXPORT ||
-              ins->op == AGX_APPLE9_VIR_COVERAGE) &&
-             ins->src[0] == prod->dest;
-
-   if (ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC &&
-       (ins->atomic_discard || ins->atomic_op == AGX_APPLE9_ATOMIC_CMPXCHG ||
-        prod->op != AGX_APPLE9_VIR_DEVICE_LOAD || prod->dest_components != 1 ||
-        ins->src[0] != prod->dest))
-      return false;
-
-   if (ins->op == AGX_APPLE9_VIR_IOR &&
-       ins->encoding == AGX_APPLE9_ENC_LOGIC_EXTENDED && ins->nr_srcs == 2 &&
-       ins->src[0] == ins->src[1] && ins->src[0] == prod->dest)
-      return true;
-
-   bool tuple = prod->op != AGX_APPLE9_VIR_SPILL_LOAD;
-   bool can_retain =
-      tuple && agx_apple9_encoding_info(ins->encoding)->dependency_retains_sources;
-   unsigned consumed = 0;
-   for (unsigned s = 0; s < ins->nr_srcs; ++s) {
-      if (!a9_sb_producer_writes(prod, ins->src[s]))
-         continue;
-      if ((ins->live_after_mask & BITFIELD_BIT(s)) && !can_retain)
-         return false;
-      consumed |= BITFIELD_BIT(ins->src[s] - prod->dest);
-   }
-   return consumed == BITFIELD_MASK(prod->dest_components) ||
-          (tuple && consumed != 0);
-}
-
-static bool
-a9_sb_needs_wait(const struct agx_apple9_vir_instr *ins,
-                 const struct agx_apple9_vir_instr *prod)
-{
-   /* Control flow / completion barriers drain pending slots. */
-   if (apple9_ra_after_logical_end(ins) ||
-       (ins->encoding != AGX_APPLE9_ENC_PSEUDO &&
-        agx_apple9_encoding_info(ins->encoding)->requires_prior_completion))
-      return true;
-
-   /* Direct RAW on producer's result. */
-   for (unsigned s = 0; s < ins->nr_srcs; ++s) {
-      if (a9_sb_producer_writes(prod, ins->src[s]))
-         return true;
-   }
-
-   /* WAW / WAR hazard on producer's dest or non-at-issue sources. */
-   bool save = (ins->op == AGX_APPLE9_VIR_SPILL_STORE);
-   unsigned wcount = ins->dest_components + (save ? 1u : 0u);
-   for (unsigned c = 0; c < wcount; ++c) {
-      unsigned reg = save ? ins->src[0] : (ins->dest + c);
-      if (a9_sb_producer_writes(prod, reg))
-         return true;
-      if (!a9_reads_sources_at_issue(prod)) {
-         for (unsigned s = 0; s < prod->nr_srcs; ++s) {
-            if (prod->op == AGX_APPLE9_VIR_IMAGE_STORE &&
-                prod->src[s] < A9_PUB_BASE)
-               continue;
-            if (prod->src[s] == reg)
-               return true;
-         }
-      }
-   }
-
-   /* Scratch slot hazard (covers both compact SPILL_* and indexed PRIVATE_*). */
-   bool is_spill_load =
-      (ins->op == AGX_APPLE9_VIR_SPILL_LOAD ||
-       (ins->spill_access && ins->op == AGX_APPLE9_VIR_PRIVATE_LOAD));
-   bool is_spill_store =
-      (ins->op == AGX_APPLE9_VIR_SPILL_STORE ||
-       (ins->spill_access && ins->op == AGX_APPLE9_VIR_PRIVATE_STORE));
-   bool prev_spill_load =
-      (prod->op == AGX_APPLE9_VIR_SPILL_LOAD ||
-       (prod->spill_access && prod->op == AGX_APPLE9_VIR_PRIVATE_LOAD));
-   bool prev_spill_store =
-      (prod->op == AGX_APPLE9_VIR_SPILL_STORE ||
-       (prod->spill_access && prod->op == AGX_APPLE9_VIR_PRIVATE_STORE));
-   if ((is_spill_load || is_spill_store) &&
-       (prev_spill_load || prev_spill_store) &&
-       ins->immediate == prod->immediate &&
-       (is_spill_store || prev_spill_store))
-      return true;
-
-   /* Memory hazards. */
-   if ((ins->op == AGX_APPLE9_VIR_DEVICE_STORE ||
-        ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC) &&
-       (prod->op == AGX_APPLE9_VIR_DEVICE_LOAD ||
-        prod->op == AGX_APPLE9_VIR_DEVICE_ATOMIC))
-      return true;
-   if (ins->op == AGX_APPLE9_VIR_PRIVATE_STORE &&
-       prod->op == AGX_APPLE9_VIR_PRIVATE_LOAD)
-      return true;
-   if ((ins->op == AGX_APPLE9_VIR_SHARED_STORE ||
-        ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC ||
-        ins->op == AGX_APPLE9_VIR_SHARED_LOAD) &&
-       (prod->op == AGX_APPLE9_VIR_SHARED_LOAD ||
-        prod->op == AGX_APPLE9_VIR_SHARED_ATOMIC))
-      return true;
-
-   return false;
-}
-
-static void
-a9_select_compact_alu(struct agx_apple9_vir_instr *I)
-{
-   if (I->scoreboard_slot || I->saturate || I->src_abs_mask ||
-       I->src_neg_mask || I->dest >= 64u)
-      return;
-   for (unsigned s = 0; s < I->nr_srcs; ++s) {
-      if (I->src[s] >= 64u)
-         return;
-   }
-   if (I->encoding == AGX_APPLE9_ENC_GET_SR_EXTENDED) {
-      I->encoding = AGX_APPLE9_ENC_GET_SR;
-      return;
-   }
-   unsigned inline_mask = I->alu_src_uniform_mask | I->alu_src_immediate_mask;
-   if (I->encoding == AGX_APPLE9_ENC_FLOAT2_COMPACT && !inline_mask &&
-       !I->src_hi_mask &&
-       (I->op == AGX_APPLE9_VIR_FADD || I->op == AGX_APPLE9_VIR_FMUL)) {
-      I->encoding = AGX_APPLE9_ENC_FLOAT2_BASE;
-   } else if (I->encoding == AGX_APPLE9_ENC_FLOAT3_EXTENDED &&
-              !(inline_mask & ~2u) && !I->src_half_mask &&
-              (!(I->alu_src_uniform_mask & 2u) || I->alu_src_value[1] < 64u) &&
-              !((I->alu_src_immediate_mask & 2u) &&
-                (I->alu_src_value[1] >> 31))) {
-      I->encoding = AGX_APPLE9_ENC_FLOAT3_COMPACT;
-   }
-}
-
-static bool
-a9_sb_emit_wait(struct agx_apple9_vir_program *out, struct a9_sb_slot slots[7],
-                unsigned mask)
-{
-   unsigned active = 0;
-   for (unsigned s = 1; s <= 6; ++s) {
-      if ((mask & BITFIELD_BIT(s - 1)) && slots[s].active) {
-         active |= BITFIELD_BIT(s - 1);
-         slots[s].active = false;
-      }
-   }
-   if (!active)
-      return true;
-   struct agx_apple9_vir_instr wait = a9_make_phys_instr(
-      AGX_APPLE9_VIR_WAIT, AGX_APPLE9_ENC_WAIT, AGX_APPLE9_VREG_INVALID);
-   wait.immediate = active;
-   return a9_emit_phys(out, &wait);
-}
-
-static bool
-a9_finalize_physical_scoreboards(struct agx_apple9_vir_program *program,
-                                 const char **error)
-{
-   struct agx_apple9_vir_program out;
-   if (!a9_init_physical_program(&out)) {
-      agx_apple9_vir_finish(&out);
-      *error = "out of memory initializing scoreboard-finalized VIR";
-      return false;
-   }
-   memcpy(out.reserved_gprs, program->reserved_gprs, sizeof(out.reserved_gprs));
-
-   unsigned bcount = program->last_block ? (program->last_block->index + 1u) : 0u;
-   struct agx_apple9_block **blocks = calloc(MAX2(bcount, 1u), sizeof(*blocks));
-   if (!blocks) {
-      agx_apple9_vir_finish(&out);
-      *error = "out of memory allocating block map";
-      return false;
-   }
-
-   for (struct agx_apple9_block *b = program->blocks; b; b = b->next) {
-      blocks[b->index] = agx_apple9_block_create(&out);
-      if (!blocks[b->index]) {
-         free(blocks);
-         agx_apple9_vir_finish(&out);
-         *error = "out of memory creating finalized block";
-         return false;
-      }
-      blocks[b->index]->nir = b->nir;
-      blocks[b->index]->nir_exit = b->nir_exit;
-   }
-
-   static const uint16_t load_tokens[6] = {
-      AGX_APPLE9_DEVICE_LOAD_TOKEN_1100, AGX_APPLE9_DEVICE_LOAD_TOKEN_5100,
-      AGX_APPLE9_DEVICE_LOAD_TOKEN_9100, AGX_APPLE9_DEVICE_LOAD_TOKEN_D100,
-      AGX_APPLE9_DEVICE_LOAD_TOKEN_1101, AGX_APPLE9_DEVICE_LOAD_TOKEN_5101,
-   };
-
-   bool ok = true;
-   for (struct agx_apple9_block *b = program->blocks; b && ok; b = b->next) {
-      agx_apple9_block_begin(&out, blocks[b->index]);
-      struct a9_sb_slot slots[7] = {0};
-
-      unsigned end = b->next ? b->next->start_index : program->instruction_count;
-      for (unsigned i = b->start_index; i < end && ok; ++i) {
-         struct agx_apple9_vir_instr ins = *program->instructions[i];
-         if (ins.branch_target)
-            ins.branch_target = blocks[ins.branch_target->index];
-
-         if (ins.op == AGX_APPLE9_VIR_DEVICE_ATOMIC_RESULT) {
-            assert(out.instruction_count > 0 &&
-                   out.instructions[out.instruction_count - 1]->op ==
-                      AGX_APPLE9_VIR_DEVICE_ATOMIC);
-            ins.producer_scoreboard_slot =
-               out.instructions[out.instruction_count - 1]->producer_scoreboard_slot;
-            ok = a9_emit_phys(&out, &ins);
-            continue;
-         }
-
-         if (ins.op == AGX_APPLE9_VIR_WAIT) {
-            for (unsigned s = 1; s <= 6; ++s) {
-               if (ins.immediate & BITFIELD_BIT(s - 1))
-                  slots[s].active = false;
-            }
-            ok = a9_emit_phys(&out, &ins);
-            continue;
-         }
-
-         ins.scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_NONE;
-         unsigned fold = 0, retire = 0;
-         for (unsigned s = 1; s <= 6; ++s) {
-            if (!slots[s].active)
-               continue;
-            if (!a9_sb_needs_wait(&ins, &slots[s].producer))
-               continue;
-            if (!fold && a9_sb_can_fold(&ins, &slots[s].producer))
-               fold = s;
-            else
-               retire |= BITFIELD_BIT(s - 1);
-         }
-
-         if (!a9_sb_emit_wait(&out, slots, retire)) {
-            ok = false;
-            break;
-         }
-         if (fold && slots[fold].active) {
-            if ((ins.encoding == AGX_APPLE9_ENC_LOGIC_EXTENDED ||
-                 ins.encoding == AGX_APPLE9_ENC_LOGIC_EXPORT) &&
-                ins.nr_srcs == 2 &&
-                !a9_sb_producer_writes(&slots[fold].producer, ins.src[0]) &&
-                a9_sb_producer_writes(&slots[fold].producer, ins.src[1])) {
-               SWAP(ins.src[0], ins.src[1]);
-               ins.live_after_mask = (uint16_t)(((ins.live_after_mask & 1u) << 1) |
-                                                ((ins.live_after_mask & 2u) >> 1));
-            }
-            ins.scoreboard_slot = (uint8_t)fold;
-            slots[fold].active = false;
-         }
-
-         if (a9_async(&ins)) {
-            unsigned slot = a9_fixed_producer_slot(&ins);
-            if (!slot) {
-               unsigned first =
-                  ins.op == AGX_APPLE9_VIR_TEXTURE_SAMPLE ? 1u
-                  : ins.op == AGX_APPLE9_VIR_IMAGE_STORE  ? 2u
-                                                          : 6u;
-               for (unsigned p = 0; p < 6; ++p) {
-                  unsigned cand = (first - 1u + p) % 6u + 1u;
-                  if (!slots[cand].active) {
-                     slot = cand;
-                     break;
-                  }
-               }
-               if (!slot) {
-                  slot = first;
-                  for (unsigned c = 1; c <= 6; ++c) {
-                     if (slots[c].issue_idx < slots[slot].issue_idx)
-                        slot = c;
-                  }
-               }
-            }
-            unsigned res_mask = BITFIELD_BIT(slot - 1);
-            if (a9_fixed_producer_slot(&ins))
-               res_mask |=
-                  agx_apple9_encoding_info(ins.encoding)->fixed_producer_alternates;
-            if (!a9_sb_emit_wait(&out, slots, res_mask)) {
-               ok = false;
-               break;
-            }
-            ins.producer_scoreboard_slot = (uint8_t)slot;
-            if (ins.op == AGX_APPLE9_VIR_DEVICE_LOAD)
-               ins.device_load_raw_token = load_tokens[slot - 1];
-            slots[slot].active = true;
-            slots[slot].issue_idx = out.instruction_count;
-            slots[slot].producer = ins;
-         }
-
-         a9_select_compact_alu(&ins);
-         ok = a9_emit_phys(&out, &ins);
-      }
-
-      /* Conservatively drain any remaining pending slots at block exit so
-       * control-flow transitions, loops, and shader exits are always ordered. */
-      if (ok)
-         ok = a9_sb_emit_wait(&out, slots, BITFIELD_MASK(6));
-   }
-
-   free(blocks);
-   if (!ok) {
-      agx_apple9_vir_finish(&out);
-      *error = "out of memory finalizing physical scoreboards";
-      return false;
-   }
-
-   agx_apple9_vir_reindex(&out);
-   out.private_size = program->private_size;
-   out.spill_slots = program->spill_slots;
-   out.scratch_size = program->scratch_size;
-   out.peak_live_gprs = program->peak_live_gprs;
-   out.max_phys_gpr = MAX2(out.max_phys_gpr, program->max_phys_gpr);
-   out.publication_count = program->publication_count;
-   out.fragment_shader = program->fragment_shader;
-   out.output = program->output;
-   out.physical = true;
-   out.dependencies_finalized = true;
-
-   agx_apple9_vir_finish(program);
-   *program = out;
-   for (struct agx_apple9_block *b = program->allocated_blocks; b;
-        b = b->allocated_next)
-      b->program = program;
-   return true;
-}
-
 static bool
 a9_lower_to_physical_vir(struct agx_apple9_vir_program *program,
                          const struct apple9_ra_spill_state *spill,
@@ -4075,7 +3708,7 @@ a9_lower_to_physical_vir(struct agx_apple9_vir_program *program,
    out.dependencies_finalized = false;
 
    if (!skip_physical_schedule) {
-      if (!a9_finalize_physical_scoreboards(&out, error)) {
+      if (!agx_apple9_schedule_physical(&out, error)) {
          agx_apple9_vir_finish(&out);
          return false;
       }
@@ -4613,12 +4246,22 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
                      g = g->next;
                   if (!g) {
                      g = rzalloc(memctx, struct a9_phi_dead_group);
+                     if (!g) {
+                        ralloc_free(graph_ctx);
+                        res->error = "out of memory allocating phi dead group";
+                        goto cleanup;
+                     }
                      *g = (struct a9_phi_dead_group){
                         rctx.dead_groups[sv], blk, pred, NULL, weight};
                      rctx.dead_groups[sv] = g;
                   }
                   struct a9_phi_dead_dest *dd =
                      ralloc(memctx, struct a9_phi_dead_dest);
+                  if (!dd) {
+                     ralloc_free(graph_ctx);
+                     res->error = "out of memory allocating phi dead dest";
+                     goto cleanup;
+                  }
                   *dd = (struct a9_phi_dead_dest){g->dests, dv};
                   g->dests = dd;
                }
@@ -4627,6 +4270,11 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
                   ralloc(memctx, struct a9_phi_preference);
                struct a9_phi_preference *rev =
                   ralloc(memctx, struct a9_phi_preference);
+               if (!fwd || !rev) {
+                  ralloc_free(graph_ctx);
+                  res->error = "out of memory allocating phi preferences";
+                  goto cleanup;
+               }
                *fwd = (struct a9_phi_preference){rctx.phi_prefs[dv], sv, weight};
                *rev = (struct a9_phi_preference){rctx.phi_prefs[sv], dv, weight};
                rctx.phi_prefs[dv] = fwd;
@@ -4653,6 +4301,11 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
                ralloc(memctx, struct a9_phi_preference);
             struct a9_phi_preference *rev =
                ralloc(memctx, struct a9_phi_preference);
+            if (!fwd || !rev) {
+               ralloc_free(graph_ctx);
+               res->error = "out of memory allocating mov preferences";
+               goto cleanup;
+            }
             *fwd = (struct a9_phi_preference){rctx.phi_prefs[dv], sv, weight};
             *rev = (struct a9_phi_preference){rctx.phi_prefs[sv], dv, weight};
             rctx.phi_prefs[dv] = fwd;
@@ -4782,13 +4435,23 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
    unsigned live_words = BITSET_WORDS(MAX2(program->value_count, 1u));
    for (unsigned bi = 0; bi < num_blocks; ++bi) {
       struct agx_apple9_block *blk = rctx.cfg_blocks[bi];
-      free(blk->live_out);
-      blk->live_out = calloc(live_words, sizeof(BITSET_WORD));
-      if (!blk->live_out) {
-         res->error = "out of memory populating block->live_out";
+      BITSET_WORD *new_in = calloc(live_words, sizeof(BITSET_WORD));
+      BITSET_WORD *new_out = calloc(live_words, sizeof(BITSET_WORD));
+      if (!new_in || !new_out) {
+         free(new_in);
+         free(new_out);
+         res->error = "out of memory populating block liveness";
          goto cleanup;
       }
+      free(blk->live_in);
+      free(blk->live_out);
+      blk->live_in = new_in;
+      blk->live_out = new_out;
       blk->live_words = live_words;
+      U_SPARSE_BITSET_FOREACH_SET(&liveness.live_in[bi], v) {
+         if (v < program->value_count)
+            BITSET_SET(blk->live_in, v);
+      }
       U_SPARSE_BITSET_FOREACH_SET(&liveness.live_out[bi], v) {
          if (v < program->value_count)
             BITSET_SET(blk->live_out, v);

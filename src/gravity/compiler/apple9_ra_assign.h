@@ -134,6 +134,11 @@ bool apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
                                const struct apple9_ra_assign_options *opts,
                                struct apple9_ra_assign_result *result);
 
+/* CFG-aware physical scoreboard & barrier finalizer (defined in
+ * agx_apple9_ra.c, shared with apple9_ra_allocate_native). */
+bool agx_apple9_schedule_physical(struct agx_apple9_vir_program *program,
+                                  const char **reason);
+
 #ifdef __cplusplus
 }
 #endif
