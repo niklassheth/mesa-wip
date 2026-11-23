@@ -1882,3 +1882,174 @@ TEST_F(Apple9RaAssignTest, SplitVec4LoadDoesNotInflateAsyncDeadLaneBoundPast18)
    EXPECT_LE(res.max_phys_gpr + 1u, 18u);
    EXPECT_GT(verify_binary_emission(&p), 0u);
 }
+
+TEST_F(Apple9RaAssignTest, SoftFmaBankColoringAvoidsMod4Collisions)
+{
+   /* Construct a sequence of 3-source FFMA instructions whose operands would
+    * naively land on colliding (r % 4) banks under first-fit assignment
+    * (e.g. r0, r4, r8). Soft bank coloring must assign distinct (r % 4) banks
+    * for (src0, src1, src2) with zero extra copies or occupancy tier loss. */
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block_begin(&p, b0);
+
+   /* Pin 4 inputs in r0..r3 and define 3 values whose naive first-fit slots
+    * would be r4 (bank 0), r5 (bank 1), r6 (bank 2), plus another pair
+    * colliding with r4 (bank 0) if assigned first-fit at r8. */
+   uint32_t in0 = agx_apple9_vir_emit_entry_reg(&p, 0);
+   uint32_t in1 = agx_apple9_vir_emit_entry_reg(&p, 1);
+   uint32_t in2 = agx_apple9_vir_emit_entry_reg(&p, 2);
+   uint32_t in3 = agx_apple9_vir_emit_entry_reg(&p, 3);
+
+   /* Define a_bank0 (will take r4 -> bank 0), then 3 unrelated temps to advance
+    * free cursor to r8 (bank 0!), then b_peer which pairs with a_bank0 in FMA:
+    * first-fit would assign b_peer = r8 (bank 0 == r4 % 4!), whereas bank
+    * coloring must pick r9 (bank 1 != bank 0). */
+   uint32_t a_peer = emit_iadd(in0, in1);
+   uint32_t pad0 = emit_iadd(in1, in2);
+   uint32_t pad1 = emit_iadd(in2, in3);
+   uint32_t pad2 = emit_iadd(in3, in0);
+   uint32_t b_peer = emit_iadd(in0, in2);
+   uint32_t c_peer = emit_iadd(in1, in3);
+
+   uint32_t fma_srcs[3] = {a_peer, b_peer, c_peer};
+   uint32_t fma = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FMA,
+                                      AGX_APPLE9_ENC_FLOAT3_EXTENDED,
+                                      fma_srcs, 3, 0);
+   uint32_t sum = emit_iadd(fma, pad0);
+   sum = emit_iadd(sum, pad1);
+   sum = emit_iadd(sum, pad2);
+   p.output = sum;
+   emit_halt();
+   cfg_init(&p, {b0});
+
+   auto opts = validated_opts();
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+   EXPECT_FALSE(res.has_spills);
+   EXPECT_EQ(res.num_copies_emitted, 0u);
+
+   /* Find the lowered FMA instruction and verify zero r % 4 collisions among
+    * its three distinct GPR sources! */
+   bool found_fma = false;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      const auto *ins = p.instructions[i];
+      if (ins->op != AGX_APPLE9_VIR_FMA)
+         continue;
+      found_fma = true;
+      ASSERT_EQ(ins->nr_srcs, 3u);
+      unsigned r0 = ins->src[0];
+      unsigned r1 = ins->src[1];
+      unsigned r2 = ins->src[2];
+      EXPECT_NE(r0 & 3u, r1 & 3u) << "src0=r" << r0 << " src1=r" << r1;
+      EXPECT_NE(r0 & 3u, r2 & 3u) << "src0=r" << r0 << " src2=r" << r2;
+      EXPECT_NE(r1 & 3u, r2 & 3u) << "src1=r" << r1 << " src2=r" << r2;
+   }
+   EXPECT_TRUE(found_fma);
+   EXPECT_GT(verify_binary_emission(&p), 0u);
+}
+
+TEST_F(Apple9RaAssignTest, CompactAluPreferenceKeepsHotFmaInR0ToR63Above64Gprs)
+{
+   /* When a shader uses >64 live GPRs (bound = 96), defs feeding compact-eligible
+    * ALU (FMA) should prefer freed r0..r63 slots over r64..r95 so 4B compact
+    * encoding stays enabled and code stays compact below the 16 KiB L1I cliff. */
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block_begin(&p, b0);
+
+   uint32_t base = agx_apple9_vir_emit_entry_reg(&p, 0);
+   std::vector<uint32_t> hold;
+   for (unsigned i = 0; i < 66; ++i) {
+      uint32_t idx = emit_imm(i + 1);
+      uint32_t srcs[2] = {base, idx};
+      uint32_t v = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IADD,
+                                       AGX_APPLE9_ENC_INT_ADD_EXTENDED, srcs, 2, 0);
+      hold.push_back(v);
+   }
+   /* Kill hold[0..2] so three low r0..r63 slots open up while 63 other values
+    * remain live (total peak > 64 -> bound = 96). */
+   uint32_t kill_sum = emit_iadd(hold[0], hold[1]);
+   kill_sum = emit_iadd(kill_sum, hold[2]);
+
+   /* Now emit 3 compact-eligible FMAs consuming/producing scalar results. */
+   uint32_t a = emit_iadd(base, kill_sum);
+   uint32_t b = emit_iadd(base, a);
+   uint32_t fma_srcs[3] = {kill_sum, a, b};
+   uint32_t fma = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FMA,
+                                      AGX_APPLE9_ENC_FLOAT3_EXTENDED,
+                                      fma_srcs, 3, 0);
+
+   uint32_t acc = fma;
+   for (unsigned i = 3; i < hold.size(); ++i)
+      acc = emit_iadd(acc, hold[i]);
+   p.output = acc;
+   emit_halt();
+   cfg_init(&p, {b0});
+
+   auto opts = validated_opts();
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+   EXPECT_FALSE(res.has_spills);
+
+   bool found_fma = false;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      const auto *ins = p.instructions[i];
+      if (ins->op != AGX_APPLE9_VIR_FMA)
+         continue;
+      found_fma = true;
+      EXPECT_LT(ins->dest, 64u);
+      for (unsigned s = 0; s < ins->nr_srcs; ++s)
+         EXPECT_LT(ins->src[s], 64u);
+   }
+   EXPECT_TRUE(found_fma);
+   EXPECT_GT(verify_binary_emission(&p), 0u);
+}
+
+TEST_F(Apple9RaAssignTest, CompactFmaCollectAffinityRefreshesAfterReleasingReusableRegs)
+{
+   /* Regression test: a 3-source FFMA whose killed inputs sit in r0/r1/r2 and
+    * whose result feeds a COLLECT(fma, unplaced_sibling) must compute collect
+    * affinity AFTER releasing reusable registers so it can still reuse a killed
+    * input register and pack as a 4-byte FFMA instead of skipping to r3 (8B). */
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block_begin(&p, b0);
+
+   uint32_t s0 = agx_apple9_vir_emit_entry_reg(&p, 0);
+   uint32_t s1 = agx_apple9_vir_emit_entry_reg(&p, 1);
+   uint32_t s2 = agx_apple9_vir_emit_entry_reg(&p, 2);
+
+   uint32_t fma_srcs[3] = {s0, s1, s2};
+   uint32_t fma = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FMA,
+                                      AGX_APPLE9_ENC_FLOAT3_EXTENDED,
+                                      fma_srcs, 3, 0);
+   uint32_t sib = emit_imm(7);
+   uint32_t col_srcs[2] = {fma, sib};
+   uint32_t col = agx_apple9_vir_emit_collect(&p, col_srcs, 2);
+   ASSERT_NE(col, AGX_APPLE9_VREG_INVALID);
+   uint32_t out = emit_iadd(col, col + 1);
+   p.output = out;
+   emit_halt();
+   cfg_init(&p, {b0});
+
+   auto opts = validated_opts();
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+   EXPECT_FALSE(res.has_spills);
+
+   bool found_4b_fma = false;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      const auto *ins = p.instructions[i];
+      if (ins->op != AGX_APPLE9_VIR_FMA)
+         continue;
+      agx_apple9_packed_instruction packed = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(ins, p.phys, &packed, &reason))
+         << (reason ?: "");
+      EXPECT_EQ(packed.length, 4u);
+      found_4b_fma = (packed.length == 4u);
+   }
+   EXPECT_TRUE(found_4b_fma);
+   EXPECT_GT(verify_binary_emission(&p), 0u);
+}
