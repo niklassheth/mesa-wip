@@ -5751,6 +5751,35 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
                   return false;
             }
             if (control) {
+               /* U0 consumes a 16-bit primitive count in src[0], but NIR
+                * algebraic rules (such as during preamble preparation) may
+                * strip an explicit (x & 0xffff) feeding u2u16(x), leaving
+                * stale upper bits in the 32-bit GPR because u2u16 lowers as a
+                * no-op. Mask src[0] to 16 bits unless it is already masked. */
+               nir_scalar prim_s = apple9_chase_trivial(
+                  nir_get_scalar(intr->src[0].ssa, 0));
+               bool masked16 = nir_scalar_is_const(prim_s);
+               if (!masked16 &&
+                   nir_def_instr_type(prim_s.def) == nir_instr_type_alu &&
+                   nir_scalar_alu_op(prim_s) == nir_op_u2u16) {
+                  nir_scalar inner = apple9_chase_trivial(
+                     nir_scalar_chase_alu_src(prim_s, 0));
+                  if (nir_def_instr_type(inner.def) == nir_instr_type_alu &&
+                      nir_scalar_alu_op(inner) == nir_op_iand) {
+                     for (unsigned k = 0; k < 2; ++k) {
+                        uint32_t mask;
+                        if (apple9_const_u32(nir_scalar_chase_alu_src(inner, k),
+                                             &mask) &&
+                            mask <= 0xffff)
+                           masked16 = true;
+                     }
+                  }
+               }
+               if (!masked16) {
+                  sources[0] = apple9_dag_extract(lower, sources[0], 0, 16);
+                  if (sources[0] == AGX_APPLE9_VREG_INVALID)
+                     return false;
+               }
                if (nir_intrinsic_base(intr) > 1 ||
                    !agx_apple9_vir_emit_mesh_control(&lower->program,
                       sources[0], sources[1], nir_intrinsic_base(intr)))
