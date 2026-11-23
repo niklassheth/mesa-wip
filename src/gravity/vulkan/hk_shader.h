@@ -228,9 +228,6 @@ struct hk_shader_info {
       struct {
          struct agx_interp_info interp;
 
-         bool reads_sample_mask;
-         bool post_depth_coverage;
-         bool uses_sample_shading;
          bool early_fragment_tests;
          bool writes_memory;
          /* Fragment-invocation statistics counter was lowered inline

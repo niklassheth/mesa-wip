@@ -82,7 +82,6 @@ struct agx_apple9_render_stage {
    uint8_t resource_count;
    uint8_t resource_binding[AGX_APPLE9_MAX_GRAPHICS_BUFFERS];
    uint32_t texture_mask, sampler_mask, image_mask;
-   struct agx_apple9_texture_mapping texture_mapping;
    bool uses_texel_fetch;
    bool uses_discard;
    bool writes_depth;

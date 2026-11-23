@@ -454,7 +454,6 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)
       return VK_SUCCESS;
 
-   hk_cmd_buffer_begin_compute(cmd, pBeginInfo);
    hk_cmd_buffer_begin_graphics(cmd, pBeginInfo);
 
    return VK_SUCCESS;
@@ -1307,7 +1306,6 @@ hk_bind_descriptor_sets(UNUSED struct hk_cmd_buffer *cmd,
             desc->set_sizes[s] = 0;
          }
          desc->sets[s] = set;
-         desc->sets_dirty |= BITFIELD_BIT(s);
          desc->descriptor_buffer_sets &= ~BITFIELD_BIT(s);
 
          /* Binding descriptors invalidates push descriptors */
@@ -1381,7 +1379,6 @@ hk_bind_descriptor_memory(struct hk_descriptor_state *desc, unsigned s,
    desc->set_sizes[s] = HK_MAX_DESCRIPTOR_SET_SIZE;
    desc->sets[s] = NULL;
    desc->descriptor_buffer_sets |= BITFIELD_BIT(s);
-   desc->sets_dirty |= BITFIELD_BIT(s);
    /* Binding descriptors invalidates push descriptors */
    desc->push_dirty &= ~BITFIELD_BIT(s);
    desc->root_dirty = true;
@@ -1671,7 +1668,7 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    struct agx_precompiled_shader *prog = agx_get_precompiled(&dev->bg_eot, idx);
    /* Apple9 internal programs are uploaded on first use and can fail when
     * the USC aperture is full. */
-   if (!prog || !prog->apple9) {
+   if (!prog) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return;
    }

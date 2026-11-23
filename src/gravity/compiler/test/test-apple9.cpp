@@ -8749,9 +8749,8 @@ TEST(Apple9Compiler, TextureLodQueryUsesNativeSamplerOperation)
       b.shader->info.io_lowered = true;
       agx_apple9_sampler_key key[32] = {};
       key[5].mip_filter = filter;
-      agx_apple9_texture_mapping mapping = {};
       const char *reason = nullptr;
-      ASSERT_TRUE(agx_nir_lower_apple9_sampler_state(b.shader, key, &mapping, &reason))
+      ASSERT_TRUE(agx_nir_lower_apple9_sampler_state(b.shader, key, &reason))
          << (reason ?: "");
       agx_shader_part compiled = {};
       ASSERT_TRUE(agx_compile_apple9_fragment(b.shader, &compiled, &reason))
@@ -14334,9 +14333,8 @@ TEST(Apple9Compiler, SamplerArrayStateIsAppliedAfterUnrolling)
       key[j].wrap[0] = key[j].wrap[1] = key[j].wrap[2] = PIPE_TEX_WRAP_CLAMP_TO_EDGE;
       key[j].min_filter = key[j].mag_filter = PIPE_TEX_FILTER_LINEAR;
    }
-   agx_apple9_texture_mapping mapping = {};
    const char *reason = nullptr;
-   ASSERT_TRUE(agx_nir_lower_apple9_sampler_state(b.shader, key, &mapping, &reason))
+   ASSERT_TRUE(agx_nir_lower_apple9_sampler_state(b.shader, key, &reason))
       << (reason ?: "");
    unsigned count = 0;
    nir_foreach_block(block, b.impl) {

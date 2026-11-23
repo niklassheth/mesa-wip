@@ -269,18 +269,12 @@ void agx_bo_mapping_dontfork(void *map, size_t size);
 static inline void *
 agx_bo_map_range(struct agx_bo *bo, void *fixed_addr, size_t size)
 {
-   /* An ordinary map can escape and be written after any submission. */
-   if (bo->shim_cpu_epoch)
-      *bo->shim_cpu_epoch = 0;
-
    return bo->dev->ops.bo_mmap(bo->dev, bo, fixed_addr, size);
 }
 
 static inline void *
 agx_bo_map(struct agx_bo *bo)
 {
-   if (bo->shim_cpu_epoch)
-      *bo->shim_cpu_epoch = 0;
    if (!bo->_map)
       bo->_map = bo->dev->ops.bo_mmap(bo->dev, bo, NULL, bo->size);
 
@@ -317,8 +311,6 @@ int agx_create_command_queue(struct agx_device *dev,
                              enum drm_asahi_priority priority,
                              uint32_t *queue_id_out);
 int agx_destroy_command_queue(struct agx_device *dev, uint32_t queue_id);
-
-int agx_import_sync_file(struct agx_device *dev, struct agx_bo *bo, int fd);
 
 uint64_t agx_get_gpu_timestamp(struct agx_device *dev);
 

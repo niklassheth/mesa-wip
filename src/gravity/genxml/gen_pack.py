@@ -454,39 +454,6 @@ class Group(object):
         else:
             print("   return true;")
 
-    def emit_print_function(self):
-        for field in self.fields:
-            convert = None
-            name, val = field.human_name, f'values->{field.name}'
-
-            if field.exact:
-                continue
-
-            if field.type in self.parser.structs:
-                pack_name = self.parser.gen_prefix(safe_name(field.type)).upper()
-                print(f'   fprintf(fp, "%*s{field.human_name}:\\n", indent, "");')
-                print(f"   {pack_name}_print(fp, &values->{field.name}, indent + 2);")
-            elif field.type == "address":
-                # TODO resolve to name
-                print(f'   fprintf(fp, "%*s{name}: 0x%" PRIx64 "\\n", indent, "", {val});')
-            elif field.type in self.parser.enums:
-                print(f'   if ({enum_name(field.type)}_as_str({val}))')
-                print(f'     fprintf(fp, "%*s{name}: %s\\n", indent, "", {enum_name(field.type)}_as_str({val}));')
-                print(f'   else')
-                print(f'     fprintf(fp, "%*s{name}: unknown %X (XXX)\\n", indent, "", {val});')
-            elif field.type == "int":
-                print(f'   fprintf(fp, "%*s{name}: %d\\n", indent, "", {val});')
-            elif field.type == "bool":
-                print(f'   fprintf(fp, "%*s{name}: %s\\n", indent, "", {val} ? "true" : "false");')
-            elif field.type in ["float", "lod", "half"]:
-                print(f'   fprintf(fp, "%*s{name}: %f\\n", indent, "", {val});')
-            elif field.type in ["uint", "hex"] and (field.end - field.start) >= 32:
-                print(f'   fprintf(fp, "%*s{name}: 0x%" PRIx64 "\\n", indent, "", {val});')
-            elif field.type == "hex":
-                print(f'   fprintf(fp, "%*s{name}: 0x%" PRIx32 "\\n", indent, "", {val});')
-            else:
-                print(f'   fprintf(fp, "%*s{name}: %u\\n", indent, "", {val});')
-
 class Value(object):
     def __init__(self, attrs):
         self.name = attrs["name"]
@@ -593,16 +560,6 @@ class Parser(object):
 
         print("}\n")
 
-    def emit_print_function(self, name, group):
-        print("#ifndef __OPENCL_VERSION__")
-        print("static inline void")
-        print(f"{name.upper()}_print(FILE *fp, const struct {name} * values, unsigned indent)\n{{")
-
-        group.emit_print_function()
-
-        print("}")
-        print("#endif\n")
-
     def emit_struct(self):
         name = self.struct
 
@@ -610,10 +567,6 @@ class Parser(object):
         self.emit_header(name)
         self.emit_pack_function(self.struct, self.group)
         self.emit_unpack_function(self.struct, self.group)
-        self.emit_print_function(self.struct, self.group)
-
-    def enum_prefix(self, name):
-        return 
 
     def emit_enum(self):
         e_name = enum_name(self.enum)
@@ -625,19 +578,6 @@ class Parser(object):
             name = safe_name(name).upper()
             print(f'   {name} = {value.value},')
         print('};\n')
-
-        print("#ifndef __OPENCL_VERSION__")
-        print("static inline const char *")
-        print(f"{e_name.lower()}_as_str(enum {e_name} imm)\n{{")
-        print("    switch (imm) {")
-        for value in self.values:
-            name = f'{prefix}_{value.name}'
-            name = safe_name(name).upper()
-            print(f'    case {name}: return "{value.name}";')
-        print('    default: return NULL;')
-        print("    }")
-        print("}")
-        print("#endif\n")
 
     def parse(self, filename):
         file = open(filename, "rb")

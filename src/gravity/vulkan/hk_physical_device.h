@@ -46,7 +46,6 @@ struct hk_physical_device {
    bool disable_native_blocks;
    bool disable_native_stages;
    dev_t render_dev;
-   int master_fd;
 
    /* Only used for VK_EXT_memory_budget */
    struct agx_device dev;

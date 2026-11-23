@@ -337,8 +337,6 @@ retry:
       /* If this bo came back to us via import, it had better
        * been marked shared to begin with.
        */
-      if (bo->shim_cpu_epoch)
-         *bo->shim_cpu_epoch = 0;
       assert(bo->flags & AGX_BO_SHAREABLE);
       assert(bo->flags & AGX_BO_SHARED);
       assert(bo->prime_fd != -1);
@@ -369,22 +367,6 @@ agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo)
 
    bo->prime_fd = prime_fd;
    bo->flags |= AGX_BO_SHARED;
-
-   /* If there is a pending writer to this BO, import it into the buffer
-    * for implicit sync.
-    */
-   uint64_t writer = p_atomic_read_relaxed(&bo->writer);
-   if (writer) {
-      int out_sync_fd = -1;
-      int ret = drmSyncobjExportSyncFile(dev->fd, agx_bo_writer_syncobj(writer),
-                                         &out_sync_fd);
-      assert(ret >= 0);
-      assert(out_sync_fd >= 0);
-
-      ret = agx_import_sync_file(dev, bo, out_sync_fd);
-      assert(ret >= 0);
-      close(out_sync_fd);
-   }
 
    return true;
 }
@@ -1013,24 +995,6 @@ agx_destroy_command_queue(struct agx_device *dev, uint32_t queue_id)
 
    return asahi_simple_ioctl(dev, DRM_IOCTL_ASAHI_QUEUE_DESTROY,
                              &queue_destroy);
-}
-
-int
-agx_import_sync_file(struct agx_device *dev, struct agx_bo *bo, int fd)
-{
-   struct dma_buf_import_sync_file import_sync_file_ioctl = {
-      .flags = DMA_BUF_SYNC_WRITE,
-      .fd = fd,
-   };
-
-   assert(fd >= 0);
-   assert(bo->prime_fd != -1);
-
-   int ret = drmIoctl(bo->prime_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
-                      &import_sync_file_ioctl);
-   assert(ret >= 0);
-
-   return ret;
 }
 
 uint64_t

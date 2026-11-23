@@ -344,7 +344,7 @@ agx_bo_reap_one(struct agx_device *dev)
       return false;
    }
 
-   assert(!bo->refcnt && !bo->writer);
+   assert(!bo->refcnt);
    assert(!dev->bo_cache.busy && !dev->bo_closing_handle);
    dev->bo_cache.busy = true;
    if (bo->flags & AGX_BO_SHARED)
@@ -674,8 +674,6 @@ agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo)
          return;
       }
 
-      assert(!p_atomic_read_relaxed(&bo->writer));
-
       agx_shader_body_finish(dev, &bo->apple9_body);
 
       if (!agx_bo_cache_put(dev, bo))
@@ -768,8 +766,6 @@ static void
 agx_bo_finish_create(struct agx_device *dev, struct agx_bo *bo,
                      const char *label)
 {
-   if (bo->shim_cpu_epoch)
-      *bo->shim_cpu_epoch = 0; /* Cache reuse must opt in again. */
    bo->label = label;
    agx_shader_body_init_bo(bo);
    if (agx_apple9_debug_enabled(AGX_A9_DBG_BO_LABELS))

@@ -50,7 +50,6 @@ agx_compile_apple9_precompiled(struct agx_bg_eot_cache *cache,
       abort();
    }
    ralloc_free(nir);
-   p->apple9 = true;
    p->bo = agx_bo_create(cache->dev, part.info.binary_size, 0,
                          AGX_BO_EXEC | AGX_BO_LOW_VA | AGX_BO_WRITEBACK,
                          "Apple9 internal shader");
@@ -67,7 +66,6 @@ agx_compile_apple9_precompiled(struct agx_bg_eot_cache *cache,
    }
    memcpy(map, part.binary, part.info.binary_size);
    agx_bo_note_cpu_write(p->bo, 0, part.info.binary_size);
-   p->ptr = p->bo->va->addr;
    free(part.binary);
    return true;
 }

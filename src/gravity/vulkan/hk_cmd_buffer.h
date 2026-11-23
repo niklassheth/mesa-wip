@@ -197,7 +197,6 @@ struct hk_descriptor_state {
 
    uint32_t set_sizes[HK_MAX_SETS];
    struct hk_descriptor_set *sets[HK_MAX_SETS];
-   uint32_t sets_dirty;
 
    struct hk_push_descriptor_set *push[HK_MAX_SETS];
    uint32_t push_dirty;
@@ -244,7 +243,6 @@ struct hk_render_registers {
    uint32_t isp_bgobjdepth;
    uint32_t isp_bgobjvals;
    struct agx_zls_control_packed zls_control, zls_control_partial;
-   uint32_t depth_dimensions;
    bool process_empty_tiles;
    enum u_tristate dbias_is_int;
 
@@ -351,7 +349,6 @@ struct hk_graphics_state {
 
    uint64_t root;
    uint64_t draw_params;
-   uint64_t draw_id_ptr;
 
    uint32_t shaders_dirty;
    struct hk_api_shader *shaders[MESA_SHADER_MESH + 1];
@@ -463,9 +460,6 @@ struct hk_graphics_state {
    /* Fast linked shader data structures */
    uint64_t varyings;
 
-   uint32_t linked_dirty;
-   bool generate_primitive_id;
-
    /* Tessellation state */
    struct {
       uint64_t out_draws;
@@ -482,18 +476,6 @@ struct hk_graphics_state {
 struct hk_compute_state {
    struct hk_descriptor_state descriptors;
    struct hk_api_shader *shader;
-};
-
-struct hk_cmd_push {
-   void *map;
-   uint64_t addr;
-   uint32_t range;
-   bool no_prefetch;
-};
-
-struct hk_scratch_req {
-   bool main;
-   bool preamble;
 };
 
 /*
@@ -741,12 +723,6 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b,
    a->stats.cmds += b->stats.cmds;
    a->stats.flushes += b->stats.flushes;
    a->stats.merged++;
-}
-
-static inline uint64_t
-hk_cs_current_addr(struct hk_cs *cs)
-{
-   return cs->chunk.gpu + ((uint8_t *)cs->current - (uint8_t *)cs->chunk.cpu);
 }
 
 struct hk_uploader {
@@ -1356,17 +1332,6 @@ hk_cmd_buffer_get_cs(struct hk_cmd_buffer *cmd, bool compute)
 bool hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                             size_t space);
 
-static inline uint64_t
-hk_cs_alloc_for_indirect(struct hk_cs *cs, size_t size_B)
-{
-   if (!hk_ensure_cs_has_space(cs->cmd, cs, size_B))
-      return 0;
-
-   uint64_t addr = hk_cs_current_addr(cs);
-   cs->current += size_B;
-   return addr;
-}
-
 static void
 hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
 {
@@ -1376,7 +1341,6 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
    vk_dynamic_graphics_state_dirty_all(dyn);
    gfx->dirty = ~0;
    gfx->shaders_dirty = ~0;
-   gfx->linked_dirty = ~0;
    gfx->descriptors.root_dirty = true;
 }
 
@@ -1591,8 +1555,6 @@ hk_stat_enabled(uint64_t addr)
 
 void hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
                                   const VkCommandBufferBeginInfo *pBeginInfo);
-void hk_cmd_buffer_begin_compute(struct hk_cmd_buffer *cmd,
-                                 const VkCommandBufferBeginInfo *pBeginInfo);
 
 void hk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
                          const mesa_shader_stage *stages,

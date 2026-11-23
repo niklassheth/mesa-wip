@@ -667,7 +667,6 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       /* Bound runtime counts before publishing or narrowing either operand.
        * Completion must not submit channels beyond the declared layout.
        * Use a single empty shape even when only one input count is zero. */
-      s->info->uses_vertex_count = true;
       nir_def *v = nir_umin(b, intr->src[0].ssa,
                             nir_imm_int(b, l->max_vertices));
       nir_def *p = nir_umin(b, intr->src[1].ssa,

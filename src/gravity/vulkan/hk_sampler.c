@@ -86,32 +86,18 @@ uses_border(const VkSamplerCreateInfo *info)
           info->addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
 }
 
-static enum agx_border_colour
-is_border_color_custom(VkBorderColor color, bool workaround_rgba4)
+static bool
+is_border_color_custom(VkBorderColor color)
 {
-   switch (color) {
-   case VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK:
-      /* We may need to workaround RGBA4 UNORM issues with opaque black. This
-       * only affects float opaque black, there are no pure integer RGBA4
-       * formats to worry about.
-       */
-      return workaround_rgba4;
-
-   case VK_BORDER_COLOR_INT_CUSTOM_EXT:
-   case VK_BORDER_COLOR_FLOAT_CUSTOM_EXT:
-      return true;
-
-   default:
-      return false;
-   }
+   return color == VK_BORDER_COLOR_INT_CUSTOM_EXT ||
+          color == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
 }
 
 /* Translate an American VkBorderColor into a Canadian agx_border_colour */
 static enum agx_border_colour
-translate_border_color(VkBorderColor color, bool custom_to_1,
-                       bool workaround_rgba4)
+translate_border_color(VkBorderColor color, bool custom_to_1)
 {
-   if (is_border_color_custom(color, workaround_rgba4)) {
+   if (is_border_color_custom(color)) {
       return custom_to_1 ? AGX_BORDER_COLOUR_OPAQUE_WHITE
                          : AGX_BORDER_COLOUR_TRANSPARENT_BLACK;
    }
@@ -137,8 +123,7 @@ translate_border_color(VkBorderColor color, bool custom_to_1,
 static void
 pack_sampler(const struct hk_physical_device *pdev,
              const struct VkSamplerCreateInfo *info, bool custom_to_1,
-             bool workaround_rgba4, bool native_custom,
-             struct agx_sampler_packed *out)
+             bool native_custom, struct agx_sampler_packed *out)
 {
    agx_pack(out, SAMPLER, cfg) {
       cfg.minimum_lod = info->minLod;
@@ -174,7 +159,7 @@ pack_sampler(const struct hk_physical_device *pdev,
          cfg.border_colour =
             native_custom ? AGX_BORDER_COLOUR_CUSTOM
                           : translate_border_color(info->borderColor,
-                                                   custom_to_1, workaround_rgba4);
+                                                   custom_to_1);
       }
    }
 }
@@ -210,8 +195,7 @@ hk_CreateSampler(VkDevice device,
    /* Apple9 samples custom border colours natively, with the border format the
     * application provides (customBorderColorWithoutFormat is not exposed). */
    bool custom_border =
-      uses_border(info) &&
-      is_border_color_custom(info->borderColor, false);
+      uses_border(info) && is_border_color_custom(info->borderColor);
    bool native_custom =
       custom_border && sampler->vk.format != VK_FORMAT_UNDEFINED;
 
@@ -228,7 +212,7 @@ hk_CreateSampler(VkDevice device,
    }
 
    struct agx_sampler_packed samp;
-   pack_sampler(pdev, info, true, false, native_custom, &samp);
+   pack_sampler(pdev, info, true, native_custom, &samp);
 
    /* LOD bias passed in the descriptor set */
    sampler->lod_bias_fp16 = _mesa_float_to_half(info->mipLodBias);
@@ -274,7 +258,7 @@ hk_CreateSampler(VkDevice device,
          plane2_info.magFilter = chroma_filter;
          plane2_info.minFilter = chroma_filter;
 
-         pack_sampler(pdev, &plane2_info, false, false, false, &samp);
+         pack_sampler(pdev, &plane2_info, false, false, &samp);
          result = hk_sampler_heap_add(
             dev, samp, replay.index[sampler->plane_count],
             &sampler->planes[sampler->plane_count].hw);

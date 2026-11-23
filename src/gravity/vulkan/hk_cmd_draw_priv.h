@@ -15,9 +15,6 @@
 #define IS_SHADER_DIRTY(bit)                                                   \
    (cmd->state.gfx.shaders_dirty & BITFIELD_BIT(MESA_SHADER_##bit))
 
-#define IS_LINKED_DIRTY(bit)                                                   \
-   (cmd->state.gfx.linked_dirty & BITFIELD_BIT(MESA_SHADER_##bit))
-
 /* hk_cmd_render.c */
 bool hk_feedback_prepare_draw(struct hk_cmd_buffer *cmd);
 

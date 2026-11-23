@@ -1178,6 +1178,12 @@ struct apple9_loop_context {
 
 #define APPLE9_SSA_COMPONENTS 5
 
+enum apple9_tile_lock {
+   APPLE9_TILE_LOCK_NONE,
+   APPLE9_TILE_LOCK_SHARED,
+   APPLE9_TILE_LOCK_EXCLUSIVE,
+};
+
 struct apple9_dag_lower {
    struct agx_apple9_vir_program program;
    /* Set when one export per varying store would exceed the bank. */
@@ -1208,7 +1214,6 @@ struct apple9_dag_lower {
    uint8_t per_vertex[AGX_APPLE9_MAX_PER_VERTEX];
    const struct agx_apple9_varying_layout *varyings;
    unsigned position_mask;
-   bool color_stores;
    bool tile_read;
    bool tile_write;
    bool object_calls;
@@ -1221,10 +1226,8 @@ struct apple9_dag_lower {
    bool tile_coords;
    bool tile_preamble_needed;
    uint32_t tile_preamble_imm;
-   bool tile_lock_needed;
-   bool tile_lock_exclusive;
-   bool tile_read_lock_acquired;
-   bool tile_write_lock_acquired;
+   enum apple9_tile_lock tile_lock_mode;
+   enum apple9_tile_lock tile_lock_held;
    /* Fragment shader interlock holds the pixel acquired for writing. */
    bool interlock;
    uint32_t coverage_control;
@@ -1292,71 +1295,37 @@ apple9_acquire_tile_preamble(struct apple9_dag_lower *lower)
 }
 
 static bool
-apple9_acquire_tile_read_lock(struct apple9_dag_lower *lower)
+apple9_acquire_tile_lock(struct apple9_dag_lower *lower)
 {
    if (!apple9_acquire_tile_preamble(lower))
       return false;
-   if (!lower->tile_lock_needed || lower->tile_read_lock_acquired ||
-       lower->tile_write_lock_acquired)
+   if (lower->tile_lock_mode == APPLE9_TILE_LOCK_NONE ||
+       lower->tile_lock_held != APPLE9_TILE_LOCK_NONE)
       return true;
    /* Any shader that writes tile data (RMW / programmable blend), hands off to
     * a color-writing epilog, or uses fragment shader interlock must acquire an
     * exclusive R/W lock (0x80c) up front so overlapping fragments on the same
     * pixel cannot both read stale tile color before writing. Strictly read-only
     * tile access uses the shared read lock (0x808). */
-   if (lower->tile_lock_exclusive) {
-      lower->tile_read_lock_acquired = true;
-      lower->tile_write_lock_acquired = true;
-      return agx_apple9_vir_emit_side_effect(
-         &lower->program, AGX_APPLE9_VIR_TILE_ACCESS, AGX_APPLE9_ENC_TILE_ACCESS,
-         NULL, 0, 0x80c);
-   }
-   lower->tile_read_lock_acquired = true;
-   return agx_apple9_vir_emit_side_effect(
-      &lower->program, AGX_APPLE9_VIR_TILE_ACCESS, AGX_APPLE9_ENC_TILE_ACCESS,
-      NULL, 0, 0x808);
-}
-
-static bool
-apple9_acquire_tile_write_lock(struct apple9_dag_lower *lower)
-{
-   if (!apple9_acquire_tile_preamble(lower))
-      return false;
-   if (!lower->tile_lock_needed || lower->tile_write_lock_acquired)
-      return true;
-   uint32_t imm = lower->tile_read_lock_acquired ? 0x804 : 0x80c;
-   lower->tile_read_lock_acquired = true;
-   lower->tile_write_lock_acquired = true;
+   lower->tile_lock_held = lower->tile_lock_mode;
+   uint32_t imm =
+      lower->tile_lock_mode == APPLE9_TILE_LOCK_EXCLUSIVE ? 0x80c : 0x808;
    return agx_apple9_vir_emit_side_effect(
       &lower->program, AGX_APPLE9_VIR_TILE_ACCESS, AGX_APPLE9_ENC_TILE_ACCESS,
       NULL, 0, imm);
 }
 
 static bool
-apple9_cf_node_needs_tile_write_lock(nir_cf_node *node)
+apple9_cf_node_needs_tile_lock(nir_cf_node *node)
 {
    nir_foreach_block_in_cf_node(block, node) {
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
             continue;
          nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
-         if (op == nir_intrinsic_store_local_pixel_agx ||
+         if (op == nir_intrinsic_load_local_pixel_agx ||
+             op == nir_intrinsic_store_local_pixel_agx ||
              op == nir_intrinsic_begin_invocation_interlock)
-            return true;
-      }
-   }
-   return false;
-}
-
-static bool
-apple9_cf_node_needs_tile_read_lock(nir_cf_node *node)
-{
-   nir_foreach_block_in_cf_node(block, node) {
-      nir_foreach_instr(instr, block) {
-         if (instr->type != nir_instr_type_intrinsic)
-            continue;
-         if (nir_instr_as_intrinsic(instr)->intrinsic ==
-             nir_intrinsic_load_local_pixel_agx)
             return true;
       }
    }
@@ -1392,6 +1361,24 @@ apple9_cf_node_needs_tile_preamble(nir_cf_node *node)
       }
    }
    return false;
+}
+
+static bool
+apple9_hoist_tile_access_for_cf(struct apple9_dag_lower *lower,
+                                nir_cf_node *node)
+{
+   if (lower->mask_depth || lower->loop_depth || lower->object_region)
+      return true;
+   if (lower->tile_lock_mode != APPLE9_TILE_LOCK_NONE &&
+       lower->tile_lock_held == APPLE9_TILE_LOCK_NONE &&
+       apple9_cf_node_needs_tile_lock(node) &&
+       !apple9_acquire_tile_lock(lower))
+      return false;
+   if (lower->tile_preamble_needed && !lower->tile_access &&
+       apple9_cf_node_needs_tile_preamble(node) &&
+       !apple9_acquire_tile_preamble(lower))
+      return false;
+   return true;
 }
 
 static uint32_t
@@ -3507,7 +3494,7 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
             lower, nir_get_scalar(intr->src[coords ? 1 : 0].ssa, 0));
          if (source == AGX_APPLE9_VREG_INVALID)
             return AGX_APPLE9_VREG_INVALID;
-         if (!coords && !apple9_acquire_tile_read_lock(lower))
+         if (!coords && !apple9_acquire_tile_lock(lower))
             return AGX_APPLE9_VREG_INVALID;
          assert(lower->tile_access && lower->tile_read);
          value = apple9_dag_emit(lower, AGX_APPLE9_VIR_TILE_LOAD,
@@ -4367,14 +4354,7 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
                };
                if (sources[0] != AGX_APPLE9_VREG_INVALID &&
                    sources[1] != AGX_APPLE9_VREG_INVALID) {
-                  const struct agx_apple9_operand_constraint *destination =
-                     agx_apple9_find_operand(encoding, AGX_APPLE9_OPERAND_DEST);
-                  value = destination != NULL && (destination->flags &
-                                                  AGX_APPLE9_OPERAND_HARD_LOW)
-                             ? apple9_dag_emit(
-                                  lower, vir_op, encoding, sources, 2, 0)
-                             : apple9_dag_emit(lower, vir_op, encoding, sources,
-                                               2, 0);
+                  value = apple9_dag_emit(lower, vir_op, encoding, sources, 2, 0);
                }
             }
          }
@@ -4877,16 +4857,6 @@ apple9_find_buffer_dag(nir_shader *nir, const struct apple9_buffer_map *map,
 }
 
 static bool
-apple9_emit_device_store_vir(struct apple9_emitter *emitter,
-                             const struct agx_apple9_vir_instr *instruction,
-                             const uint8_t *phys, const char **reason)
-{
-   struct agx_apple9_packed_instruction packed;
-   return agx_apple9_pack_vir_instruction(instruction, phys, &packed, reason) &&
-          apple9_emit_packed(emitter, &packed);
-}
-
-static bool
 apple9_lower_buffer_store_operands(struct apple9_dag_lower *lower,
                                    struct apple9_buffer_store *store)
 {
@@ -5294,7 +5264,6 @@ apple9_emit_graphics_output(struct apple9_dag_lower *lower,
           intr->src[0].ssa->bit_size != 32 ||
           intr->num_components < 1 || intr->num_components > 4)
          return false;
-      lower->color_stores = true;
       uint32_t sample_mask = apple9_lower_dag_scalar(lower,
          nir_get_scalar(intr->src[1].ssa, 0));
       if (sample_mask == AGX_APPLE9_VREG_INVALID)
@@ -5306,9 +5275,10 @@ apple9_emit_graphics_output(struct apple9_dag_lower *lower,
          if (colors[word] == AGX_APPLE9_VREG_INVALID)
             return false;
       }
-      if (!apple9_acquire_tile_write_lock(lower))
+      if (!apple9_acquire_tile_lock(lower))
          return false;
-      assert(lower->tile_access && lower->tile_write);
+      assert(lower->tile_access && lower->tile_write &&
+             lower->tile_lock_held == APPLE9_TILE_LOCK_EXCLUSIVE);
       for (unsigned word = 0; word < intr->num_components; ++word) {
          uint32_t store_sources[] = {colors[word], sample_mask};
          if (!agx_apple9_vir_emit_side_effect(
@@ -5554,8 +5524,9 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
           * if a prior tile access already opened it). Its end orders the
           * section's memory accesses before the release at exit. */
          if (intr->intrinsic == nir_intrinsic_begin_invocation_interlock) {
-            if (!apple9_acquire_tile_write_lock(lower))
+            if (!apple9_acquire_tile_lock(lower))
                return false;
+            assert(lower->tile_lock_held == APPLE9_TILE_LOCK_EXCLUSIVE);
             continue;
          }
          if (intr->intrinsic == nir_intrinsic_end_invocation_interlock) {
@@ -7014,42 +6985,14 @@ apple9_emit_cf_list(struct apple9_dag_lower *lower,
          break;
       }
       case nir_cf_node_if:
-         if (!lower->mask_depth && !lower->loop_depth && !lower->object_region) {
-            if (lower->tile_lock_needed) {
-               if (!lower->tile_write_lock_acquired &&
-                   apple9_cf_node_needs_tile_write_lock(node) &&
-                   !apple9_acquire_tile_write_lock(lower))
-                  return false;
-               else if (!lower->tile_read_lock_acquired &&
-                        apple9_cf_node_needs_tile_read_lock(node) &&
-                        !apple9_acquire_tile_read_lock(lower))
-                  return false;
-            }
-            if (lower->tile_preamble_needed && !lower->tile_access &&
-                apple9_cf_node_needs_tile_preamble(node) &&
-                !apple9_acquire_tile_preamble(lower))
-               return false;
-         }
+         if (!apple9_hoist_tile_access_for_cf(lower, node))
+            return false;
          if (!apple9_emit_if(lower, stores, nir_cf_node_as_if(node)))
             return false;
          break;
       case nir_cf_node_loop:
-         if (!lower->mask_depth && !lower->loop_depth && !lower->object_region) {
-            if (lower->tile_lock_needed) {
-               if (!lower->tile_write_lock_acquired &&
-                   apple9_cf_node_needs_tile_write_lock(node) &&
-                   !apple9_acquire_tile_write_lock(lower))
-                  return false;
-               else if (!lower->tile_read_lock_acquired &&
-                        apple9_cf_node_needs_tile_read_lock(node) &&
-                        !apple9_acquire_tile_read_lock(lower))
-                  return false;
-            }
-            if (lower->tile_preamble_needed && !lower->tile_access &&
-                apple9_cf_node_needs_tile_preamble(node) &&
-                !apple9_acquire_tile_preamble(lower))
-               return false;
-         }
+         if (!apple9_hoist_tile_access_for_cf(lower, node))
+            return false;
          lower->loop_depth++;
          if (!apple9_emit_loop(lower, stores, nir_cf_node_as_loop(node)))
             return false;
@@ -9042,16 +8985,14 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
          /* Per-sample trampoline acquires 0x600/0x80c once before the sample
           * loop and releases 0x020c + ZS once after the final sample. */
          lower.tile_access = true;
-         lower.tile_read_lock_acquired = true;
-         lower.tile_write_lock_acquired = true;
+         lower.tile_lock_held = APPLE9_TILE_LOCK_EXCLUSIVE;
          lower.tile_read = reads;
          lower.tile_write = true;
       } else if (tile_mode == APPLE9_TILE_EPILOG_TAIL_LOCKED) {
-         /* fs_main already acquired 0x600 + 0x80c (or 0x808 -> 0x804) and
-          * handed off the lock for this epilog to release. */
+         /* fs_main already acquired 0x600 + 0x80c and handed off the lock for
+          * this epilog to release. */
          lower.tile_access = true;
-         lower.tile_read_lock_acquired = true;
-         lower.tile_write_lock_acquired = true;
+         lower.tile_lock_held = APPLE9_TILE_LOCK_EXCLUSIVE;
          lower.tile_read = reads;
          lower.tile_write = true;
       } else {
@@ -9070,9 +9011,10 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
             }
          }
          if ((reads || writes || lower.interlock) && !lower.tile_coords) {
-            lower.tile_lock_needed = true;
-            lower.tile_lock_exclusive =
-               writes || lower.interlock || tile_mode == APPLE9_TILE_EPILOG_MAIN;
+            lower.tile_lock_mode =
+               (writes || lower.interlock || tile_mode == APPLE9_TILE_EPILOG_MAIN)
+                  ? APPLE9_TILE_LOCK_EXCLUSIVE
+                  : APPLE9_TILE_LOCK_SHARED;
             lower.tile_read = reads;
             lower.tile_write = writes;
          }
@@ -9091,11 +9033,9 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
        tile_mode == APPLE9_TILE_EPILOG_MAIN) {
-      if (lower.tile_read_lock_acquired && !lower.tile_write_lock_acquired &&
-          !apple9_acquire_tile_write_lock(&lower))
-         goto fail;
+      assert(lower.tile_lock_held != APPLE9_TILE_LOCK_SHARED);
       lower.handed_off_tile_lock =
-         lower.tile_read_lock_acquired || lower.tile_write_lock_acquired;
+         lower.tile_lock_held == APPLE9_TILE_LOCK_EXCLUSIVE;
       lower.handed_off_tile_preamble = lower.tile_access;
    }
 
@@ -9107,8 +9047,7 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
 
    /* Finalize tile writes once after all color outputs. The release marks
     * completion of the fragment's tile transaction, including MRT stores. */
-   const bool any_tile_lock =
-      lower.tile_read_lock_acquired || lower.tile_write_lock_acquired;
+   const bool any_tile_lock = lower.tile_lock_held != APPLE9_TILE_LOCK_NONE;
    bool need_tile_fence =
       tile_mode == APPLE9_TILE_EPILOG_TAIL_LOCKED ||
       (tile_mode != APPLE9_TILE_PROLOG &&
@@ -9195,15 +9134,6 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
       vir_offsets[i] = emitter.bytes.size;
       const struct agx_apple9_vir_instr *instruction =
          lower.program.instructions[i];
-      if (instruction->op == AGX_APPLE9_VIR_DEVICE_STORE) {
-         if (!apple9_emit_device_store_vir(&emitter, instruction,
-                                           lower.program.phys, reason)) {
-            util_dynarray_fini(&emitter.bytes);
-            free(vir_offsets);
-            goto fail;
-         }
-         continue;
-      }
       if (!agx_apple9_pack_vir_instruction(instruction, lower.program.phys,
                                            &packed, reason) ||
           (packed.length > 0 && !apple9_emit_packed(&emitter, &packed)) ||
@@ -11875,39 +11805,13 @@ apple9_lower_texture_lod_query(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
-uint32_t
-agx_nir_apple9_offset_samplers(const nir_shader *nir)
-{
-   uint32_t mask = 0;
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type != nir_instr_type_tex)
-               continue;
-            nir_tex_instr *tex = nir_instr_as_tex(instr);
-            if (nir_tex_instr_src_index(tex, nir_tex_src_offset) < 0)
-               continue;
-            if (nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref) >= 0 ||
-                tex->sampler_index >= 32)
-               return UINT32_MAX;
-            mask |= BITFIELD_BIT(tex->sampler_index);
-         }
-      }
-   }
-   return mask;
-}
-
 /* Sampler bias is per-draw state, independent of a shader's explicit bias.
  * Keep this in FP32, matching the rest of the Apple9 texture operands. */
 bool
 agx_nir_lower_apple9_sampler_state(
    nir_shader *nir, const struct agx_apple9_sampler_key key[32],
-   struct agx_apple9_texture_mapping *mapping, const char **reason)
+   const char **reason)
 {
-   memset(mapping, 0, sizeof(*mapping));
-   for (unsigned i = 0; i < 32; ++i) {
-      mapping->samplers[i] = i;
-   }
    nir_lower_global_vars_to_local(nir);
    nir_split_var_copies(nir);
    nir_lower_var_copies(nir);
@@ -11932,7 +11836,6 @@ agx_nir_lower_apple9_sampler_state(
    nir_lower_tex(nir, &options);
    nir_shader_instructions_pass(nir, apple9_lower_texture_lod_query,
                                 nir_metadata_control_flow, (void *)key);
-   mapping->runtime_samplers = agx_nir_apple9_offset_samplers(nir);
    if (!agx_nir_lower_apple9_texture_offsets(nir, key, reason))
       return false;
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
@@ -11989,7 +11892,6 @@ agx_nir_lower_apple9_sampler_state(
              * Sampling that face as an array layer restores ordinary 2D
              * wrapping when seamless cube filtering is disabled. */
             tex->backend_flags |= AGX_APPLE9_TEXTURE_CUBE_AS_ARRAY;
-            mapping->seamful_cubes |= BITFIELD_BIT(tex->texture_index);
             progress = true;
          }
       }
@@ -15783,6 +15685,62 @@ agx_compile_apple9_stipple_prolog(
    return ok;
 }
 
+static bool
+apple9_emit_vertex_prolog_inputs(
+   nir_builder *b, const struct agx_apple9_vertex_prolog_key *key,
+   bool software, const char **reason)
+{
+   unsigned reg = AGX_APPLE9_ABI_REG_BASE;
+   for (unsigned a = 0; a < 16; ++a) {
+      if (!(key->iface.attribs_read & BITFIELD_BIT(a)))
+         continue;
+      uint8_t mask = key->iface.attrib_mask[a] & 0xf;
+      if (!mask)
+         continue;
+      unsigned first = ffs(mask) - 1;
+      unsigned last = util_last_bit(mask) - 1;
+      unsigned comps = last - first + 1;
+      nir_alu_type dest_type =
+         (key->iface.integer_attribs & BITFIELD_BIT(a)) ? nir_type_uint32
+                                                        : nir_type_float32;
+      nir_def *v = nir_load_input(
+         b, comps, 32, nir_imm_int(b, 0), .base = a, .component = first,
+         .dest_type = dest_type,
+         .io_semantics.location = VERT_ATTRIB_GENERIC0 + a,
+         .io_semantics.num_slots = 1);
+      u_foreach_bit(c, mask) {
+         if (reg >= AGX_APPLE9_ABI_REG_BASE + AGX_APPLE9_MAX_ABI_REGS) {
+            *reason = software
+                         ? "Apple9 SW-VS prolog exceeds ABI register capacity"
+                         : "Apple9 vertex prolog exceeds ABI register capacity";
+            return false;
+         }
+         nir_export_agx(b, nir_channel(b, v, c - first), .base = reg++);
+      }
+   }
+
+   struct agx_apple9_vertex_layout layout = {
+      .draw_params_ubo = key->draw_params_ubo,
+      .buffer_descriptor_ubo = key->buffer_descriptor_ubo,
+      .dynamic_stride = key->dynamic_stride,
+      .unbounded = key->unbounded,
+   };
+   memcpy(layout.format, key->format, sizeof(layout.format));
+   memcpy(layout.offset, key->offset, sizeof(layout.offset));
+   memcpy(layout.stride, key->stride, sizeof(layout.stride));
+   memcpy(layout.divisor, key->divisor, sizeof(layout.divisor));
+   memcpy(layout.buffer, key->buffer, sizeof(layout.buffer));
+
+   if (!agx_nir_lower_apple9_vertex_inputs(b->shader, &layout, software)) {
+      *reason = software
+                   ? "Apple9 SW-VS prolog requires supported naturally aligned formats"
+                   : "Apple9 vertex prolog requires supported naturally aligned formats";
+      return false;
+   }
+
+   return true;
+}
+
 bool
 agx_compile_apple9_vertex_prolog_key(
    const struct agx_apple9_vertex_prolog_key *key,
@@ -15803,49 +15761,8 @@ agx_compile_apple9_vertex_prolog_key(
       MESA_SHADER_VERTEX, &agx_nir_options, "apple9_vs_prolog");
    nir_shader *nir = b.shader;
 
-   unsigned reg = AGX_APPLE9_ABI_REG_BASE;
-   for (unsigned a = 0; a < 16; ++a) {
-      if (!(key->iface.attribs_read & BITFIELD_BIT(a)))
-         continue;
-      uint8_t mask = key->iface.attrib_mask[a] & 0xf;
-      if (!mask)
-         continue;
-      unsigned first = ffs(mask) - 1;
-      unsigned last = util_last_bit(mask) - 1;
-      unsigned comps = last - first + 1;
-      nir_alu_type dest_type =
-         (key->iface.integer_attribs & BITFIELD_BIT(a)) ? nir_type_uint32
-                                                        : nir_type_float32;
-      nir_def *v = nir_load_input(
-         &b, comps, 32, nir_imm_int(&b, 0), .base = a, .component = first,
-         .dest_type = dest_type,
-         .io_semantics.location = VERT_ATTRIB_GENERIC0 + a,
-         .io_semantics.num_slots = 1);
-      u_foreach_bit(c, mask) {
-         if (reg >= AGX_APPLE9_ABI_REG_BASE + AGX_APPLE9_MAX_ABI_REGS) {
-            ralloc_free(nir);
-            *reason = "Apple9 vertex prolog exceeds ABI register capacity";
-            return false;
-         }
-         nir_export_agx(&b, nir_channel(&b, v, c - first), .base = reg++);
-      }
-   }
-
-   struct agx_apple9_vertex_layout layout = {
-      .draw_params_ubo = key->draw_params_ubo,
-      .buffer_descriptor_ubo = key->buffer_descriptor_ubo,
-      .dynamic_stride = key->dynamic_stride,
-      .unbounded = key->unbounded,
-   };
-   memcpy(layout.format, key->format, sizeof(layout.format));
-   memcpy(layout.offset, key->offset, sizeof(layout.offset));
-   memcpy(layout.stride, key->stride, sizeof(layout.stride));
-   memcpy(layout.divisor, key->divisor, sizeof(layout.divisor));
-   memcpy(layout.buffer, key->buffer, sizeof(layout.buffer));
-
-   if (!agx_nir_lower_apple9_vertex_inputs(nir, &layout, false)) {
+   if (!apple9_emit_vertex_prolog_inputs(&b, key, false, reason)) {
       ralloc_free(nir);
-      *reason = "Apple9 vertex prolog requires supported naturally aligned formats";
       return false;
    }
 
@@ -15995,49 +15912,9 @@ agx_compile_apple9_sw_vs_prolog_key(
    nir->info.workgroup_size[1] = 1;
    nir->info.workgroup_size[2] = 1;
 
-   unsigned reg = AGX_APPLE9_ABI_REG_BASE;
-   for (unsigned a = 0; a < 16; ++a) {
-      if (!(key->base.iface.attribs_read & BITFIELD_BIT(a)))
-         continue;
-      uint8_t mask = key->base.iface.attrib_mask[a] & 0xf;
-      if (!mask)
-         continue;
-      unsigned first = ffs(mask) - 1;
-      unsigned last = util_last_bit(mask) - 1;
-      unsigned comps = last - first + 1;
-      nir_alu_type dest_type =
-         (key->base.iface.integer_attribs & BITFIELD_BIT(a)) ? nir_type_uint32
-                                                             : nir_type_float32;
-      nir_def *v = nir_load_input(
-         &b, comps, 32, nir_imm_int(&b, 0), .base = a, .component = first,
-         .dest_type = dest_type,
-         .io_semantics.location = VERT_ATTRIB_GENERIC0 + a,
-         .io_semantics.num_slots = 1);
-      u_foreach_bit(c, mask) {
-         if (reg >= AGX_APPLE9_ABI_REG_BASE + AGX_APPLE9_MAX_ABI_REGS) {
-            ralloc_free(nir);
-            *reason = "Apple9 SW-VS prolog exceeds ABI register capacity";
-            return false;
-         }
-         nir_export_agx(&b, nir_channel(&b, v, c - first), .base = reg++);
-      }
-   }
-
-   struct agx_apple9_vertex_layout layout = {
-      .draw_params_ubo = key->base.draw_params_ubo,
-      .buffer_descriptor_ubo = key->base.buffer_descriptor_ubo,
-      .dynamic_stride = key->base.dynamic_stride,
-      .unbounded = key->base.unbounded,
-   };
-   memcpy(layout.format, key->base.format, sizeof(layout.format));
-   memcpy(layout.offset, key->base.offset, sizeof(layout.offset));
-   memcpy(layout.stride, key->base.stride, sizeof(layout.stride));
-   memcpy(layout.divisor, key->base.divisor, sizeof(layout.divisor));
-   memcpy(layout.buffer, key->base.buffer, sizeof(layout.buffer));
-
-   if (!agx_nir_lower_apple9_vertex_inputs(nir, &layout, true /* software */)) {
+   if (!apple9_emit_vertex_prolog_inputs(&b, &key->base, true /* software */,
+                                         reason)) {
       ralloc_free(nir);
-      *reason = "Apple9 SW-VS prolog requires supported naturally aligned formats";
       return false;
    }
 

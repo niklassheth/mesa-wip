@@ -447,19 +447,6 @@ bool agx_nir_lower_apple9_texture_offsets(
    nir_shader *nir, const struct agx_apple9_sampler_key key[32],
    const char **reason);
 
-struct agx_apple9_texture_mapping {
-   uint8_t samplers[32];
-   uint32_t seamful_cubes;
-   /* Samplers used by texel-offset samples. Offsets the sample instruction
-    * cannot encode are lowered with runtime sampler state, so the driver
-    * must fill these runtime sampler records of the graphics sysval table. */
-   uint32_t runtime_samplers;
-};
-
-/* Mask of sampler indices sampled with texel offsets; all samplers when an
- * offset sample has no sampler index yet. */
-uint32_t agx_nir_apple9_offset_samplers(const nir_shader *nir);
-
 /* Apple9 backend texture flags. They share nir_tex_instr::backend_flags with
  * the AGX_TEXTURE_FLAG_* bits in agx_nir_texture.h, so keep them disjoint. */
 #define AGX_APPLE9_TEXTURE_CUBE_AS_ARRAY (1 << 8)
@@ -478,7 +465,7 @@ uint32_t agx_nir_apple9_offset_samplers(const nir_shader *nir);
 
 bool agx_nir_lower_apple9_sampler_state(
    nir_shader *nir, const struct agx_apple9_sampler_key key[32],
-   struct agx_apple9_texture_mapping *mapping, const char **reason);
+   const char **reason);
 
 struct agx_apple9_fs_epilog_key {
    struct agx_apple9_fs_epilog_iface iface;

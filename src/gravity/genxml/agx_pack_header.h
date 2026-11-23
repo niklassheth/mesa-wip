@@ -101,20 +101,6 @@ __gen_from_groups(uint32_t value, uint32_t group_size, uint32_t length)
    struct AGX_##T name;                                                        \
    AGX_##T##_unpack(fp, (CONST uint8_t *)(src), &name)
 
-#define agx_print(fp, T, var, indent) AGX_##T##_print(fp, &(var), indent)
-
-static inline void
-agx_merge_helper(uint32_t *dst, const uint32_t *src, size_t bytes)
-{
-   assert((bytes & 3) == 0);
-
-   for (unsigned i = 0; i < (bytes / 4); ++i)
-      dst[i] |= src[i];
-}
-
-#define agx_merge(packed1, packed2, type)                                      \
-   agx_merge_helper((packed1).opaque, (packed2).opaque, AGX_##type##_LENGTH)
-
 #if defined(NDEBUG) || defined(__OPENCL_VERSION__)
 #define agx_genxml_validate_bounds(a, b, c)
 #define agx_genxml_validate_mask(a, b, c, d, e) true

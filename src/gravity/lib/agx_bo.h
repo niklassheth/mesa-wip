@@ -102,7 +102,6 @@ struct agx_bo {
    struct agx_va *va;
 
    /* Suffixed to force agx_bo_map access */
-   uint64_t *shim_cpu_epoch; /* Optional shim-owned CPU-write generation. */
    void *_map;
 
    /* Process-local index */
@@ -113,9 +112,6 @@ struct agx_bo {
 
    /* DMA-BUF fd clone for adding fences to imports/exports */
    int prime_fd;
-
-   /* Current writer, if any (queue in upper 32 bits, syncobj in lower 32 bits) */
-   uint64_t writer;
 
    /* Entry identity for callers that store one Apple9 body in this BO. */
    struct agx_shader_body apple9_body;
@@ -130,24 +126,6 @@ struct agx_bo {
    /* For debugging */
    const char *label;
 };
-
-static inline uint32_t
-agx_bo_writer_syncobj(uint64_t writer)
-{
-   return writer;
-}
-
-static inline uint32_t
-agx_bo_writer_queue(uint64_t writer)
-{
-   return writer >> 32;
-}
-
-static inline uint64_t
-agx_bo_writer(uint32_t queue, uint32_t syncobj)
-{
-   return (((uint64_t)queue) << 32) | syncobj;
-}
 
 struct agx_bo *agx_bo_create(struct agx_device *dev, size_t size,
                              unsigned align, enum agx_bo_flags flags,

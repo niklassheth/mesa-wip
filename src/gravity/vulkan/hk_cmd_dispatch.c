@@ -25,12 +25,6 @@
 #include "libcl/tessellator_fold.h"
 
 void
-hk_cmd_buffer_begin_compute(struct hk_cmd_buffer *cmd,
-                            const VkCommandBufferBeginInfo *pBeginInfo)
-{
-}
-
-void
 hk_cmd_bind_compute_shader(struct hk_cmd_buffer *cmd,
                            struct hk_api_shader *shader)
 {
@@ -762,7 +756,7 @@ hk_tess_fold_dispatch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct agx_precompiled_shader *prog = agx_get_precompiled(&dev->bg_eot, idx);
    uint64_t args = hk_pool_upload(cmd, data, size, 8);
-   if (!prog || !prog->apple9 || !args) {
+   if (!prog || !args) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return;
    }

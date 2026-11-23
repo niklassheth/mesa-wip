@@ -1562,12 +1562,12 @@ agx_apple9_optimize_vir_with_constants(
    for (unsigned i = 0; i < p->instruction_count; ++i)
       uniform_writes |= p->instructions[i]->op == AGX_APPLE9_VIR_STORE_UNIFORM;
 
-   constant_words = _mesa_hash_table_u64_create(NULL);
-   if (!constant_words) {
-      success = false;
-      goto cleanup;
-   }
    if (constants && !uniform_writes) {
+      constant_words = _mesa_hash_table_u64_create(NULL);
+      if (!constant_words) {
+         success = false;
+         goto cleanup;
+      }
       assert(constants->base + constants->count <= AGX_APPLE9_UNIFORM_COUNT);
       for (unsigned i = 0; i < constants->count; ++i)
          _mesa_hash_table_u64_insert(constant_words, constants->values[i],
@@ -1655,10 +1655,12 @@ agx_apple9_optimize_vir_with_constants(
       if (I->op == AGX_APPLE9_VIR_IMM) {
          constant[I->dest] = true;
          values[I->dest] = I->immediate;
-         uint16_t cw = (uintptr_t)_mesa_hash_table_u64_search(
-            constant_words, I->immediate);
-         if (cw)
-            uniform_facts_set(&uf, I->dest, cw);
+         if (constant_words) {
+            uint16_t cw = (uintptr_t)_mesa_hash_table_u64_search(
+               constant_words, I->immediate);
+            if (cw)
+               uniform_facts_set(&uf, I->dest, cw);
+         }
       }
       if (I->op == AGX_APPLE9_VIR_IOR_UNIFORM &&
           I->immediate < AGX_APPLE9_UNIFORM_COUNT &&

@@ -131,7 +131,6 @@ struct agx_apple9_mesh_body_info {
    bool requires_native_entry;
    bool requires_object_completion;
    bool requires_mesh_completion;
-   bool uses_vertex_count;
    /* Lowered for multi-round publication at T32 (bound at upload). */
    bool publication_rounds;
    /* Rasterizer point size (points topology) and packed layer/viewport word

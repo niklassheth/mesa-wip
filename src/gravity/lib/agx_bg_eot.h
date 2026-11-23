@@ -16,8 +16,6 @@ struct agx_device;
 
 struct agx_precompiled_shader {
    struct agx_bo *bo;
-   uint64_t ptr;
-   bool apple9;
    struct agx_apple9_compute_profile apple9_profile;
 };
 
