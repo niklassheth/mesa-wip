@@ -1137,6 +1137,7 @@ apple9_instruction_is_in_subset(nir_instr *instr, bool graphics)
              op == nir_intrinsic_quad_swap_vertical ||
              op == nir_intrinsic_quad_swap_diagonal ||
              op == nir_intrinsic_rotate ||
+             op == nir_intrinsic_cmat_muladd_agx ||
              op == nir_intrinsic_ballot ||
              op == nir_intrinsic_load_scratch ||
              op == nir_intrinsic_store_scratch ||
@@ -3112,6 +3113,56 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
             }
             c += w;
          }
+         value = lower->ssa_to_vreg[key];
+      } else if (intr && intr->intrinsic == nir_intrinsic_cmat_muladd_agx) {
+         uint32_t flags = nir_intrinsic_flags(intr);
+         enum agx_apple9_mma_type ty_a = agx_apple9_mma_src_type(flags, 0);
+         enum agx_apple9_mma_type ty_b = agx_apple9_mma_src_type(flags, 1);
+         enum agx_apple9_mma_type ty_c = agx_apple9_mma_src_type(flags, 2);
+         enum agx_apple9_mma_type ty_dst = agx_apple9_mma_dst_type(flags);
+         bool has_c = agx_apple9_mma_has_c(flags);
+         unsigned wa = agx_apple9_mma_type_gprs(ty_a);
+         unsigned wb = agx_apple9_mma_type_gprs(ty_b);
+         unsigned wc = has_c ? agx_apple9_mma_type_gprs(ty_c) : 0u;
+         unsigned wd = agx_apple9_mma_type_gprs(ty_dst);
+         if (scalar.def->bit_size != 32 || scalar.def->num_components != wd ||
+             intr->src[0].ssa->bit_size != 32 ||
+             intr->src[0].ssa->num_components != wa ||
+             intr->src[1].ssa->bit_size != 32 ||
+             intr->src[1].ssa->num_components != wb ||
+             (has_c && (intr->src[2].ssa->bit_size != 32 ||
+                        intr->src[2].ssa->num_components != wc))) {
+            lower->reason = "Apple9 cmat_muladd_agx operand width mismatch";
+            return AGX_APPLE9_VREG_INVALID;
+         }
+         uint32_t src_a[2], src_b[2], src_c[2];
+         for (unsigned c = 0; c < wa; ++c) {
+            src_a[c] = apple9_lower_dag_scalar(
+               lower, nir_get_scalar(intr->src[0].ssa, c));
+            if (src_a[c] == AGX_APPLE9_VREG_INVALID)
+               return AGX_APPLE9_VREG_INVALID;
+         }
+         for (unsigned c = 0; c < wb; ++c) {
+            src_b[c] = apple9_lower_dag_scalar(
+               lower, nir_get_scalar(intr->src[1].ssa, c));
+            if (src_b[c] == AGX_APPLE9_VREG_INVALID)
+               return AGX_APPLE9_VREG_INVALID;
+         }
+         for (unsigned c = 0; c < wc; ++c) {
+            src_c[c] = apple9_lower_dag_scalar(
+               lower, nir_get_scalar(intr->src[2].ssa, c));
+            if (src_c[c] == AGX_APPLE9_VREG_INVALID)
+               return AGX_APPLE9_VREG_INVALID;
+         }
+         uint32_t dst = agx_apple9_vir_emit_mma(
+            &lower->program, src_a, src_b, has_c ? src_c : NULL, flags);
+         if (dst == AGX_APPLE9_VREG_INVALID) {
+            lower->reason = "Apple9 could not emit VIR MMA";
+            return AGX_APPLE9_VREG_INVALID;
+         }
+         for (unsigned c = 0; c < wd; ++c)
+            lower->ssa_to_vreg[scalar.def->index * APPLE9_SSA_COMPONENTS + c] =
+               dst + c;
          value = lower->ssa_to_vreg[key];
       } else if (intr && intr->intrinsic == nir_intrinsic_reduce) {
          enum agx_apple9_subgroup_reduce_op reduce_op;
@@ -6991,6 +7042,7 @@ apple9_hoist_fence(nir_instr *instr)
    case nir_intrinsic_quad_swap_vertical:
    case nir_intrinsic_quad_swap_diagonal:
    case nir_intrinsic_rotate:
+   case nir_intrinsic_cmat_muladd_agx:
    case nir_intrinsic_ballot:
    case nir_intrinsic_exclusive_scan:
    case nir_intrinsic_inclusive_scan:

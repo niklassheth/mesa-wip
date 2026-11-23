@@ -100,6 +100,7 @@ apple9_schedule_resources(const agx_instr *I, uint32_t *reads, uint32_t *writes)
       return;
    case AGX_APPLE9_VIR_GET_GLOBAL_ID:
    case AGX_APPLE9_VIR_DERIVATIVE:
+   case AGX_APPLE9_VIR_MMA:
       return;
    case AGX_APPLE9_VIR_DEVICE_LOAD:
    case AGX_APPLE9_VIR_PRIVATE_LOAD:
@@ -174,6 +175,7 @@ apple9_dependency_delay(const struct agx_apple9_vir_instr *I)
    case AGX_APPLE9_VIR_SUBGROUP_REDUCE:
    case AGX_APPLE9_VIR_SUBGROUP_SHUFFLE:
    case AGX_APPLE9_VIR_SUBGROUP_ROTATE:
+   case AGX_APPLE9_VIR_MMA:
       return 4;
    default:
       return 1;
@@ -220,6 +222,8 @@ apple9_source_width(const struct agx_apple9_vir_instr *ins, unsigned source)
    if ((ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT && source == 1) ||
        (ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_POINTER && source == 0))
       return 2;
+   if (ins->op == AGX_APPLE9_VIR_MMA)
+      return agx_apple9_mma_source_width(ins, source);
    return 1;
 }
 
@@ -281,6 +285,9 @@ apple9_source_constraint(const struct agx_apple9_vir_instr *ins, unsigned source
    }
    if (ins->encoding == AGX_APPLE9_ENC_PSEUDO)
       return NULL;
+   if (ins->op == AGX_APPLE9_VIR_MMA)
+      return agx_apple9_find_operand(ins->encoding,
+                                     agx_apple9_mma_source_role(ins, source));
    const struct agx_apple9_encoding_info *info =
       agx_apple9_encoding_info(ins->encoding);
    for (unsigned o = 0, s = 0; o < info->operand_count; ++o) {
@@ -705,6 +712,11 @@ apple9_shared_dataflow(struct apple9_shared_ra *ra, nir_shader *nir,
                else if (ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC &&
                         ins->memory_components > 1)
                   c.max = 2 * (AGX_APPLE9_GPR_COUNT - ins->memory_components);
+            }
+            if (ins->op == AGX_APPLE9_VIR_MMA) {
+               unsigned w = apple9_source_width(ins, source);
+               if (w > 1)
+                  c.max = MIN2(c.max, 2 * (AGX_APPLE9_GPR_COUNT - w));
             }
             unsigned fixed = p->fixed_phys[ins->src[source]];
             if (fixed != AGX_APPLE9_PHYS_INVALID && !ra->publication[ins->src[source]])

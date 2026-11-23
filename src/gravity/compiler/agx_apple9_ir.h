@@ -186,6 +186,10 @@ enum agx_apple9_vir_opcode {
    /* 12-byte simd_shuffle_and_fill_down (C7 06): shifts src0 down by src2
     * (GPR or 5-bit immediate), filling upper lanes from src1. */
    AGX_APPLE9_VIR_SUBGROUP_ROTATE,
+   /* 12-byte 8x8x8 SIMD-group matrix multiply-accumulate (CF 02 FP32 dst,
+    * CF 00 FP16 dst). immediate packs agx_apple9_mma_flags(); src[] packs
+    * A (1-2 GPRs), B (1-2 GPRs), and optional C (1-2 GPRs). */
+   AGX_APPLE9_VIR_MMA,
    AGX_APPLE9_VIR_WORKGROUP_BARRIER,
    AGX_APPLE9_VIR_DEVICE_FENCE,
    AGX_APPLE9_VIR_HALT,
@@ -1100,6 +1104,100 @@ uint32_t agx_apple9_vir_emit_subgroup_rotate(
 uint32_t agx_apple9_vir_emit_subgroup_rotate_imm(
    struct agx_apple9_vir_program *program, uint32_t data, uint32_t fill,
    uint8_t delta);
+
+/* Apple9 (G16G) 8x8x8 SIMD-group MMA (opcode 0xCF: CF 02 FP32 dst, CF 00 FP16 dst). */
+enum agx_apple9_mma_type {
+   AGX_APPLE9_MMA_BF16 = 0,
+   AGX_APPLE9_MMA_F16  = 1,
+   AGX_APPLE9_MMA_F32  = 2,
+};
+
+#define AGX_APPLE9_MMA_HAS_C (1u << 8)
+
+static inline uint32_t
+agx_apple9_mma_flags(enum agx_apple9_mma_type ty_a,
+                     enum agx_apple9_mma_type ty_b,
+                     enum agx_apple9_mma_type ty_c,
+                     enum agx_apple9_mma_type ty_dst,
+                     bool has_c)
+{
+   return ((uint32_t)ty_a & 3u) |
+          (((uint32_t)ty_b & 3u) << 2) |
+          (((uint32_t)ty_c & 3u) << 4) |
+          (((uint32_t)ty_dst & 3u) << 6) |
+          (has_c ? AGX_APPLE9_MMA_HAS_C : 0u);
+}
+
+static inline enum agx_apple9_mma_type
+agx_apple9_mma_src_type(uint32_t flags, unsigned op_idx)
+{
+   return (enum agx_apple9_mma_type)((flags >> (op_idx * 2u)) & 3u);
+}
+
+static inline enum agx_apple9_mma_type
+agx_apple9_mma_dst_type(uint32_t flags)
+{
+   return (enum agx_apple9_mma_type)((flags >> 6u) & 3u);
+}
+
+static inline bool
+agx_apple9_mma_has_c(uint32_t flags)
+{
+   return !!(flags & AGX_APPLE9_MMA_HAS_C);
+}
+
+static inline unsigned
+agx_apple9_mma_type_gprs(enum agx_apple9_mma_type ty)
+{
+   return ty == AGX_APPLE9_MMA_F32 ? 2u : 1u;
+}
+
+static inline unsigned
+agx_apple9_mma_src_layout(uint32_t flags,
+                          unsigned offsets[3], unsigned widths[3])
+{
+   widths[0] = agx_apple9_mma_type_gprs(agx_apple9_mma_src_type(flags, 0));
+   widths[1] = agx_apple9_mma_type_gprs(agx_apple9_mma_src_type(flags, 1));
+   widths[2] = agx_apple9_mma_has_c(flags)
+                  ? agx_apple9_mma_type_gprs(agx_apple9_mma_src_type(flags, 2))
+                  : 0u;
+   offsets[0] = 0;
+   offsets[1] = widths[0];
+   offsets[2] = widths[0] + widths[1];
+   return widths[0] + widths[1] + widths[2];
+}
+
+static inline unsigned
+agx_apple9_mma_source_width(const struct agx_apple9_vir_instr *ins,
+                            unsigned source)
+{
+   unsigned off[3], w[3];
+   agx_apple9_mma_src_layout(ins->immediate, off, w);
+   for (unsigned k = 0; k < 3; ++k) {
+      if (w[k] && source == off[k])
+         return w[k];
+   }
+   return 1;
+}
+
+static inline enum agx_apple9_operand_role
+agx_apple9_mma_source_role(const struct agx_apple9_vir_instr *ins,
+                           unsigned source)
+{
+   unsigned off[3], w[3];
+   agx_apple9_mma_src_layout(ins->immediate, off, w);
+   if (source < off[1])
+      return AGX_APPLE9_OPERAND_SRC0;
+   if (source < off[2])
+      return AGX_APPLE9_OPERAND_SRC1;
+   return AGX_APPLE9_OPERAND_SRC2;
+}
+
+uint32_t agx_apple9_vir_emit_mma(struct agx_apple9_vir_program *program,
+                                 const uint32_t *src_a,
+                                 const uint32_t *src_b,
+                                 const uint32_t *src_c,
+                                 uint32_t flags);
 
 /* Native single-instruction ALU unlocks. */
 uint32_t agx_apple9_vir_emit_iadd_sat(struct agx_apple9_vir_program *program,

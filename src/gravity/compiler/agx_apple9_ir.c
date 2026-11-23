@@ -1903,6 +1903,67 @@ agx_apple9_vir_emit_subgroup_rotate_imm(struct agx_apple9_vir_program *program,
    return dst;
 }
 
+static bool
+apple9_mma_flags_valid(uint32_t flags)
+{
+   if (flags & ~0x1ffu)
+      return false;
+   enum agx_apple9_mma_type ty_a = agx_apple9_mma_src_type(flags, 0);
+   enum agx_apple9_mma_type ty_b = agx_apple9_mma_src_type(flags, 1);
+   enum agx_apple9_mma_type ty_c = agx_apple9_mma_src_type(flags, 2);
+   enum agx_apple9_mma_type ty_dst = agx_apple9_mma_dst_type(flags);
+   bool has_c = agx_apple9_mma_has_c(flags);
+   if (ty_a > AGX_APPLE9_MMA_F32 || ty_b > AGX_APPLE9_MMA_F32 ||
+       ty_c > AGX_APPLE9_MMA_F32)
+      return false;
+   if (ty_dst == AGX_APPLE9_MMA_F32)
+      return true;
+   if (ty_dst == AGX_APPLE9_MMA_F16)
+      return ty_a == AGX_APPLE9_MMA_F16 && ty_b == AGX_APPLE9_MMA_F16 &&
+             (!has_c || ty_c == AGX_APPLE9_MMA_F16);
+   return false;
+}
+
+uint32_t
+agx_apple9_vir_emit_mma(struct agx_apple9_vir_program *program,
+                        const uint32_t *src_a, const uint32_t *src_b,
+                        const uint32_t *src_c, uint32_t flags)
+{
+   if (!program || !src_a || !src_b || !apple9_mma_flags_valid(flags))
+      return AGX_APPLE9_VREG_INVALID;
+   bool has_c = agx_apple9_mma_has_c(flags);
+   if (has_c && !src_c)
+      return AGX_APPLE9_VREG_INVALID;
+
+   unsigned off[3], w[3];
+   unsigned nr_srcs = agx_apple9_mma_src_layout(flags, off, w);
+   uint32_t srcs[6];
+   const uint32_t *inputs[3] = {src_a, src_b, src_c};
+   for (unsigned k = 0; k < 3; ++k) {
+      for (unsigned c = 0; c < w[k]; ++c) {
+         if (inputs[k][c] >= program->value_count)
+            return AGX_APPLE9_VREG_INVALID;
+         srcs[off[k] + c] = inputs[k][c];
+      }
+   }
+
+   enum agx_apple9_mma_type ty_dst = agx_apple9_mma_dst_type(flags);
+   enum agx_apple9_encoding enc =
+      ty_dst == AGX_APPLE9_MMA_F32 ? AGX_APPLE9_ENC_MMA_F32
+                                   : AGX_APPLE9_ENC_MMA_F16;
+   uint32_t dst = agx_apple9_vir_emit(program, AGX_APPLE9_VIR_MMA, enc,
+                                      srcs, nr_srcs, flags);
+   if (dst == AGX_APPLE9_VREG_INVALID)
+      return dst;
+
+   if (ty_dst == AGX_APPLE9_MMA_F32) {
+      if (!apple9_vir_append_values(program, 1))
+         return AGX_APPLE9_VREG_INVALID;
+      program->instructions[program->instruction_count - 1]->dest_components = 2;
+   }
+   return dst;
+}
+
 uint32_t
 agx_apple9_vir_emit_iadd_sat(struct agx_apple9_vir_program *program,
                              uint32_t a, uint32_t b, bool is_sub,
@@ -3238,6 +3299,22 @@ encoding_tuple(const struct agx_apple9_vir_instr *instruction,
       return true;
    }
 
+   if (instruction->op == AGX_APPLE9_VIR_MMA) {
+      if (!apple9_mma_flags_valid(instruction->immediate) ||
+          instruction->dest == AGX_APPLE9_VREG_INVALID)
+         return false;
+      unsigned off[3], w[3];
+      unsigned expected = agx_apple9_mma_src_layout(instruction->immediate, off, w);
+      if (instruction->nr_srcs != expected)
+         return false;
+      gprs[0] = phys[instruction->dest];
+      gprs[1] = phys[instruction->src[off[0]]];
+      gprs[2] = phys[instruction->src[off[1]]];
+      gprs[3] = w[2] ? phys[instruction->src[off[2]]] : 0;
+      *count = 4;
+      return true;
+   }
+
    unsigned gpr_operand_count = 0;
    for (unsigned i = 0; i < info->operand_count; ++i)
       gpr_operand_count += !!(info->operands[i].files & AGX_APPLE9_FILE_GPR);
@@ -4157,6 +4234,75 @@ agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
          continue;
       }
 
+      if (instruction->op == AGX_APPLE9_VIR_MMA) {
+         if (!apple9_mma_flags_valid(instruction->immediate) ||
+             instruction->dest == AGX_APPLE9_VREG_INVALID) {
+            if (reason != NULL)
+               *reason = "Apple9 MMA has invalid flags or destination";
+            return false;
+         }
+         enum agx_apple9_mma_type ty_dst =
+            agx_apple9_mma_dst_type(instruction->immediate);
+         unsigned dst_comps = agx_apple9_mma_type_gprs(ty_dst);
+         enum agx_apple9_encoding expected_enc =
+            ty_dst == AGX_APPLE9_MMA_F32 ? AGX_APPLE9_ENC_MMA_F32
+                                         : AGX_APPLE9_ENC_MMA_F16;
+         unsigned off[3], w[3];
+         unsigned expected_srcs =
+            agx_apple9_mma_src_layout(instruction->immediate, off, w);
+         if (instruction->encoding != expected_enc ||
+             apple9_vir_dest_components(instruction) != dst_comps ||
+             instruction->nr_srcs != expected_srcs ||
+             dst_comps > program->value_count ||
+             instruction->dest > program->value_count - dst_comps) {
+            if (reason != NULL)
+               *reason = "Apple9 MMA violates its VIR contract";
+            return false;
+         }
+         unsigned dst_reg = program->phys[instruction->dest];
+         if (dst_reg + dst_comps > AGX_APPLE9_GPR_COUNT ||
+             (dst_comps == 2 &&
+              program->phys[instruction->dest + 1] != dst_reg + 1)) {
+            if (reason != NULL)
+               *reason = "Apple9 MMA destination is not a valid contiguous GPR tuple";
+            return false;
+         }
+         for (unsigned c = 0; c < dst_comps; ++c) {
+            unsigned maximum = program->max_phys[instruction->dest + c];
+            if (maximum != AGX_APPLE9_PHYS_INVALID &&
+                program->phys[instruction->dest + c] > maximum) {
+               if (reason != NULL)
+                  *reason = "Apple9 MMA destination violates register-class constraint";
+               return false;
+            }
+         }
+         for (unsigned k = 0; k < 3; ++k) {
+            if (!w[k])
+               continue;
+            unsigned base = program->phys[instruction->src[off[k]]];
+            if (base + w[k] > AGX_APPLE9_GPR_COUNT ||
+                (w[k] == 2 &&
+                 program->phys[instruction->src[off[k] + 1]] != base + 1)) {
+               if (reason != NULL)
+                  *reason = "Apple9 MMA source is not a valid contiguous GPR tuple";
+               return false;
+            }
+         }
+         unsigned tuple[AGX_APPLE9_MAX_ENCODING_OPERANDS] = {0};
+         unsigned tuple_count = 0;
+         struct agx_apple9_packed_instruction packed;
+         if (!encoding_tuple(instruction, program->phys, tuple, &tuple_count) ||
+             !agx_apple9_encoding_accepts_gpr_tuple(instruction->encoding, tuple,
+                                                    tuple_count, 32) ||
+             !agx_apple9_pack_vir_instruction(instruction, program->phys,
+                                              &packed, reason)) {
+            if (reason != NULL && *reason == NULL)
+               *reason = "Apple9 MMA violates an encoding constraint";
+            return false;
+         }
+         continue;
+      }
+
       const unsigned components = apple9_vir_dest_components(instruction);
       const unsigned max_components =
          instruction->op == AGX_APPLE9_VIR_PUBLICATION_TUPLE ? 16 :
@@ -4344,6 +4490,40 @@ apple9_propagate_source_register_classes(struct agx_apple9_vir_program *program,
       }
       if (instruction->encoding == AGX_APPLE9_ENC_PSEUDO)
          continue;
+
+      if (instruction->op == AGX_APPLE9_VIR_MMA) {
+         if (!apple9_mma_flags_valid(instruction->immediate) ||
+             instruction->dest == AGX_APPLE9_VREG_INVALID)
+            goto invalid;
+         enum agx_apple9_mma_type ty_dst =
+            agx_apple9_mma_dst_type(instruction->immediate);
+         unsigned dst_comps = agx_apple9_mma_type_gprs(ty_dst);
+         unsigned off[3], w[3];
+         unsigned expected_srcs =
+            agx_apple9_mma_src_layout(instruction->immediate, off, w);
+         if (instruction->nr_srcs != expected_srcs ||
+             instruction->dest + dst_comps > program->value_count)
+            goto invalid;
+         for (unsigned c = 0; c < dst_comps; ++c) {
+            uint8_t maximum = (uint8_t)(AGX_APPLE9_GPR_COUNT - dst_comps + c);
+            uint32_t value = instruction->dest + c;
+            if (program->max_phys[value] == AGX_APPLE9_PHYS_INVALID ||
+                maximum < program->max_phys[value])
+               program->max_phys[value] = maximum;
+         }
+         for (unsigned k = 0; k < 3; ++k) {
+            for (unsigned c = 0; c < w[k]; ++c) {
+               uint32_t value = instruction->src[off[k] + c];
+               if (value >= program->value_count)
+                  goto invalid;
+               uint8_t maximum = (uint8_t)(AGX_APPLE9_GPR_COUNT - w[k] + c);
+               if (program->max_phys[value] == AGX_APPLE9_PHYS_INVALID ||
+                   maximum < program->max_phys[value])
+                  program->max_phys[value] = maximum;
+            }
+         }
+         continue;
+      }
 
       if (instruction->op == AGX_APPLE9_VIR_DEVICE_STORE) {
          const unsigned gprs = agx_apple9_mem_data_gprs(instruction);
@@ -4965,6 +5145,33 @@ apple9_collect_memory_source_tuples(struct agx_apple9_vir_program *program,
 {
    for (unsigned i = 0; i < program->instruction_count; ++i) {
       struct agx_apple9_vir_instr *store = program->instructions[i];
+      if (store->op == AGX_APPLE9_VIR_MMA) {
+         unsigned off[3], w[3];
+         agx_apple9_mma_src_layout(store->immediate, off, w);
+         for (unsigned k = 0; k < 3; ++k) {
+            if (w[k] < 2 ||
+                apple9_vir_values_form_tuple(program, store->src + off[k], w[k]))
+               continue;
+            uint32_t sources[2] = {store->src[off[k]], store->src[off[k] + 1]};
+            const unsigned old_count = program->instruction_count;
+            const uint32_t tuple =
+               agx_apple9_vir_emit_collect(program, sources, 2);
+            if (tuple == AGX_APPLE9_VREG_INVALID) {
+               if (reason != NULL)
+                  *reason = "out of memory collecting Apple9 MMA source tuples";
+               return false;
+            }
+            struct agx_apple9_vir_instr *collect =
+               program->instructions[old_count];
+            agx_apple9_vir_move_before(program, collect, store);
+            agx_apple9_invalidate_uses(program);
+            store = program->instructions[i + 1];
+            store->src[off[k]] = tuple;
+            store->src[off[k] + 1] = tuple + 1;
+            ++i;
+         }
+         continue;
+      }
       const bool load_pointer =
          store->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_POINTER;
       const bool load_indirect =
@@ -8776,6 +8983,85 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
          (uint8_t)(imm ? 0x02 : 0x06),
          0x00,
       };
+      packed_init(packed, bytes, sizeof(bytes));
+      return true;
+   }
+   case AGX_APPLE9_VIR_MMA: {
+      if (!apple9_mma_flags_valid(instruction->immediate) ||
+          instruction->alu_src_uniform_mask ||
+          instruction->alu_src_immediate_mask ||
+          instruction->dest == AGX_APPLE9_VREG_INVALID)
+         return false;
+      enum agx_apple9_mma_type ty_a =
+         agx_apple9_mma_src_type(instruction->immediate, 0);
+      enum agx_apple9_mma_type ty_b =
+         agx_apple9_mma_src_type(instruction->immediate, 1);
+      enum agx_apple9_mma_type ty_c =
+         agx_apple9_mma_src_type(instruction->immediate, 2);
+      enum agx_apple9_mma_type ty_dst =
+         agx_apple9_mma_dst_type(instruction->immediate);
+      bool has_c = agx_apple9_mma_has_c(instruction->immediate);
+      unsigned dst_comps = agx_apple9_mma_type_gprs(ty_dst);
+      unsigned off[3], w[3];
+      unsigned expected_srcs =
+         agx_apple9_mma_src_layout(instruction->immediate, off, w);
+      if (instruction->nr_srcs != expected_srcs ||
+          apple9_vir_dest_components(instruction) != dst_comps)
+         return false;
+      unsigned dst = phys[instruction->dest];
+      unsigned src_a = phys[instruction->src[off[0]]];
+      unsigned src_b = phys[instruction->src[off[1]]];
+      unsigned src_c = has_c ? phys[instruction->src[off[2]]] : 0u;
+      if (dst + dst_comps > AGX_APPLE9_GPR_COUNT ||
+          src_a + w[0] > AGX_APPLE9_GPR_COUNT ||
+          src_b + w[1] > AGX_APPLE9_GPR_COUNT ||
+          (has_c && src_c + w[2] > AGX_APPLE9_GPR_COUNT))
+         return false;
+      if (dst_comps == 2 && phys[instruction->dest + 1] != dst + 1)
+         return false;
+      if (w[0] == 2 && phys[instruction->src[off[0] + 1]] != src_a + 1)
+         return false;
+      if (w[1] == 2 && phys[instruction->src[off[1] + 1]] != src_b + 1)
+         return false;
+      if (w[2] == 2 && phys[instruction->src[off[2] + 1]] != src_c + 1)
+         return false;
+
+      uint8_t bytes[12];
+      if (ty_dst == AGX_APPLE9_MMA_F32) {
+         if (instruction->encoding != AGX_APPLE9_ENC_MMA_F32)
+            return false;
+         uint8_t c_enc =
+            has_c ? (uint8_t)(((src_c & 0x55u) << 1) | ((src_c & 0xAAu) >> 1))
+                  : 0x00;
+         bytes[0]  = 0xCF;
+         bytes[1]  = 0x02;
+         bytes[2]  = 0x54;
+         bytes[3]  = (uint8_t)(dst & 0x7Fu);
+         bytes[4]  = 0x00;
+         bytes[5]  = (uint8_t)(((src_a & 0x3Fu) << 1) | ((src_a >> 6) & 1u));
+         bytes[6]  = (uint8_t)((src_b & 0x7Fu) << 1);
+         bytes[7]  = c_enc;
+         bytes[8]  = (uint8_t)(((unsigned)ty_a << 1) | ((unsigned)ty_b << 3) |
+                               ((unsigned)(has_c ? ty_c : AGX_APPLE9_MMA_F32) << 5));
+         bytes[9]  = 0x40;
+         bytes[10] = 0x24;
+         bytes[11] = has_c ? 0x01 : 0x00;
+      } else {
+         if (instruction->encoding != AGX_APPLE9_ENC_MMA_F16)
+            return false;
+         bytes[0]  = 0xCF;
+         bytes[1]  = 0x00;
+         bytes[2]  = 0x54;
+         bytes[3]  = (uint8_t)((dst & 0x7Fu) << 1);
+         bytes[4]  = 0x02;
+         bytes[5]  = (uint8_t)((src_a & 0x7Fu) << 1);
+         bytes[6]  = (uint8_t)((src_b & 0x7Fu) << 1);
+         bytes[7]  = has_c ? (uint8_t)((src_c & 0x7Fu) << 1) : 0x00;
+         bytes[8]  = 0x10;
+         bytes[9]  = 0x42;
+         bytes[10] = has_c ? 0x08 : 0x00;
+         bytes[11] = 0x00;
+      }
       packed_init(packed, bytes, sizeof(bytes));
       return true;
    }

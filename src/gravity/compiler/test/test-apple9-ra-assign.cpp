@@ -1339,3 +1339,103 @@ TEST_F(Apple9RaAssignTest, EvenGprAlignedUnpackNormAndImulWide)
       EXPECT_GT(packed.length, 0u);
    }
 }
+
+TEST_F(Apple9RaAssignTest, MmaTupleAllocationAndPacking)
+{
+   auto *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block_begin(&p, b0);
+
+   uint32_t a0 = emit_imm(0x3f800000u);
+   uint32_t a1 = emit_imm(0x40000000u);
+   uint32_t b0v = emit_imm(0x40400000u);
+   uint32_t b1v = emit_imm(0x40800000u);
+   uint32_t c0 = emit_imm(0x40a00000u);
+   uint32_t c1 = emit_imm(0x40c00000u);
+   uint32_t ha = emit_imm(0x3c003c00u);
+   uint32_t hb = emit_imm(0x40004000u);
+   uint32_t hc = emit_imm(0x42004200u);
+
+   uint32_t sa[2] = {a0, a1};
+   uint32_t sb[2] = {b0v, b1v};
+   uint32_t sc[2] = {c0, c1};
+   uint32_t d_f32 = agx_apple9_vir_emit_mma(
+      &p, sa, sb, sc,
+      agx_apple9_mma_flags(AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32,
+                           AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32, true));
+   ASSERT_NE(d_f32, AGX_APPLE9_VREG_INVALID);
+
+   uint32_t d_f32_pair[2] = {d_f32, d_f32 + 1};
+   uint32_t d_mix = agx_apple9_vir_emit_mma(
+      &p, &ha, &hb, d_f32_pair,
+      agx_apple9_mma_flags(AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16,
+                           AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32, true));
+   ASSERT_NE(d_mix, AGX_APPLE9_VREG_INVALID);
+
+   uint32_t d_f16 = agx_apple9_vir_emit_mma(
+      &p, &ha, &hb, &hc,
+      agx_apple9_mma_flags(AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16,
+                           AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16, true));
+   ASSERT_NE(d_f16, AGX_APPLE9_VREG_INVALID);
+
+   uint32_t s1 = emit_iadd(d_mix, d_mix + 1);
+   p.output = emit_iadd(s1, d_f16);
+   emit_halt();
+   cfg_init(&p, {b0});
+
+   auto opts = validated_opts();
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+   EXPECT_GT(verify_binary_emission(&p), 0u);
+}
+
+TEST_F(Apple9RaAssignTest, MmaForcedSpillAndPacking)
+{
+   auto *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block_begin(&p, b0);
+
+   /* 94 non-rematerializable values live across FP32 + FP16 MMA to force spills. */
+   agx_apple9_device_load_contract contract = {
+      .index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR,
+      .flags = 0,
+      .raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_1100,
+   };
+   uint32_t live[94];
+   for (unsigned i = 0; i < ARRAY_SIZE(live); ++i) {
+      uint32_t idx = emit_imm(i);
+      live[i] = agx_apple9_vir_emit_device_load(&p, 0, idx, &contract);
+      ASSERT_NE(live[i], AGX_APPLE9_VREG_INVALID);
+   }
+
+   uint32_t sa[2] = {live[0], live[1]};
+   uint32_t sb[2] = {live[2], live[3]};
+   uint32_t sc[2] = {live[4], live[5]};
+   uint32_t d_f32 = agx_apple9_vir_emit_mma(
+      &p, sa, sb, sc,
+      agx_apple9_mma_flags(AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32,
+                           AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32, true));
+   ASSERT_NE(d_f32, AGX_APPLE9_VREG_INVALID);
+
+   uint32_t d_f16 = agx_apple9_vir_emit_mma(
+      &p, &live[6], &live[7], &live[8],
+      agx_apple9_mma_flags(AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16,
+                           AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16, true));
+   ASSERT_NE(d_f16, AGX_APPLE9_VREG_INVALID);
+
+   uint32_t acc = emit_iadd(d_f32, d_f32 + 1);
+   acc = emit_iadd(acc, d_f16);
+   for (unsigned i = 0; i < ARRAY_SIZE(live); ++i)
+      acc = emit_iadd(acc, live[i]);
+   p.output = acc;
+   emit_halt();
+   cfg_init(&p, {b0});
+
+   auto opts = validated_opts();
+   opts.force_spill = true;
+   opts.max_gprs = 24;
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+   EXPECT_GT(p.scratch_size, 0u);
+   EXPECT_GT(verify_binary_emission(&p), 0u);
+}

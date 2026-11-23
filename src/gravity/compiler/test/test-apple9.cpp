@@ -17981,3 +17981,380 @@ TEST(Apple9Vir, ResolvePhiEdgeNativeCycleTreeAndErrors)
 
    agx_apple9_vir_finish(&program);
 }
+
+TEST(Apple9Vir, MmaGoldenEncodings)
+{
+   struct mma_case {
+      const char *name;
+      enum agx_apple9_mma_type ty_a, ty_b, ty_c, ty_dst;
+      bool has_c;
+      uint8_t dst, a, b, c;
+      enum agx_apple9_scoreboard_slot wait;
+      uint8_t metal[12];
+      uint8_t canonical[12];
+   };
+
+   /* All 13 representative vectors from SUMMARY.md §1.5.
+    * Metal vectors carry optional .cache / .discard / .q2 hint bits; canonical
+    * vectors are Gravity's exact zero-hint encodings (b2 issue group 0x54,
+    * cache=0, discard=0). */
+   const mma_case cases[] = {
+      {
+         "mma_f32_inplace",
+         AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32,
+         AGX_APPLE9_MMA_F32, true, 0, 0, 2, 4, AGX_APPLE9_SCOREBOARD_SLOT_6,
+         {0xCF, 0x02, 0x56, 0x00, 0x00, 0x00, 0x04, 0x08, 0xD4, 0x43, 0x24, 0x01},
+         {0xCF, 0x02, 0x56, 0x00, 0x00, 0x00, 0x04, 0x08, 0x54, 0x40, 0x24, 0x01},
+      },
+      {
+         "mul_f32",
+         AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32,
+         AGX_APPLE9_MMA_F32, false, 0, 0, 2, 0, AGX_APPLE9_SCOREBOARD_SLOT_6,
+         {0xCF, 0x02, 0x56, 0x00, 0x00, 0x00, 0x04, 0x00, 0xD4, 0x41, 0x24, 0x00},
+         {0xCF, 0x02, 0x56, 0x00, 0x00, 0x00, 0x04, 0x00, 0x54, 0x40, 0x24, 0x00},
+      },
+      {
+         "mma_f16_inplace",
+         AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16,
+         AGX_APPLE9_MMA_F16, true, 1, 1, 2, 3, AGX_APPLE9_SCOREBOARD_SLOT_6,
+         {0xCF, 0x00, 0x56, 0x02, 0x02, 0x02, 0x04, 0x06, 0x10, 0x62, 0x8C, 0x00},
+         {0xCF, 0x00, 0x56, 0x02, 0x02, 0x02, 0x04, 0x06, 0x10, 0x42, 0x08, 0x00},
+      },
+      {
+         "mul_f16",
+         AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16,
+         AGX_APPLE9_MMA_F16, false, 1, 1, 2, 0, AGX_APPLE9_SCOREBOARD_SLOT_6,
+         {0xCF, 0x00, 0x56, 0x02, 0x02, 0x02, 0x04, 0x00, 0x10, 0x62, 0x04, 0x00},
+         {0xCF, 0x00, 0x56, 0x02, 0x02, 0x02, 0x04, 0x00, 0x10, 0x42, 0x00, 0x00},
+      },
+      {
+         "mma_f16_f16_f32",
+         AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F32,
+         AGX_APPLE9_MMA_F32, true, 0, 5, 3, 0, AGX_APPLE9_SCOREBOARD_SLOT_6,
+         {0xCF, 0x02, 0x56, 0x00, 0x00, 0x0A, 0x06, 0x00, 0xCA, 0x43, 0x24, 0x01},
+         {0xCF, 0x02, 0x56, 0x00, 0x00, 0x0A, 0x06, 0x00, 0x4A, 0x40, 0x24, 0x01},
+      },
+      {
+         "mma_f16_f16_f16_to_f32",
+         AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16,
+         AGX_APPLE9_MMA_F32, true, 0, 0, 1, 5, AGX_APPLE9_SCOREBOARD_SLOT_6,
+         {0xCF, 0x02, 0x56, 0x00, 0x00, 0x00, 0x02, 0x0A, 0xAA, 0x43, 0x24, 0x01},
+         {0xCF, 0x02, 0x56, 0x00, 0x00, 0x00, 0x02, 0x0A, 0x2A, 0x40, 0x24, 0x01},
+      },
+      {
+         "bf16_bf16_f32",
+         AGX_APPLE9_MMA_BF16, AGX_APPLE9_MMA_BF16, AGX_APPLE9_MMA_F32,
+         AGX_APPLE9_MMA_F32, true, 0, 5, 3, 0, AGX_APPLE9_SCOREBOARD_SLOT_6,
+         {0xCF, 0x02, 0x56, 0x00, 0x00, 0x0A, 0x06, 0x00, 0xC0, 0x43, 0x24, 0x01},
+         {0xCF, 0x02, 0x56, 0x00, 0x00, 0x0A, 0x06, 0x00, 0x40, 0x40, 0x24, 0x01},
+      },
+      {
+         "bf16_bf16_bf16",
+         AGX_APPLE9_MMA_BF16, AGX_APPLE9_MMA_BF16, AGX_APPLE9_MMA_BF16,
+         AGX_APPLE9_MMA_F32, true, 0, 0, 1, 5, AGX_APPLE9_SCOREBOARD_SLOT_6,
+         {0xCF, 0x02, 0x56, 0x00, 0x01, 0x00, 0x02, 0x0A, 0x80, 0x43, 0x24, 0x01},
+         {0xCF, 0x02, 0x56, 0x00, 0x00, 0x00, 0x02, 0x0A, 0x00, 0x40, 0x24, 0x01},
+      },
+      {
+         "mid_reg_f32",
+         AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32,
+         AGX_APPLE9_MMA_F32, true, 45, 38, 36, 41, AGX_APPLE9_SCOREBOARD_SLOT_6,
+         {0xCF, 0x02, 0x56, 0x2D, 0x01, 0xCC, 0x49, 0x56, 0x54, 0x40, 0x24, 0x01},
+         {0xCF, 0x02, 0x56, 0x2D, 0x00, 0x4C, 0x48, 0x16, 0x54, 0x40, 0x24, 0x01},
+      },
+      {
+         "high_reg_all_f32",
+         AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32,
+         AGX_APPLE9_MMA_F32, true, 68, 72, 70, 74, AGX_APPLE9_SCOREBOARD_SLOT_1,
+         {0xCF, 0x12, 0x54, 0x44, 0x01, 0x91, 0x8D, 0xC5, 0x54, 0x40, 0x24, 0x01},
+         {0xCF, 0x12, 0x54, 0x44, 0x00, 0x11, 0x8C, 0x85, 0x54, 0x40, 0x24, 0x01},
+      },
+      {
+         "reg100_f32",
+         AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32,
+         AGX_APPLE9_MMA_F32, true, 88, 12, 10, 8, AGX_APPLE9_SCOREBOARD_SLOT_6,
+         {0xCF, 0x02, 0x66, 0x58, 0x00, 0x18, 0x14, 0x04, 0xD4, 0x43, 0x24, 0x01},
+         {0xCF, 0x02, 0x56, 0x58, 0x00, 0x18, 0x14, 0x04, 0x54, 0x40, 0x24, 0x01},
+      },
+      {
+         "reg100_f16",
+         AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16,
+         AGX_APPLE9_MMA_F16, true, 90, 94, 92, 90, AGX_APPLE9_SCOREBOARD_SLOT_2,
+         {0xCF, 0x20, 0x64, 0xB4, 0x02, 0xBC, 0xB8, 0xB4, 0x10, 0x62, 0x8C, 0x00},
+         {0xCF, 0x20, 0x54, 0xB4, 0x02, 0xBC, 0xB8, 0xB4, 0x10, 0x42, 0x08, 0x00},
+      },
+      {
+         "f16_c_cache",
+         AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16,
+         AGX_APPLE9_MMA_F16, true, 3, 1, 3, 2, AGX_APPLE9_SCOREBOARD_SLOT_6,
+         {0xCF, 0x00, 0x56, 0x06, 0x03, 0x02, 0x06, 0x04, 0x15, 0x42, 0x0C, 0x00},
+         {0xCF, 0x00, 0x56, 0x06, 0x02, 0x02, 0x06, 0x04, 0x10, 0x42, 0x08, 0x00},
+      },
+   };
+
+   /* Non-hint bit masks for comparing against Metal captures. */
+   const uint8_t cf02_mask[12] = {
+      0xFF, 0xFF, 0xCF, 0xFF, 0xFE, 0x7F, 0xFE, 0xBF, 0x7F, 0xFC, 0xFF, 0xFF,
+   };
+   const uint8_t cf00_mask[12] = {
+      0xFF, 0xFF, 0xCF, 0xFF, 0xFE, 0xFF, 0xFF, 0xFF, 0xF8, 0xDF, 0x7B, 0xFF,
+   };
+
+   for (const auto &tc : cases) {
+      uint32_t flags =
+         agx_apple9_mma_flags(tc.ty_a, tc.ty_b, tc.ty_c, tc.ty_dst, tc.has_c);
+      unsigned off[3], w[3];
+      unsigned nr_srcs = agx_apple9_mma_src_layout(flags, off, w);
+      unsigned wd = agx_apple9_mma_type_gprs(tc.ty_dst);
+
+      agx_apple9_vir_instr ins = {};
+      ins.op = AGX_APPLE9_VIR_MMA;
+      ins.encoding = tc.ty_dst == AGX_APPLE9_MMA_F32 ? AGX_APPLE9_ENC_MMA_F32
+                                                     : AGX_APPLE9_ENC_MMA_F16;
+      ins.immediate = flags;
+      ins.dest = 0;
+      ins.dest_components = wd;
+      ins.nr_srcs = nr_srcs;
+      ins.scoreboard_slot = tc.wait;
+
+      uint8_t phys[8] = {};
+      phys[0] = tc.dst;
+      if (wd == 2)
+         phys[1] = tc.dst + 1;
+      unsigned next_v = wd;
+      const uint8_t regs[3] = {tc.a, tc.b, tc.c};
+      for (unsigned k = 0; k < 3; ++k) {
+         for (unsigned c = 0; c < w[k]; ++c) {
+            ins.src[off[k] + c] = next_v;
+            phys[next_v++] = regs[k] + c;
+         }
+      }
+
+      agx_apple9_packed_instruction packed = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason))
+         << tc.name << ": " << (reason ? reason : "");
+      ASSERT_EQ(packed.length, 12u) << tc.name;
+      EXPECT_EQ(memcmp(packed.bytes, tc.canonical, 12), 0) << tc.name;
+
+      const uint8_t *mask =
+         tc.ty_dst == AGX_APPLE9_MMA_F32 ? cf02_mask : cf00_mask;
+      for (unsigned b = 0; b < 12; ++b) {
+         EXPECT_EQ(packed.bytes[b] & mask[b], tc.metal[b] & mask[b])
+            << tc.name << " byte " << b;
+      }
+   }
+
+   /* Verify all 6 scoreboard wait slots on both CF 02 and CF 00. */
+   const uint8_t exp_b1_wait[6] = {0x10, 0x20, 0x40, 0x80, 0x00, 0x00};
+   const uint8_t exp_b2_wait[6] = {0x00, 0x00, 0x00, 0x00, 0x01, 0x02};
+   for (unsigned s = 0; s < 6; ++s) {
+      agx_apple9_vir_instr ins = {};
+      ins.op = AGX_APPLE9_VIR_MMA;
+      ins.encoding = AGX_APPLE9_ENC_MMA_F16;
+      ins.immediate = agx_apple9_mma_flags(
+         AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16,
+         AGX_APPLE9_MMA_F16, true);
+      ins.dest = 0;
+      ins.dest_components = 1;
+      ins.nr_srcs = 3;
+      ins.src[0] = 1;
+      ins.src[1] = 2;
+      ins.src[2] = 3;
+      ins.scoreboard_slot = (enum agx_apple9_scoreboard_slot)(s + 1);
+      uint8_t phys[4] = {0, 1, 2, 3};
+      agx_apple9_packed_instruction packed = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason))
+         << (reason ? reason : "");
+      EXPECT_EQ(packed.bytes[1], exp_b1_wait[s]);
+      EXPECT_EQ(packed.bytes[2], (uint8_t)(0x54 | exp_b2_wait[s]));
+   }
+
+   /* Negative tests: non-contiguous 2-GPR source and out-of-range r95 FP32. */
+   {
+      agx_apple9_vir_instr ins = {};
+      ins.op = AGX_APPLE9_VIR_MMA;
+      ins.encoding = AGX_APPLE9_ENC_MMA_F32;
+      ins.immediate = agx_apple9_mma_flags(
+         AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32,
+         AGX_APPLE9_MMA_F32, true);
+      ins.dest = 0;
+      ins.dest_components = 2;
+      ins.nr_srcs = 6;
+      for (unsigned i = 0; i < 6; ++i)
+         ins.src[i] = 2 + i;
+      uint8_t bad_non_contig[8] = {0, 1, 2, 4, 6, 7, 8, 9};
+      agx_apple9_packed_instruction packed = {};
+      const char *reason = nullptr;
+      EXPECT_FALSE(
+         agx_apple9_pack_vir_instruction(&ins, bad_non_contig, &packed, &reason));
+
+      uint8_t bad_non_contig_dst[8] = {4, 7, 2, 3, 4, 5, 6, 7};
+      EXPECT_FALSE(
+         agx_apple9_pack_vir_instruction(&ins, bad_non_contig_dst, &packed, &reason));
+
+      uint8_t bad_r95[8] = {95, 96, 2, 3, 4, 5, 6, 7};
+      EXPECT_FALSE(
+         agx_apple9_pack_vir_instruction(&ins, bad_r95, &packed, &reason));
+   }
+}
+
+TEST(Apple9Vir, MmaSharedRaAllocation)
+{
+   nir_builder nir = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "mma_shared_ra");
+   nir_block logical = {};
+   agx_apple9_vir_program program;
+   agx_apple9_vir_init(&program);
+   auto *b0 = agx_apple9_block_create(&program);
+   ASSERT_NE(b0, nullptr);
+   b0->nir = &logical;
+   agx_apple9_block_begin(&program, b0);
+
+   auto emit_imm = [&](uint32_t v) {
+      return agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IMM,
+                                 AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, v);
+   };
+   uint32_t a0 = emit_imm(0x3f800000u);
+   uint32_t a1 = emit_imm(0x40000000u);
+   uint32_t b0v = emit_imm(0x40400000u);
+   uint32_t b1v = emit_imm(0x40800000u);
+   uint32_t c0 = emit_imm(0x40a00000u);
+   uint32_t c1 = emit_imm(0x40c00000u);
+   uint32_t h_a = emit_imm(0x3c003c00u);
+   uint32_t h_b = emit_imm(0x40004000u);
+   uint32_t h_c = emit_imm(0x42004200u);
+
+   uint32_t sa[2] = {a0, a1};
+   uint32_t sb[2] = {b0v, b1v};
+   uint32_t sc[2] = {c0, c1};
+   uint32_t d_f32 = agx_apple9_vir_emit_mma(
+      &program, sa, sb, sc,
+      agx_apple9_mma_flags(AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32,
+                           AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32, true));
+   ASSERT_NE(d_f32, AGX_APPLE9_VREG_INVALID);
+
+   /* Chained mixed F16*F16 + F32 -> F32 consuming previous FP32 tuple directly. */
+   uint32_t d_f32_pair[2] = {d_f32, d_f32 + 1};
+   uint32_t d_mix = agx_apple9_vir_emit_mma(
+      &program, &h_a, &h_b, d_f32_pair,
+      agx_apple9_mma_flags(AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16,
+                           AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32, true));
+   ASSERT_NE(d_mix, AGX_APPLE9_VREG_INVALID);
+
+   /* Pure FP16 CF 00 MMA. */
+   uint32_t d_f16 = agx_apple9_vir_emit_mma(
+      &program, &h_a, &h_b, &h_c,
+      agx_apple9_mma_flags(AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16,
+                           AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16, true));
+   ASSERT_NE(d_f16, AGX_APPLE9_VREG_INVALID);
+
+   uint32_t sum0_srcs[2] = {d_mix, d_mix + 1};
+   uint32_t sum0 = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IADD,
+                                       AGX_APPLE9_ENC_INT_ADD_EXTENDED,
+                                       sum0_srcs, 2, 0);
+   uint32_t sum1_srcs[2] = {sum0, d_f16};
+   uint32_t out_v = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IADD,
+                                        AGX_APPLE9_ENC_INT_ADD_EXTENDED,
+                                        sum1_srcs, 2, 0);
+   uint32_t idx = emit_imm(0);
+   ASSERT_TRUE(agx_apple9_vir_emit_device_store(&program, 0, idx, &out_v, 1, 32));
+
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_apple9_allocate_shared(&program, nir.shader, &reason))
+      << (reason ? reason : "");
+
+   unsigned mma_count = 0;
+   for (unsigned i = 0; i < program.instruction_count; ++i) {
+      agx_apple9_packed_instruction packed = {};
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(
+         program.instructions[i], program.phys, &packed, &reason))
+         << "insn " << i << ": " << (reason ? reason : "");
+      if (program.instructions[i]->op == AGX_APPLE9_VIR_MMA) {
+         EXPECT_EQ(packed.length, 12u);
+         EXPECT_EQ(packed.bytes[0], 0xCF);
+         ++mma_count;
+      }
+   }
+   EXPECT_EQ(mma_count, 3u);
+   agx_apple9_vir_finish(&program);
+   ralloc_free(nir.shader);
+}
+
+TEST(Apple9Vir, MmaSharedRaForcedSpill)
+{
+   nir_builder nir = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "mma_shared_ra_spill");
+   nir_block logical = {};
+   agx_apple9_vir_program program;
+   agx_apple9_vir_init(&program);
+   auto *b0 = agx_apple9_block_create(&program);
+   ASSERT_NE(b0, nullptr);
+   b0->nir = &logical;
+   agx_apple9_block_begin(&program, b0);
+
+   /* Load 94 independent non-rematerializable values to force spilling across MMA. */
+   agx_apple9_device_load_contract contract = {
+      .index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR,
+      .flags = 0,
+      .raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_1100,
+   };
+   uint32_t live[94];
+   for (unsigned i = 0; i < ARRAY_SIZE(live); ++i) {
+      uint32_t idx = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IMM,
+                                         AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, i);
+      live[i] = agx_apple9_vir_emit_device_load(&program, 0, idx, &contract);
+      ASSERT_NE(live[i], AGX_APPLE9_VREG_INVALID);
+   }
+
+   uint32_t sa[2] = {live[0], live[1]};
+   uint32_t sb[2] = {live[2], live[3]};
+   uint32_t sc[2] = {live[4], live[5]};
+   uint32_t d_f32 = agx_apple9_vir_emit_mma(
+      &program, sa, sb, sc,
+      agx_apple9_mma_flags(AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32,
+                           AGX_APPLE9_MMA_F32, AGX_APPLE9_MMA_F32, true));
+   ASSERT_NE(d_f32, AGX_APPLE9_VREG_INVALID);
+
+   uint32_t d_f16 = agx_apple9_vir_emit_mma(
+      &program, &live[6], &live[7], &live[8],
+      agx_apple9_mma_flags(AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16,
+                           AGX_APPLE9_MMA_F16, AGX_APPLE9_MMA_F16, true));
+   ASSERT_NE(d_f16, AGX_APPLE9_VREG_INVALID);
+
+   uint32_t acc_srcs[2] = {d_f32, d_f32 + 1};
+   uint32_t acc = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IADD,
+                                      AGX_APPLE9_ENC_INT_ADD_EXTENDED,
+                                      acc_srcs, 2, 0);
+   uint32_t f16_srcs[2] = {acc, d_f16};
+   acc = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IADD,
+                             AGX_APPLE9_ENC_INT_ADD_EXTENDED, f16_srcs, 2, 0);
+   for (unsigned i = 0; i < ARRAY_SIZE(live); ++i) {
+      uint32_t s[2] = {acc, live[i]};
+      acc = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IADD,
+                                AGX_APPLE9_ENC_INT_ADD_EXTENDED, s, 2, 0);
+   }
+   uint32_t out_idx = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IMM,
+                                          AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+   ASSERT_TRUE(agx_apple9_vir_emit_device_store(&program, 0, out_idx, &acc, 1, 32));
+
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_apple9_allocate_shared(&program, nir.shader, &reason))
+      << (reason ? reason : "");
+   EXPECT_GT(program.scratch_size, 0u);
+
+   unsigned mma_count = 0;
+   for (unsigned i = 0; i < program.instruction_count; ++i) {
+      agx_apple9_packed_instruction packed = {};
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(
+         program.instructions[i], program.phys, &packed, &reason))
+         << "insn " << i << ": " << (reason ? reason : "");
+      if (program.instructions[i]->op == AGX_APPLE9_VIR_MMA)
+         ++mma_count;
+   }
+   EXPECT_EQ(mma_count, 2u);
+   agx_apple9_vir_finish(&program);
+   ralloc_free(nir.shader);
+}
+

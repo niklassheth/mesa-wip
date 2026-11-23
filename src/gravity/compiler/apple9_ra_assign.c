@@ -209,6 +209,8 @@ a9_source_width(const struct agx_apple9_vir_instr *ins, unsigned source)
    if ((ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT && source == 1) ||
        (ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_POINTER && source == 0))
       return 2;
+   if (ins->op == AGX_APPLE9_VIR_MMA)
+      return agx_apple9_mma_source_width(ins, source);
    return 1;
 }
 
@@ -272,6 +274,10 @@ a9_find_source_constraint(const struct agx_apple9_vir_instr *ins,
                                                     : AGX_APPLE9_OPERAND_ATOMIC_DATA;
       return agx_apple9_find_operand(ins->encoding, role);
    }
+
+   if (ins->op == AGX_APPLE9_VIR_MMA)
+      return agx_apple9_find_operand(ins->encoding,
+                                     agx_apple9_mma_source_role(ins, source));
 
    const struct agx_apple9_encoding_info *info =
       agx_apple9_encoding_info(ins->encoding);

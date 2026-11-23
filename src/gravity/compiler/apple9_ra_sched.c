@@ -729,6 +729,7 @@ apple9_ra_schedule_resources(const struct agx_apple9_vir_instr *ins,
       return;
    case AGX_APPLE9_VIR_GET_GLOBAL_ID:
    case AGX_APPLE9_VIR_DERIVATIVE:
+   case AGX_APPLE9_VIR_MMA:
       return;
    case AGX_APPLE9_VIR_DEVICE_LOAD:
    case AGX_APPLE9_VIR_PRIVATE_LOAD:
@@ -825,6 +826,7 @@ apple9_ra_dependency_delay(const struct agx_apple9_vir_instr *ins)
    case AGX_APPLE9_VIR_SUBGROUP_REDUCE:
    case AGX_APPLE9_VIR_SUBGROUP_SHUFFLE:
    case AGX_APPLE9_VIR_SUBGROUP_ROTATE:
+   case AGX_APPLE9_VIR_MMA:
       return 4;
    default:
       return 1;
@@ -867,6 +869,10 @@ vir_source_constraint(const struct agx_apple9_vir_instr *ins, unsigned source)
                                                   : AGX_APPLE9_OPERAND_ATOMIC_DATA;
       return agx_apple9_find_operand(ins->encoding, role);
    }
+
+   if (ins->op == AGX_APPLE9_VIR_MMA)
+      return agx_apple9_find_operand(ins->encoding,
+                                     agx_apple9_mma_source_role(ins, source));
 
    const struct agx_apple9_encoding_info *info =
       agx_apple9_encoding_info(ins->encoding);
