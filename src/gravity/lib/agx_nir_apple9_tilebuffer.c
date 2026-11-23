@@ -85,6 +85,13 @@ agx_nir_apple9_tilebuffer(const nir_shader_compiler_options *options,
                      color = nir_vector_insert_imm(
                         &b, nir_format_linear_to_srgb(&b, color), alpha, 3);
                   }
+                  if (util_format_is_float(tile_format)) {
+                     if (util_format_is_unorm(format))
+                        color = nir_fsat(&b, color);
+                     else if (util_format_is_snorm(format))
+                        color = nir_fclamp(&b, color, nir_imm_float(&b, -1),
+                                           nir_imm_float(&b, 1));
+                  }
                } else if (key->samples > 1) {
                   color = nir_txf_ms(&b, coords, nir_imm_int(&b, sample),
                                      .texture_index = rt, .sampler_index = rt,

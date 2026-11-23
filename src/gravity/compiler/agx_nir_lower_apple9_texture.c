@@ -160,7 +160,7 @@ struct offset_sample {
    nir_def *coord, *offset, *comparator, *layer;
    nir_def *base_size[3];
    nir_def *wrap[3], *min, *mag, *mip, *compare, *min_lod, *max_lod, *bias,
-      *border;
+      *border, *custom_border, *shadow_border;
 };
 
 nir_def *
@@ -217,24 +217,30 @@ normalize_runtime_coordinates(nir_builder *b, nir_tex_instr *tex,
 }
 
 /* Explicit-LOD sample of tex's view and sampler outside the image on every
- * axis (keeping an array layer), as a 32-bit vec4. */
+ * axis (keeping an array layer), returning either a 32-bit vec4 border color
+ * or a scalar float32 shadow comparison against the custom border depth. */
 static nir_def *
-sample_border(nir_builder *b, nir_tex_instr *tex, nir_def *coord, unsigned dims)
+sample_border(nir_builder *b, nir_tex_instr *tex, nir_def *coord,
+              nir_def *comparator, unsigned dims)
 {
    static const nir_tex_src_type copied[] = {
       nir_tex_src_texture_deref, nir_tex_src_sampler_deref,
       nir_tex_src_texture_offset, nir_tex_src_sampler_offset,
       nir_tex_src_texture_handle, nir_tex_src_sampler_handle,
    };
-   unsigned count = 2;
+   unsigned count = 2 + (tex->is_shadow ? 1 : 0);
    for (unsigned i = 0; i < ARRAY_SIZE(copied); ++i)
       count += nir_tex_instr_src_index(tex, copied[i]) >= 0;
    nir_tex_instr *bt = nir_tex_instr_create(b->shader, count);
    bt->op = nir_texop_txl;
    bt->sampler_dim = tex->sampler_dim;
    bt->is_array = tex->is_array;
+   bt->is_shadow = tex->is_shadow;
+   bt->is_new_style_shadow = tex->is_shadow;
    bt->coord_components = coord->num_components;
-   bt->dest_type = nir_alu_type_get_base_type(tex->dest_type) | 32;
+   bt->dest_type = tex->is_shadow
+                      ? nir_type_float32
+                      : (nir_alu_type_get_base_type(tex->dest_type) | 32);
    bt->texture_index = tex->texture_index;
    bt->sampler_index = tex->sampler_index;
    bt->backend_flags = tex->backend_flags | AGX_APPLE9_TEXTURE_BIASED_LEVEL;
@@ -248,13 +254,17 @@ sample_border(nir_builder *b, nir_tex_instr *tex, nir_def *coord, unsigned dims)
       .src = nir_src_for_ssa(nir_vec(b, comps, coord->num_components))};
    bt->src[n++] = (nir_tex_src){.src_type = nir_tex_src_lod,
                                 .src = nir_src_for_ssa(nir_imm_float(b, 0))};
+   if (tex->is_shadow) {
+      bt->src[n++] = (nir_tex_src){.src_type = nir_tex_src_comparator,
+                                   .src = nir_src_for_ssa(comparator)};
+   }
    for (unsigned i = 0; i < ARRAY_SIZE(copied); ++i) {
       int src = nir_tex_instr_src_index(tex, copied[i]);
       if (src >= 0)
          bt->src[n++] = (nir_tex_src){.src_type = copied[i],
                                       .src = nir_src_for_ssa(tex->src[src].src.ssa)};
    }
-   nir_def_init(&bt->instr, &bt->def, 4, 32);
+   nir_def_init(&bt->instr, &bt->def, tex->is_shadow ? 1 : 4, 32);
    nir_builder_instr_insert(b, &bt->instr);
    return &bt->def;
 }
@@ -345,6 +355,9 @@ fetch(nir_builder *b, const struct offset_sample *s, nir_def *coord,
             compare_depth(b, s->comparator, nir_channel(b, value, 0), f),
             result);
    }
+   if (s->shadow_border && s->custom_border)
+      result = nir_bcsel(b, nir_iand(b, border, s->custom_border),
+                         s->shadow_border, result);
    if (!sparse)
       return result;
    return nir_vec2(b, result, nir_channel(b, value, color_comps));
@@ -691,6 +704,10 @@ agx_nir_lower_apple9_texture_offsets(nir_shader *nir,
                tex->src[nir_tex_instr_src_index(tex, nir_tex_src_coord)].src.ssa,
             .offset = offset >= 0 ? tex->src[offset].src.ssa : NULL};
          b.cursor = nir_before_instr(instr);
+         if (tex->is_shadow)
+            s.comparator =
+               tex->src[nir_tex_instr_src_index(tex, nir_tex_src_comparator)]
+                  .src.ssa;
          if (s.state) {
             for (unsigned c = 0; c < s.dims; ++c)
                s.wrap[c] = nir_imm_int(&b, s.state->wrap[c]);
@@ -742,13 +759,18 @@ agx_nir_lower_apple9_texture_offsets(nir_shader *nir,
             /* A custom border colour (preset 3) is known only to the native
              * sampler record, in the view's encoding. Take it from the
              * hardware: an explicit-LOD sample outside the image on every
-             * axis returns the swizzled border. */
-            if (!tex->is_shadow) {
-               nir_push_if(&b, nir_ieq_imm(&b, preset, 3));
-               nir_def *custom = sample_border(&b, tex, s.coord, s.dims);
-               nir_pop_if(&b, NULL);
+             * axis returns the swizzled border (or the native shadow depth
+             * comparison against the custom border depth for shadow gathers). */
+            s.custom_border = nir_ieq_imm(&b, preset, 3);
+            nir_def *shadow_default = tex->is_shadow ? nir_imm_float(&b, 0) : NULL;
+            nir_push_if(&b, s.custom_border);
+            nir_def *custom =
+               sample_border(&b, tex, s.coord, s.comparator, s.dims);
+            nir_pop_if(&b, NULL);
+            if (tex->is_shadow)
+               s.shadow_border = nir_if_phi(&b, custom, shadow_default);
+            else
                s.border = nir_if_phi(&b, custom, s.border);
-            }
          }
          for (unsigned c = 0; c < s.dims; ++c)
             s.base_size[c] = agx_apple9_texture_info(&b, tex, c);
@@ -761,10 +783,6 @@ agx_nir_lower_apple9_texture_offsets(nir_shader *nir,
                &b, s.layer, nir_imm_int(&b, 0),
                nir_iadd_imm(&b, agx_apple9_texture_info(&b, tex, 2), -1));
          }
-         if (tex->is_shadow)
-            s.comparator =
-               tex->src[nir_tex_instr_src_index(tex, nir_tex_src_comparator)]
-                  .src.ssa;
          if (is_gather) {
             nir_def_replace(&tex->def, gather(&b, &s));
             progress = true;

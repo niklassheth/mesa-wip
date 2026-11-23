@@ -191,8 +191,10 @@ agx_apple9_varying_slots(const struct agx_apple9_varying_layout *layout,
          while (m) {
             unsigned c = u_bit_scan(&m);
             if (idx < AGX_APPLE9_MAX_VARYING_COMPONENTS) {
-               locs[idx] = s;
-               comps[idx] = c;
+               if (locs)
+                  locs[idx] = s;
+               if (comps)
+                  comps[idx] = c;
             }
             ++idx;
          }

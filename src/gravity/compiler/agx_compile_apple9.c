@@ -60,8 +60,10 @@ static void
 apple9_emit(struct apple9_emitter *emitter, unsigned length,
             const uint8_t *encoded)
 {
-   memcpy(util_dynarray_grow_bytes(&emitter->bytes, 1, length), encoded,
-          length);
+   void *dst = util_dynarray_grow_bytes(&emitter->bytes, 1, length);
+   if (!dst)
+      return;
+   memcpy(dst, encoded, length);
    emitter->instructions++;
 }
 
@@ -2300,6 +2302,8 @@ apple9_lower_barycentric_weight(struct apple9_dag_lower *lower,
       position = apple9_interpolation_position(
          lower, intr,
          intr->intrinsic == nir_intrinsic_load_barycentric_coord_at_sample);
+      if (position == AGX_APPLE9_VREG_INVALID)
+         return AGX_APPLE9_VREG_INVALID;
    }
    return apple9_emit_interpolation(lower, coefficient, position, linear);
 }
@@ -7747,8 +7751,24 @@ agx_nir_hoist_apple9_derivative_sources(nir_shader *nir)
       return false;
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
-   nir_divergence_analysis(nir);
    nir_block *start = nir_start_block(impl);
+   bool has_cf_derivative = false;
+   nir_foreach_block(block, impl) {
+      if (block == start)
+         continue;
+      nir_foreach_instr(instr, block) {
+         if (apple9_derivative_operand(instr)) {
+            has_cf_derivative = true;
+            break;
+         }
+      }
+      if (has_cf_derivative)
+         break;
+   }
+   if (!has_cf_derivative)
+      return false;
+
+   nir_divergence_analysis(nir);
    bool progress = false;
 
    nir_foreach_block(block, impl) {
@@ -7925,6 +7945,9 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
             if (!nir_src_is_const(intr->src[0]) || nir_src_as_uint(intr->src[0]) >= 32) {
                *reason = "Apple9 block export requires a constant image binding";
+               util_dynarray_fini(&loads);
+               util_dynarray_fini(&stores);
+               util_dynarray_fini(&atomics);
                return false;
             }
             image_mask |= BITFIELD_BIT(nir_src_as_uint(intr->src[0]));
@@ -8192,6 +8215,10 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
       }
       if (lower.interlock && lower.tile_coords) {
          *reason = "Apple9 fragment interlock with tile coordinates is unsupported";
+         goto fail;
+      }
+      if (lower.tile_coords && writes) {
+         *reason = "Apple9 mixed tile-coordinate reads with tile writes is unsupported";
          goto fail;
       }
       if (tile_mode == APPLE9_TILE_PROLOG) {
@@ -9750,6 +9777,27 @@ apple9_compile_dag(nir_shader *nir, struct agx_shader_part *out,
                    const struct apple9_buffer_map *reserved_resources,
                    bool allow_preamble, const char **reason)
 {
+   bool has_tile_coords = false;
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      bool tile_writes = false;
+      nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            has_tile_coords |= op == nir_intrinsic_load_tile_pixel_agx;
+            tile_writes |= op == nir_intrinsic_store_local_pixel_agx;
+         }
+      }
+      if (has_tile_coords && tile_writes) {
+         *reason =
+            "Apple9 mixed tile-coordinate reads with tile writes is unsupported";
+         return false;
+      }
+      if (has_tile_coords)
+         allow_preamble = false;
+   }
+
    /* Preamble extraction runs divergence analysis, which requires generic
     * sink pointers to have been lowered to this driver's concrete addresses.
     * In particular, writes to the read-only zero page use the scratch page.
@@ -9763,7 +9811,7 @@ apple9_compile_dag(nir_shader *nir, struct agx_shader_part *out,
     * algebraic cleanup, so give it this backend's options: reordered
     * shifted-byte chains otherwise become pack_32_4x8, which Apple9 lacks.
     */
-   {
+   if (!has_tile_coords) {
       const nir_shader_compiler_options *saved = nir->options;
       nir_shader_compiler_options options = *saved;
       options.lower_pack_unorm_2x16 = false;
@@ -11853,6 +11901,13 @@ apple9_lower_color(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          } else
             dst = packed_format ? nir_format_unpack_rgba(b, packed_dst, format)
                                 : nir_vec(b, channels, 4);
+         if (util_format_is_float(tile_format)) {
+            if (util_format_is_unorm(format))
+               dst = nir_fsat(b, dst);
+            else if (util_format_is_snorm(format))
+               dst = nir_fclamp(b, dst, nir_imm_float(b, -1),
+                                nir_imm_float(b, 1));
+         }
          if (util_format_is_srgb(format))
             dst = nir_vector_insert_imm(b, nir_format_srgb_to_linear(b, dst),
                                        nir_channel(b, dst, 3), 3);
@@ -14833,7 +14888,9 @@ agx_apple9_patch_vs_varyings(
    uint8_t comps[AGX_APPLE9_MAX_VARYING_COMPONENTS];
    unsigned count =
       agx_apple9_varying_slots(&info->apple9_varyings, locs, comps);
-   if (count != info->apple9_varyings.count)
+   if (count != info->apple9_varyings.count ||
+       count > ARRAY_SIZE(locs) ||
+       info->apple9_vary_reloc_count > ARRAY_SIZE(info->apple9_vary_relocs))
       return false;
 
    uint8_t remap[AGX_APPLE9_MAX_VARYING_COMPONENTS];

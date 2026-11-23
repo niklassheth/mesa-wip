@@ -463,6 +463,10 @@ select_float_sources(struct agx_apple9_vir_instr *I,
       if (minmax && s == 0)
          continue;
       unsigned bit = 1u << s;
+      /* Do not fold FP32 sign/abs bit-masks onto a packed FP16 half source:
+       * bit 31 is not the sign bit of the low FP16 lane (bit 15). */
+      if (I->src_half_mask & bit)
+         continue;
       while (true) {
          const struct agx_apple9_vir_instr *producer = definitions[I->src[s]];
          if (!producer || !agx_apple9_instr_is_pure_alu(producer) ||
@@ -509,8 +513,9 @@ select_float_sources(struct agx_apple9_vir_instr *I,
       return;
 
    /* Inline constants use an exact minifloat. Preserve unrepresentable
-    * constants and modifiers which this six-byte form cannot express. */
-   if (I->nr_srcs == 2) {
+    * constants, half-selected sources, and modifiers which this six-byte form
+    * cannot express. */
+   if (I->nr_srcs == 2 && !I->src_half_mask) {
       for (int c = 1; c >= 0; --c) {
          unsigned other = 1 - c;
          if (!constant[I->src[c]] || (I->src_abs_mask & (1u << other)))
@@ -902,6 +907,10 @@ inline_alu_sources(struct agx_apple9_vir_instr *I, const uint16_t *uniform_read,
       if (filled & BITFIELD_BIT(s))
          continue;
       reg[s] = I->src[k++];
+      /* Packed half-register sources must remain in GPRs (uniform_mask &
+       * half_mask is illegal in Apple9 encodings). */
+      if (I->src_half_mask & BITFIELD_BIT(s))
+         continue;
       if (uniform_read[reg[s]]) {
          file[s] = AGX_APPLE9_FILE_UNIFORM;
          value[s] = uniform_read[reg[s]] - 1;
@@ -966,8 +975,9 @@ inline_alu_sources(struct agx_apple9_vir_instr *I, const uint16_t *uniform_read,
       return;
    }
    /* FMA's second multiplicand has a native alternative file selector.
-    * Commuting the product preserves its absolute/negate composition. */
-   if (fma && file[0] && !file[1]) {
+    * Commuting the product preserves its absolute/negate composition,
+    * provided neither multiplicand carries a half-register selection. */
+   if (fma && file[0] && !file[1] && !(I->src_half_mask & 3)) {
       uint32_t src = I->src[0];
       I->src[0] = I->src[1]; I->src[1] = src;
       file[1] = file[0]; value[1] = value[0];
@@ -1031,6 +1041,7 @@ fold_saturate(struct agx_apple9_vir_program *p, const uint32_t *replacement)
          ++epoch;
       }
       switch (I->op) {
+      case AGX_APPLE9_VIR_STORE_UNIFORM:
       case AGX_APPLE9_VIR_OBJECT_CALL:
       case AGX_APPLE9_VIR_OBJECT_RETURN:
       case AGX_APPLE9_VIR_OBJECT_RESUME:
@@ -1050,8 +1061,12 @@ fold_saturate(struct agx_apple9_vir_program *p, const uint32_t *replacement)
       bool eliminated = I->dest != AGX_APPLE9_VREG_INVALID &&
                         replacement[I->dest] != I->dest;
       if (!eliminated) {
-         for (unsigned s = 0; s < I->nr_srcs; ++s)
-            ++uses[I->src[s]];
+         unsigned nr_srcs = agx_apple9_vir_nr_srcs(I);
+         for (unsigned s = 0; s < nr_srcs; ++s) {
+            uint32_t v = agx_apple9_vir_src(I, s);
+            if (v < p->value_count)
+               ++uses[v];
+         }
       }
       for (unsigned c = 0; c < I->dest_components; ++c) {
          definitions[I->dest + c] = I;
@@ -1116,6 +1131,7 @@ fold_uniform_stores(struct agx_apple9_vir_program *p)
           store->immediate >= AGX_APPLE9_UNIFORM_COUNT ||
           alu->dest != store->src[0] ||
           alu->saturate || alu->src_sext_mask ||
+          alu->src_half_mask || alu->src_hi_mask ||
           agx_apple9_instr_block(alu) != agx_apple9_instr_block(store) ||
           alu->alu_src_uniform_mask || alu->alu_src_immediate_mask)
          continue;
@@ -1424,8 +1440,12 @@ agx_apple9_optimize_vir_with_constants(
          if (uniform_writes)
             memset(uniform_read, 0, p->value_count * sizeof(*uniform_read));
       }
-      for (unsigned s = 0; s < I->nr_srcs; ++s)
-         I->src[s] = resolve(replacement, I->src[s]);
+      unsigned nr_srcs = agx_apple9_vir_nr_srcs(I);
+      for (unsigned s = 0; s < nr_srcs; ++s) {
+         uint32_t *sp = agx_apple9_vir_src_ptr(I, s);
+         if (*sp < p->value_count)
+            *sp = resolve(replacement, *sp);
+      }
       switch (I->op) {
       case AGX_APPLE9_VIR_STORE_UNIFORM:
          /* Uniform reads are reusable only while their argument window is
@@ -1534,14 +1554,19 @@ agx_apple9_optimize_vir_with_constants(
     * Shared DCE removes the now-unused definitions before allocation. */
    for (unsigned i = 0; i < p->instruction_count; ++i) {
       struct agx_apple9_vir_instr *I = p->instructions[i];
-      for (unsigned s = 0; s < I->nr_srcs; ++s)
-         I->src[s] = resolve(replacement, I->src[s]);
+      unsigned nr_srcs = agx_apple9_vir_nr_srcs(I);
+      for (unsigned s = 0; s < nr_srcs; ++s) {
+         uint32_t *sp = agx_apple9_vir_src_ptr(I, s);
+         if (*sp < p->value_count)
+            *sp = resolve(replacement, *sp);
+      }
    }
    for (unsigned i = 0; i < p->live_out_count; ++i)
       p->live_out[i] = resolve(replacement, p->live_out[i]);
    if (p->output != AGX_APPLE9_VREG_INVALID)
       p->output = resolve(replacement, p->output);
-   success = fold_saturate(p, replacement) && fold_uniform_stores(p) &&
+   success = fold_saturate(p, replacement) &&
+             (!uniform_writes || fold_uniform_stores(p)) &&
              fold_half_sources(p, constants);
 
 cleanup:

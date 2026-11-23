@@ -69,7 +69,8 @@ agx_nir_lower_frag_sidefx(nir_shader *s)
     * will predicate simple writes for us, but that fails with sample shading so
     * we do that in software too.
     */
-   NIR_PASS(_, s, nir_lower_helper_writes, s->info.fs.uses_sample_shading);
+   bool progress = false;
+   NIR_PASS(progress, s, nir_lower_helper_writes, s->info.fs.uses_sample_shading);
 
    bool writes_zs =
       s->info.outputs_written &
@@ -82,11 +83,11 @@ agx_nir_lower_frag_sidefx(nir_shader *s)
     * in. But this happens there to avoid it happening twice with a discard.
     */
    if (s->info.fs.early_fragment_tests)
-      return false;
+      return progress;
 
    /* If depth/stencil feedback is already used, we're done */
    if (writes_zs)
-      return false;
+      return progress;
 
    bool done = false;
    nir_shader_intrinsics_pass(s, pass, nir_metadata_control_flow, &done);

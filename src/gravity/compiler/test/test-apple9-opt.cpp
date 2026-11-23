@@ -1457,3 +1457,120 @@ TEST_F(Apple9Optimization, CseDeduplicatesIterAndCubeRespectingControlFlow)
    EXPECT_EQ(agx_apple9_definition(&p, sum_cf)->src[0], it_after);
    EXPECT_EQ(agx_apple9_definition(&p, sum_cf)->src[1], c1_after);
 }
+
+TEST_F(Apple9Optimization, FoldSaturateDoesNotCrossStoreUniform)
+{
+   /* P0-C2: x = FADD(v, u7); STORE_UNIFORM u7 = new; y = FSAT(x).
+    * fold_saturate must NOT move FADD past STORE_UNIFORM u7. */
+   auto v = agx_apple9_vir_input(&p, 0);
+   auto new_u = agx_apple9_vir_input(&p, 1);
+   auto u7 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+                                 AGX_APPLE9_ENC_UNIFORM_MOVE, nullptr, 0, 7);
+   uint32_t add_srcs[] = {v, u7};
+   auto x = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FADD,
+                                AGX_APPLE9_ENC_FLOAT2_COMPACT, add_srcs, 2, 0);
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_STORE_UNIFORM, AGX_APPLE9_ENC_STORE_UNIFORM, &new_u, 1,
+      7));
+   p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FSAT,
+                                  AGX_APPLE9_ENC_FLOAT2_IMMEDIATE_EXTENDED, &x,
+                                  1, 0);
+
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+   const auto *out_ins = agx_apple9_definition(&p, p.output);
+   ASSERT_NE(out_ins, nullptr);
+   /* Output must stay a separate clamping FADD_IMM(x, 0) rather than relocating
+    * FADD(v, u7) after STORE_UNIFORM u7! */
+   EXPECT_EQ(out_ins->op, AGX_APPLE9_VIR_FADD_IMM);
+   EXPECT_TRUE(out_ins->saturate);
+   EXPECT_EQ(out_ins->alu_src_uniform_mask, 0u);
+}
+
+TEST_F(Apple9Optimization, Fp32SignFoldDoesNotCorruptHalfSource)
+{
+   /* P0-C3: After pass 1 folds UNPACK_HALF into FADD (src_half_mask = 1),
+    * pass 2 (triggered by constants) must NOT fold IXOR 0x80000000 on the
+    * packed 32-bit word into src_neg_mask on the low FP16 half. */
+   auto raw = agx_apple9_vir_input(&p, 0);
+   auto other = agx_apple9_vir_input(&p, 1);
+   auto sign_mask = imm(0x80000000u);
+   uint32_t xor_srcs[] = {raw, sign_mask};
+   auto flipped = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IXOR,
+                                      AGX_APPLE9_ENC_LOGIC_EXTENDED, xor_srcs,
+                                      2, 0);
+   auto unpacked = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_UNPACK_HALF,
+                                       AGX_APPLE9_ENC_HALF_TO_FLOAT, &flipped,
+                                       1, 0);
+   uint32_t add_srcs[] = {unpacked, other};
+   p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FADD,
+                                  AGX_APPLE9_ENC_FLOAT2_COMPACT, add_srcs, 2,
+                                  0);
+
+   agx_apple9_uniform_constants constants = {};
+   constants.base = 4;
+   constants.count = 1;
+   constants.values[0] = 0x3f800000u;
+   ASSERT_TRUE(agx_apple9_optimize_vir_with_constants(&p, &constants));
+
+   const auto *add = agx_apple9_definition(&p, p.output);
+   ASSERT_NE(add, nullptr);
+   EXPECT_EQ(add->op, AGX_APPLE9_VIR_FADD);
+   EXPECT_EQ(add->src_half_mask, 1u);
+   EXPECT_EQ(add->src_neg_mask, 0u);
+   EXPECT_EQ(add->src[0], flipped);
+}
+
+TEST_F(Apple9Optimization, UniformInliningSkipsHalfSelectedSource)
+{
+   /* P0-C4: Constant uniform table must NOT inline a uniform into a slot that
+    * already has src_half_mask set (uniform_mask & half_mask is illegal). */
+   auto other = agx_apple9_vir_input(&p, 0);
+   auto packed_half = imm(0x3c003c00u);
+   auto unpacked = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_UNPACK_HALF,
+                                       AGX_APPLE9_ENC_HALF_TO_FLOAT,
+                                       &packed_half, 1, 0);
+   uint32_t add_srcs[] = {unpacked, other};
+   p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FADD,
+                                  AGX_APPLE9_ENC_FLOAT2_COMPACT, add_srcs, 2,
+                                  0);
+
+   agx_apple9_uniform_constants constants = {};
+   constants.base = 4;
+   constants.count = 1;
+   constants.values[0] = 0x3c003c00u;
+   ASSERT_TRUE(agx_apple9_optimize_vir_with_constants(&p, &constants));
+
+   const auto *add = agx_apple9_definition(&p, p.output);
+   ASSERT_NE(add, nullptr);
+   EXPECT_EQ(add->alu_src_uniform_mask & add->src_half_mask, 0u);
+   /* Also verify the resulting instruction actually packs cleanly. */
+   const char *reason = nullptr;
+   agx_apple9_packed_instruction packed = {};
+   std::vector<uint8_t> phys(p.value_count, 0);
+   for (unsigned v = 0; v < p.value_count; ++v)
+      phys[v] = (uint8_t)(v % 32);
+   EXPECT_TRUE(agx_apple9_pack_vir_instruction(add, phys.data(), &packed, &reason))
+      << (reason ?: "");
+}
+
+TEST_F(Apple9Optimization, FoldUniformStoresRejectsHalfAndHiMasks)
+{
+   /* P0-C5: fold_uniform_stores must NOT drop src_half_mask / src_hi_mask when
+    * fusing an integer ALU into STORE_UNIFORM. */
+   auto a = agx_apple9_vir_input(&p, 0);
+   auto b = agx_apple9_vir_input(&p, 1);
+   uint32_t srcs[] = {a, b};
+   auto sum = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IADD,
+                                  AGX_APPLE9_ENC_INT_ADD_EXTENDED, srcs, 2, 0);
+   auto *add = p.instructions[p.instruction_count - 1];
+   add->src_half_mask = 1;
+   add->src_hi_mask = 1;
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_STORE_UNIFORM, AGX_APPLE9_ENC_STORE_UNIFORM, &sum, 1,
+      4));
+   auto *store = p.instructions[p.instruction_count - 1];
+
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+   EXPECT_EQ(store->encoding, AGX_APPLE9_ENC_STORE_UNIFORM);
+   EXPECT_EQ(store->nr_srcs, 1u);
+}

@@ -419,6 +419,8 @@ agx_nir_lower_apple9_denorms(nir_shader *shader)
     * the provenance of floating results. Keep this independent of fast-math
     * permissions: removing an unobservable flush preserves even exact math. */
    struct set *flush = _mesa_pointer_set_create(NULL);
+   if (!flush)
+      return false;
    if (nir_is_denorm_flush_to_zero(shader->info.float_controls_execution_mode,
                                    32)) {
       BITSET_DECLARE(canonical_uniforms, AGX_APPLE9_UNIFORM_COUNT) = {0};

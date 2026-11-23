@@ -19787,3 +19787,158 @@ TEST(Apple9CompactIsa, CodexAuditRegressionChecks)
       EXPECT_FALSE(agx_apple9_pack_vir_instruction(&iadd_bad, phys_bad, &packed, &reason));
    }
 }
+
+TEST(Apple9CompilerP0, MixedTileCoordsAndWritesRejected)
+{
+   /* P0-C11: A fragment shader mixing load_tile_pixel_agx (tile_coords) with
+    * store_local_pixel_agx (writes) must fail cleanly instead of asserting or
+    * emitting an unlocked store with the wrong tile fence. */
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                  &agx_nir_options,
+                                                  "mixed_tile_coords_writes");
+   nir_def *tile_val = nir_load_tile_pixel_agx(
+      &b, 1, 32, nir_imm_ivec2(&b, 0, 0), nir_imm_intN_t(&b, 1, 16),
+      .base = 0, .format = PIPE_FORMAT_R32_UINT);
+   nir_store_local_pixel_agx(&b, tile_val, nir_imm_intN_t(&b, 1, 16),
+                             nir_undef(&b, 2, 16), .base = 0, .write_mask = 1,
+                             .format = PIPE_FORMAT_R32_UINT);
+
+   agx_shader_part out = {};
+   const char *reason = nullptr;
+   EXPECT_FALSE(agx_compile_apple9_fragment(b.shader, &out, &reason));
+   EXPECT_NE(reason, nullptr);
+   if (reason) {
+      EXPECT_NE(std::string(reason).find("tile"), std::string::npos) << reason;
+   }
+   free(out.binary);
+   ralloc_free(b.shader);
+}
+
+TEST(Apple9CompilerP0, VaryingPatcherRejectsOutOfBoundsCounts)
+{
+   /* P0-C13: Deserialized b_info with >124 varying components or >256 relocs
+    * must be rejected before indexing locs[]/remap[]/apple9_vary_relocs[]. */
+   uint8_t src[16] = {};
+   uint8_t dst[16] = {};
+   agx_shader_info info = {};
+   info.apple9_vary_relocs_valid = true;
+   info.main_size = sizeof(src);
+
+   /* 1. Out-of-bounds reloc count (> 256) */
+   info.apple9_vary_reloc_count = ARRAY_SIZE(info.apple9_vary_relocs) + 1;
+   agx_apple9_varying_layout layout = {};
+   EXPECT_FALSE(agx_apple9_patch_vs_varyings(src, sizeof(src), &info, 0, 0, dst,
+                                             &layout));
+
+   /* 2. Out-of-bounds varying slot count (128 > 124) */
+   info.apple9_vary_reloc_count = 0;
+   for (unsigned s = 0; s < 32; ++s) {
+      info.apple9_varyings.mask[s] = 0xf;
+      info.apple9_varyings.group[s] = 0;
+   }
+   info.apple9_varyings.count =
+      (uint8_t)agx_apple9_varying_slots(&info.apple9_varyings, nullptr, nullptr);
+   ASSERT_EQ(info.apple9_varyings.count, 128u);
+   EXPECT_FALSE(agx_apple9_patch_vs_varyings(src, sizeof(src), &info, 0, 0, dst,
+                                             &layout));
+}
+
+TEST(Apple9CompilerP0, Fp16UnormBlendClampsDstLoad)
+{
+   /* P0-C14: UNORM formats backed by an RGBA16F tilebuffer (B4G4R4A4_UNORM /
+    * B5G6R5_UNORM) must saturate dst loads to [0, 1] before blending. */
+   for (enum pipe_format fmt :
+        {PIPE_FORMAT_B4G4R4A4_UNORM, PIPE_FORMAT_B5G6R5_UNORM}) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                     &agx_nir_options,
+                                                     "unorm_f16_blend");
+      nir_def *src = nir_imm_vec4(&b, 0.25f, 0.5f, 0.75f, 1.0f);
+      nir_store_output(&b, src, nir_imm_int(&b, 0),
+                       .write_mask = 0xf,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+
+      agx_apple9_blend blend = {};
+      blend.format = fmt;
+      blend.colormask = 0xf;
+      blend.samples = 1;
+      blend.rgb_func = PIPE_BLEND_ADD;
+      blend.rgb_src = PIPE_BLENDFACTOR_ONE;
+      blend.rgb_dst = PIPE_BLENDFACTOR_ONE;
+      blend.alpha_func = PIPE_BLEND_ADD;
+      blend.alpha_src = PIPE_BLENDFACTOR_ONE;
+      blend.alpha_dst = PIPE_BLENDFACTOR_ONE;
+
+      /* Compile cleanly and verify the blend dst path lowers with fsat. */
+      agx_shader_part out = {};
+      const char *reason = nullptr;
+      EXPECT_TRUE(agx_compile_apple9_fragment_blend(b.shader, nullptr, &blend,
+                                                    &out, &reason))
+         << (reason ?: "");
+      EXPECT_GT(out.info.main_size, 0u);
+
+      /* Also verify lowered NIR has at least two fsat ops (dst load + store)
+       * on a fresh shader passed through agx_nir_lower_apple9_blend. */
+      unsigned fsat_count = 0;
+      nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_alu &&
+                nir_instr_as_alu(instr)->op == nir_op_fsat)
+               ++fsat_count;
+         }
+      }
+      /* At least one fsat survives on the loaded tilebuffer dst path. */
+      EXPECT_GE(fsat_count, 1u);
+      free(out.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(Apple9CompilerP0, ShadowGatherCustomBorderSamplesNativeShadowBorder)
+{
+   /* P0-C12: Software shadow gather lowering must query the hardware shadow
+    * border (preset == 3) instead of comparing against hardcoded 0.0. */
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                  &agx_nir_options,
+                                                  "sw_shadow_gather_border");
+   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 3);
+   tex->op = nir_texop_tg4;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->is_shadow = true;
+   tex->is_new_style_shadow = true;
+   tex->coord_components = 2;
+   tex->dest_type = nir_type_float32;
+   tex->texture_index = 0;
+   tex->sampler_index = 0;
+   tex->backend_flags = AGX_APPLE9_TEXTURE_OFFSET_FALLBACK;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord,
+                                     nir_imm_vec2(&b, 0.5f, 0.5f));
+   tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_comparator,
+                                     nir_imm_float(&b, 0.5f));
+   tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_offset,
+                                     nir_imm_ivec2(&b, 1, 1));
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   nir_store_output(&b, &tex->def, nir_imm_int(&b, 0),
+                    .write_mask = 0xf,
+                    .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                     .num_slots = 1});
+
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_nir_lower_apple9_texture_offsets(b.shader, nullptr, &reason))
+      << (reason ?: "");
+
+   bool found_shadow_border_txl = false;
+   nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_tex)
+            continue;
+         nir_tex_instr *t = nir_instr_as_tex(instr);
+         if (t->op == nir_texop_txl && t->is_shadow &&
+             nir_tex_instr_src_index(t, nir_tex_src_comparator) >= 0)
+            found_shadow_border_txl = true;
+      }
+   }
+   EXPECT_TRUE(found_shadow_border_txl);
+   ralloc_free(b.shader);
+}

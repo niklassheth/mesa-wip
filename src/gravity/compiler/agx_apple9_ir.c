@@ -391,10 +391,9 @@ agx_apple9_instr_prev(const struct agx_apple9_vir_instr *instr)
    return &prev->instruction;
 }
 
-void
-agx_apple9_vir_reindex(struct agx_apple9_vir_program *program)
+static void
+apple9_vir_refresh_index(struct agx_apple9_vir_program *program)
 {
-   agx_apple9_invalidate_uses(program);
    unsigned count = 0, index = 0;
    for (struct agx_apple9_block *block = program->blocks; block; block = block->next) {
       block->index = index++;
@@ -405,6 +404,13 @@ agx_apple9_vir_reindex(struct agx_apple9_vir_program *program)
       }
    }
    assert(count == program->instruction_count);
+}
+
+void
+agx_apple9_vir_reindex(struct agx_apple9_vir_program *program)
+{
+   agx_apple9_invalidate_uses(program);
+   apple9_vir_refresh_index(program);
 }
 
 void
@@ -1187,7 +1193,8 @@ agx_apple9_vir_emit_coefficients(struct agx_apple9_vir_program *program,
    if (base == AGX_APPLE9_VREG_INVALID)
       return base;
    if (!apple9_vir_append_values(program, 2)) {
-      --program->instruction_count;
+      agx_apple9_vir_remove(program,
+                            program->instructions[program->instruction_count - 1]);
       program->value_count = base;
       return AGX_APPLE9_VREG_INVALID;
    }
@@ -1254,8 +1261,12 @@ agx_apple9_vir_emit_cube(struct agx_apple9_vir_program *program,
    if (value == AGX_APPLE9_VREG_INVALID)
       return value;
    if (mode == 0) {
-      if (!apple9_vir_append_values(program, 1))
+      if (!apple9_vir_append_values(program, 1)) {
+         agx_apple9_vir_remove(
+            program, program->instructions[program->instruction_count - 1]);
+         program->value_count = value;
          return AGX_APPLE9_VREG_INVALID;
+      }
       program->instructions[program->instruction_count - 1]->dest_components = 2;
    }
    return value;
@@ -1267,8 +1278,14 @@ agx_apple9_vir_emit_unpack_norm(struct agx_apple9_vir_program *program,
 {
    uint32_t value = agx_apple9_vir_emit(program, AGX_APPLE9_VIR_UNPACK_NORM,
                                        AGX_APPLE9_ENC_UNPACK_NORM, &src, 1, mode);
-   if (value == AGX_APPLE9_VREG_INVALID || !apple9_vir_append_values(program, 1))
+   if (value == AGX_APPLE9_VREG_INVALID)
       return AGX_APPLE9_VREG_INVALID;
+   if (!apple9_vir_append_values(program, 1)) {
+      agx_apple9_vir_remove(
+         program, program->instructions[program->instruction_count - 1]);
+      program->value_count = value;
+      return AGX_APPLE9_VREG_INVALID;
+   }
    program->instructions[program->instruction_count - 1]->dest_components = 2;
    return value;
 }
@@ -1280,9 +1297,14 @@ agx_apple9_vir_emit_mul_wide(struct agx_apple9_vir_program *program,
    uint32_t value = agx_apple9_vir_emit(
       program, AGX_APPLE9_VIR_IMUL_WIDE, AGX_APPLE9_ENC_INT_MUL_WIDE,
       src, 2, is_signed);
-   if (value == AGX_APPLE9_VREG_INVALID ||
-       !apple9_vir_append_values(program, 1))
+   if (value == AGX_APPLE9_VREG_INVALID)
       return AGX_APPLE9_VREG_INVALID;
+   if (!apple9_vir_append_values(program, 1)) {
+      agx_apple9_vir_remove(
+         program, program->instructions[program->instruction_count - 1]);
+      program->value_count = value;
+      return AGX_APPLE9_VREG_INVALID;
+   }
    program->instructions[program->instruction_count - 1]->dest_components = 2;
    return value;
 }
@@ -1301,7 +1323,8 @@ agx_apple9_vir_emit_device_load_vector(
       return value;
 
    if (!apple9_vir_append_values(program, components - 1)) {
-      --program->instruction_count;
+      agx_apple9_vir_remove(
+         program, program->instructions[program->instruction_count - 1]);
       program->value_count = value;
       return AGX_APPLE9_VREG_INVALID;
    }
@@ -1327,7 +1350,8 @@ agx_apple9_vir_emit_device_load_vector_u16(
       return value;
 
    if (gprs > 1 && !apple9_vir_append_values(program, gprs - 1)) {
-      --program->instruction_count;
+      agx_apple9_vir_remove(
+         program, program->instructions[program->instruction_count - 1]);
       program->value_count = value;
       return AGX_APPLE9_VREG_INVALID;
    }
@@ -3431,7 +3455,7 @@ agx_apple9_analyze_uses(struct agx_apple9_vir_program *program)
 {
    if (program->use_analysis && program->use_analysis->valid)
       return true;
-   agx_apple9_vir_reindex(program);
+   apple9_vir_refresh_index(program);
    struct agx_apple9_use_analysis *a = calloc(1, sizeof(*a));
    if (!a)
       return false;
@@ -3870,6 +3894,12 @@ agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
    for (unsigned i = 0; i < program->instruction_count; ++i) {
       const struct agx_apple9_vir_instr *instruction =
          program->instructions[i];
+      if (instruction->encoding != AGX_APPLE9_ENC_PSEUDO &&
+          instruction->encoding >= AGX_APPLE9_ENC_COUNT) {
+         if (reason != NULL)
+            *reason = "Apple9 instruction has an out-of-range encoding";
+         return false;
+      }
       const enum agx_apple9_dependency_layout dependency_layout =
          instruction->encoding == AGX_APPLE9_ENC_PSEUDO
             ? AGX_APPLE9_DEPENDENCY_NONE
@@ -3980,6 +4010,13 @@ agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
             instruction->encoding == AGX_APPLE9_ENC_DEVICE_ATOMIC_INDIRECT;
          const bool compare_exchange =
             instruction->atomic_op == AGX_APPLE9_ATOMIC_CMPXCHG;
+         if ((instruction->encoding != AGX_APPLE9_ENC_DEVICE_ATOMIC && !indirect) ||
+             components != (compare_exchange ? 2u : 1u) ||
+             instruction->nr_srcs != components + (indirect ? 3u : 1u)) {
+            if (reason != NULL)
+               *reason = "Apple9 device atomic has an invalid VIR contract";
+            return false;
+         }
          const unsigned data = program->phys[instruction->src[0]];
          bool adjacent = true;
          for (unsigned c = 1; c < components; ++c)
@@ -3994,10 +4031,7 @@ agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
                     instruction->producer_scoreboard_slot <=
                        AGX_APPLE9_SCOREBOARD_SLOT_6;
          const bool valid =
-            (instruction->encoding == AGX_APPLE9_ENC_DEVICE_ATOMIC || indirect) &&
             instruction->memory_bits == 32 &&
-            components == (compare_exchange ? 2 : 1) &&
-            instruction->nr_srcs == components + (indirect ? 3 : 1) &&
             (instruction->atomic_discard
                 ? instruction->dest == AGX_APPLE9_VREG_INVALID
                 : instruction->dest < program->value_count) &&
@@ -8448,6 +8482,10 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       }
       break;
    case AGX_APPLE9_VIR_GET_GLOBAL_ID:
+      if (instruction->encoding != AGX_APPLE9_ENC_GET_SR ||
+          instruction->nr_srcs != 0 ||
+          instruction->dest == AGX_APPLE9_VREG_INVALID)
+         break;
       return agx_apple9_pack_get_global_id(phys[instruction->dest],
                                            instruction->immediate, packed);
    case AGX_APPLE9_VIR_GET_SR:
@@ -8516,7 +8554,10 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
                     AGX_APPLE9_DEVICE_LOAD_INDEX_LAST_USE_GPR) ||
                 (instruction->encoding != AGX_APPLE9_ENC_DEVICE_LOAD &&
                  instruction->encoding != AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT) ||
-                (instruction->nr_srcs != 1 && instruction->nr_srcs != 3)))
+                instruction->nr_srcs !=
+                   (instruction->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT
+                       ? 3u
+                       : 1u)))
          break;
       unsigned index = pointer ? 0 : phys[instruction->src[0]];
 
@@ -10568,6 +10609,13 @@ agx_apple9_pack_vir_instruction(const struct agx_apple9_vir_instr *instruction,
        !int_add_sat) {
       if (reason)
          *reason = "Apple9 operation has no supported saturation modifier";
+      return false;
+   }
+
+   if (instruction->encoding != AGX_APPLE9_ENC_PSEUDO &&
+       instruction->encoding >= AGX_APPLE9_ENC_COUNT) {
+      if (reason != NULL)
+         *reason = "Apple9 instruction has an out-of-range encoding";
       return false;
    }
 
