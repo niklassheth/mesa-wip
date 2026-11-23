@@ -3,6 +3,8 @@
 #include "gravity/compiler/agx_compile_apple9.h"
 #include "compiler/nir/nir_builder.h"
 #include "poly/nir/poly_nir.h"
+#include "../hk_apple9_polygon_points.h"
+#include "../hk_cmd_buffer.h"
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%u: %s\n", __LINE__, #c); return 1; } } while (0)
 
@@ -60,6 +62,166 @@ geometry_outputs(void)
    return 0;
 }
 
+static nir_def *
+pp_forbid_load(nir_builder *b, void *data, unsigned vertex, unsigned location,
+               unsigned offset, unsigned component, unsigned comps,
+               nir_alu_type type)
+{
+   unsigned *calls = data;
+   (*calls)++;
+   return nir_imm_zero(b, comps, 32);
+}
+
+static nir_def *
+pp_const_pos_load(nir_builder *b, void *data, unsigned vertex,
+                  unsigned location, unsigned offset, unsigned component,
+                  unsigned comps, nir_alu_type type)
+{
+   unsigned *calls = data;
+   (*calls)++;
+   if (location == VARYING_SLOT_POS)
+      return nir_imm_vec4(b, vertex == 1 ? 1.0f : 0.0f,
+                          vertex == 2 ? 1.0f : 0.0f, 0.5f, 1.0f);
+   return nir_imm_zero(b, comps, 32);
+}
+
+static int
+polygon_points_no_position(void)
+{
+   unsigned output_comps[VARYING_SLOT_MAX] = {0};
+   output_comps[VARYING_SLOT_POS] = 4;
+   output_comps[VARYING_SLOT_VAR0] = 4;
+
+   /* Case 1: GS polygon-points lowering (only == NULL) without VARYING_BIT_POS.
+    * Must not invoke load (even for POS or clip/cull distances), must leave
+    * valid NIR, and must lower cleanly through poly_nir_lower_gs with 0 emitted
+    * vertices. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_GEOMETRY, &agx_nir_options, "gs_pp_no_pos");
+      b.shader->info.gs.input_primitive = MESA_PRIM_TRIANGLES;
+      b.shader->info.gs.output_primitive = MESA_PRIM_POINTS;
+      b.shader->info.gs.vertices_in = 3;
+      b.shader->info.gs.vertices_out = 1;
+      b.shader->info.gs.invocations = 1;
+      b.shader->info.gs.active_stream_mask = 1;
+      b.shader->info.io_lowered = true;
+
+      struct hk_pp_info pp_info = {
+         .clip = 2,
+         .cull = 1,
+         .outputs = VARYING_BIT_VAR(0),
+         .output_components = output_comps,
+         .face_slot = VARYING_SLOT_FOGC,
+      };
+      unsigned loads = 0;
+      hk_apple9_pp_emit_triangle(&b, &pp_info, pp_forbid_load, &loads,
+                                 nir_imm_int(&b, 0), nir_imm_int(&b, 0), NULL);
+      CHECK(loads == 0);
+      nir_validate_shader(b.shader, "gs_pp_no_pos");
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      CHECK(b.shader->info.outputs_written == 0);
+
+      nir_shader *count = NULL, *rast = NULL, *pre = NULL;
+      struct poly_gs_info gs_info = {0};
+      CHECK(poly_nir_lower_gs(b.shader, &count, &rast, &pre, &gs_info));
+      CHECK(gs_info.max_indices == 0);
+      CHECK(rast && rast->info.stage == MESA_SHADER_VERTEX);
+      ralloc_free(count);
+      ralloc_free(rast);
+      ralloc_free(pre);
+      ralloc_free(b.shader);
+   }
+
+   /* Case 2: Vertex/mesh single-point emission (only != NULL) without
+    * VARYING_BIT_POS emits a behind-the-eye POS without calling load. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "vs_pp_no_pos");
+      b.shader->info.io_lowered = true;
+
+      struct hk_pp_info pp_info = {
+         .outputs = VARYING_BIT_VAR(0),
+         .output_components = output_comps,
+         .face_slot = VARYING_SLOT_FOGC,
+      };
+      unsigned loads = 0;
+      hk_apple9_pp_emit_triangle(&b, &pp_info, pp_forbid_load, &loads,
+                                 nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                                 nir_imm_int(&b, 0));
+      CHECK(loads == 0);
+      nir_validate_shader(b.shader, "vs_pp_no_pos");
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      CHECK(b.shader->info.outputs_written == VARYING_BIT_POS);
+      CHECK(output_components(b.shader) == 4);
+      ralloc_free(b.shader);
+   }
+
+   /* Case 3: With VARYING_BIT_POS set, normal triangle point emission loads
+    * POS for all three vertices and emits output points. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_GEOMETRY, &agx_nir_options, "gs_pp_with_pos");
+      b.shader->info.gs.input_primitive = MESA_PRIM_TRIANGLES;
+      b.shader->info.gs.output_primitive = MESA_PRIM_POINTS;
+      b.shader->info.gs.vertices_in = 3;
+      b.shader->info.gs.vertices_out = HK_PP_MAX_VERTICES;
+      b.shader->info.gs.invocations = 1;
+      b.shader->info.gs.active_stream_mask = 1;
+      b.shader->info.io_lowered = true;
+
+      struct hk_pp_info pp_info = {
+         .outputs = VARYING_BIT_POS,
+         .output_components = output_comps,
+         .face_slot = VARYING_SLOT_FOGC,
+      };
+      unsigned loads = 0;
+      hk_apple9_pp_emit_triangle(&b, &pp_info, pp_const_pos_load, &loads,
+                                 nir_imm_int(&b, 0), nir_imm_int(&b, 0), NULL);
+      CHECK(loads == 3);
+      nir_validate_shader(b.shader, "gs_pp_with_pos");
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      CHECK(b.shader->info.outputs_written & VARYING_BIT_POS);
+      CHECK(b.shader->info.outputs_written & VARYING_BIT_FOGC);
+      ralloc_free(b.shader);
+   }
+
+   /* Case 4: hk_apple9_select_gs keeps the original application GS (preserving
+    * geometry-primitives query accounting) when rasterizer discard is enabled
+    * or when the polygon-points variant emits 0 indices (e.g. no_position GS).
+    */
+   {
+      size_t sz = sizeof(struct hk_api_shader) +
+                  HK_GS_VARIANTS * sizeof(struct hk_shader);
+      struct hk_api_shader *gs = calloc(1, sz);
+      struct hk_api_shader *pp_gs = calloc(1, sz);
+      CHECK(gs && pp_gs);
+      gs->variants[HK_GS_VARIANT_MAIN].info.gs.max_indices = 3;
+      pp_gs->variants[HK_GS_VARIANT_MAIN].info.gs.max_indices = 3;
+      gs->apple9_gs_polygon_points = pp_gs;
+
+      struct hk_cmd_buffer cmd = {0};
+      cmd.vk.dynamic_graphics_state.rs.polygon_mode = VK_POLYGON_MODE_POINT;
+      cmd.vk.dynamic_graphics_state.rs.rasterizer_discard_enable = false;
+      CHECK(hk_apple9_select_gs(&cmd, gs) == pp_gs);
+
+      /* Rasterizer discard keeps original GS so primitive queries stay exact. */
+      cmd.vk.dynamic_graphics_state.rs.rasterizer_discard_enable = true;
+      CHECK(hk_apple9_select_gs(&cmd, gs) == gs);
+
+      /* Zero-vertex polygon-points variant (no_position) keeps original GS. */
+      cmd.vk.dynamic_graphics_state.rs.rasterizer_discard_enable = false;
+      pp_gs->variants[HK_GS_VARIANT_MAIN].info.gs.max_indices = 0;
+      CHECK(hk_apple9_select_gs(&cmd, gs) == gs);
+
+      free(pp_gs);
+      free(gs);
+   }
+
+   puts("Polygon points no_position lowering: PASS");
+   return 0;
+}
+
 /* A full API interface plus the default point-size output inserted by TES
  * lowering needs 129 publications. Keep the native limit until there is an
  * overflow path; compute-based pre-rasterization alone cannot raise it.
@@ -68,6 +230,7 @@ int main(void)
 {
    glsl_type_singleton_init_or_ref();
    CHECK(geometry_outputs() == 0);
+   CHECK(polygon_points_no_position() == 0);
    const unsigned counts[] = {116, 122, 123, 124};
    for (unsigned t = 0; t < ARRAY_SIZE(counts); ++t) {
       unsigned users = counts[t];

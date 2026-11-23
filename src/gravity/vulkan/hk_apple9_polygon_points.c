@@ -50,6 +50,20 @@ hk_apple9_pp_emit_triangle(nir_builder *b, const struct hk_pp_info *info,
                            hk_pp_load_fn load, void *data, nir_def *provoking,
                            nir_def *prim, nir_def *only)
 {
+   /* Shaders that omit VARYING_SLOT_POS (for example no_position shader
+    * objects, or linked GS variants whose upstream position was DCE'd) have
+    * no clip-space geometry to rasterize and may not allocate a POS slot in
+    * their load callback. */
+   if (!(info->outputs & VARYING_BIT_POS)) {
+      if (only) {
+         nir_store_output(b, nir_imm_vec4(b, 0.0, 0.0, 0.0, -1.0),
+                          nir_imm_int(b, 0), .src_type = nir_type_float32,
+                          .io_semantics = {.location = VARYING_SLOT_POS,
+                                           .num_slots = 1});
+      }
+      return;
+   }
+
    unsigned clip = info->clip, cull = info->cull;
    nir_def *pos[3];
    nir_def *dist[3][16];

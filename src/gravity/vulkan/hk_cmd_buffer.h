@@ -1038,6 +1038,8 @@ hk_apple9_select_gs(const struct hk_cmd_buffer *cmd,
 {
    if (gs && gs->apple9_gs_polygon_points &&
        cmd->vk.dynamic_graphics_state.rs.polygon_mode == VK_POLYGON_MODE_POINT &&
+       !cmd->vk.dynamic_graphics_state.rs.rasterizer_discard_enable &&
+       gs->apple9_gs_polygon_points->variants[HK_GS_VARIANT_MAIN].info.gs.max_indices > 0 &&
        !gs->variants[HK_GS_VARIANT_MAIN].info.gs.xfb)
       return gs->apple9_gs_polygon_points;
    return gs;

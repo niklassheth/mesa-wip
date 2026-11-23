@@ -654,6 +654,7 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
        dyn->ia.primitive_topology ==
           VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY);
    bool stipple_gs =
+      !dyn->rs.rasterizer_discard_enable &&
       dyn->rs.line.stipple.enable &&
       u_reduced_prim(in_prim) == MESA_PRIM_LINES;
 
@@ -661,6 +662,7 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
     * polygon stage, see hk_apple9_polygon_point_gs. */
    struct hk_device *dev_check = hk_cmd_buffer_device(cmd);
    bool polygon_points =
+      !dyn->rs.rasterizer_discard_enable &&
       (!fs_stipple || fs_stipple == hk_only_variant(dev_check->null_fs) ||
        fs_stipple->info.fs.polygon_points) &&
       dyn->rs.polygon_mode == VK_POLYGON_MODE_POINT &&
@@ -684,9 +686,13 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    /* Determine if we need a geometry shader to emulate XFB or adjacency */
    struct hk_shader *last_sw = hk_bound_sw_vs_before_gs(gfx);
    uint32_t xfb_outputs = last_sw->info.xfb_info.output_count;
+   /* Software polygon points and line stipple compute clip-space / window
+    * geometry from VARYING_SLOT_POS; skip them when the producer omits it. */
+   bool has_pos = (last_sw->b.info.outputs & VARYING_BIT_POS) != 0;
    /* Captured vertices are the polygon's, not points: transform feedback
     * keeps the hardware polygon mode. */
-   polygon_points &= !xfb_outputs;
+   polygon_points &= !xfb_outputs && has_pos;
+   stipple_gs &= has_pos;
    /* A per-vertex cull mask is the primitive's only for points. */
    bool cull_mask = last_sw->info.cull_mask;
    /* Each reason for a passthrough GS, also counted under HK_CPU_TIMING. */
