@@ -719,16 +719,15 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxImageDimensionCube = 16384,
       .maxImageArrayLayers = 2048,
       .maxTexelBufferElements = AGX_TEXTURE_BUFFER_MAX_SIZE,
-      .maxUniformBufferRange = 65536,
 
-      /* From a hardware perspective, storage buffers are lowered to global
-       * address arithmetic so there is no hard limit. However, making efficient
-       * use of the hardware addressing modes depends on no signed wrapping in
-       * any `amul` operations, which are themselves bounded by
-       * maxStorageBufferRange. Therefore, limit storage buffers to INT32_MAX
-       * bytes instead of UINT32_MAX. This is believed to be acceptable for
-       * Direct3D.
+      /* Uniform and storage buffers both lower through hk_buffer_address to
+       * global address arithmetic, so there is no 64 KiB hardware UBO limit.
+       * Making efficient use of hardware addressing modes depends on no signed
+       * wrapping in any `amul` operations, which are bounded by the buffer
+       * range. Limit both UBOs and SSBOs to INT32_MAX bytes instead of
+       * UINT32_MAX. This is believed to be acceptable for Direct3D.
        */
+      .maxUniformBufferRange = INT32_MAX,
       .maxStorageBufferRange = INT32_MAX,
       .maxPushConstantsSize = HK_MAX_PUSH_SIZE,
       .maxMemoryAllocationCount = 4096,
@@ -779,7 +778,9 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxComputeSharedMemorySize = HK_MAX_SHARED_SIZE,
       .maxComputeWorkGroupCount = {0x7fffffff, 65535, 65535},
       .maxComputeWorkGroupInvocations = 1024,
-      .maxComputeWorkGroupSize = {1024, 1024, 64},
+      /* Apple9 CDM encodes all three local axes symmetrically and enforces
+       * only the total workgroup product (x * y * z <= 1024). */
+      .maxComputeWorkGroupSize = {1024, 1024, 1024},
       .subPixelPrecisionBits = 8,
       .subTexelPrecisionBits = 8,
       .mipmapPrecisionBits = 8,
@@ -931,9 +932,9 @@ hk_get_device_properties(const struct agx_device *dev,
       .minSubgroupSize = 32,
       .maxSubgroupSize = 32,
       .maxComputeWorkgroupSubgroups = 1024 / 32,
-      /* Apple9 executes fixed 32-lane subgroups, including explicitly
-       * required size 32 in compute pipelines. */
-      .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
+      /* Apple9 executes fixed 32-lane subgroups across every stage. */
+      .requiredSubgroupSizeStages =
+         VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_ALL_GRAPHICS,
       .maxInlineUniformBlockSize = HK_MAX_INLINE_UNIFORM_BLOCK_SIZE,
       .maxPerStageDescriptorInlineUniformBlocks = 32,
       .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 32,
@@ -1808,7 +1809,7 @@ hk_apple9_restrict_caps(struct vk_device_extension_table *ext,
       VK_SUBGROUP_FEATURE_QUAD_BIT | VK_SUBGROUP_FEATURE_ROTATE_BIT |
       VK_SUBGROUP_FEATURE_ROTATE_CLUSTERED_BIT;
    props->subgroupQuadOperationsInAllStages = true;
-   props->requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT;
+   props->requiredSubgroupSizeStages = props->subgroupSupportedStages;
 
    props->maxComputeSharedMemorySize = AGX_APPLE9_MAX_SHARED_BYTES;
 
@@ -1818,20 +1819,22 @@ hk_apple9_restrict_caps(struct vk_device_extension_table *ext,
    props->resolveSrgbFormatAppliesTransferFunction = true;
    props->resolveSrgbFormatSupportsTransferFunctionControl = true;
 
-   /* VK_EXT_mesh_shader */
+   /* VK_EXT_mesh_shader: emulated task/mesh stages run on the compute path
+    * up to the full 1024-thread workgroup limit (native paths independently
+    * check their qualified thread counts). */
    props->maxTaskWorkGroupTotalCount = 1 << 22;
    for (unsigned i = 0; i < 3; ++i) {
       props->maxTaskWorkGroupCount[i] = 65535;
-      props->maxTaskWorkGroupSize[i] = 128;
+      props->maxTaskWorkGroupSize[i] = 1024;
       props->maxMeshWorkGroupCount[i] = 65535;
-      props->maxMeshWorkGroupSize[i] = 128;
+      props->maxMeshWorkGroupSize[i] = 1024;
    }
-   props->maxTaskWorkGroupInvocations = 128;
+   props->maxTaskWorkGroupInvocations = 1024;
    props->maxTaskPayloadSize = 16384;
    props->maxTaskSharedMemorySize = AGX_APPLE9_MAX_SHARED_BYTES;
    props->maxTaskPayloadAndSharedMemorySize = AGX_APPLE9_MAX_SHARED_BYTES;
    props->maxMeshWorkGroupTotalCount = 1 << 22;
-   props->maxMeshWorkGroupInvocations = 128;
+   props->maxMeshWorkGroupInvocations = 1024;
    props->maxMeshSharedMemorySize = AGX_APPLE9_MAX_SHARED_BYTES;
    props->maxMeshPayloadAndSharedMemorySize = AGX_APPLE9_MAX_SHARED_BYTES;
    props->maxMeshOutputMemorySize = 32768;
@@ -1914,6 +1917,8 @@ hk_apple9_restrict_caps(struct vk_device_extension_table *ext,
     * Qualified on G16; retain the existing exposure on older generations.
     */
    props->transformFeedbackDraw = true;
+   /* Direct compute CDM encodes total threads (groupCount * local_size) in
+    * 32 bits; keep X at 65535 so 65535 * 1024 cannot overflow uint32_t. */
    props->maxComputeWorkGroupCount[0] = 65535;
 
    /* The native 4x tile layout supports 64 bytes per pixel. Four RGBA32
