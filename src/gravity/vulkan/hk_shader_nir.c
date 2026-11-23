@@ -2398,13 +2398,15 @@ hk_apple9_can_native_store(const nir_builder *b, const nir_intrinsic_instr *intr
 }
 
 static nir_def *
-hk_apple9_native_write_ok(nir_builder *b, nir_def *desc_handle)
+hk_apple9_native_write_ok(nir_builder *b, nir_def *desc_handle, bool require_read)
 {
    nir_def *flags = nir_load_global_constant(b, 1, 32,
       nir_iadd_imm(b, nir_load_from_texture_handle_agx(b, desc_handle),
                    offsetof(struct hk_apple9_storage_descriptor, native_ok)),
       .align_mul = 4);
-   return nir_ine_imm(b, nir_iand_imm(b, flags, HK_APPLE9_STORAGE_WRITE_VALID), 0);
+   const uint32_t mask = HK_APPLE9_STORAGE_WRITE_VALID |
+                         (require_read ? HK_APPLE9_STORAGE_READ_VALID : 0);
+   return nir_ieq_imm(b, nir_iand_imm(b, flags, mask), mask);
 }
 
 /* Compute software storage bounds check (used only on SW fallback paths). */
@@ -2614,10 +2616,14 @@ hk_apple9_lower_formatless_storage(nir_builder *b, nir_intrinsic_instr *intr,
 
    bool native = !load && hk_apple9_can_native_store(b, intr, lower->native_stores);
    /* Inline 2D/2D-array PBE covers all 1D/2D/cube views unconditionally; only
-    * 3D (mipmapped compressed block-texel views), internal shaders, and
-    * sparse-buffer descriptor-buffer texel buffers need a runtime check. */
+    * 3D (mipmapped compressed block-texel views), internal shaders,
+    * sparse-buffer descriptor-buffer texel buffers, and fenced RW stores
+    * (which must fall back to global stores whenever the view's reads stay
+    * global, e.g. padded 2D block-texel aliases with READ_VALID == 0) need a
+    * runtime check. */
+   bool require_read = lower->fence_stores && dim != GLSL_SAMPLER_DIM_BUF;
    bool checked = dim == GLSL_SAMPLER_DIM_BUF ? lower->checked_buf
-                  : dim == GLSL_SAMPLER_DIM_3D || lower->checked;
+                  : dim == GLSL_SAMPLER_DIM_3D || lower->checked || require_read;
    bool native_array = array || cube || dim == GLSL_SAMPLER_DIM_3D;
    bool check_sparse = load && !route && (sparse || lower->sparse_images) &&
                        dim != GLSL_SAMPLER_DIM_BUF && dim != GLSL_SAMPLER_DIM_MS;
@@ -2688,7 +2694,7 @@ hk_apple9_lower_formatless_storage(nir_builder *b, nir_intrinsic_instr *intr,
    /* Fast path 3: checked native IMAGE_WRITE — branchless HW OOB on the uniform
     * HK_APPLE9_STORAGE_WRITE_VALID path; bounds check & SW encode only on fallback. */
    if (native) {
-      nir_def *ok = hk_apple9_native_write_ok(b, tex);
+      nir_def *ok = hk_apple9_native_write_ok(b, tex, require_read);
       nir_push_if(b, ok);
       if (dim == GLSL_SAMPLER_DIM_BUF)
          hk_apple9_native_buffer_store(b, intr, pbe_addr, nir_channel(b, coord, 0),
@@ -3042,7 +3048,8 @@ hk_apple9_lower_storage_image(nir_builder *b, nir_intrinsic_instr *intr,
    bool can_tex = load && ((route && dim != GLSL_SAMPLER_DIM_BUF) || check_sparse);
    bool native = !load && hk_apple9_can_native_store(b, intr, lower->native_stores);
    bool native_array = array || cube || dim == GLSL_SAMPLER_DIM_3D;
-   bool checked = native_array || lower->checked;
+   bool require_read = lower->fence_stores && dim != GLSL_SAMPLER_DIM_BUF;
+   bool checked = native_array || lower->checked || require_read;
 
    /* Fast path 1: unchecked native IMAGE_WRITE — completely branchless HW OOB. */
    if (native && !checked) {
@@ -3099,7 +3106,7 @@ hk_apple9_lower_storage_image(nir_builder *b, nir_intrinsic_instr *intr,
    /* Fast path 3: checked native IMAGE_WRITE — branchless HW OOB on the uniform
     * WRITE_VALID path; bounds check and global pack live only on fallback. */
    if (native) {
-      nir_def *ok = hk_apple9_native_write_ok(b, tex);
+      nir_def *ok = hk_apple9_native_write_ok(b, tex, require_read);
       nir_push_if(b, ok);
       hk_apple9_native_store(b, intr, nir_load_from_texture_handle_agx(b, pbe),
                               coord, native_array, lower->fence_stores);

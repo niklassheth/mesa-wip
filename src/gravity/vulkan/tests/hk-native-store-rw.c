@@ -64,6 +64,7 @@ struct nir_stats {
    unsigned txf_inside_nested_if;
    unsigned umin_ffff;
    unsigned global_stores;
+   unsigned rw_valid_checks;
 };
 
 static void
@@ -119,6 +120,14 @@ collect_cf_stats(struct exec_list *cf_list, unsigned if_depth,
                      if (nir_src_is_const(alu->src[s].src) &&
                          nir_src_as_uint(alu->src[s].src) == 0xffffu)
                         st->umin_ffff++;
+                  }
+               } else if (alu->op == nir_op_iand) {
+                  const uint32_t rw_mask = HK_APPLE9_STORAGE_WRITE_VALID |
+                                           HK_APPLE9_STORAGE_READ_VALID;
+                  for (unsigned s = 0; s < 2; ++s) {
+                     if (nir_src_is_const(alu->src[s].src) &&
+                         nir_src_as_uint(alu->src[s].src) == rw_mask)
+                        st->rw_valid_checks++;
                   }
                }
             }
@@ -572,6 +581,24 @@ test_branchless_storage_and_tbuf(void)
       struct nir_stats st = gather_stats(nir);
       CHECK(st.native_stores == 1 && st.native_store_16bit == 1);
       CHECK(st.ifs == 0);
+      CHECK(compile_lowered_compute(nir) == 0);
+      ralloc_free(nir);
+   }
+
+   /* 11. Fenced RW compute 2D stores (typed & formatless) must require BOTH
+    *     WRITE_VALID and READ_VALID so views whose reads stay global (e.g.
+    *     padded 2D block-texel aliases with READ_VALID == 0) fall back to
+    *     coherent global stores rather than mixing PBE writes with L1 loads. */
+   for (unsigned i = 0; i < ARRAY_SIZE(fmts); ++i) {
+      nir_shader *nir = build_storage_shader(MESA_SHADER_COMPUTE,
+                                             GLSL_SAMPLER_DIM_2D, false,
+                                             fmts[i], true, true);
+      hk_lower_nir(dev, nir, &rs, false, 1, img_sets, 0);
+      struct nir_stats st = gather_stats(nir);
+      CHECK(st.native_stores == 1);
+      CHECK(st.fence_image_write == 1 && st.fence_tex_invalidate == 1);
+      CHECK(st.rw_valid_checks >= 1);
+      CHECK(st.global_stores >= 2); /* fallback image store + final result store */
       CHECK(compile_lowered_compute(nir) == 0);
       ralloc_free(nir);
    }
