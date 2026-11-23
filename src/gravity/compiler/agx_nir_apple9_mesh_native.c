@@ -521,7 +521,7 @@ varying_layout(const struct agx_apple9_mesh_body_info *info,
  * and plane, so the output planes keep matching the PPP output count. */
 struct cull_storage {
    unsigned clip, cull, base;
-   bool failed;
+   bool keep_outputs, failed;
 };
 
 static bool
@@ -568,10 +568,12 @@ move_cull_distance(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_store_shared(b, nir_channel(b, intr->src[0].ssa, c), offset,
                        .base = st->base, .align_mul = 4);
    }
-   if (mask & ~cull_mask)
-      nir_intrinsic_set_write_mask(intr, mask & ~cull_mask);
-   else
-      nir_instr_remove(&intr->instr);
+   if (!st->keep_outputs) {
+      if (mask & ~cull_mask)
+         nir_intrinsic_set_write_mask(intr, mask & ~cull_mask);
+      else
+         nir_instr_remove(&intr->instr);
+   }
    return true;
 }
 
@@ -767,6 +769,7 @@ agx_nir_lower_apple9_native_mesh(
       .clip = nir->info.clip_distance_array_size,
       .cull = nir->info.cull_distance_array_size,
       .base = ALIGN_POT(nir->info.shared_size, 4),
+      .keep_outputs = options && options->link_clip_distances,
    };
    if (cull.cull) {
       if (!packed_indices || cull.cull > 8 ||
@@ -799,8 +802,8 @@ agx_nir_lower_apple9_native_mesh(
       }
    }
    bool clip_linked = options && options->link_clip_distances &&
-                      nir->info.clip_distance_array_size;
-   if (clip_linked) {
+                      (nir->info.clip_distance_array_size || cull.cull);
+   if (clip_linked && nir->info.clip_distance_array_size) {
       if (nir->info.outputs_written &
           BITFIELD64_RANGE(AGX_APPLE9_CLIP_MIRROR_SLOT, 2))
          return fail(reason, "native mesh clip mirror slots are already written");

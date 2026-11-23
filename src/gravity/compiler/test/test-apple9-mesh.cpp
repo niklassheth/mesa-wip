@@ -2987,6 +2987,8 @@ TEST(Apple9MeshNativeExpand, ClipDistancePreservedAcrossCullPrimitiveAndSerializ
       {{64, 1, 1}, 4, 0, false, false},
       {{4, 4, 4}, 2, 2, true, false},
       {{128, 1, 1}, 2, 2, true, true},
+      {{32, 1, 1}, 0, 2, false, true},
+      {{32, 1, 1}, 3, 3, false, true},
    };
 
    for (const auto &c : cases) {
@@ -3021,9 +3023,17 @@ TEST(Apple9MeshNativeExpand, ClipDistancePreservedAcrossCullPrimitiveAndSerializ
       EXPECT_EQ(info.cull_primitive, c.cull_prim);
       EXPECT_EQ(info.clip_linked, c.link_clips);
       EXPECT_EQ(code.info.apple9_clip_distance_count, c.clips);
-      EXPECT_EQ(code.info.apple9_varyings.count, c.link_clips ? c.clips : 0u);
+      unsigned expected_varyings = c.link_clips ? (c.clips + c.culls) : 0u;
+      EXPECT_EQ(code.info.apple9_varyings.count, expected_varyings);
       EXPECT_EQ(info.layout.vertex_components,
-                4u + c.clips * (c.link_clips ? 2u : 1u));
+                4u + c.clips + expected_varyings);
+      if (c.link_clips) {
+         unsigned total = c.clips + c.culls;
+         EXPECT_EQ(code.info.apple9_varyings.mask[VARYING_SLOT_CLIP_DIST0],
+                   BITFIELD_MASK(MIN2(total, 4u)));
+         EXPECT_EQ(code.info.apple9_varyings.mask[VARYING_SLOT_CLIP_DIST1],
+                   total > 4 ? BITFIELD_MASK(total - 4u) : 0u);
+      }
       free(code.binary);
       ralloc_free(nir);
    }

@@ -305,6 +305,34 @@ main(int argc, char **argv)
          free(part.binary);
          ralloc_free(nir);
       }
+      /* A fragment shader reading gl_CullDistance (alone or mixed with
+       * gl_ClipDistance) links both as varyings while still evaluating cull
+       * distances from shared storage at completion. */
+      const unsigned linked_combos[][2] = {{0, 2}, {2, 2}, {3, 3}};
+      for (unsigned k = 0; k < ARRAY_SIZE(linked_combos); ++k) {
+         clip_distances = linked_combos[k][0];
+         cull_distances = linked_combos[k][1];
+         nir_shader *nir = source(32, 64, 126, false, false);
+         struct hk_apple9_graphics_key key = {.fs_reads_clip_distance = true};
+         struct agx_shader_part part = {0};
+         struct agx_apple9_mesh_body_info body;
+         const char *why = NULL;
+         bool ok = hk_apple9_compile_native_mesh_program(nir, &key, &part, &body, &why);
+         if (!ok) fprintf(stderr, "linked clip %u cull %u: %s\n", clip_distances, cull_distances, why);
+         CHECK(ok && body.clip_linked && body.clip_distances == clip_distances &&
+               body.cull_distances == cull_distances);
+         CHECK(part.info.apple9_varyings.count == clip_distances + cull_distances);
+         CHECK(body.layout.vertex_components == 4 + 2 * clip_distances + cull_distances);
+         CHECK(part.info.apple9_varyings.mask[VARYING_SLOT_CLIP_DIST0] ==
+               BITFIELD_MASK(MIN2(clip_distances + cull_distances, 4u)));
+         CHECK(part.info.apple9_varyings.mask[VARYING_SLOT_CLIP_DIST1] ==
+               (clip_distances + cull_distances > 4
+                   ? BITFIELD_MASK(clip_distances + cull_distances - 4u) : 0u));
+         CHECK(hk_apple9_native_shader_valid(&part.info, &body, HK_APPLE9_NATIVE_MESH));
+         free(part.binary);
+         ralloc_free(nir);
+      }
+      cull_distances = 0;
       /* Capability probing must reject dynamic clip slots before the mirror
        * pass reads an immediate. The ordinary IO validator handles this
        * unsupported shape, but runs after mirror construction. */
