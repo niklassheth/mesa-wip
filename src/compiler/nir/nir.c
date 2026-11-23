@@ -1435,7 +1435,9 @@ nir_instr_free_and_dce_is_live(nir_instr *instr)
    if (instr->type == nir_instr_type_intrinsic) {
       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
       const nir_intrinsic_info *info = &nir_intrinsic_infos[intr->intrinsic];
-      if (!(info->flags & NIR_INTRINSIC_CAN_ELIMINATE))
+      if (!(info->flags & NIR_INTRINSIC_CAN_ELIMINATE) ||
+          (nir_intrinsic_has_access(intr) &&
+           (nir_intrinsic_access(intr) & ACCESS_VOLATILE)))
          return true;
    }
 

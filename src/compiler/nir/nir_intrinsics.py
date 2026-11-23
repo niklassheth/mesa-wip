@@ -1801,6 +1801,14 @@ system_value("raw_vertex_offset", 1)
 intrinsic("cmat_muladd_pan", src_comp=[1, 1, 1], dest_comp=1, bit_sizes=[32],
           indices=[SRC_TYPE], flags=SUBGROUP_FLAGS)
 
+# Apple9 (G16G) 8x8x8 cooperative matrix multiply-accumulate (0xCF).
+# src[] = { a, b, c }, each in 32-bit GPRs: u32x2 for FP32, packed u32 (2x16)
+# for FP16/BF16. dest is u32x2 (FP32, CF 02) or packed u32 (FP16, CF 00).
+# FLAGS: [1:0]=a_type, [3:2]=b_type, [5:4]=c_type, [7:6]=dst_type
+# (0=bf16, 1=f16, 2=f32), [8]=has_c.
+intrinsic("cmat_muladd_agx", src_comp=[-1, -1, -1], dest_comp=0, bit_sizes=[32],
+          indices=[FLAGS], flags=SUBGROUP_FLAGS)
+
 # Intrinsics used by the Midgard/Bifrost blend pipeline. These are defined
 # within a blend shader to read/write the raw value from the tile buffer,
 # without applying any format conversion in the process. If the shader needs

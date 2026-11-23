@@ -235,6 +235,62 @@ nir_deref_instr_has_complex_use(nir_deref_instr *deref,
                continue;
             return true;
 
+         case nir_intrinsic_cmat_construct:
+         case nir_intrinsic_cmat_load:
+         case nir_intrinsic_cmat_extract:
+            if (use_src == &use_intrin->src[0] &&
+                glsl_type_is_cmat(deref->type) &&
+                (opts & nir_deref_instr_has_complex_use_allow_cmat))
+               continue;
+            return true;
+
+         case nir_intrinsic_cmat_store:
+            if (use_src == &use_intrin->src[1] &&
+                glsl_type_is_cmat(deref->type) &&
+                (opts & nir_deref_instr_has_complex_use_allow_cmat))
+               continue;
+            return true;
+
+         case nir_intrinsic_cmat_convert:
+         case nir_intrinsic_cmat_unary_op:
+         case nir_intrinsic_cmat_scalar_op:
+         case nir_intrinsic_cmat_bitcast:
+         case nir_intrinsic_cmat_copy:
+         case nir_intrinsic_cmat_transpose:
+            if ((use_src == &use_intrin->src[0] ||
+                 use_src == &use_intrin->src[1]) &&
+                glsl_type_is_cmat(deref->type) &&
+                (opts & nir_deref_instr_has_complex_use_allow_cmat))
+               continue;
+            return true;
+
+         case nir_intrinsic_cmat_binary_op:
+            if ((use_src == &use_intrin->src[0] ||
+                 use_src == &use_intrin->src[1] ||
+                 use_src == &use_intrin->src[2]) &&
+                glsl_type_is_cmat(deref->type) &&
+                (opts & nir_deref_instr_has_complex_use_allow_cmat))
+               continue;
+            return true;
+
+         case nir_intrinsic_cmat_insert:
+            if ((use_src == &use_intrin->src[0] ||
+                 use_src == &use_intrin->src[2]) &&
+                glsl_type_is_cmat(deref->type) &&
+                (opts & nir_deref_instr_has_complex_use_allow_cmat))
+               continue;
+            return true;
+
+         case nir_intrinsic_cmat_muladd:
+            if ((use_src == &use_intrin->src[0] ||
+                 use_src == &use_intrin->src[1] ||
+                 use_src == &use_intrin->src[2] ||
+                 use_src == &use_intrin->src[3]) &&
+                glsl_type_is_cmat(deref->type) &&
+                (opts & nir_deref_instr_has_complex_use_allow_cmat))
+               continue;
+            return true;
+
          default:
             return true;
          }

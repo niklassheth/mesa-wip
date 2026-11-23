@@ -536,16 +536,24 @@ split_cmat_muladd(nir_builder *b,
          unsigned idx = m * n_splits + n;
          nir_deref_instr *dst_deref = result_split ? recreate_derefs(b, &intr->src[0], result_split->split_vars[idx]) : nir_src_as_deref(intr->src[0]);
          nir_deref_instr *c_deref = c_split ? recreate_derefs(b, &intr->src[3], c_split->split_vars[idx]) : nir_src_as_deref(intr->src[3]);
+         nir_deref_instr *acc_deref = NULL;
+         if (k_splits > 1) {
+            nir_variable *acc_var =
+               nir_local_variable_create(impl, dst_deref->type, "cmat_acc");
+            b->cursor = nir_before_instr(instr);
+            acc_deref = nir_build_deref_var(b, acc_var);
+         }
 
          for (unsigned k = 0; k < k_splits; k++) {
             unsigned a_idx = m * k_splits + k;
             unsigned b_idx = k * n_splits + n;
             nir_deref_instr *a_deref = a_split ? recreate_derefs(b, &intr->src[1], a_split->split_vars[a_idx]) : nir_src_as_deref(intr->src[1]);
             nir_deref_instr *b_deref = b_split ? recreate_derefs(b, &intr->src[2], b_split->split_vars[b_idx]) : nir_src_as_deref(intr->src[2]);
-            nir_deref_instr *k_dst_deref = k == k_splits - 1 ? dst_deref : c_deref;
+            nir_deref_instr *k_c_deref = k == 0 ? c_deref : acc_deref;
+            nir_deref_instr *k_dst_deref = k == k_splits - 1 ? dst_deref : acc_deref;
             b->cursor = nir_before_instr(instr);
 
-            nir_cmat_muladd(b, &k_dst_deref->def, &a_deref->def, &b_deref->def, &c_deref->def,
+            nir_cmat_muladd(b, &k_dst_deref->def, &a_deref->def, &b_deref->def, &k_c_deref->def,
                             .saturate = nir_intrinsic_saturate(intr),
                             .cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr));
          }
@@ -796,11 +804,10 @@ split_cmat_load_store(nir_builder *b,
       if (i > 0) {
          nir_deref_instr *addr_deref = nir_src_as_deref(intr->src[is_load]);
          unsigned dst_bit_size = addr_deref->def.bit_size;
-         nir_def *this_index = nir_imm_zero(b, 1, dst_bit_size);
          unsigned deref_bytes_size = glsl_get_explicit_size(addr_deref->type, false);
-         const struct glsl_type *scalar_type = glsl_get_scalar_type(glsl_get_cmat_element(var->type));
+         const struct glsl_type *scalar_type = glsl_get_scalar_type(glsl_get_cmat_element(new_deref->type));
          unsigned elem_size = glsl_get_explicit_size(scalar_type, false);
-         struct glsl_cmat_description desc = *glsl_get_cmat_description(split->split_vars[i]->type);
+         struct glsl_cmat_description desc = *glsl_get_cmat_description(new_deref->type);
          unsigned row_offset, col_offset;
 
          row_offset = (i % split->box.outer_cols) * desc.cols;
@@ -809,14 +816,22 @@ split_cmat_load_store(nir_builder *b,
          if (layout == GLSL_MATRIX_LAYOUT_ROW_MAJOR)
             SWAP(row_offset, col_offset);
 
-         ptr_deref = nir_build_deref_cast(b, &addr_deref->def, addr_deref->modes, scalar_type, elem_size);
-         stride = nir_udiv_imm(b, nir_imul_imm(b, stride, deref_bytes_size), elem_size);
-
-         if (col_offset)
-            this_index = nir_imm_intN_t(b, col_offset, dst_bit_size);
-         if (row_offset)
-            this_index = nir_iadd(b, this_index, nir_u2uN(b, nir_imul_imm(b, stride, row_offset), dst_bit_size));
-         ptr_deref = nir_build_deref_ptr_as_array(b, ptr_deref, this_index);
+         ptr_deref = addr_deref;
+         if (row_offset) {
+            ptr_deref = nir_build_deref_cast(b, &ptr_deref->def, addr_deref->modes,
+                                             addr_deref->type, deref_bytes_size);
+            nir_def *row_index =
+               nir_imul_imm(b, nir_u2uN(b, stride, dst_bit_size), row_offset);
+            ptr_deref = nir_build_deref_ptr_as_array(b, ptr_deref, row_index);
+         }
+         if (col_offset) {
+            ptr_deref = nir_build_deref_cast(b, &ptr_deref->def, addr_deref->modes,
+                                             scalar_type, elem_size);
+            ptr_deref = nir_build_deref_ptr_as_array(
+               b, ptr_deref, nir_imm_intN_t(b, col_offset, dst_bit_size));
+            ptr_deref = nir_build_deref_cast(b, &ptr_deref->def, addr_deref->modes,
+                                             addr_deref->type, deref_bytes_size);
+         }
          ptr = &ptr_deref->def;
       }
       if (is_load)

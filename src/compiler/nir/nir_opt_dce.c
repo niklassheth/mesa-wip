@@ -83,6 +83,8 @@ is_live(BITSET_WORD *defs_live, nir_instr *instr)
       nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
       const nir_intrinsic_info *info = &nir_intrinsic_infos[intrin->intrinsic];
       return !(info->flags & NIR_INTRINSIC_CAN_ELIMINATE) ||
+             (nir_intrinsic_has_access(intrin) &&
+              (nir_intrinsic_access(intrin) & ACCESS_VOLATILE)) ||
              (info->has_dest && is_def_live(&intrin->def, defs_live));
    }
    case nir_instr_type_tex: {

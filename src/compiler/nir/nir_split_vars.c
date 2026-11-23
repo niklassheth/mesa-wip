@@ -57,8 +57,9 @@ get_complex_used_vars(nir_shader *shader, void *mem_ctx)
              * nir_deref_instr_has_complex_use is recursive.
              */
             if (deref->deref_type == nir_deref_type_var &&
-                nir_deref_instr_has_complex_use(deref,
-                                                nir_deref_instr_has_complex_use_allow_atomics))
+                nir_deref_instr_has_complex_use(
+                   deref, nir_deref_instr_has_complex_use_allow_atomics |
+                             nir_deref_instr_has_complex_use_allow_cmat))
                _mesa_set_add(complex_vars, deref->var);
          }
       }
