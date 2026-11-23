@@ -558,6 +558,18 @@ if with_tests
     suite : ['gravity'],
   )
   test(
+    'gravity_cdm_va_alias',
+    executable(
+      'gravity_cdm_va_alias',
+      'tests/hk-cdm-va-alias.c',
+      include_directories : [inc_gallium, inc_gallium_aux, inc_include,
+                             inc_src, inc_gravity],
+      dependencies : [gravity_vk_deps],
+      link_with : [libgravity_vk],
+    ),
+    suite : ['gravity'],
+  )
+  test(
     'gravity_barrier_fixes',
     executable(
       'gravity_barrier_fixes',

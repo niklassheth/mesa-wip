@@ -621,6 +621,8 @@ hk_flush_bind(struct hk_bind_builder *b)
          .range = b->size,
       };
    } else {
+      hk_memory_record_va_bind(b->dev, b->mem, b->memoryOffset, b->size,
+                               va_addr, NULL, NULL);
       op = (struct drm_asahi_gem_bind_op){
          .handle = b->mem->bo->uapi_handle,
          .flags = DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE,
@@ -1053,9 +1055,13 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    unsigned command_count = 0;
 
    /* Gather the number of individual commands to submit up front */
+   const bool upgrade_narrow_cdm = hk_device_has_va_alias(dev);
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
       struct hk_cmd_buffer *cmdbuf =
          (struct hk_cmd_buffer *)submit->command_buffers[i];
+
+      if (unlikely(upgrade_narrow_cdm))
+         hk_cmd_upgrade_narrow_cdm_barriers(cmdbuf, dev);
 
       command_count += list_length(&cmdbuf->control_streams);
    }

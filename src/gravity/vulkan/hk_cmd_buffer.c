@@ -183,6 +183,7 @@ hk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    util_dynarray_fini(&cmd->sync_remap);
    util_dynarray_fini(&cmd->sync_first_event);
    util_dynarray_fini(&cmd->feedback_raw);
+   util_dynarray_fini(&cmd->cdm_narrow_barriers);
    free(cmd->merge_empty_render);
    vk_command_buffer_finish(&cmd->vk);
    vk_free(&pool->vk.alloc, cmd);
@@ -225,6 +226,7 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    cmd->sync_remap = UTIL_DYNARRAY_INIT;
    cmd->sync_first_event = UTIL_DYNARRAY_INIT;
    cmd->feedback_raw = UTIL_DYNARRAY_INIT;
+   cmd->cdm_narrow_barriers = UTIL_DYNARRAY_INIT;
    for (unsigned i = 0; i < HK_TESS_BATCH_LANES; ++i)
       cmd->tess_batch.lane[i] = UTIL_DYNARRAY_INIT;
    cmd->tess_batch.fold = UTIL_DYNARRAY_INIT;
@@ -269,6 +271,8 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    for (unsigned i = 0; i < HK_TESS_BATCH_LANES; ++i)
       util_dynarray_clear(&cmd->tess_batch.lane[i]);
    util_dynarray_clear(&cmd->tess_batch.fold);
+   util_dynarray_clear(&cmd->cdm_narrow_barriers);
+   cmd->cdm_narrow_upgraded = 0;
    cmd->tess_batch.capture = NULL;
    cmd->tess_batch.draws = 0;
 
@@ -436,6 +440,28 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    return VK_SUCCESS;
 }
 
+void
+hk_cmd_record_narrow_cdm_barrier(struct hk_cmd_buffer *cmd, uint32_t *word)
+{
+   util_dynarray_append(&cmd->cdm_narrow_barriers, word);
+}
+
+void
+hk_cmd_upgrade_narrow_cdm_barriers(struct hk_cmd_buffer *cmd,
+                                   const struct hk_device *dev)
+{
+   if (!cmd->cdm_narrow_barriers.size ||
+       __atomic_load_n(&cmd->cdm_narrow_upgraded, __ATOMIC_ACQUIRE))
+      return;
+
+   uint32_t full;
+   agx_cdm_barrier(&full, dev->dev.chip);
+   util_dynarray_foreach(&cmd->cdm_narrow_barriers, uint32_t *, word) {
+      __atomic_store_n(*word, full, __ATOMIC_RELAXED);
+   }
+   __atomic_store_n(&cmd->cdm_narrow_upgraded, 1, __ATOMIC_RELEASE);
+}
+
 /*
  * Merge adjacent compute control streams. Except for reading timestamps, there
  * is no reason to submit two CDM streams back-to-back in the same command
@@ -453,7 +479,7 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
       if (cs->type == HK_CS_CDM && last && last->type == HK_CS_CDM &&
           !last->timestamp.end.handle) {
 
-         hk_cs_merge_cdm(last, cs);
+         hk_cs_merge_cdm(last, cs, hk_cmd_buffer_device(cmd));
          last->sync_stages |= cs->sync_stages;
          *util_dynarray_element(&cmd->sync_remap, uint32_t, cs->sync_id) =
             last->sync_id;
@@ -959,13 +985,15 @@ hk_cmd_sync_barrier_group(struct hk_cmd_buffer *cmd,
        !(ordered & ~compute) && !(cs->sync_stages & ~compute)) {
       /* The cache barrier is also an execution barrier. Keep compute-only
        * dependencies in one CDM stream; no firmware command boundary is needed.
-       * Shader-to-shader dependencies take the compute-only barrier on G16;
-       * indirect grids and host-read visibility need the full flush.
+       * Same-VA shader-to-shader dependencies take the compute-only barrier on
+       * G16; indirect grids, host-read visibility, and cross-VA memory aliases
+       * need the full flush.
        */
       struct hk_device *dev = hk_cmd_buffer_device(cmd);
       hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
       if (!(dst_stages & HK_SYNC_DISPATCH_INDIRECT) &&
-          !(dst & VK_PIPELINE_STAGE_2_HOST_BIT))
+          !(dst & VK_PIPELINE_STAGE_2_HOST_BIT) &&
+          !hk_device_has_va_alias(dev))
          hk_cdm_compute_barrier(dev, cs);
       else
          hk_cdm_cache_flush(dev, cs);

@@ -266,6 +266,11 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
          }
          memset(agx_bo_map(buffer->apple9_residency), 0, pages);
       }
+
+      if (hk_buffer_needs_cdm_full_flush(dev, buffer)) {
+         buffer->va_alias_guard = true;
+         p_atomic_inc(&dev->va_alias_count);
+      }
    }
 
 done:
@@ -283,6 +288,12 @@ hk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
 
    if (!buffer)
       return;
+
+   if (buffer->va_alias_guard) {
+      p_atomic_dec(&dev->va_alias_count);
+      buffer->va_alias_guard = false;
+   }
+   hk_memory_remove_va_bind(dev, buffer->va_bind_bo_key, buffer->va_bind_id);
 
    if (buffer->va)
       hk_buffer_free_va(dev, buffer);
@@ -451,6 +462,10 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
          }
       }
 
+      hk_memory_record_va_bind(dev, mem, pBindInfos[i].memoryOffset,
+                               buffer->vk.size, buffer->vk.device_address,
+                               &buffer->va_bind_bo_key, &buffer->va_bind_id);
+
       const VkBindMemoryStatusKHR *status =
          vk_find_struct_const(pBindInfos[i].pNext, BIND_MEMORY_STATUS_KHR);
       if (status != NULL && status->pResult != NULL)
@@ -472,6 +487,29 @@ hk_GetBufferOpaqueCaptureAddress(UNUSED VkDevice device,
    return buffer->va->addr;
 }
 
+/* Whether this buffer requires full CDM flushes (including the 0x10 drain)
+ * while alive:
+ * - Under strict soft-fault residency, writes to unbound sparse-resident pages
+ *   (mapped read-only to zero_bo) remain live in Apple9's write-back shader
+ *   cache across 0x60000160 until a 0x10 drain pushes them to the MMU so the
+ *   soft-fault drops them.
+ * - Without soft-fault residency, read-only sparse buffer accesses route
+ *   through sparse_ro_offset, creating a second GPU VA aliasing the primary VA.
+ */
+bool
+hk_buffer_needs_cdm_full_flush(const struct hk_device *dev,
+                               const struct hk_buffer *buffer)
+{
+   if (!buffer->va || buffer->apple9_index_va)
+      return false;
+
+   if (hk_sparse_unbound_unmapped(&dev->dev))
+      return (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT) != 0;
+
+   return (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) != 0 &&
+          hk_va_has_ro_shadow(dev, buffer->va->addr);
+}
+
 uint64_t
 hk_buffer_address(const struct hk_buffer *buffer, uint64_t offset,
                   bool read_only)
@@ -480,12 +518,16 @@ hk_buffer_address(const struct hk_buffer *buffer, uint64_t offset,
    uint64_t addr = vk_buffer_address(&buffer->vk, offset);
 
    /* If we are accessing the buffer read-only, we want to return the read-only
-    * shadow mapping so non-resident pages return zeroes. That only applies to
-    * sparse resident buffers, which will have buffer->va != NULL. If buffer->va
-    * is NULL, the buffer is not sparse resident, so we don't need the fix up...
-    * and indeed, there may not be a shadow map available.
+    * shadow mapping so non-resident pages return zeroes. Under strict
+    * soft-fault residency (hk_sparse_unbound_unmapped), unbound sparse buffer
+    * ranges already map zero_bo read-only in the primary VA, and non-sparse
+    * capture-replay buffers have no unbound ranges at all. Avoid routing reads
+    * through the secondary RO shadow VA in those cases so reads and writes
+    * share one GPU VA in Apple9's virtually-tagged shader cache.
     */
    if (read_only && buffer->va && !buffer->apple9_index_va &&
+       (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) &&
+       !hk_sparse_unbound_unmapped(&dev->dev) &&
        hk_va_has_ro_shadow(dev, addr)) {
       addr = agx_rw_addr_to_ro(&dev->dev, addr);
    }

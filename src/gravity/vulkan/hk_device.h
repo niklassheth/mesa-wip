@@ -31,6 +31,7 @@
 DEBUG_GET_ONCE_OPTION(cached_hk_apple9_sparse_scratch,
                       "HK_APPLE9_SPARSE_SCRATCH", NULL)
 
+struct hash_table_u64;
 struct hk_physical_device;
 struct nir_builder;
 struct vk_pipeline_cache;
@@ -200,11 +201,27 @@ struct hk_device {
 
    struct hk_cmd_bo_cache cmd_bos;
 
+   /* Active multi-VA aliases of physical memory (same physical range mapped at
+    * >1 distinct GPU VA, or scratch-page sparse buffers using the RO shadow).
+    * Apple9's shader cache is virtually tagged, so cross-VA coherency requires
+    * a full flush (with the 0x10 drain) instead of 0x60000160.
+    */
+   simple_mtx_t va_alias_lock;
+   struct hash_table_u64 *va_alias_bos;
+   uint64_t next_va_bind_id;
+   uint32_t va_alias_count;
+
    uint32_t perftest;
 
 };
 
 VK_DEFINE_HANDLE_CASTS(hk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+
+static inline bool
+hk_device_has_va_alias(const struct hk_device *dev)
+{
+   return unlikely(p_atomic_read(&dev->va_alias_count) > 0);
+}
 
 /* Sparse resources shadow their pages read-only at sparse_ro_offset in the
  * main heap. VAs in the USC aperture (G16 sparse descriptor buffers) have no

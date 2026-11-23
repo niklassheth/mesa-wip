@@ -587,6 +587,17 @@ struct hk_cs {
     */
    bool cdm_compute_barrier;
 
+   /* The stream's final full flush, emitted when it ended. Merging the next
+    * CDM stream of the command buffer into this one turns it into a junction
+    * between dispatches of one firmware command.
+    */
+   uint32_t *end_flush;
+
+   /* An indirect grid was fetched before the stream's first full flush, so
+    * the junction in front of it must remain a full flush.
+    */
+   bool head_flushed, head_indirect;
+
    /* Address of the root control stream for the job */
    uint64_t addr;
 
@@ -669,20 +680,46 @@ struct hk_cs {
    } diag;
 };
 
+void hk_cmd_record_narrow_cdm_barrier(struct hk_cmd_buffer *cmd,
+                                      uint32_t *word);
+void hk_cmd_upgrade_narrow_cdm_barriers(struct hk_cmd_buffer *cmd,
+                                        const struct hk_device *dev);
+
 /*
  * Helper to merge two compute control streams, concatenating the second control
  * stream to the first one. Must sync with hk_cs.
  */
 static inline void
-hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
+hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b,
+                const struct hk_device *dev)
 {
    assert(a->type == HK_CS_CDM && b->type == HK_CS_CDM);
    assert(a->cmd == b->cmd);
    assert(!a->timestamp.end.handle);
 
+   /* On G16 the compute-only barrier orders every same-VA shader-to-shader
+    * dependency and makes its writes visible, so a junction followed by
+    * compute in the same firmware command needs no drain. Consumers outside
+    * it run in later commands, behind the merged stream's own final flush, so
+    * b must end in one: a stream with nothing to flush (e.g. holding only a
+    * compute timestamp) would leave the narrowed junction as the last flush,
+    * and without the drain the end timestamp never lands. The CDM fetches
+    * indirect grids itself, and cross-VA aliases of the same physical memory
+    * need the drain because Apple9's shader cache is virtually tagged; keep
+    * the full flush in both cases.
+    */
+   if (a->end_flush && b->end_flush &&
+       (uint8_t *)a->end_flush + AGX_CDM_BARRIER_LENGTH == a->current &&
+       !b->head_indirect && !hk_device_has_va_alias(dev) &&
+       dev->dev.chip == AGX_CHIP_G16G) {
+      *a->end_flush = 0x60000160;
+      hk_cmd_record_narrow_cdm_barrier(a->cmd, a->end_flush);
+   }
+
    agx_cdm_jump(a->current, b->addr);
    a->current = b->current;
    a->stream_linked = true;
+   a->end_flush = b->end_flush;
 
    a->timestamp = b->timestamp;
 
@@ -950,6 +987,13 @@ struct hk_cmd_buffer {
    /* Owned large BOs */
    struct util_dynarray large_bos;
 
+   /* Patch pointers (uint32_t *) for every emitted 0x60000160 CDM barrier
+    * word, upgraded in-place to a full flush at queue submit if VA aliasing
+    * became active after command buffer recording.
+    */
+   struct util_dynarray cdm_narrow_barriers;
+   uint32_t cdm_narrow_upgraded;
+
    /* Virtio resource ids (uint32_t) of implicit-sync (WSI) memory this
     * recording accesses; submissions list them as external resources. */
    struct util_dynarray implicit_sync_res;
@@ -1088,6 +1132,14 @@ hk_cmd_use_implicit_sync(struct hk_cmd_buffer *cmd, uint32_t res)
    util_dynarray_append(&cmd->implicit_sync_res, res);
 }
 void hk_cdm_compute_barrier(struct hk_device *dev, struct hk_cs *cs);
+
+static inline void
+hk_cs_note_indirect(struct hk_cs *cs)
+{
+   if (!cs->head_flushed)
+      cs->head_indirect = true;
+}
+
 uint32_t hk_default_sample_positions(unsigned nr_samples);
 struct vk_sample_locations_state;
 uint32_t hk_pack_ppp_multisamplectrl(const struct vk_sample_locations_state *sl);
@@ -1387,8 +1439,10 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
        * stream that only carries an end timestamp needs the full flush too:
        * without the drain at its end, the timestamp never lands.
        */
-      if (cs->cdm_dirty || cs->timestamp.end.handle)
+      if (cs->cdm_dirty || cs->timestamp.end.handle) {
+         cs->end_flush = (uint32_t *)cs->current;
          hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
+      }
    }
 
    *ptr = NULL;

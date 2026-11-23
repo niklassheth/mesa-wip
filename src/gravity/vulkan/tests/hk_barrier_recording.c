@@ -101,6 +101,61 @@ main(void)
    CHECK(event->dst == HK_SYNC_FRAGMENT);
    CHECK(!cmd->sync_render_continuation);
 
+   /* Merging the next compute stream turns the earlier stream's final full
+    * flush into a junction inside one firmware command: compute-only on G16,
+    * unless the next stream fetches an indirect grid before its own flush,
+    * has no final flush of its own, or the device has active VA aliasing.
+    */
+   for (unsigned c = 0; c < 5; ++c) {
+      bool indirect = c == 1, flushless = c == 3, va_alias = c == 4;
+      dev->dev.chip = c == 2 ? AGX_CHIP_G17P : AGX_CHIP_G16G;
+      dev->va_alias_count = va_alias ? 1 : 0;
+      uint8_t a_bytes[256] = {0}, b_bytes[256] = {0};
+      struct hk_cs a = {.cmd = cmd, .type = HK_CS_CDM, .current = a_bytes,
+                        .end = a_bytes + sizeof(a_bytes), .cdm_dirty = true};
+      struct hk_cs b = {.cmd = cmd, .type = HK_CS_CDM, .current = b_bytes,
+                        .end = b_bytes + sizeof(b_bytes), .addr = 0x1000};
+      if (indirect)
+         hk_cs_note_indirect(&b);
+      cmd->current_cs.cs = &a;
+      hk_cmd_buffer_end_compute(cmd);
+      CHECK(a.end_flush == (uint32_t *)a_bytes && !a.cdm_dirty);
+      uint32_t full = *a.end_flush;
+      CHECK(full != 0x60000160);
+      b.current = b_bytes + AGX_CDM_BARRIER_LENGTH;
+      b.end_flush = flushless ? NULL : (uint32_t *)b_bytes;
+      hk_cs_merge_cdm(&a, &b, dev);
+      CHECK(*(uint32_t *)a_bytes == (c == 0 ? 0x60000160 : full));
+      CHECK(a.end_flush == b.end_flush && a.current == b.current);
+   }
+   dev->dev.chip = AGX_CHIP_G16G;
+   dev->va_alias_count = 0;
+
+   /* Inline COMPUTE -> COMPUTE barrier also keeps full flush when VA aliasing
+    * is active on the device.
+    */
+   {
+      uint8_t alias_bytes[4096] = {0};
+      struct hk_cs alias_cs = {
+         .cmd = cmd, .type = HK_CS_CDM,
+         .current = alias_bytes, .end = alias_bytes + sizeof(alias_bytes),
+         .sync_stages = HK_SYNC_COMPUTE, .cdm_dirty = true,
+      };
+      cmd->current_cs.cs = &alias_cs;
+      dev->va_alias_count = 1;
+      hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+      CHECK(cmd->current_cs.cs == &alias_cs);
+      CHECK(alias_cs.current == alias_bytes + AGX_CDM_BARRIER_LENGTH);
+      CHECK(*(uint32_t *)alias_bytes != 0x60000160 &&
+            *(uint32_t *)alias_bytes != 0);
+      CHECK(!alias_cs.cdm_dirty && !alias_cs.cdm_compute_barrier);
+      dev->va_alias_count = 0;
+      cmd->current_cs.cs = NULL;
+   }
+
    /* A compute stream that only carries an end timestamp (back-to-back
     * vkCmdWriteTimestamp, or one around a render) has run no dispatch, yet
     * must end in the full flush for the timestamp to land. One without a
@@ -116,16 +171,18 @@ main(void)
       hk_cmd_buffer_end_compute(cmd);
       CHECK(cmd->current_cs.cs == NULL);
       if (c) {
+         CHECK(t.end_flush == (uint32_t *)t_bytes);
          CHECK(t.current == t_bytes + AGX_CDM_BARRIER_LENGTH);
-         CHECK(*(uint32_t *)t_bytes != 0x60000160 && *(uint32_t *)t_bytes != 0);
+         CHECK(*t.end_flush != 0x60000160 && *t.end_flush != 0);
       } else {
-         CHECK(t.current == t_bytes);
+         CHECK(t.end_flush == NULL && t.current == t_bytes);
       }
    }
 
    util_dynarray_fini(&cmd->sync_events);
    util_dynarray_fini(&cmd->sync_remap);
    util_dynarray_fini(&cmd->sync_first_event);
+   util_dynarray_fini(&cmd->cdm_narrow_barriers);
    free(cmd);
 
    /* Record an actual new stream. Producer ordering alone does not make

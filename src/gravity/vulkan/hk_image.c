@@ -1113,6 +1113,8 @@ hk_image_plane_finish(struct hk_device *dev, struct hk_image_plane *plane,
                       VkImageCreateFlags create_flags,
                       const VkAllocationCallbacks *pAllocator)
 {
+   hk_memory_remove_va_bind(dev, plane->va_bind_bo_key, plane->va_bind_id);
+
    if (plane->va) {
       if (hk_va_has_ro_shadow(dev, plane->va->addr))
          agx_bo_bind(&dev->dev, NULL,
@@ -1524,6 +1526,9 @@ hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
          void *map = agx_bo_map(mem->bo);
          plane->map = map ? (char *)map + *offset_B : NULL;
       }
+      hk_memory_record_va_bind(dev, mem, *offset_B, plane->layout.size_B,
+                               plane->addr, &plane->va_bind_bo_key,
+                               &plane->va_bind_id);
    }
 
    *offset_B += plane->layout.size_B;

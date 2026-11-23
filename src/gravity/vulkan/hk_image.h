@@ -74,6 +74,10 @@ struct hk_image_plane {
     * secondary page table. Otherwise, this map is NULL.
     */
    struct agx_bo *sparse_map;
+
+   /* Tracking for hk_device_memory VA-alias detection. */
+   uint64_t va_bind_bo_key;
+   uint64_t va_bind_id;
 };
 
 struct hk_image {

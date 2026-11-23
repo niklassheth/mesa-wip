@@ -513,6 +513,12 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    simple_mtx_init(&dev->apple9_sw_vs_prologs.lock, mtx_plain);
    simple_mtx_init(&dev->apple9_per_sample_trampolines.lock, mtx_plain);
    list_inithead(&dev->apple9_per_sample_trampolines.lru);
+   simple_mtx_init(&dev->va_alias_lock, mtx_plain);
+   dev->va_alias_bos = _mesa_hash_table_u64_create(NULL);
+   if (!dev->va_alias_bos) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_mem_cache;
+   }
    result = hk_device_init_meta(dev);
    if (result != VK_SUCCESS)
       goto fail_mem_cache;
@@ -561,6 +567,9 @@ fail_mem_cache:
    simple_mtx_destroy(&dev->apple9_vs_prologs.lock);
    simple_mtx_destroy(&dev->apple9_bodies.lock);
    simple_mtx_destroy(&dev->apple9_tile_helpers.lock);
+   if (dev->va_alias_bos)
+      _mesa_hash_table_u64_destroy(dev->va_alias_bos);
+   simple_mtx_destroy(&dev->va_alias_lock);
 fail_queues:
    vk_foreach_queue_safe(iter, &dev->vk) {
       struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
@@ -655,6 +664,9 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    }
    agx_bo_unreference(&dev->dev, dev->heap);
    simple_mtx_destroy(&dev->heap_lock);
+   if (dev->va_alias_bos)
+      _mesa_hash_table_u64_destroy(dev->va_alias_bos);
+   simple_mtx_destroy(&dev->va_alias_lock);
    agx_bo_unreference(&dev->dev, dev->mesh_heap);
    agx_bg_eot_cleanup(&dev->bg_eot);
    hk_device_finish_usc_heap(dev);

@@ -14,6 +14,7 @@
 
 #include "gravity/lib/agx_bo.h"
 #include "wsi_common.h"
+#include "util/hash_table.h"
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
 
@@ -216,6 +217,11 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    }
 
    mem->implicit_sync = false;
+   if (!hk_memory_init_va_tracking(dev, mem)) {
+      agx_bo_unreference(&dev->dev, mem->bo);
+      result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto fail_alloc;
+   }
 
    uint64_t heap_used = p_atomic_add_return(&heap->used, mem->bo->size);
    p_atomic_add(&hk_process_heap_used[type->heapIndex], mem->bo->size);
@@ -269,6 +275,7 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
    if (mem->map)
       munmap(mem->map, mem->map_size);
 
+   hk_memory_finish_va_tracking(dev, mem);
    hk_memory_free_index_va(dev, mem);
    simple_mtx_destroy(&mem->index_va_lock);
    agx_bo_unreference(&dev->dev, mem->bo);
@@ -331,6 +338,264 @@ hk_memory_free_index_va(struct hk_device *dev, struct hk_device_memory *mem)
    agx_va_free(&dev->dev, mem->index_va, true);
    p_atomic_add(&dev->apple9_index_alias_bytes, -((int64_t)charge));
    mem->index_va = NULL;
+}
+
+/* Cap uncoalesced sparse fragments per BO to keep sparse tile tracking O(1)
+ * bounded; exceeding it conservatively falls back to full CDM flushes.
+ */
+#define HK_VA_MAX_SPARSE_RANGES 256
+
+static uint64_t
+hk_va_bo_key(const struct agx_bo *bo)
+{
+   if (bo->handle)
+      return (uint64_t)bo->handle;
+   /* Fallback for synthetic unit-test BOs without a GEM handle. */
+   return (uint64_t)(uintptr_t)bo | (1ull << 63);
+}
+
+static void
+hk_va_bo_destroy(struct hk_device *dev, struct hk_va_bo *va_bo)
+{
+   util_dynarray_fini(&va_bo->primary_ranges);
+   util_dynarray_fini(&va_bo->other_ranges);
+   if (va_bo->aliased)
+      p_atomic_dec(&dev->va_alias_count);
+   simple_mtx_destroy(&va_bo->lock);
+   free(va_bo);
+}
+
+bool
+hk_memory_init_va_tracking(struct hk_device *dev, struct hk_device_memory *mem)
+{
+   if (!mem->bo) {
+      mem->va_bo = NULL;
+      return true;
+   }
+
+   const uint64_t key = hk_va_bo_key(mem->bo);
+   simple_mtx_lock(&dev->va_alias_lock);
+   struct hk_va_bo *va_bo =
+      dev->va_alias_bos ? _mesa_hash_table_u64_search(dev->va_alias_bos, key)
+                        : NULL;
+   if (va_bo) {
+      va_bo->mem_refcnt++;
+      va_bo->obj_refcnt++;
+      mem->va_bo = va_bo;
+      simple_mtx_unlock(&dev->va_alias_lock);
+      return true;
+   }
+
+   va_bo = calloc(1, sizeof(*va_bo));
+   if (!va_bo) {
+      simple_mtx_unlock(&dev->va_alias_lock);
+      return false;
+   }
+   va_bo->key = key;
+   va_bo->primary_base = mem->bo->va ? mem->bo->va->addr : 0;
+   simple_mtx_init(&va_bo->lock, mtx_plain);
+   va_bo->primary_ranges = UTIL_DYNARRAY_INIT;
+   va_bo->other_ranges = UTIL_DYNARRAY_INIT;
+   va_bo->mem_refcnt = 1;
+   va_bo->obj_refcnt = 1;
+   if (dev->va_alias_bos)
+      _mesa_hash_table_u64_insert(dev->va_alias_bos, key, va_bo);
+   mem->va_bo = va_bo;
+   simple_mtx_unlock(&dev->va_alias_lock);
+   return true;
+}
+
+void
+hk_memory_finish_va_tracking(struct hk_device *dev,
+                             struct hk_device_memory *mem)
+{
+   struct hk_va_bo *va_bo = mem->va_bo;
+   if (!va_bo)
+      return;
+   mem->va_bo = NULL;
+
+   simple_mtx_lock(&dev->va_alias_lock);
+   assert(va_bo->mem_refcnt > 0 && va_bo->obj_refcnt > 0);
+   if (--va_bo->mem_refcnt == 0 && dev->va_alias_bos)
+      _mesa_hash_table_u64_remove(dev->va_alias_bos, va_bo->key);
+   bool destroy = (--va_bo->obj_refcnt == 0);
+   simple_mtx_unlock(&dev->va_alias_lock);
+
+   if (destroy)
+      hk_va_bo_destroy(dev, va_bo);
+}
+
+static bool
+hk_va_ranges_overlap_other(struct util_dynarray *ranges, uint64_t start,
+                           uint64_t end, uint64_t va_base)
+{
+   util_dynarray_foreach(ranges, struct hk_va_range, r) {
+      if (r->start < end && start < r->end &&
+          (r->va_base_mixed || r->va_base != va_base))
+         return true;
+   }
+   return false;
+}
+
+static bool
+hk_va_ranges_remove_id(struct util_dynarray *ranges, uint64_t bind_id)
+{
+   unsigned n = util_dynarray_num_elements(ranges, struct hk_va_range);
+   struct hk_va_range *arr = ranges->data;
+   for (unsigned i = n; i-- > 0;) {
+      if (arr[i].bind_id == bind_id) {
+         arr[i] = arr[n - 1];
+         ranges->size -= sizeof(*arr);
+         return true;
+      }
+   }
+   return false;
+}
+
+static void
+hk_va_bo_mark_aliased(struct hk_device *dev, struct hk_va_bo *va_bo)
+{
+   va_bo->aliased = true;
+   p_atomic_inc(&dev->va_alias_count);
+   util_dynarray_fini(&va_bo->primary_ranges);
+   util_dynarray_fini(&va_bo->other_ranges);
+}
+
+void
+hk_memory_record_va_bind(struct hk_device *dev, struct hk_device_memory *mem,
+                         uint64_t mem_offset, uint64_t size, uint64_t gpu_addr,
+                         uint64_t *out_bo_key, uint64_t *out_bind_id)
+{
+   struct hk_va_bo *va_bo = mem->va_bo;
+   if (size == 0 || !va_bo)
+      return;
+
+   /* Align outward to 128-byte cache-line granularity so two distinct GPU VAs
+    * sharing a cache line in Apple9's virtually-tagged shader cache are caught
+    * as aliases, while disjoint 16 KiB-aligned sub-allocations stay distinct.
+    */
+   const uint64_t start = mem_offset & ~127ull;
+   const uint64_t end = align64(mem_offset + size, 128);
+   const uint64_t va_base = gpu_addr - mem_offset;
+
+   simple_mtx_lock(&va_bo->lock);
+   if (va_bo->aliased) {
+      simple_mtx_unlock(&va_bo->lock);
+      return;
+   }
+
+   if (va_bo->primary_base == 0 && mem->bo && mem->bo->va)
+      va_bo->primary_base = mem->bo->va->addr;
+
+   const bool is_primary = (va_base == va_bo->primary_base);
+   bool aliased =
+      hk_va_ranges_overlap_other(&va_bo->other_ranges, start, end, va_base);
+   if (!aliased && !is_primary)
+      aliased = hk_va_ranges_overlap_other(&va_bo->primary_ranges, start, end,
+                                           va_base);
+
+   if (aliased) {
+      hk_va_bo_mark_aliased(dev, va_bo);
+      simple_mtx_unlock(&va_bo->lock);
+      return;
+   }
+
+   struct util_dynarray *target =
+      is_primary ? &va_bo->primary_ranges : &va_bo->other_ranges;
+   if (!out_bind_id) {
+      /* Sparse bind (no per-resource destroy hook): coalesce overlapping
+       * same-VA ranges and strictly adjacent disjoint sparse ranges (bridging
+       * gaps so twiddled sparse image tile binds stay O(1) bounded).
+       */
+      unsigned n = util_dynarray_num_elements(target, struct hk_va_range);
+      struct hk_va_range *arr = target->data;
+      unsigned merged_idx = UINT32_MAX;
+      for (unsigned i = 0; i < n;) {
+         if (arr[i].bind_id == 0 &&
+             arr[i].start <= end && start <= arr[i].end) {
+            if (merged_idx == UINT32_MAX) {
+               if (arr[i].va_base != va_base)
+                  arr[i].va_base_mixed = true;
+               arr[i].start = MIN2(arr[i].start, start);
+               arr[i].end = MAX2(arr[i].end, end);
+               merged_idx = i;
+               i++;
+            } else {
+               if (arr[i].va_base_mixed ||
+                   arr[i].va_base != arr[merged_idx].va_base)
+                  arr[merged_idx].va_base_mixed = true;
+               arr[merged_idx].start = MIN2(arr[merged_idx].start, arr[i].start);
+               arr[merged_idx].end = MAX2(arr[merged_idx].end, arr[i].end);
+               arr[i] = arr[--n];
+               target->size -= sizeof(*arr);
+            }
+         } else {
+            i++;
+         }
+      }
+      if (merged_idx == UINT32_MAX) {
+         if (n >= HK_VA_MAX_SPARSE_RANGES) {
+            hk_va_bo_mark_aliased(dev, va_bo);
+            simple_mtx_unlock(&va_bo->lock);
+            return;
+         }
+         struct hk_va_range range = {
+            .start = start,
+            .end = end,
+            .va_base = va_base,
+            .bind_id = 0,
+            .va_base_mixed = false,
+         };
+         util_dynarray_append(target, range);
+      }
+   } else {
+      uint64_t bind_id = p_atomic_inc_return(&dev->next_va_bind_id);
+      struct hk_va_range range = {
+         .start = start,
+         .end = end,
+         .va_base = va_base,
+         .bind_id = bind_id,
+         .va_base_mixed = false,
+      };
+      util_dynarray_append(target, range);
+      if (out_bo_key)
+         *out_bo_key = va_bo->key;
+      *out_bind_id = bind_id;
+   }
+   simple_mtx_unlock(&va_bo->lock);
+}
+
+void
+hk_memory_remove_va_bind(struct hk_device *dev, uint64_t bo_key,
+                         uint64_t bind_id)
+{
+   if (!bo_key || !bind_id)
+      return;
+
+   simple_mtx_lock(&dev->va_alias_lock);
+   struct hk_va_bo *va_bo =
+      dev->va_alias_bos ? _mesa_hash_table_u64_search(dev->va_alias_bos, bo_key)
+                        : NULL;
+   if (va_bo)
+      va_bo->obj_refcnt++;
+   simple_mtx_unlock(&dev->va_alias_lock);
+
+   if (!va_bo)
+      return;
+
+   simple_mtx_lock(&va_bo->lock);
+   if (!va_bo->aliased) {
+      if (!hk_va_ranges_remove_id(&va_bo->other_ranges, bind_id))
+         hk_va_ranges_remove_id(&va_bo->primary_ranges, bind_id);
+   }
+   simple_mtx_unlock(&va_bo->lock);
+
+   simple_mtx_lock(&dev->va_alias_lock);
+   bool destroy = (--va_bo->obj_refcnt == 0);
+   simple_mtx_unlock(&dev->va_alias_lock);
+
+   if (destroy)
+      hk_va_bo_destroy(dev, va_bo);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

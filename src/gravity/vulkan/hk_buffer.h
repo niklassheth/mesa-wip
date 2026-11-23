@@ -36,6 +36,11 @@ struct hk_buffer {
 
    /* Virtio resource id of bound implicit-sync (WSI) memory, or 0. */
    uint32_t implicit_sync_res;
+
+   /* Tracking for hk_device_memory VA-alias / full-flush CDM guard. */
+   uint64_t va_bind_bo_key;
+   uint64_t va_bind_id;
+   bool va_alias_guard;
 };
 
 /* Descriptor residency pointer of a sparse residency buffer, biased so the
@@ -56,6 +61,8 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(hk_buffer, vk.base, VkBuffer,
 
 uint64_t hk_buffer_address(const struct hk_buffer *buffer, uint64_t offset,
                            bool read_only);
+bool hk_buffer_needs_cdm_full_flush(const struct hk_device *dev,
+                                    const struct hk_buffer *buffer);
 
 static inline uint64_t
 hk_buffer_address_rw(const struct hk_buffer *buffer, uint64_t offset)

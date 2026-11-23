@@ -64,6 +64,7 @@ hk_cdm_compute_barrier(struct hk_device *dev, struct hk_cs *cs)
    uint32_t *barrier = (uint32_t *)cs->current;
    cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
    *barrier = 0x60000160;
+   hk_cmd_record_narrow_cdm_barrier(cs->cmd, barrier);
    cs->stats.flushes++;
    cs->cdm_dirty = true;
    cs->cdm_compute_barrier = true;
@@ -80,6 +81,7 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
    cs->stats.flushes++;
    cs->cdm_dirty = false;
    cs->cdm_compute_barrier = false;
+   cs->head_flushed = true;
 }
 
 static struct agx_ptr
@@ -569,6 +571,8 @@ hk_apple9_dispatch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                          (flush_before ? AGX_CDM_BARRIER_LENGTH : 0));
    if (flush_before)
       hk_cdm_cache_flush(dev, cs);
+   if (agx_is_indirect(grid))
+      hk_cs_note_indirect(cs);
    bool ok = agx_is_indirect(grid)
       ? agx_apple9_emit_indirect_dispatch(cs->current, launch, grid.ptr,
                                          geometry.local, indirect_local, p, barrier)
@@ -580,11 +584,24 @@ hk_apple9_dispatch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   if (barrier)
+   bool compute_barrier = barrier && !hk_device_has_va_alias(dev);
+   if (compute_barrier) {
       agx_apple9_set_compute_barrier(cs->current, record_size);
+      hk_cmd_record_narrow_cdm_barrier(
+         cmd,
+         (uint32_t *)((uint8_t *)cs->current + record_size -
+                      AGX_CDM_BARRIER_LENGTH));
+   }
    cs->current += record_size;
-   cs->cdm_dirty = true;
-   cs->cdm_compute_barrier = barrier;
+   if (barrier && !compute_barrier) {
+      /* agx_apple9_emit_*_dispatch already emitted a full barrier word. */
+      cs->cdm_dirty = false;
+      cs->cdm_compute_barrier = false;
+      cs->head_flushed = true;
+   } else {
+      cs->cdm_dirty = true;
+      cs->cdm_compute_barrier = compute_barrier;
+   }
    cs->stats.flushes += barrier;
    cs->stats.cmds++;
    cs->stats.calls++;
@@ -871,6 +888,8 @@ hk_tess_batch_flush(struct hk_cmd_buffer *cmd)
          /* Whatever came before the batch must be complete. */
          if (first && cs->cdm_dirty && !cs->cdm_compute_barrier)
             hk_cdm_cache_flush(dev, cs);
+         /* Batched records may fetch indirect grids. */
+         hk_cs_note_indirect(cs);
          first = false;
          memcpy(cs->current, data, size);
          cs->current += size;
@@ -879,7 +898,10 @@ hk_tess_batch_flush(struct hk_cmd_buffer *cmd)
          data += size;
       }
 
-      hk_cdm_compute_barrier(dev, cs);
+      if (!hk_device_has_va_alias(dev))
+         hk_cdm_compute_barrier(dev, cs);
+      else
+         hk_cdm_cache_flush(dev, cs);
       util_dynarray_clear(lane);
    }
 }
