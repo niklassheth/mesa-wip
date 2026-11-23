@@ -332,6 +332,46 @@ main(void)
    CHECK(img.feedback_submitted_raw_mask == 0);
    CHECK(img_other_dev.feedback_submitted_raw_mask == 0);
 
+   /* Drawless keep_raw_clear pass near end of a command pool chunk must
+    * upload a valid mapped 8-byte zeroed scissor inside a BO (never a
+    * past-end VA from a 0-byte upload) and leave uploaded_zbias == 0.
+    */
+   struct hk_cmd_buffer cb_raw_clear = {0};
+   vk_object_base_init(&dev_a.vk, &cb_raw_clear.vk.base,
+                       VK_OBJECT_TYPE_COMMAND_BUFFER);
+   list_inithead(&cb_raw_clear.control_streams);
+   uint8_t chunk0_mem[64] = {0};
+   uint8_t chunk1_mem[128];
+   memset(chunk1_mem, 0xaa, sizeof(chunk1_mem));
+   cb_raw_clear.uploader[HK_CMD_POOL_MAIN].chunks[0] = (struct hk_upload_chunk){
+      .map = chunk0_mem,
+      .base = 0x10000000ull,
+      .offset = HK_CMD_BO_SIZE - 32,
+   };
+   cb_raw_clear.uploader[HK_CMD_POOL_MAIN].chunks[1] = (struct hk_upload_chunk){
+      .map = chunk1_mem,
+      .base = 0x20000000ull,
+      .offset = 0,
+   };
+   uint8_t vdm_mem[64] = {0};
+   struct hk_cs cs_raw_clear = {
+      .cmd = &cb_raw_clear,
+      .type = HK_CS_VDM,
+      .current = vdm_mem,
+      .end = vdm_mem + sizeof(vdm_mem),
+      .cr = {.process_empty_tiles = true},
+   };
+   cb_raw_clear.current_cs.gfx = &cs_raw_clear;
+   cb_raw_clear.state.gfx.render.raw_color_mask = 1;
+   CHECK(hk_pool_upload(&cb_raw_clear, NULL, 0, 64) == 0);
+   hk_cmd_buffer_end_graphics(&cb_raw_clear);
+   CHECK(cs_raw_clear.uploaded_scissor == 0x20000000ull);
+   CHECK(cs_raw_clear.uploaded_scissor + AGX_SCISSOR_LENGTH <=
+         0x20000000ull + HK_CMD_BO_SIZE);
+   for (unsigned b = 0; b < AGX_SCISSOR_LENGTH; ++b)
+      CHECK(chunk1_mem[b] == 0);
+   CHECK(cs_raw_clear.uploaded_zbias == 0);
+
    util_dynarray_fini(&cb_fb.feedback_ops);
    util_dynarray_fini(&cb_write.feedback_ops);
    util_dynarray_fini(&cb_normal_raw.feedback_ops);

@@ -425,6 +425,9 @@ uint64_t
 hk_pool_upload(struct hk_cmd_buffer *cmd, const void *data, uint32_t size,
                uint32_t alignment)
 {
+   if (unlikely(size == 0))
+      return 0;
+
    struct agx_ptr T = hk_pool_alloc(cmd, size, alignment);
    if (unlikely(T.cpu == NULL))
       return 0;

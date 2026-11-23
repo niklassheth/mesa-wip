@@ -1493,13 +1493,22 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
    } else if (cs) {
       /* Scissor and depth bias arrays are staged to dynamic arrays on the
        * CPU. When we end the control stream, they're done growing and are
-       * ready for upload.
+       * ready for upload. The kernel always requires a mapped 8-byte scissor
+       * table, including for drawless keep_raw_clear passes.
        */
-      cs->uploaded_scissor =
-         hk_pool_upload(cmd, cs->scissor.data, cs->scissor.size, 64);
+      if (cs->scissor.size) {
+         cs->uploaded_scissor =
+            hk_pool_upload(cmd, cs->scissor.data, cs->scissor.size, 64);
+      } else {
+         static const struct agx_scissor_packed zero_scissor = {0};
+         cs->uploaded_scissor =
+            hk_pool_upload(cmd, &zero_scissor, sizeof(zero_scissor), 64);
+      }
 
       cs->uploaded_zbias =
-         hk_pool_upload(cmd, cs->depth_bias.data, cs->depth_bias.size, 64);
+         cs->depth_bias.size
+            ? hk_pool_upload(cmd, cs->depth_bias.data, cs->depth_bias.size, 64)
+            : 0;
 
       /* TODO: maybe free scissor/depth_bias now? */
       cs->current = agx_vdm_terminate(cs->current);
