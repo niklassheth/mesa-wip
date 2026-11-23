@@ -1877,8 +1877,391 @@ test_vectorize_preamble_liveness_policy(void)
       ralloc_free(b.shader);
    }
 
+   /* Case 3: In the flat 48..84 GPR plateau (832 thr/core on G16G), distant
+    * loads with ~82 divergent live words must merge unwindowed instead of
+    * throttling at the old 80-word budget. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                     &agx_nir_options,
+                                                     "cs_flat_plateau_unwindowed");
+      nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *base = nir_imm_int64(&b, 0x100000);
+      nir_def *bound = nir_load_global_constant(&b, 1, 32, nir_imm_int64(&b, 0x20000),
+                                                .align_mul = 4);
+      nir_def *off = nir_amul_imm(&b, gid, 16);
+
+      nir_def *first = nir_load_global_constant_bounded(
+         &b, 1, 32, base, off, bound, .align_mul = 16, .align_offset = 0);
+
+      nir_def *div[78];
+      for (unsigned i = 0; i < ARRAY_SIZE(div); ++i) {
+         div[i] = nir_load_global(&b, 1, 32,
+                                  nir_iadd_imm(&b, nir_u2u64(&b, nir_imul_imm(&b, gid, 4)),
+                                               0x40000 + i * 256),
+                                  .align_mul = 4);
+      }
+
+      nir_def *second = nir_load_global_constant_bounded(
+         &b, 1, 32, base, nir_iadd_imm(&b, off, 4), bound,
+         .align_mul = 16, .align_offset = 4);
+      nir_def *acc = nir_fadd(&b, first, second);
+      for (unsigned i = 0; i < ARRAY_SIZE(div); ++i)
+         acc = nir_fadd(&b, acc, div[i]);
+      nir_store_global(&b, acc, nir_imm_int64(&b, 0x80000),
+                       .write_mask = 0x1, .align_mul = 4);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      hk_lower_nir(dev, b.shader, &rs, false, 0, NULL, 0);
+
+      unsigned vec_loads = 0;
+      nir_foreach_block(blk, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(ins, blk) {
+            if (ins->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global_constant &&
+                intr->def.num_components == 2)
+               vec_loads++;
+         }
+      }
+      CHECK(vec_loads == 1);
+      ralloc_free(b.shader);
+   }
+
+   /* Case 4: Below 48 GPRs, unwindowed merging that jumps >= 4 live words
+    * across a real G16G occupancy cliff (24-GPR tier -> 28-GPR tier) must
+    * fall back to windowed merging when windowed preserves the higher tier. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                     &agx_nir_options,
+                                                     "cs_sub48_cliff_windowed");
+      nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *base0 = nir_imm_int64(&b, 0x100000);
+      nir_def *base1 = nir_imm_int64(&b, 0x200000);
+      nir_def *bound = nir_load_global_constant(&b, 1, 32, nir_imm_int64(&b, 0x20000),
+                                                .align_mul = 4);
+      nir_def *off = nir_amul_imm(&b, gid, 16);
+
+      nir_def *a0 = nir_load_global_constant_bounded(
+         &b, 1, 32, base0, off, bound, .align_mul = 16, .align_offset = 0);
+      nir_def *b0 = nir_load_global_constant_bounded(
+         &b, 1, 32, base1, off, bound, .align_mul = 16, .align_offset = 0);
+
+      nir_def *div[16];
+      for (unsigned i = 0; i < ARRAY_SIZE(div); ++i) {
+         div[i] = nir_load_global(&b, 1, 32,
+                                  nir_iadd_imm(&b, nir_u2u64(&b, nir_imul_imm(&b, gid, 4)),
+                                               0x40000 + i * 256),
+                                  .align_mul = 4);
+      }
+
+      nir_def *acc = nir_fadd(&b, a0, b0);
+      for (unsigned i = 0; i < ARRAY_SIZE(div); ++i)
+         acc = nir_fadd(&b, acc, div[i]);
+
+      /* Distant fields hoisted across all 16 live defs would add 6 live words,
+       * crossing the 24-GPR G16G occupancy cliff. */
+      nir_def *a1 = nir_load_global_constant_bounded(
+         &b, 1, 32, base0, nir_iadd_imm(&b, off, 4), bound,
+         .align_mul = 16, .align_offset = 4);
+      nir_def *a2 = nir_load_global_constant_bounded(
+         &b, 1, 32, base0, nir_iadd_imm(&b, off, 8), bound,
+         .align_mul = 16, .align_offset = 8);
+      nir_def *a3 = nir_load_global_constant_bounded(
+         &b, 1, 32, base0, nir_iadd_imm(&b, off, 12), bound,
+         .align_mul = 16, .align_offset = 12);
+      nir_def *b1 = nir_load_global_constant_bounded(
+         &b, 1, 32, base1, nir_iadd_imm(&b, off, 4), bound,
+         .align_mul = 16, .align_offset = 4);
+      nir_def *b2 = nir_load_global_constant_bounded(
+         &b, 1, 32, base1, nir_iadd_imm(&b, off, 8), bound,
+         .align_mul = 16, .align_offset = 8);
+      nir_def *b3 = nir_load_global_constant_bounded(
+         &b, 1, 32, base1, nir_iadd_imm(&b, off, 12), bound,
+         .align_mul = 16, .align_offset = 12);
+      acc = nir_fadd(&b, acc, nir_fadd(&b, nir_fadd(&b, a1, a2), a3));
+      acc = nir_fadd(&b, acc, nir_fadd(&b, nir_fadd(&b, b1, b2), b3));
+      nir_store_global(&b, acc, nir_imm_int64(&b, 0x80000),
+                       .write_mask = 0x1, .align_mul = 4);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      hk_lower_nir(dev, b.shader, &rs, false, 0, NULL, 0);
+
+      unsigned vec4_loads = 0;
+      nir_foreach_block(blk, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(ins, blk) {
+            if (ins->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global_constant &&
+                intr->def.num_components == 4)
+               vec4_loads++;
+         }
+      }
+      CHECK(vec4_loads == 0);
+      ralloc_free(b.shader);
+   }
+
    free(dev);
    puts("vectorize preamble-aware liveness policy: pass");
+   return 0;
+}
+
+static unsigned
+count_nir_loops(struct exec_list *cf_list)
+{
+   unsigned loops = 0;
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         loops += count_nir_loops(&nif->then_list);
+         loops += count_nir_loops(&nif->else_list);
+      } else if (node->type == nir_cf_node_loop) {
+         loops += 1 + count_nir_loops(&nir_cf_node_as_loop(node)->body);
+      }
+   }
+   return loops;
+}
+
+static nir_loop *
+nth_nir_loop(struct exec_list *cf_list, unsigned *index)
+{
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         nir_loop *l = nth_nir_loop(&nif->then_list, index);
+         if (l)
+            return l;
+         l = nth_nir_loop(&nif->else_list, index);
+         if (l)
+            return l;
+      } else if (node->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         if (*index == 0)
+            return loop;
+         (*index)--;
+         nir_loop *inner = nth_nir_loop(&loop->body, index);
+         if (inner)
+            return inner;
+      }
+   }
+   return NULL;
+}
+
+static unsigned
+shader_loop_count(nir_shader *nir)
+{
+   return count_nir_loops(&nir_shader_get_entrypoint(nir)->body);
+}
+
+static nir_loop *
+shader_nth_loop(nir_shader *nir, unsigned idx)
+{
+   return nth_nir_loop(&nir_shader_get_entrypoint(nir)->body, &idx);
+}
+
+static int
+test_l1i_loop_unroll_cap(void)
+{
+   /* Case 1: Normal small loop (4 iterations of light ALU) still unrolls. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                     &agx_nir_options,
+                                                     "cs_small_loop_unroll");
+      nir_function_impl *impl = nir_shader_get_entrypoint(b.shader);
+      nir_variable *idx = nir_local_variable_create(impl, glsl_uint_type(), "i");
+      nir_variable *acc = nir_local_variable_create(impl, glsl_float_type(), "acc");
+      nir_def *gid = nir_u2f32(&b, nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0));
+      nir_store_var(&b, idx, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, acc, gid, 1);
+      nir_push_loop(&b);
+      {
+         nir_def *i = nir_load_var(&b, idx);
+         nir_break_if(&b, nir_uge_imm(&b, i, 4));
+         nir_store_var(&b, acc, nir_fadd(&b, nir_load_var(&b, acc), nir_fmul(&b, gid, nir_u2f32(&b, i))), 1);
+         nir_store_var(&b, idx, nir_iadd_imm(&b, i, 1), 1);
+      }
+      nir_pop_loop(&b, NULL);
+      nir_store_global(&b, nir_load_var(&b, acc), nir_imm_int64(&b, 0x80000),
+                       .write_mask = 0x1, .align_mul = 4);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      CHECK(shader_loop_count(b.shader) == 1);
+      CHECK(hk_apple9_opt_loop_unroll(b.shader));
+      CHECK(shader_loop_count(b.shader) == 0);
+      ralloc_free(b.shader);
+   }
+
+   /* Case 2: Heavy storage-image loop whose unrolling would cross the ~15 KiB
+    * L1I budget stays rolled and preserves its original loop->control. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                     &agx_nir_options,
+                                                     "cs_heavy_image_loop_capped");
+      nir_function_impl *impl = nir_shader_get_entrypoint(b.shader);
+      nir_variable *idx = nir_local_variable_create(impl, glsl_uint_type(), "i");
+      nir_variable *acc = nir_local_variable_create(impl, glsl_vec4_type(), "acc");
+      nir_store_var(&b, idx, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, acc, nir_imm_vec4(&b, 0, 0, 0, 0), 0xf);
+      nir_def *handle = nir_imm_int(&b, 0);
+      nir_push_loop(&b);
+      {
+         nir_def *i = nir_load_var(&b, idx);
+         nir_break_if(&b, nir_uge_imm(&b, i, 27));
+         nir_def *sum = nir_load_var(&b, acc);
+         for (unsigned k = 0; k < 3; ++k) {
+            nir_def *coord = nir_vec4(&b, i, nir_imm_int(&b, k),
+                                      nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+            nir_def *px = nir_bindless_image_load(
+               &b, 4, 32, handle, coord, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+               .image_dim = GLSL_SAMPLER_DIM_2D, .dest_type = nir_type_float32);
+            sum = nir_fadd(&b, sum, px);
+         }
+         nir_store_var(&b, acc, sum, 0xf);
+         nir_store_var(&b, idx, nir_iadd_imm(&b, i, 1), 1);
+      }
+      nir_pop_loop(&b, NULL);
+      nir_store_global(&b, nir_load_var(&b, acc), nir_imm_int64(&b, 0x80000),
+                       .write_mask = 0xf, .align_mul = 4);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      CHECK(shader_loop_count(b.shader) == 1);
+      CHECK(!hk_apple9_opt_loop_unroll(b.shader));
+      CHECK(shader_loop_count(b.shader) == 1);
+      nir_loop *surviving = shader_nth_loop(b.shader, 0);
+      CHECK(surviving && surviving->control == nir_loop_control_none);
+      ralloc_free(b.shader);
+   }
+
+   /* Case 3: Loop with indirect function_temp array deref still unrolls even
+    * when heavy so local arrays promote to SSA instead of scratch memory. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                     &agx_nir_options,
+                                                     "cs_indirect_temp_unroll");
+      nir_function_impl *impl = nir_shader_get_entrypoint(b.shader);
+      nir_variable *idx = nir_local_variable_create(impl, glsl_uint_type(), "i");
+      nir_variable *arr = nir_local_variable_create(
+         impl, glsl_array_type(glsl_vec4_type(), 27, 0), "arr");
+      nir_store_var(&b, idx, nir_imm_int(&b, 0), 1);
+      nir_def *handle = nir_imm_int(&b, 0);
+      nir_push_loop(&b);
+      {
+         nir_def *i = nir_load_var(&b, idx);
+         nir_break_if(&b, nir_uge_imm(&b, i, 27));
+         nir_def *sum = nir_imm_vec4(&b, 0, 0, 0, 0);
+         for (unsigned k = 0; k < 3; ++k) {
+            nir_def *coord = nir_vec4(&b, i, nir_imm_int(&b, k),
+                                      nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+            nir_def *px = nir_bindless_image_load(
+               &b, 4, 32, handle, coord, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+               .image_dim = GLSL_SAMPLER_DIM_2D, .dest_type = nir_type_float32);
+            sum = nir_fadd(&b, sum, px);
+         }
+         nir_store_array_var(&b, arr, i, sum, 0xf);
+         nir_store_var(&b, idx, nir_iadd_imm(&b, i, 1), 1);
+      }
+      nir_pop_loop(&b, NULL);
+      nir_store_global(&b, nir_load_array_var_imm(&b, arr, 5),
+                       nir_imm_int64(&b, 0x80000), .write_mask = 0xf,
+                       .align_mul = 4);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      CHECK(shader_loop_count(b.shader) == 1);
+      CHECK(hk_apple9_opt_loop_unroll(b.shader));
+      CHECK(shader_loop_count(b.shader) == 0);
+      ralloc_free(b.shader);
+   }
+
+   /* Case 4: Identical-body sibling loops inside a 1-iteration parent (tested
+    * in BOTH orders: capped-first / orig-dont_unroll-second, and vice versa).
+    * When the parent unrolls and clones both children, the temporarily capped
+    * child must have its control restored (and unroll after CSE shrinks it
+    * below the L1I budget) while the identical originally-dont_unroll sibling
+    * must preserve dont_unroll. */
+   for (unsigned order = 0; order < 2; ++order) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                     &agx_nir_options,
+                                                     "cs_cloned_identical_siblings");
+      nir_function_impl *impl = nir_shader_get_entrypoint(b.shader);
+      nir_variable *p_idx = nir_local_variable_create(impl, glsl_uint_type(), "p");
+      nir_variable *idx[2] = {
+         nir_local_variable_create(impl, glsl_uint_type(), "c0"),
+         nir_local_variable_create(impl, glsl_uint_type(), "c1"),
+      };
+      nir_variable *acc = nir_local_variable_create(impl, glsl_vec4_type(), "acc");
+      nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *handle = nir_imm_int(&b, 0);
+      nir_store_var(&b, p_idx, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, acc, nir_imm_vec4(&b, 0, 0, 0, 0), 0xf);
+
+      nir_push_loop(&b);
+      {
+         nir_def *p = nir_load_var(&b, p_idx);
+         nir_break_if(&b, nir_uge_imm(&b, p, 1));
+
+         for (unsigned s = 0; s < 2; ++s) {
+            bool is_orig_dont = (s == (order == 0 ? 1u : 0u));
+            nir_store_var(&b, idx[s], nir_imm_int(&b, 0), 1);
+            nir_loop *child = nir_push_loop(&b);
+            if (is_orig_dont)
+               child->control = nir_loop_control_dont_unroll;
+            {
+               nir_def *c = nir_load_var(&b, idx[s]);
+               nir_break_if(&b, nir_uge_imm(&b, c, 27));
+               nir_def *sum = nir_load_var(&b, acc);
+               for (unsigned k = 0; k < 3; ++k) {
+                  nir_def *coord = nir_vec4(&b, c, gid, nir_imm_int(&b, 0),
+                                            nir_imm_int(&b, 0));
+                  nir_def *px = nir_bindless_image_load(
+                     &b, 4, 32, handle, coord, nir_imm_int(&b, 0),
+                     nir_imm_int(&b, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                     .dest_type = nir_type_float32,
+                     .access = ACCESS_CAN_REORDER | ACCESS_NON_WRITEABLE);
+                  sum = nir_fadd(&b, sum, px);
+               }
+               nir_store_var(&b, acc, sum, 0xf);
+               nir_store_var(&b, idx[s], nir_iadd_imm(&b, c, 1), 1);
+            }
+            nir_pop_loop(&b, NULL);
+         }
+
+         nir_store_var(&b, p_idx, nir_iadd_imm(&b, p, 1), 1);
+      }
+      nir_pop_loop(&b, NULL);
+
+      nir_store_global(&b, nir_load_var(&b, acc), nir_imm_int64(&b, 0x80000),
+                       .write_mask = 0xf, .align_mul = 4);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      CHECK(shader_loop_count(b.shader) == 3);
+
+      /* Parent unrolls (3 -> 2 loops), cloning both identical children. */
+      CHECK(hk_apple9_opt_loop_unroll(b.shader));
+      CHECK(shader_loop_count(b.shader) == 2);
+      nir_loop *child0 = shader_nth_loop(b.shader, 0);
+      nir_loop *child1 = shader_nth_loop(b.shader, 1);
+      nir_loop_control expect0 =
+         order == 0 ? nir_loop_control_none : nir_loop_control_dont_unroll;
+      nir_loop_control expect1 =
+         order == 0 ? nir_loop_control_dont_unroll : nir_loop_control_none;
+      CHECK(child0 && child0->control == expect0);
+      CHECK(child1 && child1->control == expect1);
+
+      /* CSE collapses the 3 identical loads per loop to 1 (below 1800 budget),
+       * so a second unroll pass unrolls only the formerly-capped sibling. */
+      NIR_PASS(_, b.shader, nir_opt_cse);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      CHECK(hk_apple9_opt_loop_unroll(b.shader));
+      CHECK(shader_loop_count(b.shader) == 1);
+      nir_loop *remaining = shader_nth_loop(b.shader, 0);
+      CHECK(remaining && remaining->control == nir_loop_control_dont_unroll);
+      ralloc_free(b.shader);
+   }
+
+   puts("L1I-aware loop unroll cap: pass");
    return 0;
 }
 
@@ -1891,6 +2274,7 @@ main(void)
    CHECK(test_soft_fault_ssbo_and_4b_vectorize() == 0);
    CHECK(test_coalesced_lazy_image_fences() == 0);
    CHECK(test_vectorize_preamble_liveness_policy() == 0);
+   CHECK(test_l1i_loop_unroll_cap() == 0);
 
    glsl_type_singleton_decref();
    return 0;

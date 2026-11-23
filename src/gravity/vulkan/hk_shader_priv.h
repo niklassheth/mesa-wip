@@ -124,6 +124,7 @@ bool hk_apple9_clamp_depth_export(nir_builder *b, nir_intrinsic_instr *intr,
 bool hk_apple9_lower_roots(nir_builder *b, nir_intrinsic_instr *intr,
                            void *data);
 void hk_apple9_strip_unread_outputs(nir_shader *nir);
+bool hk_apple9_opt_loop_unroll(nir_shader *nir);
 void hk_nir_opts(nir_shader *nir, void *data);
 void hk_apple9_lower_fs_statistics(nir_shader *nir);
 void hk_apple9_lower_prerast_sysvals(nir_shader *nir,

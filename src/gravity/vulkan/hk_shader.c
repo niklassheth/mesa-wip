@@ -295,7 +295,7 @@ hk_preprocess_nir_early(struct vk_physical_device *vk_pdev, nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
       NIR_PASS(progress, nir, nir_opt_loop);
-      NIR_PASS(progress, nir, nir_opt_loop_unroll);
+      NIR_PASS(progress, nir, hk_apple9_opt_loop_unroll);
    } while (progress);
 
    /* Treat position, point size, clip/cull distances and tessellation levels

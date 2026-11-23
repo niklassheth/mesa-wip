@@ -1246,10 +1246,13 @@ static bool hk_apple9_vectorize_cb(unsigned align_mul, unsigned align_offset,
                                    int64_t hole_size, nir_intrinsic_instr *low,
                                    nir_intrinsic_instr *high, void *data);
 
-/* Above this divergent live-word peak, unwindowed merging is only allowed if
- * it does not increase peak live words (e.g. by eliminating CSE'd +4/+8/+12
- * address offsets). */
-#define HK_APPLE9_VECTORIZE_PRESSURE_BUDGET 80
+/* G16G occupancy scales across real cliffs below 48 GPRs and stays flat at
+ * 832 threads/core across 48..96 GPRs. Keep unwindowed merging active up to
+ * 84 divergent live words (unless it inflates pressure substantially across
+ * a real sub-48 occupancy cliff); above 84 words, allow unwindowed merging
+ * only when it strictly reduces peak live words by at least 8 and stays
+ * within the 96-GPR register file. */
+#define HK_APPLE9_VECTORIZE_PRESSURE_BUDGET 84
 
 static unsigned
 hk_apple9_count_vectorizable_global_ops(const nir_shader *nir)
@@ -1349,23 +1352,41 @@ hk_apple9_vectorize_global(nir_shader *nir, bool soft_fault)
          } else {
             nir_opt_dce(nir);
             peak_free = hk_apple9_peak_live_words(nir);
-            if (peak_free <= HK_APPLE9_VECTORIZE_PRESSURE_BUDGET && !dbg_pressure) {
+            /* Below 48 GPRs, real G16G occupancy cliffs sit at 18/24/28/32/36/
+             * 40/44 GPRs; across 48..96 GPRs occupancy is flat at 832 thr/core.
+             * Only check windowed fallback below 84 words when unwindowed
+             * merging inflates pressure substantially across a real sub-48
+             * occupancy cliff. */
+            const unsigned occ_before =
+               agx_occupancy_for_register_count(2 * peak).max_threads;
+            const unsigned occ_free =
+               agx_occupancy_for_register_count(2 * peak_free).max_threads;
+            const bool sub48_cliff =
+               peak_free <= HK_APPLE9_VECTORIZE_PRESSURE_BUDGET &&
+               occ_free < occ_before && peak_free >= peak + 4u;
+            if (peak_free <= HK_APPLE9_VECTORIZE_PRESSURE_BUDGET &&
+                !sub48_cliff && !dbg_pressure) {
                ralloc_free(backup_impl);
             } else {
                nir_function_set_impl(func, backup_impl);
                policy.windowed = true;
                nir_opt_load_store_vectorize(nir, &vec_opts);
-               if (peak_free <= 88u || dbg_pressure) {
+               if (sub48_cliff || peak_free <= 96u || dbg_pressure) {
                   nir_opt_dce(nir);
                   peak_windowed = hk_apple9_peak_live_words(nir);
                }
-               /* Keep windowed merging if unwindowed merging still exceeds the
-                * pressure budget (unless it strictly reduces peak live words
-                * below windowed, e.g. by eliminating dozens of CSE'd +4/+8/+12
-                * offsets). */
-               policy.windowed =
-                  peak_free > HK_APPLE9_VECTORIZE_PRESSURE_BUDGET &&
-                  !(peak_free + 8u <= peak_windowed && peak_free <= 88u);
+               if (sub48_cliff) {
+                  const unsigned occ_win =
+                     agx_occupancy_for_register_count(2 * peak_windowed).max_threads;
+                  policy.windowed = occ_win > occ_free;
+               } else {
+                  /* Above the 84-word plateau budget, keep windowed merging
+                   * unless unwindowed merging strictly reduces peak live words
+                   * by at least 8 words and stays within the 96-GPR file. */
+                  policy.windowed =
+                     peak_free > HK_APPLE9_VECTORIZE_PRESSURE_BUDGET &&
+                     !(peak_free + 8u <= peak_windowed && peak_free <= 96u);
+               }
                if (policy.windowed) {
                   ralloc_free(orig_impl);
                } else {
@@ -3360,6 +3381,8 @@ hk_apple9_lower_tex_2d_as_array(nir_builder *b, nir_tex_instr *tex, void *data)
    return true;
 }
 
+static void hk_apple9_cap_loop_unroll_l1i(nir_shader *nir);
+
 void
 hk_lower_nir(struct hk_device *dev, nir_shader *nir,
              const struct vk_pipeline_robustness_state *rs, bool is_multiview,
@@ -3599,6 +3622,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    /* Keep radians until Apple9 range reduction. The common preprocessor
     * otherwise replaces sine/cosine with the older fsin_agx operation. */
    NIR_PASS(_, nir, agx_nir_lower_apple9_math);
+   hk_apple9_cap_loop_unroll_l1i(nir);
    agx_preprocess_nir(nir);
    const bool has_global_image_fallback =
       texel_buf_global || buf_addr_global || lower_images_global;
@@ -4161,6 +4185,326 @@ hk_apple9_strip_unread_outputs(nir_shader *nir)
 }
 
 
+/* G16G L1I cache is 16 KiB/core; crossing 16 KiB degrades real fragment
+ * shader throughput by 8%-60%. Weight pre-lowering NIR ops by their post-
+ * lowering Apple9 instruction count so ~1800 weighted instructions tracks
+ * ~15 KiB of packed machine code (~8.5 B/insn). */
+#define HK_APPLE9_L1I_UNROLL_INSTR_BUDGET 1800u
+
+static unsigned
+hk_nir_intrinsic_est_instrs(const nir_intrinsic_instr *intr)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_sparse_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+   case nir_intrinsic_bindless_image_load:
+   case nir_intrinsic_bindless_image_sparse_load:
+   case nir_intrinsic_bindless_image_store:
+   case nir_intrinsic_bindless_image_atomic:
+   case nir_intrinsic_bindless_image_atomic_swap:
+      return 24u;
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_store_ssbo:
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap:
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_global_bounded:
+   case nir_intrinsic_load_global_constant_bounded:
+      return 2u;
+   case nir_intrinsic_load_deref:
+   case nir_intrinsic_store_deref:
+   case nir_intrinsic_deref_atomic:
+   case nir_intrinsic_deref_atomic_swap: {
+      nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+      if (deref && nir_deref_mode_may_be(deref, nir_var_mem_ssbo |
+                                                nir_var_mem_ubo |
+                                                nir_var_mem_global))
+         return 2u;
+      return 1u;
+   }
+   default:
+      return 1u;
+   }
+}
+
+static unsigned
+hk_cf_list_est_instrs(struct exec_list *cf_list)
+{
+   unsigned count = 0;
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      switch (node->type) {
+      case nir_cf_node_block: {
+         nir_block *block = nir_cf_node_as_block(node);
+         nir_foreach_instr(instr, block) {
+            switch (instr->type) {
+            case nir_instr_type_alu: {
+               nir_alu_instr *alu = nir_instr_as_alu(instr);
+               if (!nir_op_is_vec_or_mov(alu->op))
+                  count += alu->def.num_components;
+               break;
+            }
+            case nir_instr_type_tex:
+               count += 4u;
+               break;
+            case nir_instr_type_intrinsic:
+               count += hk_nir_intrinsic_est_instrs(nir_instr_as_intrinsic(instr));
+               break;
+            default:
+               break;
+            }
+         }
+         break;
+      }
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         count += hk_cf_list_est_instrs(&nif->then_list);
+         count += hk_cf_list_est_instrs(&nif->else_list);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         count += hk_cf_list_est_instrs(&loop->body);
+         break;
+      }
+      default:
+         break;
+      }
+   }
+   return count;
+}
+
+static bool
+hk_loop_has_indirect_local_deref(struct exec_list *cf_list)
+{
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      switch (node->type) {
+      case nir_cf_node_block: {
+         nir_block *block = nir_cf_node_as_block(node);
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+            if (deref->deref_type == nir_deref_type_array &&
+                !nir_src_is_const(deref->arr.index) &&
+                nir_deref_mode_may_be(deref, nir_var_function_temp |
+                                             nir_var_shader_in |
+                                             nir_var_shader_out))
+               return true;
+         }
+         break;
+      }
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (hk_loop_has_indirect_local_deref(&nif->then_list) ||
+             hk_loop_has_indirect_local_deref(&nif->else_list))
+            return true;
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         if (hk_loop_has_indirect_local_deref(&loop->body))
+            return true;
+         break;
+      }
+      default:
+         break;
+      }
+   }
+   return false;
+}
+
+struct hk_l1i_unroll_tags {
+   nir_function_impl *impl;
+   nir_variable *none_var;
+   nir_variable *unroll_var;
+};
+
+static nir_variable *
+hk_get_l1i_tag_var(struct hk_l1i_unroll_tags *tags, nir_loop_control control)
+{
+   nir_variable **slot =
+      control == nir_loop_control_unroll ? &tags->unroll_var : &tags->none_var;
+   if (!*slot) {
+      *slot = nir_local_variable_create(tags->impl, glsl_uint_type(),
+                                        "hk_l1i_unroll_tag");
+   }
+   return *slot;
+}
+
+static void
+hk_collect_l1i_unroll_caps(const nir_shader *nir, struct exec_list *cf_list,
+                           unsigned *est_instrs,
+                           struct hk_l1i_unroll_tags *tags, bool persistent)
+{
+   const unsigned max_iter = nir->options->max_unroll_iterations;
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      switch (node->type) {
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         hk_collect_l1i_unroll_caps(nir, &nif->then_list, est_instrs, tags,
+                                    persistent);
+         hk_collect_l1i_unroll_caps(nir, &nif->else_list, est_instrs, tags,
+                                    persistent);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         hk_collect_l1i_unroll_caps(nir, &loop->body, est_instrs, tags,
+                                    persistent);
+         const nir_loop_control orig_control = loop->control;
+         if (orig_control == nir_loop_control_dont_unroll || !loop->info)
+            break;
+         const nir_loop_info *li = loop->info;
+         unsigned trip_count =
+            li->max_trip_count ? li->max_trip_count : li->guessed_trip_count;
+         if (li->force_unroll || trip_count <= 1 || li->instr_cost == 0)
+            break;
+         if (orig_control != nir_loop_control_unroll &&
+             max_iter && trip_count > max_iter)
+            break;
+         if (hk_loop_has_indirect_local_deref(&loop->body))
+            break;
+         /* Estimate scalarized post-lowering body cost so pre-scalarization
+          * vector/image loops do not underestimate post-unroll code size. */
+         unsigned body_est =
+            MAX2(li->instr_cost, hk_cf_list_est_instrs(&loop->body));
+         uint64_t added = (uint64_t)body_est * (trip_count - 1);
+         if ((uint64_t)*est_instrs + added > HK_APPLE9_L1I_UNROLL_INSTR_BUDGET) {
+            if (!persistent && tags) {
+               /* Tag the loop's first block with a temporary load of a fresh
+                * local variable so nir_cf_list_clone preserves exact cap
+                * provenance even if an enclosing <=1-iteration loop clones
+                * identical sibling loops. */
+               nir_variable *tag_var = hk_get_l1i_tag_var(tags, orig_control);
+               if (!tag_var)
+                  break;
+               nir_builder b =
+                  nir_builder_at(nir_after_phis(nir_loop_first_block(loop)));
+               nir_load_var(&b, tag_var);
+            }
+            loop->control = nir_loop_control_dont_unroll;
+         } else {
+            *est_instrs += (unsigned)added;
+         }
+         break;
+      }
+      default:
+         break;
+      }
+   }
+}
+
+static void
+hk_apple9_cap_loop_unroll_l1i(nir_shader *nir)
+{
+   const nir_variable_mode indirect_mask = nir->options->force_indirect_unrolling;
+   const bool force_sampler = nir->options->force_indirect_unrolling_sampler;
+   nir_foreach_function_impl(impl, nir) {
+      nir_metadata_require(impl, nir_metadata_loop_analysis, indirect_mask,
+                           (int)force_sampler);
+      unsigned est = hk_cf_list_est_instrs(&impl->body);
+      hk_collect_l1i_unroll_caps(nir, &impl->body, &est, NULL, true);
+   }
+}
+
+static void
+hk_restore_l1i_unroll_caps(struct exec_list *cf_list,
+                           const struct hk_l1i_unroll_tags *tags)
+{
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      switch (node->type) {
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         hk_restore_l1i_unroll_caps(&nif->then_list, tags);
+         hk_restore_l1i_unroll_caps(&nif->else_list, tags);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         nir_block *first = nir_loop_first_block(loop);
+         nir_foreach_instr_safe(instr, first) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_deref)
+               continue;
+            nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+            if (!deref || deref->deref_type != nir_deref_type_var)
+               continue;
+            if (deref->var == tags->none_var || deref->var == tags->unroll_var) {
+               loop->control = deref->var == tags->unroll_var
+                                  ? nir_loop_control_unroll
+                                  : nir_loop_control_none;
+               nir_instr_remove(instr);
+               nir_deref_instr_remove_if_unused(deref);
+            }
+         }
+         hk_restore_l1i_unroll_caps(&loop->body, tags);
+         break;
+      }
+      default:
+         break;
+      }
+   }
+}
+
+static void
+hk_cleanup_l1i_tag_vars(struct hk_l1i_unroll_tags *tags)
+{
+   if (tags->none_var) {
+      tags->none_var->data.mode = 0;
+      exec_node_remove(&tags->none_var->node);
+   }
+   if (tags->unroll_var) {
+      tags->unroll_var->data.mode = 0;
+      exec_node_remove(&tags->unroll_var->node);
+   }
+}
+
+bool
+hk_apple9_opt_loop_unroll(nir_shader *nir)
+{
+   const nir_variable_mode indirect_mask = nir->options->force_indirect_unrolling;
+   const bool force_sampler = nir->options->force_indirect_unrolling_sampler;
+   struct util_dynarray impl_tags = UTIL_DYNARRAY_INIT;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_metadata_require(impl, nir_metadata_loop_analysis, indirect_mask,
+                           (int)force_sampler);
+      unsigned est = hk_cf_list_est_instrs(&impl->body);
+      struct hk_l1i_unroll_tags tags = {.impl = impl};
+      hk_collect_l1i_unroll_caps(nir, &impl->body, &est, &tags, false);
+      if (tags.none_var || tags.unroll_var) {
+         struct hk_l1i_unroll_tags *slot =
+            util_dynarray_grow(&impl_tags, struct hk_l1i_unroll_tags, 1);
+         if (slot) {
+            *slot = tags;
+         } else {
+            /* OOM saving tag metadata: roll back immediately so no temporary
+             * cap or tag variable can escape into the shader. */
+            hk_restore_l1i_unroll_caps(&impl->body, &tags);
+            hk_cleanup_l1i_tag_vars(&tags);
+            nir_progress(true, impl, nir_metadata_control_flow |
+                                     nir_metadata_loop_analysis);
+         }
+      }
+   }
+
+   bool progress = nir_opt_loop_unroll(nir);
+
+   util_dynarray_foreach(&impl_tags, struct hk_l1i_unroll_tags, tags) {
+      hk_restore_l1i_unroll_caps(&tags->impl->body, tags);
+      hk_cleanup_l1i_tag_vars(tags);
+      nir_progress(true, tags->impl, nir_metadata_control_flow |
+                                     nir_metadata_loop_analysis);
+   }
+   util_dynarray_fini(&impl_tags);
+   return progress;
+}
+
 void
 hk_nir_opts(nir_shader *nir, void *data)
 {
@@ -4190,7 +4534,7 @@ hk_nir_opts(nir_shader *nir, void *data)
       NIR_PASS(progress, nir, nir_opt_constant_folding);
 
       NIR_PASS(progress, nir, nir_opt_undef);
-      NIR_PASS(progress, nir, nir_opt_loop_unroll);
+      NIR_PASS(progress, nir, hk_apple9_opt_loop_unroll);
    } while (progress);
 }
 
