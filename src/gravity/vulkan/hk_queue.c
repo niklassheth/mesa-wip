@@ -309,19 +309,6 @@ max_commands_per_submit(struct hk_device *dev)
                        DRM_ASAHI_BARRIER_NONE - 1));
 }
 
-/* Cap renders per submit ioctl to 1 while shipping against Apple9 kernels
- * where shared_notifier=1 can attach a second render in the same submission
- * to a JobNotifier already flushed and drained in an earlier flush() pass
- * under EBUSY backpressure (g16_runtime_render.rs). Batching compute/transfer
- * commands alongside a single render still eliminates cross-engine ioctl
- * overhead without ever triggering multi-render notifier sharing.
- */
-static inline unsigned
-max_renders_per_submit(UNUSED struct hk_device *dev)
-{
-   return 1;
-}
-
 unsigned
 hk_fill_submit_wait_syncs(struct drm_asahi_sync *syncs,
                           const struct vk_sync_wait *waits,
@@ -469,26 +456,20 @@ queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
       submit->syncs + sizeof(struct drm_asahi_sync) * submit->in_sync_count;
    bool seen_vdm = false, seen_cdm = false;
    const unsigned slice_limit = max_commands_per_submit(dev);
-   const unsigned vdm_limit = max_renders_per_submit(dev);
    unsigned cmd_index = 0;
 
    while (commands_remaining) {
       unsigned base_offs = offs;
       unsigned count = 0;
-      unsigned slice_vdms = 0;
       bool slice_has_vdm = false, slice_has_cdm = false;
 
       /* Headers already contain slice-relative barriers. Keep each slice
-       * within both slice_limit commands and vdm_limit renders.
+       * within slice_limit commands.
        */
       while (count < commands_remaining && count < slice_limit) {
          struct drm_asahi_cmd_header *cmd = (void *)(cmdbuf + offs);
-         bool is_vdm = cmd->cmd_type == DRM_ASAHI_CMD_RENDER;
-         if (is_vdm && slice_vdms >= vdm_limit)
-            break;
-         if (is_vdm) {
+         if (cmd->cmd_type == DRM_ASAHI_CMD_RENDER) {
             slice_has_vdm = true;
-            slice_vdms++;
          } else if (cmd->cmd_type == DRM_ASAHI_CMD_COMPUTE) {
             slice_has_cdm = true;
          }
@@ -1300,11 +1281,10 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
 
    unsigned nr_vdm = 0, nr_cdm = 0;
    unsigned slice_vdm = 0, slice_cdm = 0;
-   unsigned slice_cmds = 0, slice_vdms = 0;
+   unsigned slice_cmds = 0;
    size_t last_cmd_offset = 0;
    bool slice_waits_vdm = false, slice_waits_cdm = false;
    const unsigned slice_limit = max_commands_per_submit(dev);
-   const unsigned vdm_limit = max_renders_per_submit(dev);
 
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
       struct hk_cmd_buffer *cmdbuf =
@@ -1326,19 +1306,14 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
          if (hk_feedback_plan_cs_skipped(&fb_plan, i, cs))
             continue;
-         bool is_vdm = cs->type == HK_CS_VDM;
-         if (slice_cmds == 0 || slice_cmds >= slice_limit ||
-             (is_vdm && slice_vdms >= vdm_limit)) {
+         if (slice_cmds == 0 || slice_cmds >= slice_limit) {
             slice_vdm = nr_vdm;
             slice_cdm = nr_cdm;
             slice_cmds = 0;
-            slice_vdms = 0;
             slice_waits_vdm = false;
             slice_waits_cdm = false;
          }
          slice_cmds++;
-         if (is_vdm)
-            slice_vdms++;
          const struct hk_sync_dep *wait = &streams[cs->sync_id].wait;
          struct drm_asahi_cmd_header header =
             agx_cmd_header(cs->type == HK_CS_CDM,
@@ -1483,7 +1458,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    }
 
    VkResult result;
-   if (command_count <= slice_limit && nr_vdm <= vdm_limit) {
+   if (command_count <= slice_limit) {
       result = queue_submit_single(dev, &submit_ioctl, queue, reasons);
    } else {
       result = queue_submit_looped(dev, &submit_ioctl, command_count,

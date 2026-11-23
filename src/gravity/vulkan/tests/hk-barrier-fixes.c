@@ -469,8 +469,8 @@ test_batched_submit_and_intra_barriers(void)
 
    /* Case B: Multi-render mixed-engine batch
     * [VDM_1, CDM_1 (waits VDM_1), VDM_2 (waits CDM_1), CDM_2 (indep)]
-    * caps each ioctl to 1 render (avoiding kernel shared_notifier=1 multi-render
-    * flush-boundary bugs) while batching each render with its adjacent CDMs.
+    * batches all 4 commands into a single ioctl slice with intra-submit
+    * barrier indices.
     */
    list_for_each_entry_safe(struct hk_cs, cs, &cmd->control_streams, node) {
       list_del(&cs->node);
@@ -496,25 +496,21 @@ test_batched_submit_and_intra_barriers(void)
 
    mock_slice_count = 0;
    CHECK(hk_queue_submit(&queue->vk, &submit) == VK_SUCCESS);
-   CHECK(mock_slice_count == 2);
-   /* Slice 0: [VDM_1, CDM_1] covers both engines -> receives in_syncs. */
-   CHECK(mock_slices[0].cmd_count == 2);
-   CHECK(mock_slices[0].in_sync_count == 1 && mock_slices[0].out_sync_count == 0);
+   CHECK(mock_slice_count == 1);
+   CHECK(mock_slices[0].cmd_count == 4);
+   CHECK(mock_slices[0].in_sync_count == 1 && mock_slices[0].out_sync_count == 2);
    CHECK(mock_slices[0].cmds[0].cmd_type == DRM_ASAHI_CMD_RENDER);
    CHECK(mock_slices[0].cmds[0].vdm_barrier == DRM_ASAHI_BARRIER_NONE);
+   CHECK(mock_slices[0].cmds[0].cdm_barrier == DRM_ASAHI_BARRIER_NONE);
    CHECK(mock_slices[0].cmds[1].cmd_type == DRM_ASAHI_CMD_COMPUTE);
    CHECK(mock_slices[0].cmds[1].vdm_barrier == 1);
-   /* Slice 1: [VDM_2, CDM_2] rebases cross-slice waits to 0; both engines
-    * already saw in_syncs in Slice 0.
-    */
-   CHECK(mock_slices[1].cmd_count == 2);
-   CHECK(mock_slices[1].in_sync_count == 0 && mock_slices[1].out_sync_count == 2);
-   CHECK(mock_slices[1].cmds[0].cmd_type == DRM_ASAHI_CMD_RENDER);
-   CHECK(mock_slices[1].cmds[0].vdm_barrier == 0);
-   CHECK(mock_slices[1].cmds[0].cdm_barrier == 0);
-   CHECK(mock_slices[1].cmds[1].cmd_type == DRM_ASAHI_CMD_COMPUTE);
-   CHECK(mock_slices[1].cmds[1].vdm_barrier == DRM_ASAHI_BARRIER_NONE);
-   CHECK(mock_slices[1].cmds[1].cdm_barrier == DRM_ASAHI_BARRIER_NONE);
+   CHECK(mock_slices[0].cmds[1].cdm_barrier == DRM_ASAHI_BARRIER_NONE);
+   CHECK(mock_slices[0].cmds[2].cmd_type == DRM_ASAHI_CMD_RENDER);
+   CHECK(mock_slices[0].cmds[2].vdm_barrier == 1);
+   CHECK(mock_slices[0].cmds[2].cdm_barrier == 1);
+   CHECK(mock_slices[0].cmds[3].cmd_type == DRM_ASAHI_CMD_COMPUTE);
+   CHECK(mock_slices[0].cmds[3].vdm_barrier == DRM_ASAHI_BARRIER_NONE);
+   CHECK(mock_slices[0].cmds[3].cdm_barrier == DRM_ASAHI_BARRIER_NONE);
 
    /* Case C: Kernel limit 0 safely clamps to 1 command per ioctl slice. */
    hk_sync_init(&queue->sync);
@@ -530,10 +526,11 @@ test_batched_submit_and_intra_barriers(void)
    dev->dev.params.max_commands_per_submission = 64;
 
    /* Case D: Multi-slice batch (limit=2) with
-    * [VDM_1, VDM_2, CDM_1 (waits VDM_2), CDM_2 (waits CDM_1), CDM_3 (indep)].
-    * VDM_1 runs alone (VDM_2 starts slice 1); [VDM_2, CDM_1] share slice 1
-    * (receiving in_syncs as the first CDM slice); [CDM_2, CDM_3] share slice 2
-    * with rebased cross-slice barriers and no redundant VDM join on CDM_3.
+    * [VDM_1, VDM_2, CDM_1 (waits VDM_2), CDM_2 (waits CDM_1),
+    *  CDM_3 (waits CDM_2), CDM_4 (indep)].
+    * [VDM_1, VDM_2] batch in slice 0; [CDM_1, CDM_2] share slice 1 (receiving
+    * in_syncs as the first CDM slice); [CDM_3, CDM_4] share slice 2 with
+    * rebased cross-slice barriers and no redundant VDM join on CDM_4.
     */
    list_for_each_entry_safe(struct hk_cs, cs, &cmd->control_streams, node) {
       list_del(&cs->node);
@@ -557,24 +554,35 @@ test_batched_submit_and_intra_barriers(void)
                        VK_ACCESS_2_SHADER_WRITE_BIT,
                        VK_ACCESS_2_SHADER_READ_BIT);
    add_test_cs(cmd, HK_CS_CDM, HK_SYNC_COMPUTE, buf, sizeof(buf));
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_WRITE_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT);
+   add_test_cs(cmd, HK_CS_CDM, HK_SYNC_COMPUTE, buf, sizeof(buf));
    add_test_cs(cmd, HK_CS_CDM, HK_SYNC_TRANSFER, buf, sizeof(buf));
 
    mock_slice_count = 0;
    CHECK(hk_queue_submit(&queue->vk, &submit) == VK_SUCCESS);
    CHECK(mock_slice_count == 3);
-   /* Slice 0: [VDM_1] with in_syncs. */
-   CHECK(mock_slices[0].cmd_count == 1);
+   /* Slice 0: [VDM_1, VDM_2] batched together with in_syncs. */
+   CHECK(mock_slices[0].cmd_count == 2);
    CHECK(mock_slices[0].in_sync_count == 1 && mock_slices[0].out_sync_count == 0);
-   /* Slice 1: [VDM_2, CDM_1] receives in_syncs (first CDM slice); CDM_1 gets
-    * intra-slice vdm_barrier=1 pointing to VDM_2.
+   CHECK(mock_slices[0].cmds[0].cmd_type == DRM_ASAHI_CMD_RENDER);
+   CHECK(mock_slices[0].cmds[1].cmd_type == DRM_ASAHI_CMD_RENDER);
+   /* Slice 1: [CDM_1, CDM_2] receives in_syncs (first CDM slice); CDM_1
+    * rebases VDM wait to 0; CDM_2 gets intra-slice cdm_barrier=1 pointing to
+    * CDM_1.
     */
    CHECK(mock_slices[1].cmd_count == 2);
    CHECK(mock_slices[1].in_sync_count == 1 && mock_slices[1].out_sync_count == 0);
-   CHECK(mock_slices[1].cmds[0].cmd_type == DRM_ASAHI_CMD_RENDER);
+   CHECK(mock_slices[1].cmds[0].cmd_type == DRM_ASAHI_CMD_COMPUTE);
+   CHECK(mock_slices[1].cmds[0].vdm_barrier == 0);
+   CHECK(mock_slices[1].cmds[0].cdm_barrier == DRM_ASAHI_BARRIER_NONE);
    CHECK(mock_slices[1].cmds[1].cmd_type == DRM_ASAHI_CMD_COMPUTE);
-   CHECK(mock_slices[1].cmds[1].vdm_barrier == 1);
-   /* Slice 2: [CDM_2, CDM_3] gets out_syncs only. CDM_2 rebases VDM and CDM
-    * waits to 0; CDM_3 does NOT need a redundant vdm_barrier=0 since CDM_2
+   CHECK(mock_slices[1].cmds[1].vdm_barrier == 0);
+   CHECK(mock_slices[1].cmds[1].cdm_barrier == 1);
+   /* Slice 2: [CDM_3, CDM_4] gets out_syncs only. CDM_3 rebases VDM and CDM
+    * waits to 0; CDM_4 does NOT need a redundant vdm_barrier=0 since CDM_3
     * already waited on 0 in this slice.
     */
    CHECK(mock_slices[2].cmd_count == 2);
