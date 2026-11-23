@@ -439,6 +439,14 @@ tess_routes(struct hk_cmd_buffer *cmd)
          draw.b.count[0] = dyn->ts.patch_control_points = p;
          CHECK(hk_apple9_use_native_tess(cmd, draw));
       }
+      /* Hardware 64 KiB mesh output ring gate also protects native TES:
+       * V=3 with <= 56 components stays <= 64 rows/WG; 60 components exceeds
+       * the ring for a densely tessellated patch (8192 max groups). */
+      main->info.apple9_native.layout.vertex_components = 56;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      main->info.apple9_native.layout.vertex_components = 60;
+      CHECK(!hk_apple9_use_native_tess(cmd, draw));
+      main->info.apple9_native.layout.vertex_components = 0;
       gfx->shaders[MESA_SHADER_TESS_EVAL] = ng;
       gfx->shaders[MESA_SHADER_VERTEX] = nv;
       gfx->shaders[MESA_SHADER_FRAGMENT] = nf;

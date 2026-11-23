@@ -1696,6 +1696,12 @@ hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    }
    const struct hk_shader *main = hk_native_producer_main(tes);
    const struct agx_apple9_mesh_body_info *body = &main->info.apple9_native;
+   /* One patch produces at most 2 * 64 * 64 triangles (packed TES launches
+    * one group per HK_APPLE9_NATIVE_GS_PACK triangles). */
+   const uint64_t max_tes_groups =
+      body->layout.max_vertices == 3 * HK_APPLE9_NATIVE_GS_PACK
+         ? DIV_ROUND_UP(2u * 64u * 64u, HK_APPLE9_NATIVE_GS_PACK)
+         : 2u * 64u * 64u;
    return main->info.apple9_native_stage == HK_APPLE9_NATIVE_MESH &&
           hk_native_producer_object(tes)->info.apple9_native_stage ==
              HK_APPLE9_NATIVE_OBJECT &&
@@ -1707,7 +1713,8 @@ hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw)
              hk_apple9_native_tess_enabled() && body->publication_rounds
                 ? hk_apple9_native_mesh_threads(body->logical_size)
                 : body->key.physical_threads,
-             body->layout.max_vertices, body->layout.max_primitives);
+             body->layout.max_vertices, body->layout.max_primitives) &&
+          agx_apple9_mesh_ring_fits(&body->layout, max_tes_groups);
 }
 
 DEBUG_GET_ONCE_BOOL_OPTION(tess_route_log, "HK_APPLE9_TESS_ROUTE_LOG", false)
