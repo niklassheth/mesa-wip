@@ -227,7 +227,7 @@ if with_tests
     ),
     suite : ['gravity'],
   )
-  foreach t : ['hk-feedback', 'hk-descriptor-parts', 'hk-constant-data', 'hk-draw-state-cache', 'hk-render-merge', 'hk-empty-clear-barriers', 'hk-empty-render-timestamp', 'hk-image-limits', 'hk-stage-output-limits', 'hk-cull-output-limits', 'hk-pregfx-recording', 'hk-heap-resubmit', 'hk-heap-addresses', 'hk-native-image-store', 'hk-native-store-rw', 'hk-mesh-query', 'hk-native-mesh', 'hk-robust-bounded-vector', 'hk-gs-mesh', 'hk-tes-mesh']
+  foreach t : ['hk-feedback', 'hk-descriptor-parts', 'hk-constant-data', 'hk-draw-state-cache', 'hk-render-merge', 'hk-empty-clear-barriers', 'hk-empty-render-timestamp', 'hk-tier2-caps', 'hk-image-limits', 'hk-stage-output-limits', 'hk-cull-output-limits', 'hk-pregfx-recording', 'hk-heap-resubmit', 'hk-heap-addresses', 'hk-native-image-store', 'hk-native-store-rw', 'hk-mesh-query', 'hk-native-mesh', 'hk-robust-bounded-vector', 'hk-gs-mesh', 'hk-tes-mesh']
     gravity_contract_test = executable(
       'gravity-' + t,
       'tests/' + t + '.c',

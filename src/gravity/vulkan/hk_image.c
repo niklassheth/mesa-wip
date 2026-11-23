@@ -233,7 +233,7 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
    if (ycbcr_info) {
       format = ycbcr_info->planes[plane].format;
       width /= ycbcr_info->planes[plane].denominator_scales[0];
-      height /= ycbcr_info->planes[plane].denominator_scales[0];
+      height /= ycbcr_info->planes[plane].denominator_scales[1];
    } else if (format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
       format = (plane == 0) ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_S8_UINT;
    }

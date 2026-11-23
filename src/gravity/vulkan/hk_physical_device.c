@@ -226,8 +226,8 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_transform_feedback = true,
       .EXT_vertex_attribute_divisor = true,
       .EXT_vertex_input_dynamic_state = true,
-      .EXT_ycbcr_2plane_444_formats = false,
-      .EXT_ycbcr_image_arrays = false,
+      .EXT_ycbcr_2plane_444_formats = true,
+      .EXT_ycbcr_image_arrays = true,
       .GOOGLE_decorate_string = true,
 #ifdef HK_USE_WSI_PLATFORM
       .GOOGLE_display_timing = wsi_instance_supports_google_display_timing(&instance->vk, &instance->drirc.options),
@@ -661,10 +661,10 @@ hk_get_device_features(
       .vertexInputDynamicState = true,
 
       /* VK_EXT_ycbcr_2plane_444_formats */
-      .ycbcr2plane444Formats = false,
+      .ycbcr2plane444Formats = true,
 
       /* VK_EXT_ycbcr_image_arrays */
-      .ycbcrImageArrays = false,
+      .ycbcrImageArrays = true,
 
       /* VK_KHR_shader_relaxed_extended_instruction */
       .shaderRelaxedExtendedInstruction = true,
@@ -1458,6 +1458,8 @@ hk_apple9_restrict_caps(struct vk_device_extension_table *ext,
       .EXT_attachment_feedback_loop_dynamic_state = true,
       .EXT_depth_clamp_zero_one = true,
       .EXT_depth_clamp_control = true,
+      .EXT_ycbcr_2plane_444_formats = true,
+      .EXT_ycbcr_image_arrays = true,
       /* Resolves are vk_meta blits, which honor the transfer function
        * flags. */
       .KHR_maintenance10 = true,
@@ -1732,6 +1734,8 @@ hk_apple9_restrict_caps(struct vk_device_extension_table *ext,
       .shaderStorageImageMultisample = true,
       .depthClampZeroOne = true,
       .depthClampControl = true,
+      KEEP(ycbcr2plane444Formats),
+      KEEP(ycbcrImageArrays),
       .maintenance10 = true,
    };
 #undef KEEP
