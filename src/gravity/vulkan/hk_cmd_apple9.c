@@ -3157,6 +3157,8 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    record->disable_tri_merging = fragment->disable_tri_merging;
    record->pixel_interlock = fragment->pixel_interlock;
    record->flatshade_first = pipeline.flatshade_first;
+   gfx->descriptors.root.draw.provoking =
+      dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT ? 2 : 0;
    gfx->descriptors.root.draw.producer_writes_viewport =
       !!(vertex->varyings.mask[VARYING_SLOT_VIEWPORT] & 1);
    gfx->descriptors.root.draw.polygon_point_facing =

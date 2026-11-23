@@ -1486,6 +1486,7 @@ hk_apple9_native_mesh_options(nir_shader *nir,
       .packed_index_publication = rounds || packed,
       .publication_rounds = rounds,
       .link_clip_distances = key->fs_reads_clip_distance,
+      .layer_viewport = hk_apple9_native_mesh_primitive_lowering_enabled(),
       .outputs_flat = key->vertex.outputs_flat,
       .outputs_linear = key->vertex.outputs_linear,
    };

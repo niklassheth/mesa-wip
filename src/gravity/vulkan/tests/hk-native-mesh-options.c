@@ -340,13 +340,22 @@ check_capabilities(void)
    nir = producer(true);
    nir->info.workgroup_size[0] = 128;
    check_capability(nir, true);
-   /* Layer is outside P1 broadcast, after shared/output lowering can run. */
+   /* Layer/ViewportIndex are admitted through P1 broadcast once qualified. */
    nir = producer(true);
    nir_builder b = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(nir)));
    nir_store_per_primitive_output(&b, nir_imm_int(&b, 1),
       nir_imm_int(&b, 0), nir_imm_int(&b, 0), .write_mask = 1,
       .src_type = nir_type_uint32,
       .io_semantics = {.location = VARYING_SLOT_LAYER, .num_slots = 1});
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   check_capability(nir, true);
+   /* Unsupported per-primitive builtins remain rejected. */
+   nir = producer(true);
+   b = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(nir)));
+   nir_store_per_primitive_output(&b, nir_imm_int(&b, 1),
+      nir_imm_int(&b, 0), nir_imm_int(&b, 0), .write_mask = 1,
+      .src_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_SHADING_RATE, .num_slots = 1});
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    check_capability(nir, false);
 }

@@ -347,6 +347,68 @@ main(int argc, char **argv)
       ralloc_free(nir);
       dynamic_clip_offset = false;
       clip_distances = 0;
+
+      /* Points topology (with and without gl_PointSize, and combined with
+       * per-primitive Layer/ViewportIndex) passes compilation and upload
+       * validation, while stale metadata flags are rejected. */
+      for (unsigned mode = 0; mode < 3; ++mode) {
+         nir_builder pb = nir_builder_init_simple_shader(
+            MESA_SHADER_MESH, &agx_nir_options, "points_round_valid");
+         nir_shader *pnir = pb.shader;
+         pnir->info.io_lowered = true;
+         pnir->info.workgroup_size[0] = 32;
+         pnir->info.workgroup_size[1] = pnir->info.workgroup_size[2] = 1;
+         pnir->info.mesh.max_vertices_out = 8;
+         pnir->info.mesh.max_primitives_out = 8;
+         pnir->info.mesh.primitive_type = MESA_PRIM_POINTS;
+         nir_def *lane = nir_load_local_invocation_index(&pb);
+         nir_set_vertex_and_primitive_count(&pb, nir_imm_int(&pb, 4),
+                                            nir_imm_int(&pb, 4),
+                                            nir_imm_int(&pb, 0));
+         nir_push_if(&pb, nir_ult_imm(&pb, lane, 4));
+         nir_store_per_vertex_output(&pb, nir_imm_vec4(&pb, 0, 0, 0, 1), lane,
+            nir_imm_int(&pb, 0), .write_mask = 0xf, .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         if (mode >= 1) {
+            nir_store_per_vertex_output(&pb, nir_imm_float(&pb, 4.0f), lane,
+               nir_imm_int(&pb, 0), .write_mask = 1, .src_type = nir_type_float32,
+               .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
+         }
+         nir_store_per_primitive_output(&pb, lane, lane, nir_imm_int(&pb, 0),
+            .write_mask = 1, .src_type = nir_type_uint32,
+            .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES, .num_slots = 1});
+         if (mode == 2) {
+            nir_store_per_primitive_output(&pb, nir_imm_int(&pb, 0), lane,
+               nir_imm_int(&pb, 0), .write_mask = 1, .src_type = nir_type_uint32,
+               .io_semantics = {.location = VARYING_SLOT_LAYER, .num_slots = 1});
+            nir_store_per_primitive_output(&pb, nir_iand_imm(&pb, lane, 1), lane,
+               nir_imm_int(&pb, 0), .write_mask = 1, .src_type = nir_type_uint32,
+               .io_semantics = {.location = VARYING_SLOT_VIEWPORT, .num_slots = 1});
+         }
+         nir_pop_if(&pb, NULL);
+         nir_shader_gather_info(pnir, nir_shader_get_entrypoint(pnir));
+
+         struct hk_apple9_graphics_key pkey = {0};
+         struct agx_shader_part ppart = {0};
+         struct agx_apple9_mesh_body_info pbody;
+         const char *pwhy = NULL;
+         bool pok = hk_apple9_compile_native_mesh_program(pnir, &pkey, &ppart, &pbody, &pwhy);
+         if (!pok) fprintf(stderr, "points mode %u: %s\n", mode, pwhy);
+         CHECK(pok && pbody.writes_point_size && ppart.info.apple9_writes_point_size);
+         CHECK(pbody.writes_layer_viewport == (mode == 2));
+         CHECK(ppart.info.writes_layer_viewport == (mode == 2));
+         CHECK(hk_apple9_native_shader_valid(&ppart.info, &pbody, HK_APPLE9_NATIVE_MESH));
+         struct agx_apple9_mesh_body_info stale = pbody;
+         stale.writes_point_size = false;
+         CHECK(!hk_apple9_native_shader_valid(&ppart.info, &stale, HK_APPLE9_NATIVE_MESH));
+         if (mode == 2) {
+            stale = pbody;
+            stale.writes_layer_viewport = false;
+            CHECK(!hk_apple9_native_shader_valid(&ppart.info, &stale, HK_APPLE9_NATIVE_MESH));
+         }
+         free(ppart.binary);
+         ralloc_free(pnir);
+      }
    }
    glsl_type_singleton_decref();
    return 0;

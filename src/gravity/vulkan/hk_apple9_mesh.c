@@ -306,9 +306,10 @@ hk_apple9_native_mesh_model_counts_eligible(const uint16_t size[3],
 bool
 hk_apple9_native_mesh_round_shape_eligible(const nir_shader *nir)
 {
-   bool lines = nir->info.mesh.primitive_type == MESA_PRIM_LINES;
+   bool points_or_lines = nir->info.mesh.primitive_type == MESA_PRIM_POINTS ||
+                          nir->info.mesh.primitive_type == MESA_PRIM_LINES;
    return nir->info.stage == MESA_SHADER_MESH && !nir->info.task_payload_size &&
-          (lines || nir->info.mesh.primitive_type == MESA_PRIM_TRIANGLES) &&
+          (points_or_lines || nir->info.mesh.primitive_type == MESA_PRIM_TRIANGLES) &&
           !nir->info.workgroup_size_variable &&
           (!nir->info.api_subgroup_size || nir->info.api_subgroup_size == 32) &&
           nir->info.derivative_group == DERIVATIVE_GROUP_NONE &&
@@ -320,12 +321,12 @@ hk_apple9_native_mesh_round_shape_eligible(const nir_shader *nir)
           model_counts_eligible(
              nir->info.workgroup_size, nir->info.mesh.max_vertices_out,
              nir->info.mesh.max_primitives_out) &&
-          (lines || nir->info.mesh.max_vertices_out != 3 ||
+          (points_or_lines || nir->info.mesh.max_vertices_out != 3 ||
            nir->info.mesh.max_primitives_out != 1) &&
           /* Within one round, position-only shapes stay under the explicit
            * class list (T16V16P16 is deliberately excluded); the model takes
            * only the outputs that path cannot carry. */
-          (lines || hk_apple9_native_mesh_round_counts_eligible(
+          (points_or_lines || hk_apple9_native_mesh_round_counts_eligible(
               nir->info.workgroup_size, nir->info.mesh.max_vertices_out,
               nir->info.mesh.max_primitives_out) ||
            (nir->info.outputs_written &
@@ -450,6 +451,8 @@ hk_apple9_native_shader_valid(const struct agx_shader_info *code,
        k->grid_root != expected.grid_root || k->grid_offset_B ||
        code->workgroup_size[0] != k->physical_threads ||
        !local_allocation_valid(code, body) ||
+       code->apple9_writes_point_size != body->writes_point_size ||
+       code->writes_layer_viewport != body->writes_layer_viewport ||
        code->apple9_clip_distance_count != body->clip_distances ||
        body->clip_distances > 8)
       return false;
@@ -464,9 +467,13 @@ hk_apple9_native_shader_valid(const struct agx_shader_info *code,
           body->original_max_vertices + l->max_primitives != l->max_vertices ||
           body->primitive_broadcast ||
           (body->primitive_vertices &
-           ~(VARYING_BIT_PRIMITIVE_ID | BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32))))
+           ~(VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER |
+             VARYING_BIT_VIEWPORT |
+             BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32))))
          return false;
-      u_foreach_bit64(slot, body->primitive_vertices) {
+      /* VARYING_SLOT_LAYER is packed into the rasterizer-only Layer/Viewport
+       * word rather than linked as a varying; ViewportIndex is linked flat. */
+      u_foreach_bit64(slot, body->primitive_vertices & ~VARYING_BIT_LAYER) {
          if (!code->apple9_varyings.mask[slot] ||
              code->apple9_varyings.group[slot] !=
                 agx_apple9_varying_group(body->primitive_vertices, 0, slot))
@@ -495,14 +502,17 @@ hk_apple9_native_shader_valid(const struct agx_shader_info *code,
       unsigned count_B = ALIGN_POT(l->indices_per_primitive * l->max_primitives, 16);
       unsigned position_B = count_B + 16;
       unsigned pitch_B = ALIGN_POT(l->max_vertices, 4) * 4;
+      unsigned non_varying = 4 + body->writes_point_size +
+                             body->writes_layer_viewport + body->clip_distances;
       return k->physical_threads == AGX_APPLE9_NATIVE_SERIAL_THREADS &&
              !body->primitive_broadcast &&
              (l->indices_per_primitive == 3 ||
-              (l->indices_per_primitive == 2 && !body->cull_primitive &&
-               !body->cull_distances)) &&
-             l->vertex_components >= 4 &&
+              ((l->indices_per_primitive == 2 || l->indices_per_primitive == 1) &&
+               !body->cull_primitive && !body->cull_distances)) &&
+             body->writes_point_size == (l->indices_per_primitive == 1) &&
+             l->vertex_components >= non_varying &&
              l->vertex_components <= 4 + AGX_APPLE9_MAX_VARYING_COMPONENTS &&
-             code->apple9_varyings.count == l->vertex_components - 4 - body->clip_distances &&
+             code->apple9_varyings.count == l->vertex_components - non_varying &&
              !l->primitive_components && !l->primitive_stride_B && !l->culling &&
              l->primitive_count_B == count_B && l->vertex_count_B == count_B + 4 &&
              l->cull_B == position_B && l->position_B == position_B &&
@@ -531,6 +541,7 @@ hk_apple9_native_shader_valid(const struct agx_shader_info *code,
               (body->logical_size[0] == k->physical_threads &&
                body->logical_size[1] == 1 && body->logical_size[2] == 1)) &&
              !body->shared_size_B && !body->primitive_broadcast &&
+             !body->writes_point_size && !body->writes_layer_viewport &&
              l->indices_per_primitive == 3 && l->vertex_components == 4 &&
              !code->apple9_varyings.count && !l->primitive_components &&
              !l->primitive_stride_B && !l->culling &&
@@ -539,10 +550,12 @@ hk_apple9_native_shader_valid(const struct agx_shader_info *code,
              l->position_B == position_B && l->vertex_pitch_B == pitch_B &&
              l->local_size_B == position_B + 4 * pitch_B;
    }
+   unsigned non_varying = 4 + body->writes_layer_viewport + body->clip_distances;
    return l->max_vertices == 3 && l->max_primitives == 1 &&
-          l->indices_per_primitive == 3 && l->vertex_components >= 4 &&
+          l->indices_per_primitive == 3 && !body->writes_point_size &&
+          l->vertex_components >= non_varying &&
           l->vertex_components <= 4 + AGX_APPLE9_MAX_VARYING_COMPONENTS &&
-          code->apple9_varyings.count == l->vertex_components - 4 - body->clip_distances &&
+          code->apple9_varyings.count == l->vertex_components - non_varying &&
           !l->primitive_components && !l->primitive_stride_B && !l->culling &&
           l->local_size_B == 32 + 16 * l->vertex_components && l->position_B == 32 &&
           l->vertex_pitch_B == 16;
