@@ -29,13 +29,16 @@
 
 #include <c11/threads.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/memfd.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "drm-uapi/drm.h"
 #include "drm_shim.h"
@@ -58,6 +61,13 @@ memfd_create(const char *name, unsigned int flags)
 struct shim_device shim_device;
 
 long shim_page_size;
+
+struct shim_mapping {
+   uintptr_t addr;
+   size_t length;
+   struct shim_bo *bo;
+   struct shim_mapping *next;
+};
 
 static uint32_t
 uint_key_hash(const void *key)
@@ -83,6 +93,7 @@ drm_shim_device_init(void)
                                                 uint_key_compare);
 
    shim_device.offset_map = _mesa_hash_table_u64_create(NULL);
+   shim_device.prime_map = _mesa_hash_table_u64_create(NULL);
 
    mtx_init(&shim_device.lock, mtx_plain);
 
@@ -122,6 +133,7 @@ drm_shim_file_create(int fd)
    shim_fd->handles = _mesa_hash_table_create(NULL,
                                               uint_key_hash,
                                               uint_key_compare);
+   shim_fd->next_syncobj_handle = 1;
 
    return shim_fd;
 }
@@ -132,19 +144,26 @@ drm_shim_file_create(int fd)
  */
 void drm_shim_fd_register(int fd, struct shim_fd *shim_fd)
 {
-   if (!shim_fd)
+   bool fresh = !shim_fd;
+   if (fresh)
       shim_fd = drm_shim_file_create(fd);
    else
       p_atomic_inc(&shim_fd->refcount);
 
    mtx_lock(&shim_device.lock);
+   if (fresh)
+      shim_fd->driver_id = ++shim_device.next_driver_id;
    _mesa_hash_table_insert(shim_device.fd_map, (void *)(uintptr_t)(fd + 1), shim_fd);
    mtx_unlock(&shim_device.lock);
 }
 
 static void handle_delete_fxn(struct hash_entry *entry)
 {
-   drm_shim_bo_put(entry->data);
+   struct shim_bo *bo = entry->data;
+   if (shim_device.driver_bo_handle_close)
+      shim_device.driver_bo_handle_close(
+         bo, (uint32_t)(uintptr_t)entry->key);
+   drm_shim_bo_put(bo);
 }
 
 void drm_shim_fd_unregister(int fd)
@@ -167,6 +186,8 @@ void drm_shim_fd_unregister(int fd)
       return;
 
    _mesa_hash_table_destroy(shim_fd->handles, handle_delete_fxn);
+   if (shim_device.driver_file_close)
+      shim_device.driver_file_close(shim_fd->driver_id);
    free(shim_fd);
 }
 
@@ -230,6 +251,9 @@ drm_shim_ioctl_get_cap(int fd, unsigned long request, void *arg)
 
    switch (gc->capability) {
    case DRM_CAP_PRIME:
+      gc->value = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
+      return 0;
+
    case DRM_CAP_SYNCOBJ:
    case DRM_CAP_SYNCOBJ_TIMELINE:
    case DRM_CAP_ADDFB2_MODIFIERS:
@@ -262,18 +286,131 @@ drm_shim_ioctl_gem_close(int fd, unsigned long request, void *arg)
 
    struct shim_bo *bo = entry->data;
    _mesa_hash_table_remove(shim_fd->handles, entry);
-   drm_shim_bo_put(bo);
    mtx_unlock(&shim_fd->handle_lock);
+   if (shim_device.driver_bo_handle_close)
+      shim_device.driver_bo_handle_close(bo, c->handle);
+   drm_shim_bo_put(bo);
    return 0;
 }
 
 static int
 drm_shim_ioctl_syncobj_create(int fd, unsigned long request, void *arg)
 {
+   struct shim_fd *shim_fd = drm_shim_fd_lookup(fd);
    struct drm_syncobj_create *create = arg;
 
-   create->handle = 1; /* 0 is invalid */
+   mtx_lock(&shim_fd->handle_lock);
+   create->handle = shim_fd->next_syncobj_handle++;
+   assert(create->handle != 0);
+   mtx_unlock(&shim_fd->handle_lock);
 
+   return 0;
+}
+
+static int
+drm_shim_ioctl_syncobj_handle_to_fd(int fd, unsigned long request, void *arg)
+{
+   struct drm_syncobj_handle *handle = arg;
+
+   /*
+    * Driver-backed drm-shim submissions complete synchronously.  Represent
+    * an exported sync_file by an already-signalled eventfd, which has the
+    * pollable-fd semantics Mesa needs without inventing asynchronous work.
+    */
+   handle->fd = eventfd(1, EFD_CLOEXEC | EFD_NONBLOCK);
+   return handle->fd >= 0 ? 0 : -errno;
+}
+
+static int
+drm_shim_ioctl_syncobj_fd_to_handle(int fd, unsigned long request, void *arg)
+{
+   struct shim_fd *shim_fd = drm_shim_fd_lookup(fd);
+   struct drm_syncobj_handle *handle = arg;
+
+   /* IMPORT_SYNC_FILE targets an existing handle.  Opaque imports allocate a
+    * new handle in the syncobj namespace.
+    */
+   if (handle->handle)
+      return 0;
+
+   mtx_lock(&shim_fd->handle_lock);
+   handle->handle = shim_fd->next_syncobj_handle++;
+   assert(handle->handle != 0);
+   mtx_unlock(&shim_fd->handle_lock);
+   return 0;
+}
+
+/* PRIME: an exported BO is represented by a memfd of the BO's size, so that
+ * lseek(fd, 0, SEEK_END) reports the size like a real dma-buf. Exported BOs
+ * stay alive for the life of the process. Importing returns this file's
+ * existing handle for the BO, as the kernel does.
+ */
+static int
+drm_shim_ioctl_prime_handle_to_fd(int fd, unsigned long request, void *arg)
+{
+   struct shim_fd *shim_fd = drm_shim_fd_lookup(fd);
+   struct drm_prime_handle *args = arg;
+   struct shim_bo *bo = drm_shim_bo_lookup(shim_fd, args->handle);
+   if (!bo)
+      return -ENOENT;
+
+   /* fstat() is intercepted and takes shim_device.lock: create the memfd
+    * before locking, and drop it if another export won the race. */
+   struct stat st;
+   int memfd = -1;
+   if (p_atomic_read(&bo->prime_fd) <= 0) {
+      memfd = memfd_create("shim dma-buf", MFD_CLOEXEC);
+      if (memfd < 0 || ftruncate(memfd, bo->size) || fstat(memfd, &st)) {
+         if (memfd >= 0)
+            close(memfd);
+         drm_shim_bo_put(bo);
+         return -ENOMEM;
+      }
+   }
+
+   mtx_lock(&shim_device.lock);
+   if (bo->prime_fd <= 0 && memfd >= 0) {
+      bo->prime_fd = memfd;
+      memfd = -1;
+      drm_shim_bo_get(bo);
+      _mesa_hash_table_u64_insert(shim_device.prime_map, st.st_ino, bo);
+   }
+   int prime_fd = bo->prime_fd;
+   mtx_unlock(&shim_device.lock);
+   if (memfd >= 0)
+      close(memfd);
+   /* fcntl() is intercepted too. The memfd lives as long as the process. */
+   args->fd = fcntl(prime_fd, F_DUPFD_CLOEXEC, 0);
+   drm_shim_bo_put(bo);
+   return args->fd < 0 ? -errno : 0;
+}
+
+static int
+drm_shim_ioctl_prime_fd_to_handle(int fd, unsigned long request, void *arg)
+{
+   struct shim_fd *shim_fd = drm_shim_fd_lookup(fd);
+   struct drm_prime_handle *args = arg;
+   struct stat st;
+   if (fstat(args->fd, &st))
+      return -EBADF;
+
+   mtx_lock(&shim_device.lock);
+   struct shim_bo *bo = _mesa_hash_table_u64_search(shim_device.prime_map,
+                                                    st.st_ino);
+   mtx_unlock(&shim_device.lock);
+   if (!bo)
+      return -EINVAL;
+
+   mtx_lock(&shim_fd->handle_lock);
+   hash_table_foreach(shim_fd->handles, entry) {
+      if (entry->data == bo) {
+         args->handle = (uintptr_t)entry->key;
+         mtx_unlock(&shim_fd->handle_lock);
+         return 0;
+      }
+   }
+   mtx_unlock(&shim_fd->handle_lock);
+   args->handle = drm_shim_bo_get_handle(shim_fd, bo);
    return 0;
 }
 
@@ -288,10 +425,14 @@ ioctl_fn_t core_ioctls[] = {
    [_IOC_NR(DRM_IOCTL_GET_UNIQUE)] = drm_shim_ioctl_get_unique,
    [_IOC_NR(DRM_IOCTL_GET_CAP)] = drm_shim_ioctl_get_cap,
    [_IOC_NR(DRM_IOCTL_GEM_CLOSE)] = drm_shim_ioctl_gem_close,
+   [_IOC_NR(DRM_IOCTL_PRIME_HANDLE_TO_FD)] = drm_shim_ioctl_prime_handle_to_fd,
+   [_IOC_NR(DRM_IOCTL_PRIME_FD_TO_HANDLE)] = drm_shim_ioctl_prime_fd_to_handle,
    [_IOC_NR(DRM_IOCTL_SYNCOBJ_CREATE)] = drm_shim_ioctl_syncobj_create,
    [_IOC_NR(DRM_IOCTL_SYNCOBJ_DESTROY)] = drm_shim_ioctl_stub,
-   [_IOC_NR(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD)] = drm_shim_ioctl_stub,
-   [_IOC_NR(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE)] = drm_shim_ioctl_stub,
+   [_IOC_NR(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD)] =
+      drm_shim_ioctl_syncobj_handle_to_fd,
+   [_IOC_NR(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE)] =
+      drm_shim_ioctl_syncobj_fd_to_handle,
    [_IOC_NR(DRM_IOCTL_SYNCOBJ_WAIT)] = drm_shim_ioctl_stub,
    [_IOC_NR(DRM_IOCTL_SYNCOBJ_TRANSFER)] = drm_shim_ioctl_stub,
    [_IOC_NR(DRM_IOCTL_SYNCOBJ_RESET)] = drm_shim_ioctl_stub,
@@ -454,16 +595,102 @@ drm_shim_mmap(struct shim_fd *shim_fd, size_t length, int prot, int flags,
 
    mtx_lock(&shim_device.lock);
    struct shim_bo *bo = _mesa_hash_table_u64_search(shim_device.offset_map, offset);
+   if (bo)
+      drm_shim_bo_get(bo);
    mtx_unlock(&shim_device.lock);
 
    if (!bo)
       return MAP_FAILED;
 
-   if (length > bo->size)
+   if (length > bo->size) {
+      drm_shim_bo_put(bo);
       return MAP_FAILED;
+   }
 
    /* The offset we pass to mmap must be aligned to the page size */
    assert((bo->mem_addr & (shim_page_size - 1)) == 0);
 
-   return mmap(NULL, length, prot, flags, shim_device.mem_fd, bo->mem_addr);
+   void *mapping = mmap(NULL, length, prot, flags,
+                        shim_device.mem_fd, bo->mem_addr);
+   if (mapping == MAP_FAILED) {
+      drm_shim_bo_put(bo);
+      return MAP_FAILED;
+   }
+
+   struct shim_mapping *record = malloc(sizeof(*record));
+   if (!record) {
+      munmap(mapping, length);
+      drm_shim_bo_put(bo);
+      errno = ENOMEM;
+      return MAP_FAILED;
+   }
+   *record = (struct shim_mapping) {
+      .addr = (uintptr_t)mapping,
+      .length = length,
+      .bo = bo,
+   };
+   mtx_lock(&shim_device.lock);
+   record->next = shim_device.mappings;
+   shim_device.mappings = record;
+   mtx_unlock(&shim_device.lock);
+   return mapping;
+}
+
+void
+drm_shim_munmap_notify(void *addr, size_t length)
+{
+   uintptr_t start = (uintptr_t)addr;
+   uintptr_t end = start + length;
+   if (end < start)
+      return;
+
+   struct shim_mapping *released = NULL;
+   mtx_lock(&shim_device.lock);
+   struct shim_mapping **link = &shim_device.mappings;
+   while (*link) {
+      struct shim_mapping *record = *link;
+      uintptr_t map_start = record->addr;
+      uintptr_t map_end = map_start + record->length;
+      if (end <= map_start || start >= map_end) {
+         link = &record->next;
+         continue;
+      }
+
+      uintptr_t cut_start = MAX2(start, map_start);
+      uintptr_t cut_end = MIN2(end, map_end);
+      if (cut_start == map_start && cut_end == map_end) {
+         *link = record->next;
+         record->next = released;
+         released = record;
+      } else if (cut_start == map_start) {
+         record->addr = cut_end;
+         record->length = map_end - cut_end;
+         link = &record->next;
+      } else if (cut_end == map_end) {
+         record->length = cut_start - map_start;
+         link = &record->next;
+      } else {
+         struct shim_mapping *right = malloc(sizeof(*right));
+         if (!right)
+            abort();
+         drm_shim_bo_get(record->bo);
+         *right = (struct shim_mapping) {
+            .addr = cut_end,
+            .length = map_end - cut_end,
+            .bo = record->bo,
+            .next = record->next,
+         };
+         record->length = cut_start - map_start;
+         record->next = right;
+         link = &right->next;
+      }
+   }
+   mtx_unlock(&shim_device.lock);
+
+   while (released) {
+      struct shim_mapping *next = released->next;
+      drm_shim_bo_put(released->bo);
+      free(released);
+      released = next;
+   }
 }

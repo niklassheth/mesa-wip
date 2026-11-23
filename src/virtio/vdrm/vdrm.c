@@ -3,13 +3,36 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/u_wait_watchdog.h"
 #include "util/u_math.h"
 #include "util/perf/cpu_trace.h"
 
+#include <errno.h>
+#include <string.h>
+#include <sys/mman.h>
+
+#include "util/log.h"
 #include "vdrm.h"
 
 struct vdrm_device * vdrm_virtgpu_connect(int fd, uint32_t context_type);
 struct vdrm_device * vdrm_vpipe_connect(uint32_t context_type);
+
+/* Shared memory with the host renderer (the ccmd request/response area) and
+ * GPU buffer mappings are MAP_SHARED. A forked child inherits them but none
+ * of the state that owns them, so a write it makes there (through its copy
+ * of the parent's heap pointers, or an allocator reusing the range) lands in
+ * memory the parent and the host are still using. Leave them out of fork().
+ * A failure only loses this protection.
+ */
+void
+vdrm_mapping_dontfork(void *map, size_t size)
+{
+#ifdef MADV_DONTFORK
+   if (madvise(map, size, MADV_DONTFORK))
+      mesa_logw_once("madvise(MADV_DONTFORK) on a vdrm mapping failed: %s",
+                     strerror(errno));
+#endif
+}
 
 struct vdrm_device *
 vdrm_device_connect(int fd, uint32_t context_type)
@@ -194,6 +217,13 @@ fence_before(uint32_t a, uint32_t b)
 void
 vdrm_host_sync(struct vdrm_device *vdev, const struct vdrm_ccmd_req *req)
 {
+   U_WATCHDOG_SCOPE(wd, "vdrm host request (object list=current host seqno)",
+                    -1, (uintptr_t)vdev, req->seqno, 0, UINT64_MAX,
+                    ((struct u_watchdog_objects){
+                       .objects = &vdev->shmem->seqno, .object_stride = 4,
+                       .count = 1, .object32 = true,
+                    }));
+
    while (fence_before(vdev->shmem->seqno, req->seqno))
       sched_yield();
 }
