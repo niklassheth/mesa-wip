@@ -1830,3 +1830,55 @@ TEST_F(Apple9RaAssignTest, CollectCacheLruZeroCopyBypassAndCompactR64Steering)
    EXPECT_LE(res.num_copies_emitted, 6u);
    EXPECT_GT(verify_binary_emission(&p), 0u);
 }
+
+TEST_F(Apple9RaAssignTest, SplitVec4LoadDoesNotInflateAsyncDeadLaneBoundPast18)
+{
+   /* Regression test: fully live vec4 DEVICE_LOADs consumed by 4-component
+    * VIR_SPLITs have 0 dead lanes and must NOT trigger false async-dead padding
+    * that raises assign_bound from the <=18 GPR (2048-thread) tier to 24 and
+    * lets async rotation spill past r17. */
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block_begin(&p, b0);
+
+   uint32_t idx = agx_apple9_vir_emit_entry_reg(&p, 0);
+   std::vector<uint32_t> hold;
+   for (unsigned i = 0; i < 11; ++i)
+      hold.push_back(agx_apple9_vir_emit_entry_reg(&p, i + 1));
+
+   agx_apple9_device_load_contract contract = {
+      .raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_1100,
+   };
+   uint32_t ld1 = agx_apple9_vir_emit_device_load_vector(&p, 0, idx, 4, &contract);
+   ASSERT_NE(ld1, AGX_APPLE9_VREG_INVALID);
+
+   uint32_t sp1 = agx_apple9_vir_emit_split(&p, ld1, 4);
+   ASSERT_NE(sp1, AGX_APPLE9_VREG_INVALID);
+
+   uint32_t acc = emit_iadd(sp1, sp1 + 1);
+   acc = emit_iadd(acc, sp1 + 2);
+   acc = emit_iadd(acc, sp1 + 3);
+
+   uint32_t ld2 = agx_apple9_vir_emit_device_load_vector(&p, 1, idx, 4, &contract);
+   ASSERT_NE(ld2, AGX_APPLE9_VREG_INVALID);
+
+   uint32_t sp2 = agx_apple9_vir_emit_split(&p, ld2, 4);
+   ASSERT_NE(sp2, AGX_APPLE9_VREG_INVALID);
+
+   acc = emit_iadd(acc, sp2);
+   acc = emit_iadd(acc, sp2 + 1);
+   acc = emit_iadd(acc, sp2 + 2);
+   acc = emit_iadd(acc, sp2 + 3);
+   for (uint32_t v : hold)
+      acc = emit_iadd(acc, v);
+   p.output = acc;
+   emit_halt();
+   cfg_init(&p, {b0});
+
+   auto opts = validated_opts();
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+   EXPECT_FALSE(res.has_spills);
+   EXPECT_LE(res.max_phys_gpr + 1u, 18u);
+   EXPECT_GT(verify_binary_emission(&p), 0u);
+}

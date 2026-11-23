@@ -3748,6 +3748,185 @@ a9_lower_to_physical_vir(struct agx_apple9_vir_program *program,
    return true;
 }
 
+/* Estimate peak simultaneously in-flight dead destination lanes written by
+ * multi-component async producers (e.g. vec4 TEXTURE_SAMPLE where only 1-2
+ * channels are consumed). Hardware still writes all destination lanes
+ * asynchronously, so assign_bound needs room for these dead lanes to avoid
+ * forcing WAW WAIT stalls during back-to-back async issue. */
+static unsigned
+a9_calc_async_dead_gprs(const struct agx_apple9_vir_program *program,
+                        const struct apple9_ra_spill_state *spill,
+                        void *memctx)
+{
+   const unsigned vcount = program->value_count;
+   if (!vcount)
+      return 0;
+
+   BITSET_WORD *used = BITSET_RZALLOC(memctx, vcount);
+   if (!used)
+      return 0;
+
+   if (program->output < vcount)
+      BITSET_SET(used, program->output);
+   for (unsigned i = 0; i < program->live_out_count; ++i) {
+      if (program->live_out[i] < vcount)
+         BITSET_SET(used, program->live_out[i]);
+   }
+   for (struct agx_apple9_block *b = program->blocks; b; b = b->next) {
+      if (!b->cfg_active)
+         continue;
+      for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(b);
+           ins; ins = agx_apple9_instr_next(ins)) {
+         if (ins->op == AGX_APPLE9_VIR_SPLIT && ins->nr_srcs >= 1) {
+            /* VIR_SPLIT reads the full contiguous dest_components-wide source
+             * tuple starting at ins->src[0] (matching liveness). */
+            unsigned w = ins->dest_components;
+            for (unsigned c = 0; c < w; ++c) {
+               uint32_t v = ins->src[0] + c;
+               if (v < vcount)
+                  BITSET_SET(used, v);
+            }
+            continue;
+         }
+         const unsigned nr_srcs = agx_apple9_vir_nr_srcs(ins);
+         for (unsigned s = 0; s < nr_srcs; ++s) {
+            uint32_t sv = agx_apple9_vir_src(ins, s);
+            if (sv < vcount)
+               BITSET_SET(used, sv);
+         }
+      }
+   }
+
+   unsigned peak_dead = 0;
+   for (struct agx_apple9_block *b = program->blocks; b; b = b->next) {
+      if (!b->cfg_active)
+         continue;
+      struct {
+         uint32_t dest;
+         uint8_t comps;
+         uint8_t dead;
+         bool active;
+      } pending[6] = {0};
+      unsigned next_slot = 0;
+      unsigned cur_dead = 0;
+
+      for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(b);
+           ins; ins = agx_apple9_instr_next(ins)) {
+         if (ins->op == AGX_APPLE9_VIR_SPLIT && ins->nr_srcs >= 1) {
+            unsigned w = ins->dest_components;
+            for (unsigned c = 0; c < w; ++c) {
+               uint32_t sv = ins->src[0] + c;
+               for (unsigned k = 0; k < ARRAY_SIZE(pending); ++k) {
+                  if (pending[k].active && sv >= pending[k].dest &&
+                      sv < pending[k].dest + pending[k].comps) {
+                     cur_dead -= pending[k].dead;
+                     pending[k].active = false;
+                  }
+               }
+            }
+         } else {
+            const unsigned nr_srcs = agx_apple9_vir_nr_srcs(ins);
+            for (unsigned s = 0; s < nr_srcs; ++s) {
+               uint32_t sv = agx_apple9_vir_src(ins, s);
+               for (unsigned k = 0; k < ARRAY_SIZE(pending); ++k) {
+                  if (pending[k].active && sv >= pending[k].dest &&
+                      sv < pending[k].dest + pending[k].comps) {
+                     cur_dead -= pending[k].dead;
+                     pending[k].active = false;
+                  }
+               }
+            }
+         }
+         if (ins->dest == AGX_APPLE9_VREG_INVALID || ins->dest_components <= 1 ||
+             a9_is_pub_val(program, ins->dest) ||
+             apple9_ra_value_is_mem(spill, ins->dest) ||
+             !apple9_ra_async(ins))
+            continue;
+
+         unsigned dead = 0;
+         for (unsigned c = 0; c < ins->dest_components; ++c) {
+            if (ins->dest + c < vcount && !BITSET_TEST(used, ins->dest + c))
+               dead++;
+         }
+         if (!dead)
+            continue;
+
+         if (pending[next_slot].active)
+            cur_dead -= pending[next_slot].dead;
+         pending[next_slot].dest = ins->dest;
+         pending[next_slot].comps = ins->dest_components;
+         pending[next_slot].dead = (uint8_t)dead;
+         pending[next_slot].active = true;
+         next_slot = (next_slot + 1u) % ARRAY_SIZE(pending);
+         cur_dead += dead;
+         peak_dead = MAX2(peak_dead, cur_dead);
+      }
+   }
+
+   ralloc_free(used);
+   return MIN2(peak_dead, 18u);
+}
+
+static void
+a9_add_fma_peer_dir(struct a9_fma_peers *peers, uint32_t a, uint32_t b,
+                    unsigned weight)
+{
+   struct a9_fma_peers *fp = &peers[a];
+   for (unsigned k = 0; k < fp->count; ++k) {
+      if (fp->peer[k] == b) {
+         unsigned nw = (unsigned)fp->weight[k] + weight;
+         fp->weight[k] = (uint8_t)MIN2(nw, 255u);
+         return;
+      }
+   }
+   if (fp->count < A9_FMA_MAX_PEERS) {
+      fp->peer[fp->count] = b;
+      fp->weight[fp->count] = (uint8_t)MIN2(weight, 255u);
+      fp->count++;
+      return;
+   }
+   /* Replace lowest-weight peer if the new edge is strictly stronger. */
+   unsigned min_idx = 0;
+   for (unsigned k = 1; k < A9_FMA_MAX_PEERS; ++k) {
+      if (fp->weight[k] < fp->weight[min_idx])
+         min_idx = k;
+   }
+   if (weight > fp->weight[min_idx]) {
+      fp->peer[min_idx] = b;
+      fp->weight[min_idx] = (uint8_t)MIN2(weight, 255u);
+   }
+}
+
+static bool
+a9_instr_compact_alu_eligible(const struct agx_apple9_vir_instr *ins)
+{
+   if (ins->saturate || ins->src_abs_mask || ins->src_neg_mask)
+      return false;
+   unsigned inline_mask = ins->alu_src_uniform_mask | ins->alu_src_immediate_mask;
+   switch (ins->op) {
+   case AGX_APPLE9_VIR_FMA:
+   case AGX_APPLE9_VIR_HFMA:
+      return !(inline_mask & ~2u) && !ins->src_half_mask &&
+             (!(ins->alu_src_uniform_mask & 2u) || ins->alu_src_value[1] < 64u) &&
+             !((ins->alu_src_immediate_mask & 2u) && (ins->alu_src_value[1] >> 31));
+   case AGX_APPLE9_VIR_FADD:
+   case AGX_APPLE9_VIR_FMUL:
+      return !inline_mask && !ins->src_hi_mask;
+   case AGX_APPLE9_VIR_IAND:
+   case AGX_APPLE9_VIR_IOR:
+   case AGX_APPLE9_VIR_IXOR:
+   case AGX_APPLE9_VIR_MOV:
+      return !inline_mask;
+   case AGX_APPLE9_VIR_IMM:
+      return ins->encoding == AGX_APPLE9_ENC_MOV_IMM_COMPACT ||
+             ins->encoding == AGX_APPLE9_ENC_MOV_IMM32;
+   case AGX_APPLE9_VIR_GET_SR:
+      return ins->encoding == AGX_APPLE9_ENC_GET_SR_EXTENDED;
+   default:
+      return false;
+   }
+}
+
 /* =========================================================================
  * Main Entry Point: apple9_ra_allocate_native()
  * ========================================================================= */
@@ -3976,18 +4155,25 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
    const unsigned orig_vcount = program->value_count;
    const unsigned valloc = MAX2(orig_vcount, 1u);
 
-   /* Round up effective demand to the Apple9 occupancy tier ceiling when using
-    * the default full register file so coalescing and async-WAW avoidance
-    * never cross an occupancy cliff (e.g. <= 52 GPRs stays strictly in the
-    * 1024-thread tier) and never over-round 5-word sparse results past a tier. */
+   /* Round up effective demand to the Apple9 (G16G) occupancy tier ceiling when
+    * using the default full register file so coalescing and async-WAW avoidance
+    * never cross a real sub-45 occupancy cliff (18/24/28/32/36/40/44 GPRs).
+    * Include simultaneously in-flight dead async destination lanes so back-to-back
+    * vec4 texture/load issue does not hit WAW WAIT stalls, and cap demand <= 64
+    * on the flat 45..96 shelf at 64 GPRs to preserve 4B compact ALU (r0..r63). */
    unsigned assign_bound = max_gprs;
-   if (opts.max_gprs == 0 && !opts.force_spill && opts.spill_headroom == 0 &&
+   if (opts.max_gprs == 0 && !opts.force_spill &&
        effective_demand <= max_gprs) {
+      unsigned async_dead_pad = a9_calc_async_dead_gprs(program, &spill_state, memctx);
+      unsigned target_demand =
+         MIN2(MAX2(effective_demand + async_dead_pad + opts.spill_headroom, 6u),
+              max_gprs);
       unsigned tier_gprs =
-         agx_occupancy_for_register_count(2u * MAX2(effective_demand, 6u))
-            .max_registers / 2u;
+         agx_occupancy_for_register_count(2u * target_demand).max_registers / 2u;
+      if (tier_gprs > 64u && target_demand <= 64u)
+         tier_gprs = 64u;
       tier_gprs = MIN2(tier_gprs, max_gprs);
-      assign_bound = MIN2(MAX2(effective_demand, tier_gprs), max_gprs);
+      assign_bound = MIN2(MAX2(target_demand, tier_gprs), max_gprs);
    }
 
    rctx.memctx = memctx;

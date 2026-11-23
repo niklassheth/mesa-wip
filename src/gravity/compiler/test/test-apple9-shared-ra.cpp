@@ -7,7 +7,9 @@
 #include "compiler/nir/nir_builder.h"
 #include <gtest/gtest.h>
 #include "agx_apple9_ir.h"
+extern "C" {
 #include "agx_compile.h"
+}
 #include "agx_compile_apple9.h"
 #include "apple9_ra_assign.h"
 
@@ -717,13 +719,43 @@ TEST(Apple9SharedRa, VectorSharedLoadStoreAllocatesAndPacksUint2Uint4)
    }
 }
 
+TEST(Apple9SharedRa, G16OccupancyStepFunctionMatchesSilicon)
+{
+   /* Exact G16G (T8132 / M4) dual-160 KiB register-bank occupancy curve:
+    * <=18:2048, <=24:1664, <=28:1536, <=32:1280, <=36:1152, <=40:960,
+    * <=44:896, 45..96:832 (flat across Bank A + Bank B). */
+   struct {
+      unsigned gprs;
+      unsigned max_gprs;
+      unsigned threads;
+   } cases[] = {
+      { 1, 18, 2048 }, { 18, 18, 2048 },
+      { 19, 24, 1664 }, { 24, 24, 1664 },
+      { 25, 28, 1536 }, { 28, 28, 1536 },
+      { 29, 32, 1280 }, { 32, 32, 1280 },
+      { 33, 36, 1152 }, { 36, 36, 1152 },
+      { 37, 40,  960 }, { 40, 40,  960 },
+      { 41, 44,  896 }, { 44, 44,  896 },
+      { 45, 96,  832 }, { 52, 96,  832 }, { 53, 96, 832 },
+      { 64, 96,  832 }, { 80, 96,  832 }, { 96, 96, 832 },
+      { 120, 96, 832 }, /* Pre-spill >96 estimate clamps to floor tier. */
+   };
+   for (const auto &c : cases) {
+      SCOPED_TRACE(c.gprs);
+      agx_occupancy occ = agx_occupancy_for_register_count(2u * c.gprs);
+      EXPECT_EQ(occ.max_registers, 2u * c.max_gprs);
+      EXPECT_EQ(occ.max_threads, c.threads);
+   }
+}
+
 TEST(Apple9SharedRa, AllocationCheaperBucketsRegistersByOccupancyTier)
 {
-   /* 50 and 51 GPRs (100 and 102 half-regs) sit in the same top occupancy tier
-    * (<= 104 half-regs, 1024 threads); 53 GPRs (106 half-regs) drops to 896. */
-   const unsigned base_gprs = 50;
-   const unsigned same_tier_gprs = 51;
-   const unsigned worse_tier_gprs = 53;
+   /* On G16G, 31 and 32 GPRs sit in the same 1280-thread occupancy tier
+    * (<= 32 GPRs), while 33 GPRs drops to 1152 threads/core. Meanwhile
+    * 50, 53, and 80 GPRs all sit in the flat 45..96 GPR (832-thread) tier. */
+   const unsigned base_gprs = 31;
+   const unsigned same_tier_gprs = 32;
+   const unsigned worse_tier_gprs = 33;
 
    /* Latency-hiding schedule uses +1 GPR (same occupancy tier) and +2 bytes,
     * but eliminates 16 dependency-gap stalls: MUST NOT be vetoed. */
@@ -738,12 +770,25 @@ TEST(Apple9SharedRa, AllocationCheaperBucketsRegistersByOccupancyTier)
    EXPECT_TRUE(agx_apple9_allocation_cheaper(latency, plain));
    EXPECT_FALSE(agx_apple9_allocation_cheaper(plain, latency));
 
-   /* Dropping to a lower occupancy tier IS vetoed even with fewer dep gaps. */
+   /* Dropping to a lower real G16G occupancy tier IS vetoed even with fewer dep gaps. */
    agx_apple9_allocation_cost low_occ = latency;
    low_occ.registers = worse_tier_gprs;
    low_occ.dependency_gaps = 0;
    EXPECT_TRUE(agx_apple9_allocation_cheaper(plain, low_occ));
    EXPECT_FALSE(agx_apple9_allocation_cheaper(low_occ, plain));
+
+   /* In the flat 45..96 GPR shelf (all 832 thr/core), latency hiding at 64 GPRs
+    * beats 52 GPRs with higher stalls, and spilling to hit 52 GPRs is rejected. */
+   agx_apple9_allocation_cost flat52 = {
+      .spills = 0, .instructions = 20, .bytes = 120, .dependency_gaps = 32,
+      .registers = 52, .peak_registers = 52,
+   };
+   agx_apple9_allocation_cost flat64 = {
+      .spills = 0, .instructions = 20, .bytes = 120, .dependency_gaps = 8,
+      .registers = 64, .peak_registers = 64,
+   };
+   EXPECT_TRUE(agx_apple9_allocation_cheaper(flat64, flat52));
+   EXPECT_FALSE(agx_apple9_allocation_cheaper(flat52, flat64));
 
    /* Spills remain strictly highest priority over occupancy and dep gaps. */
    agx_apple9_allocation_cost spilling = plain;

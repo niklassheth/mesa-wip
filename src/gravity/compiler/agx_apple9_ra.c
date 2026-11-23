@@ -1587,9 +1587,12 @@ apple9_allocate_native_driver(struct agx_apple9_vir_program *program,
    const bool first_latency = !high_pressure && long_dependencies > 1;
    unsigned first_slack = 0;
    if (first_latency) {
+      unsigned clamped_peak =
+         MIN2(MAX2(peak_gprs, 1u), (unsigned)AGX_APPLE9_GPR_COUNT);
       struct agx_occupancy tier =
-         agx_occupancy_for_register_count(2 * MAX2(peak_gprs, 1));
-      unsigned tier_gprs = tier.max_registers / 2;
+         agx_occupancy_for_register_count(2u * clamped_peak);
+      unsigned tier_gprs =
+         MIN2(tier.max_registers / 2u, (unsigned)AGX_APPLE9_GPR_COUNT);
       if (tier_gprs > peak_gprs + 1)
          first_slack = MIN2(8u, tier_gprs - peak_gprs - 1);
    }

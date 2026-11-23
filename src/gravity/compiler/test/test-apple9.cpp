@@ -8549,6 +8549,59 @@ TEST(Apple9Scheduling, HoistsSamplesOnlyWhenWordPressureDoesNotGrow)
    }
 }
 
+TEST(Apple9Scheduling, HoistsAtMostSixSamplesToMatchHardwareScoreboardSlots)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "sample_limit_6");
+   nir_def *coord = nir_imm_vec2(&b, 0.25, 0.75);
+   nir_def *tex_vals[10];
+   nir_def *acc = nir_imm_vec4(&b, 0.0f, 0.0f, 0.0f, 0.0f);
+   nir_instr *first_alu = nullptr;
+
+   /* Emit 10 independent texture samples separated by unrelated ALU work and
+    * consume all 10 results at the end so word pressure is unchanged by
+    * hoisting. With APPLE9_HOIST_SAMPLE_LIMIT == 6, exactly 6 samples should
+    * be pulled ahead of the first ALU instruction (matching s1..s6 1-to-1). */
+   for (unsigned i = 0; i < 10; ++i) {
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
+      tex->op = nir_texop_tex;
+      tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      tex->dest_type = nir_type_float32;
+      tex->coord_components = 2;
+      tex->texture_index = i;
+      tex->sampler_index = 0;
+      tex->src[0].src_type = nir_tex_src_coord;
+      tex->src[0].src = nir_src_for_ssa(coord);
+      nir_def_init(&tex->instr, &tex->def, 4, 32);
+      nir_builder_instr_insert(&b, &tex->instr);
+      tex_vals[i] = &tex->def;
+      acc = nir_fneg(&b, acc);
+      if (!first_alu)
+         first_alu = nir_def_instr(acc);
+   }
+   for (unsigned i = 0; i < 10; ++i)
+      acc = nir_fadd(&b, acc, tex_vals[i]);
+   nir_store_output(&b, acc, nir_imm_int(&b, 0),
+                    .write_mask = 15, .src_type = nir_type_float32,
+                    .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                     .num_slots = 1});
+
+   nir_validate_shader(b.shader, "before sample limit 6");
+   EXPECT_TRUE(agx_nir_hoist_apple9_samples(b.shader));
+   nir_validate_shader(b.shader, "after sample limit 6");
+
+   nir_block *blk = nir_start_block(nir_shader_get_entrypoint(b.shader));
+   unsigned tex_before_first_alu = 0;
+   nir_foreach_instr(instr, blk) {
+      if (instr == first_alu)
+         break;
+      if (instr->type == nir_instr_type_tex)
+         tex_before_first_alu++;
+   }
+   EXPECT_EQ(tex_before_first_alu, 6u);
+   ralloc_free(b.shader);
+}
+
 TEST(Apple9Scheduling, HoistsDerivativeInputsOutOfDivergentControlFlow)
 {
    /* 0: input-derived operand in divergent control flow moves to the start

@@ -2934,15 +2934,22 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
       bool committed = false;
 
       if (cfg->latency && cfg->auto_tier_slack) {
-         /* Always find the best achievable occupancy tier before granting
-          * latency-hiding slack: unscheduled VIR blocks frequently exceed
-          * 52..80 GPRs even when pressure scheduling compresses them down to
-          * a higher-occupancy tier (e.g. 90 -> 61 or 88 -> 49 GPRs). */
+         /* Find the best achievable G16G occupancy tier before granting
+          * latency-hiding slack. Below 45 GPRs, real occupancy steps sharply
+          * at 18/24/28/32/36/40/44 GPRs (2048 -> 896 thr/core); from 45..96
+          * GPRs, occupancy is flat at 832 thr/core so we only compress there
+          * when it unlocks a sub-45 tier, stays within compact r0..r63, or
+          * avoids spilling past 96 GPRs. */
          void *pres_ctx = NULL;
          struct vir_sched_result pres = {0};
          bool have_pres = false;
          int32_t min_all = orig_all;
-         if (orig_all > 42) {
+         unsigned orig_occ =
+            agx_occupancy_for_register_count(
+               2u * MIN2(MAX2((unsigned)MAX2(orig_all, 1), 1u),
+                         (unsigned)AGX_APPLE9_GPR_COUNT))
+               .max_threads;
+         if (orig_all > 24) {
             pres_ctx = ralloc_context(blk_ctx);
             pres = run_block_schedule_attempt(
                p, defs, pub_defs, val_max_gpr, first_body, first_tail,
@@ -2953,13 +2960,26 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                                       orig_16) &&
                 pressure_strictly_better(pres.max_all, pres.max_64, pres.max_16,
                                          orig_all, orig_64, orig_16)) {
-               have_pres = true;
-               min_all = pres.max_all;
+               unsigned pres_occ =
+                  agx_occupancy_for_register_count(
+                     2u * MIN2(MAX2((unsigned)MAX2(pres.max_all, 1), 1u),
+                               (unsigned)AGX_APPLE9_GPR_COUNT))
+                     .max_threads;
+               if (pres_occ > orig_occ || orig_all > 84 ||
+                   (orig_all > 60 && pres.max_all <= 60)) {
+                  have_pres = true;
+                  min_all = pres.max_all;
+               }
             }
-            /* When greedy bottom-up pressure scheduling fails to bring a
-             * high-pressure block comfortably below the 52-GPR cliff, try
-             * order-preserving load sinking. */
-            if (min_all > 46) {
+            /* Order-preserving load sinking: only pursue when it can cross a
+             * real sub-45 occupancy cliff or avert spilling (> 84 GPRs). Never
+             * sink loads just to move within the flat 45..84 GPR shelf. */
+            if ((min_all > 24 && min_all <= 64) || min_all > 84) {
+               unsigned cur_occ =
+                  agx_occupancy_for_register_count(
+                     2u * MIN2(MAX2((unsigned)MAX2(min_all, 1), 1u),
+                               (unsigned)AGX_APPLE9_GPR_COUNT))
+                     .max_threads;
                void *sink_ctx = ralloc_context(blk_ctx);
                struct vir_sched_result sink = run_block_sink_loads(
                   p, defs, pub_defs, val_max_gpr, first_body, first_tail,
@@ -2973,11 +2993,20 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                       have_pres ? pres.max_all : orig_all,
                       have_pres ? pres.max_64 : orig_64,
                       have_pres ? pres.max_16 : orig_16)) {
-                  ralloc_free(pres_ctx);
-                  pres_ctx = sink_ctx;
-                  pres = sink;
-                  have_pres = true;
-                  min_all = sink.max_all;
+                  unsigned sink_occ =
+                     agx_occupancy_for_register_count(
+                        2u * MIN2(MAX2((unsigned)MAX2(sink.max_all, 1), 1u),
+                                  (unsigned)AGX_APPLE9_GPR_COUNT))
+                        .max_threads;
+                  if (sink_occ > cur_occ || min_all > 84) {
+                     ralloc_free(pres_ctx);
+                     pres_ctx = sink_ctx;
+                     pres = sink;
+                     have_pres = true;
+                     min_all = sink.max_all;
+                  } else {
+                     ralloc_free(sink_ctx);
+                  }
                } else {
                   ralloc_free(sink_ctx);
                }
@@ -2991,15 +3020,23 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
             MIN2(agx_occupancy_for_register_count(2u * clamped_min)
                     .max_registers / 2u,
                  (unsigned)AGX_APPLE9_GPR_COUNT);
-         /* Leave alignment/RA headroom below each occupancy tier ceiling:
-          * 6 GPRs for the critical 52-GPR (1024-thread) tier so vec4-aligned
-          * loads don't spill over 52, and 4 GPRs for higher tiers. */
-         unsigned headroom = tier_gprs <= 52u ? 6u : 4u;
-         int32_t safe_tier =
-            (int32_t)(tier_gprs > headroom ? tier_gprs - headroom : tier_gprs);
+         /* Leave alignment/RA headroom below each real G16G occupancy cliff
+          * (18/24/28/32/36/40/44 GPRs). Across the flat 45..96 GPR shelf
+          * (832 thr/core), protect the r0..r63 compact ALU boundary when
+          * comfortably below 60, and grant generous latency slack up to 88
+          * GPRs without risking spills past 96. */
+         int32_t safe_tier;
+         if (tier_gprs <= 28u)
+            safe_tier = (int32_t)(tier_gprs - 2u);
+         else if (tier_gprs <= 40u)
+            safe_tier = (int32_t)(tier_gprs - 3u);
+         else if (tier_gprs <= 44u)
+            safe_tier = (int32_t)(tier_gprs - 4u);
+         else
+            safe_tier = (min_all <= 60) ? 60 : 88;
          int32_t lat_limit = min_all;
          if (min_all < safe_tier)
-            lat_limit = MIN2(safe_tier, min_all + 12);
+            lat_limit = MIN2(safe_tier, min_all + (tier_gprs > 44u ? 16 : 8));
 
          void *lat_ctx = ralloc_context(blk_ctx);
          unsigned orig_stalls = 0;

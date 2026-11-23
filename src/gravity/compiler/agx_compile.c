@@ -57,14 +57,23 @@ agx_get_compiler_debug(void)
 }
 
 /* Table describing the relationship between register pressure and thread
- * count. Each entry describes a maximum number of registers and the associated
- * best-case thread count.
+ * count on Apple9 (G16G B1 / T8132 / M4), empirically measured on silicon.
+ * Each entry describes a maximum number of half-registers (2 * 32-bit GPRs)
+ * and the associated maximum resident thread count per core.
  *
- * Sorted in ascending order of maximum registers for easy lookup.
+ * Dual 160 KiB/core register banks scale occupancy up to 2048 threads/core
+ * (64 warps) below 48 GPRs and stay flat at 832 threads/core (26 warps)
+ * across 45..96 GPRs. Sorted in ascending order of maximum registers.
  */
 static const struct agx_occupancy occupancies[] = {
-   {104, 1024}, {112, 896}, {128, 832}, {136, 768}, {144, 704},
-   {160, 640},  {184, 576}, {208, 512}, {232, 448}, {256, 384},
+   { 36, 2048 }, /* <= 18 GPRs: 64 warps/core */
+   { 48, 1664 }, /* <= 24 GPRs: 52 warps/core */
+   { 56, 1536 }, /* <= 28 GPRs: 48 warps/core */
+   { 64, 1280 }, /* <= 32 GPRs: 40 warps/core */
+   { 72, 1152 }, /* <= 36 GPRs: 36 warps/core */
+   { 80,  960 }, /* <= 40 GPRs: 30 warps/core */
+   { 88,  896 }, /* <= 44 GPRs: 28 warps/core */
+   { 192, 832 }, /* 45..96 GPRs: 26 warps/core */
 };
 
 struct agx_occupancy
@@ -78,7 +87,9 @@ agx_occupancy_for_register_count(unsigned halfregs)
          return occupancies[i];
    }
 
-   UNREACHABLE("Register count must be less than the maximum");
+   /* Clamp pre-spill estimates above Apple9's 96-GPR register file to the
+    * floor occupancy tier rather than aborting. */
+   return occupancies[ARRAY_SIZE(occupancies) - 1];
 }
 
 static bool

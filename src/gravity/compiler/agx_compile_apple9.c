@@ -7628,9 +7628,10 @@ apple9_prepare_dag(nir_shader *nir)
                               nir_metadata_control_flow, NULL);
 }
 
-/* At most this many hoisted samples are unconsumed at once: eight
- * four-register coordinate tuples fill p0-p31. */
-#define APPLE9_HOIST_SAMPLE_LIMIT 8
+/* At most this many hoisted samples are unconsumed at once: six matches
+ * Apple9's six hardware scoreboard slots (s1..s6) 1-to-1 and avoids slot-6
+ * serialization regressions measured on G16G silicon at N=8. */
+#define APPLE9_HOIST_SAMPLE_LIMIT 6
 
 /* Long-latency operations to issue early: samples that fetch from memory
  * (queries return without waiting). Buffer loads stay in place: hoisting them
@@ -7915,14 +7916,17 @@ agx_nir_hoist_apple9_samples(nir_shader *nir)
 
       unsigned orig_pressure =
          apple9_schedule_pressure(block, original, original_count, width, live, live_words);
-      if (orig_pressure >= 100)
+      if (orig_pressure >= 96)
          continue;
-      /* Keep hoisted texture waves within the 52-GPR (1024-thread) occupancy
-       * tier whenever the unhoisted block fits, stepping down the in-flight
-       * cap (8 -> 4 -> 2) if a wider wave increases peak pressure. */
+      /* Step down the in-flight texture wave (6 -> 4 -> 2) to guard against
+       * real G16G occupancy cliffs below 48 GPRs (18/24/28/32/36/40/44).
+       * Above 48 GPRs, G16G occupancy is flat at 832 threads/core up to 96
+       * GPRs, so allow full N=6 waves up to 88 live words without spilling. */
+      const unsigned max_pressure =
+         orig_pressure > 48 ? MIN2(orig_pressure + 8u, 88u) : orig_pressure;
       const unsigned limits[] = {
-         orig_pressure > 36 ? 4u : limit,
-         orig_pressure > 36 ? 2u : 4u,
+         limit,
+         4u,
          2u,
       };
       bool accepted = false;
@@ -7977,7 +7981,7 @@ agx_nir_hoist_apple9_samples(nir_shader *nir)
          assert(original_count == s.count);
          unsigned new_pressure =
             apple9_schedule_pressure(block, s.order, s.count, width, live, live_words);
-         if (new_pressure <= orig_pressure) {
+         if (new_pressure <= max_pressure) {
             accepted = true;
             break;
          }

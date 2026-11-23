@@ -1213,7 +1213,7 @@ TEST(Apple9RaPressureSchedule, RematLongSpanDerivedAluDropsHighBlockPressure)
    agx_apple9_vir_finish(&p);
 }
 
-TEST(Apple9RaPressureSchedule, AutoTierSlackCompressesPast52EvenWithCallerSlack)
+TEST(Apple9RaPressureSchedule, AutoTierSlackCompressesSub45TierEvenWithCallerSlack)
 {
    agx_apple9_vir_program p;
    agx_apple9_vir_init(&p);
@@ -1222,14 +1222,14 @@ TEST(Apple9RaPressureSchedule, AutoTierSlackCompressesPast52EvenWithCallerSlack)
    ASSERT_NE(b0, nullptr);
    agx_apple9_block_begin(&p, b0);
 
-   /* Build a block with 45 live values plus 12 independent early DEVICE_LOADs
-    * whose original order peaks at >52 GPRs, even though sinking/serializing
-    * the loads keeps the entire block at <= 52 GPRs. Even if the caller passes
-    * a nonzero pressure_slack (from unscheduled peak), auto_tier_slack must
-    * compress the block back into the <= 52 GPR (1024-thread) occupancy tier. */
+   /* Build a block with 37 live values plus 12 independent early DEVICE_LOADs
+    * whose original order peaks at >44 GPRs (832-thread floor tier), even
+    * though sinking/serializing the loads keeps the entire block at <= 40 GPRs
+    * (960-thread G16G tier). Even if the caller passes a nonzero pressure_slack,
+    * auto_tier_slack must compress the block into the higher real G16G tier. */
    uint32_t base = agx_apple9_vir_input(&p, 0);
    std::vector<uint32_t> keep;
-   for (unsigned i = 0; i < 44; ++i) {
+   for (unsigned i = 0; i < 36; ++i) {
       uint32_t v = agx_apple9_vir_input(&p, i + 1);
       keep.push_back(v);
       ASSERT_TRUE(agx_apple9_vir_add_live_out(&p, v));
@@ -1246,7 +1246,7 @@ TEST(Apple9RaPressureSchedule, AutoTierSlackCompressesPast52EvenWithCallerSlack)
 
    apple9_ra_liveness_info before;
    ASSERT_TRUE(apple9_ra_liveness(&p, &before));
-   ASSERT_GT(p.peak_live_gprs, 52u);
+   ASSERT_GT(p.peak_live_gprs, 44u);
    apple9_ra_liveness_finish(&before);
 
    apple9_ra_sched_options opts = {
@@ -1256,7 +1256,58 @@ TEST(Apple9RaPressureSchedule, AutoTierSlackCompressesPast52EvenWithCallerSlack)
       .rejected_pressure_increase = 0,
    };
    ASSERT_TRUE(apple9_ra_pressure_schedule_opts(&p, &opts));
-   EXPECT_LE(p.peak_live_gprs, 52u);
+   EXPECT_LE(p.peak_live_gprs, 40u);
+
+   verify_ssa_def_before_use_in_block(&p, b0);
+   agx_apple9_vir_finish(&p);
+}
+
+TEST(Apple9RaPressureSchedule, AutoTierSlackPreservesOverlapInFlat45To96Band)
+{
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   ASSERT_NE(b0, nullptr);
+   agx_apple9_block_begin(&p, b0);
+
+   /* 50 live values + 4 independent DEVICE_LOADs: both 52 and 56 GPRs sit on
+    * G16G's flat 45..96 GPR shelf (832 thr/core), so auto_tier_slack must NOT
+    * sink loads to chase the obsolete G13 52-GPR cliff. */
+   uint32_t base = agx_apple9_vir_input(&p, 0);
+   std::vector<uint32_t> keep;
+   for (unsigned i = 0; i < 49; ++i) {
+      uint32_t v = agx_apple9_vir_input(&p, i + 1);
+      keep.push_back(v);
+      ASSERT_TRUE(agx_apple9_vir_add_live_out(&p, v));
+   }
+
+   agx_apple9_vir_instr *ld_ins[4];
+   agx_apple9_vir_instr *use_ins[4];
+   uint32_t acc = keep[0];
+   for (unsigned i = 0; i < 4; ++i) {
+      uint32_t ld = emit_dev_load(&p, i, base, 1);
+      ld_ins[i] = p.instructions[p.instruction_count - 1];
+      acc = emit_iadd(&p, acc, ld);
+      use_ins[i] = p.instructions[p.instruction_count - 1];
+   }
+   ASSERT_TRUE(emit_dev_store(&p, 0, base, acc));
+
+   apple9_ra_sched_options opts = {
+      .latency = true,
+      .pressure_slack = 0,
+      .auto_tier_slack = true,
+      .rejected_pressure_increase = 0,
+   };
+   ASSERT_TRUE(apple9_ra_pressure_schedule_opts(&p, &opts));
+
+   unsigned max_ld = 0, min_use = UINT_MAX;
+   for (unsigned i = 0; i < 4; ++i) {
+      max_ld = std::max(max_ld, instr_pos_in_block(b0, ld_ins[i]));
+      min_use = std::min(min_use, instr_pos_in_block(b0, use_ins[i]));
+   }
+   EXPECT_LT(max_ld, min_use);
+   EXPECT_LE(p.peak_live_gprs, 60u);
 
    verify_ssa_def_before_use_in_block(&p, b0);
    agx_apple9_vir_finish(&p);
