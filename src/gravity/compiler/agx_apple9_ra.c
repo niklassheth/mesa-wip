@@ -1,156 +1,19 @@
-#include "gravity/debug.h"
-#include "agx_compile_apple9.h"
 /*
  * Copyright 2026 The Asahi Linux Contributors
  * SPDX-License-Identifier: MIT
  */
 
+#include "gravity/debug.h"
+#include "agx_compile.h"
+#include "agx_compile_apple9.h"
 #include "compiler/nir/nir.h"
 #include "agx_apple9_ir.h"
 #include "agx_apple9_profile.h"
-#include "agx_builder.h"
-#include "agx_compiler.h"
+#include "apple9_ra_assign.h"
+#include "apple9_ra_sched.h"
 #include "agx_debug.h"
 #include "util/hash_table.h"
-
-/* Apple9 selection keeps its machine operands and encoding contracts. The
- * shared IR carries their SSA dataflow, including genuine CFG phis, through
- * the existing spiller, memory-slot allocator and parallel-copy lowering. */
-struct apple9_shared_ra {
-   struct agx_apple9_vir_program *program;
-   agx_context *ctx;
-   struct agx_shader_key key;
-   agx_block **blocks;
-   agx_index *values;
-   agx_index *vectors;
-   agx_instr **phis;
-   bool *publication;
-   uint64_t max_spill_cost;
-};
-
-static enum agx_schedule_class
-apple9_schedule_class(const agx_instr *I)
-{
-   if (I->op == AGX_OPCODE_APPLE9 || I->op == AGX_OPCODE_APPLE9_PURE) {
-      /* GPR SSA captures arithmetic dependencies. Publications, memory and
-       * coverage still have implicit resources; serialize those operations
-       * until their complete dependency graph is exposed to shared IR. */
-      return agx_apple9_instr_is_pure_alu(I->apple9)
-                ? AGX_SCHEDULE_CLASS_NONE
-                : AGX_SCHEDULE_CLASS_BARRIER;
-   }
-   return agx_opcodes_info[I->op].schedule_class;
-}
-
-enum apple9_schedule_resource {
-   APPLE9_SCHED_STATE = BITFIELD_BIT(0),
-   APPLE9_SCHED_MEMORY = BITFIELD_BIT(1),
-   APPLE9_SCHED_PUBLICATION = BITFIELD_BIT(2),
-   APPLE9_SCHED_INTERPOLATION = BITFIELD_BIT(3),
-   APPLE9_SCHED_TILE = BITFIELD_BIT(4),
-   APPLE9_SCHED_MESH = BITFIELD_BIT(5),
-   APPLE9_SCHED_ALL = BITFIELD_MASK(6),
-};
-
-static void
-apple9_schedule_resources(const agx_instr *I, uint32_t *reads, uint32_t *writes)
-{
-   /* Every lane operation observes the active execution/coverage state. */
-   *reads = APPLE9_SCHED_STATE;
-   *writes = 0;
-   switch (I->op) {
-   case AGX_OPCODE_MOV:
-   case AGX_OPCODE_MOV_IMM:
-   case AGX_OPCODE_COLLECT:
-   case AGX_OPCODE_SPLIT:
-   case AGX_OPCODE_PHI:
-      return;
-   case AGX_OPCODE_APPLE9:
-   case AGX_OPCODE_APPLE9_PURE:
-      break;
-   default:
-      *reads = *writes = APPLE9_SCHED_ALL;
-      return;
-   }
-   const struct agx_apple9_vir_instr *ins = I->apple9;
-   if (agx_apple9_instr_is_pure_alu(ins))
-      return;
-   if (ins->publication_handoff ||
-       ins->encoding == AGX_APPLE9_ENC_FLOAT2_EXPORT ||
-       ins->encoding == AGX_APPLE9_ENC_LOGIC_EXPORT ||
-       ins->op == AGX_APPLE9_VIR_PUBLICATION_TUPLE)
-      *reads |= *writes = APPLE9_SCHED_PUBLICATION;
-   switch (ins->op) {
-   case AGX_APPLE9_VIR_MESH_CONTROL:
-   case AGX_APPLE9_VIR_MESH_SUBMIT_SCALAR:
-   case AGX_APPLE9_VIR_MESH_SUBMIT_CHANNEL:
-      /* Mesh publication consumes local output and externally visible
-       * formation records. Keep it ordered with both and with other mesh
-       * operations; execution-mask state is already an input above. */
-      *reads |= APPLE9_SCHED_MEMORY | APPLE9_SCHED_MESH;
-      *writes |= APPLE9_SCHED_MEMORY | APPLE9_SCHED_MESH;
-      return;
-   case AGX_APPLE9_VIR_GET_SR:
-      /* Async slot-1 system-value reads contend for fixed scoreboard slot 1;
-       * keep them ordered with surrounding consumers so scheduling does not
-       * overlap two slot-1 producers and force an explicit WAIT(1). */
-      if (ins->encoding == AGX_APPLE9_ENC_GET_DRAW_ID ||
-          ins->encoding == AGX_APPLE9_ENC_GET_COVERAGE)
-         *reads = *writes = APPLE9_SCHED_ALL;
-      return;
-   case AGX_APPLE9_VIR_GET_GLOBAL_ID:
-   case AGX_APPLE9_VIR_DERIVATIVE:
-   case AGX_APPLE9_VIR_MMA:
-      return;
-   case AGX_APPLE9_VIR_DEVICE_LOAD:
-   case AGX_APPLE9_VIR_PRIVATE_LOAD:
-   case AGX_APPLE9_VIR_SHARED_LOAD:
-      *reads |= APPLE9_SCHED_MEMORY;
-      if (ins->memory_volatile)
-         *writes |= APPLE9_SCHED_MEMORY;
-      return;
-   case AGX_APPLE9_VIR_DEVICE_STORE:
-   case AGX_APPLE9_VIR_PRIVATE_STORE:
-   case AGX_APPLE9_VIR_SHARED_STORE:
-   case AGX_APPLE9_VIR_SHARED_ATOMIC:
-   case AGX_APPLE9_VIR_DEVICE_ATOMIC:
-   case AGX_APPLE9_VIR_DEVICE_ATOMIC_RESULT:
-      *reads |= APPLE9_SCHED_MEMORY;
-      *writes |= APPLE9_SCHED_MEMORY;
-      return;
-   case AGX_APPLE9_VIR_IMAGE_STORE:
-   case AGX_APPLE9_VIR_BLOCK_IMAGE_STORE:
-      /* Coordinates and data live in the publication file, outside GPR
-       * SSA. Keep the store after their publication and before a later
-       * publication reuses the slots. Async IMAGE_STORE borrows its tuple
-       * until scoreboard completion (tracked in apple9_schedule_physical). */
-      *reads |= APPLE9_SCHED_MEMORY | APPLE9_SCHED_PUBLICATION;
-      *writes |= APPLE9_SCHED_MEMORY;
-      return;
-   case AGX_APPLE9_VIR_TEXTURE_SAMPLE:
-      *reads |= APPLE9_SCHED_MEMORY | APPLE9_SCHED_PUBLICATION;
-      *writes |= APPLE9_SCHED_PUBLICATION;
-      return;
-   case AGX_APPLE9_VIR_INTERPOLATION_POSITION:
-   case AGX_APPLE9_VIR_ITER:
-   case AGX_APPLE9_VIR_ITER_FLAT:
-   case AGX_APPLE9_VIR_FMUL_PROJECT:
-   case AGX_APPLE9_VIR_CUBE:
-      *reads |= APPLE9_SCHED_INTERPOLATION;
-      *writes |= APPLE9_SCHED_INTERPOLATION;
-      return;
-   case AGX_APPLE9_VIR_PUBLICATION_TUPLE:
-      return;
-   default:
-      /* ALU exports/handoffs have no extra implicit state. Everything else,
-       * including predicate, tile, coverage and control transitions, remains
-       * a full resource fence until a narrower contract has been established. */
-      if (*writes == APPLE9_SCHED_PUBLICATION)
-         return;
-      *reads = *writes = APPLE9_SCHED_ALL;
-      return;
-   }
-}
+#include "util/macros.h"
 
 static unsigned
 apple9_dependency_delay(const struct agx_apple9_vir_instr *I)
@@ -182,12 +45,6 @@ apple9_dependency_delay(const struct agx_apple9_vir_instr *I)
    }
 }
 
-static unsigned
-apple9_schedule_delay(const agx_instr *I)
-{
-   return (I->op == AGX_OPCODE_APPLE9 || I->op == AGX_OPCODE_APPLE9_PURE)
-             ? apple9_dependency_delay(I->apple9) : 1;
-}
 
 static bool
 apple9_identity(const struct agx_apple9_vir_instr *ins)
@@ -197,129 +54,6 @@ apple9_identity(const struct agx_apple9_vir_instr *ins)
           ins->nr_srcs == 2 && ins->src[0] == ins->src[1];
 }
 
-/* A hardware tuple is one vector operand in allocation IR. SPLIT/COLLECT
- * express its relationship to scalar SSA values without reserving a bank of
- * post-allocation repair registers. */
-static unsigned
-apple9_source_width(const struct agx_apple9_vir_instr *ins, unsigned source)
-{
-   if ((ins->op == AGX_APPLE9_VIR_MESH_SUBMIT_CHANNEL ||
-        ins->op == AGX_APPLE9_VIR_MESH_SUBMIT_SCALAR) && source == 0)
-      return 2;
-   if ((ins->op == AGX_APPLE9_VIR_DEVICE_STORE ||
-        ins->encoding == AGX_APPLE9_ENC_SHARED_STORE ||
-        ins->op == AGX_APPLE9_VIR_PRIVATE_STORE) && source == 0)
-      return agx_apple9_mem_data_gprs(ins);
-   if ((ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
-        ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC) && source == 0)
-      return MAX2(ins->memory_components, 1);
-   if (ins->encoding == AGX_APPLE9_ENC_DEVICE_STORE_INDIRECT &&
-       source == agx_apple9_mem_data_gprs(ins) + 1)
-      return 2;
-   if (ins->encoding == AGX_APPLE9_ENC_DEVICE_ATOMIC_INDIRECT &&
-       source == ins->memory_components + 1)
-      return 2;
-   if ((ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT && source == 1) ||
-       (ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_POINTER && source == 0))
-      return 2;
-   if (ins->op == AGX_APPLE9_VIR_MMA)
-      return agx_apple9_mma_source_width(ins, source);
-   return 1;
-}
-
-/* T8132 register-table probes validate both operands through r95. The full
- * half-register number is scattered across the sample bundle: texture bits
- * 11..14, 68..70, 122; sampler bits 32..35, 65..67, 116. */
-static const struct agx_apple9_operand_constraint apple9_table_index[2] = {
-   {
-      .role = AGX_APPLE9_OPERAND_SRC4,
-      .files = AGX_APPLE9_FILE_GPR,
-      .widths = AGX_APPLE9_WIDTH_32,
-      .min_index = 0,
-      .max_index = AGX_APPLE9_GPR_COUNT - 1,
-      .alignment_halves = 2,
-      .flags = AGX_APPLE9_OPERAND_ALLOCATABLE,
-   },
-   {
-      .role = AGX_APPLE9_OPERAND_SRC5,
-      .files = AGX_APPLE9_FILE_GPR,
-      .widths = AGX_APPLE9_WIDTH_32,
-      .min_index = 0,
-      .max_index = AGX_APPLE9_GPR_COUNT - 1,
-      .alignment_halves = 2,
-      .flags = AGX_APPLE9_OPERAND_ALLOCATABLE,
-   },
-};
-
-static const struct agx_apple9_operand_constraint *
-apple9_source_constraint(const struct agx_apple9_vir_instr *ins, unsigned source)
-{
-   if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE &&
-       source + ins->texture_bindless + ins->sampler_bindless >= ins->nr_srcs)
-      return &apple9_table_index[ins->sampler_bindless &&
-                                 source + 1 == ins->nr_srcs];
-   if (ins->encoding == AGX_APPLE9_ENC_SHARED_STORE ||
-       ins->op == AGX_APPLE9_VIR_PRIVATE_STORE) {
-      return agx_apple9_find_operand(ins->encoding,
-                                     source ? AGX_APPLE9_OPERAND_SRC1
-                                            : AGX_APPLE9_OPERAND_SRC0);
-   }
-   if (ins->op == AGX_APPLE9_VIR_DEVICE_STORE ||
-       ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
-       ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC) {
-      unsigned data_gprs = ins->op == AGX_APPLE9_VIR_DEVICE_STORE
-                              ? agx_apple9_mem_data_gprs(ins)
-                              : MAX2(ins->memory_components, 1);
-      if ((ins->encoding == AGX_APPLE9_ENC_DEVICE_STORE_INDIRECT ||
-           ins->encoding == AGX_APPLE9_ENC_DEVICE_ATOMIC_INDIRECT) &&
-          source > data_gprs)
-         return agx_apple9_find_operand(ins->encoding,
-                                        source == data_gprs + 1
-                                           ? AGX_APPLE9_OPERAND_SRC1
-                                           : AGX_APPLE9_OPERAND_SRC2);
-      enum agx_apple9_operand_role role =
-         source ? AGX_APPLE9_OPERAND_INDEX
-         : ins->op == AGX_APPLE9_VIR_DEVICE_STORE ? AGX_APPLE9_OPERAND_STORE_DATA
-                                                : AGX_APPLE9_OPERAND_ATOMIC_DATA;
-      return agx_apple9_find_operand(ins->encoding, role);
-   }
-   if (ins->encoding == AGX_APPLE9_ENC_PSEUDO)
-      return NULL;
-   if (ins->op == AGX_APPLE9_VIR_MMA)
-      return agx_apple9_find_operand(ins->encoding,
-                                     agx_apple9_mma_source_role(ins, source));
-   const struct agx_apple9_encoding_info *info =
-      agx_apple9_encoding_info(ins->encoding);
-   for (unsigned o = 0, s = 0; o < info->operand_count; ++o) {
-      const struct agx_apple9_operand_constraint *c = &info->operands[o];
-      if (!(c->files & AGX_APPLE9_FILE_GPR) ||
-          agx_apple9_inline_source_file(ins, c->role) ||
-          c->role == AGX_APPLE9_OPERAND_DEST)
-         continue;
-      if (s++ == source)
-         return c;
-   }
-   return NULL;
-}
-
-static struct agx_reg_constraint
-apple9_register_constraint(const struct agx_apple9_operand_constraint *c)
-{
-   return (struct agx_reg_constraint){
-      .min = c ? 2 * c->min_index : 0,
-      .max = c ? 2 * c->max_index : AGX_APPLE9_HALF_REGISTER_COUNT - 2,
-      .align = c ? MAX2(c->alignment_halves, 2) : 2,
-      .clobber = c && (c->flags & AGX_APPLE9_OPERAND_CLOBBER),
-   };
-}
-
-static bool
-apple9_publication(const struct agx_apple9_vir_instr *ins)
-{
-   return ins->encoding == AGX_APPLE9_ENC_FLOAT2_EXPORT ||
-          ins->encoding == AGX_APPLE9_ENC_LOGIC_EXPORT ||
-          ins->op == AGX_APPLE9_VIR_PUBLICATION_TUPLE;
-}
 
 static bool
 apple9_after_logical_end(const struct agx_apple9_vir_instr *ins)
@@ -352,394 +86,8 @@ apple9_nir_block(struct hash_table *nir_blocks, nir_block *nir)
    return entry ? entry->data : NULL;
 }
 
-static agx_block *
-apple9_shared_block(struct apple9_shared_ra *ra, struct agx_apple9_block *block)
-{
-   return block ? ra->blocks[block->index] : NULL;
-}
 
-static bool apple9_async(const struct agx_apple9_vir_instr *ins);
-static bool apple9_reads_sources_at_issue(const struct agx_apple9_vir_instr *ins);
-
-static bool
-apple9_shared_dataflow(struct apple9_shared_ra *ra, nir_shader *nir,
-                       const char **reason)
-{
-   struct agx_apple9_vir_program *p = ra->program;
-   agx_context *ctx = ra->ctx;
-   ctx->nir = nir;
-   ctx->stage = nir->info.stage;
-   ctx->key = &ra->key;
-   ctx->schedule_class = apple9_schedule_class;
-   ra->key.has_scratch = true;
-   ctx->ra_target = (struct agx_ra_target){
-      .max_registers = AGX_APPLE9_HALF_REGISTER_COUNT,
-      /* No permanent reservation: spilling reserves r0..r4 for its copy,
-       * index and memory-swap temporaries. */
-      .reserved_registers = 0,
-      .spill_reserved_registers = 10,
-      .spill_copy_register = 2,
-      .spill_swap_registers = {6, 8},
-      .late_kill_sources = true,
-      .preserve_source_kills = true,
-      .defer_spill_lowering = true,
-      .disable_occupancy_rematerialization = true,
-      .spill_partial_phi_sources = true,
-      .mov_imm_registers = 2 * 64,
-   };
-   list_inithead(&ctx->blocks);
-   unsigned block_count = p->last_block->index + 1;
-   ra->blocks = rzalloc_array(ctx, agx_block *, block_count);
-   ra->values = rzalloc_array(ctx, agx_index, p->value_count);
-   ra->vectors = rzalloc_array(ctx, agx_index, p->value_count);
-   ra->phis = rzalloc_array(ctx, agx_instr *, p->value_count);
-   ra->publication = rzalloc_array(ctx, bool, p->value_count);
-   if (!ra->blocks || !ra->values || !ra->vectors || !ra->phis || !ra->publication)
-      return false;
-
-   for (unsigned i = 0; i < p->instruction_count; ++i) {
-      const struct agx_apple9_vir_instr *ins = p->instructions[i];
-      if (apple9_publication(ins)) {
-         for (unsigned c = 0; c < ins->dest_components; ++c)
-            ra->publication[ins->dest + c] = true;
-      }
-   }
-   for (unsigned v = 0; v < p->value_count; ++v) {
-      if (!ra->publication[v])
-         ra->values[v] = agx_temp(ctx, AGX_SIZE_32);
-   }
-   for (unsigned i = 0; i < p->instruction_count; ++i) {
-      const struct agx_apple9_vir_instr *ins = p->instructions[i];
-      if (apple9_identity(ins) && !ins->publication_handoff)
-         ra->values[ins->dest] = ra->values[ins->src[0]];
-   }
-
-   for (struct agx_apple9_block *block = p->blocks; block;
-        block = block->next) {
-      /* Loop-mask restoration blocks have no SSA dataflow. Their original
-       * machine placement is retained when emitting the allocated program. */
-      if (!block->nir && block != p->blocks)
-         continue;
-      agx_block *common = rzalloc(ctx, agx_block);
-      if (!common)
-         return false;
-      list_inithead(&common->instructions);
-      util_dynarray_init(&common->predecessors, common);
-      common->index = ctx->num_blocks++;
-      list_addtail(&common->link, &ctx->blocks);
-      ra->blocks[block->index] = common;
-   }
-
-   /* Map each NIR block once rather than searching the layout per edge. */
-   struct hash_table *nir_blocks = _mesa_pointer_hash_table_create(ctx);
-   if (!nir_blocks)
-      return false;
-   for (struct agx_apple9_block *block = p->blocks; block;
-        block = block->next) {
-      if (block->nir && !_mesa_hash_table_search(nir_blocks, block->nir))
-         _mesa_hash_table_insert(nir_blocks, block->nir, block);
-   }
-
-   for (struct agx_apple9_block *block = p->blocks; block;
-        block = block->next) {
-      agx_block *common = apple9_shared_block(ra, block);
-      if (!common)
-         continue;
-      if (block->nir) {
-         nir_block *exit = block->nir_exit ?: block->nir;
-         for (unsigned s = 0; s < 2; ++s) {
-            nir_block *succ = exit->successors[s];
-            agx_block *next =
-               apple9_shared_block(ra, apple9_nir_block(nir_blocks, succ));
-            if (!next)
-               continue;
-            agx_block_add_successor(common, next);
-            next->loop_header |= next->index <= common->index;
-         }
-      } else {
-         struct agx_apple9_block *next = block->next;
-         while (next && !next->nir)
-            next = next->next;
-         if (next)
-            agx_block_add_successor(common, apple9_shared_block(ra, next));
-      }
-   }
-
-   /* Blocks after infinite loops are unreachable yet still feed their
-    * successors. Drop those edges, as the common compiler deletes such blocks:
-    * RA requires live-in values to be live-out of every predecessor.
-    */
-   bool pruned;
-   do {
-      pruned = false;
-      agx_foreach_block(ctx, block) {
-         if (block == agx_start_block(ctx) || agx_num_predecessors(block))
-            continue;
-         for (unsigned s = 0; s < ARRAY_SIZE(block->successors); ++s) {
-            agx_block *succ = block->successors[s];
-            if (!succ)
-               continue;
-            struct util_dynarray *preds = &succ->predecessors;
-            unsigned index = agx_predecessor_index(succ, block);
-            unsigned remaining = agx_num_predecessors(succ) - (index + 1);
-            memmove(util_dynarray_element(preds, agx_block *, index),
-                    util_dynarray_element(preds, agx_block *, index + 1),
-                    remaining * sizeof(agx_block *));
-            preds->size -= sizeof(agx_block *);
-            block->successors[s] = NULL;
-            pruned = true;
-         }
-      }
-   } while (pruned);
-
-   /* Declare phis before selecting instructions, since incoming backedges
-    * can refer to values whose definitions occur later in source order. */
-   for (unsigned i = 0; i < p->instruction_count; ++i) {
-      struct agx_apple9_vir_instr *ins = p->instructions[i];
-      if (ins->op != AGX_APPLE9_VIR_PHI)
-         continue;
-      agx_block *block = apple9_shared_block(ra, ins->phi_block);
-      if (!block || !agx_num_predecessors(block)) {
-         *reason = "Apple9 shared allocation requires a logical phi CFG";
-         return false;
-      }
-      agx_builder b = agx_init_builder(ctx, agx_after_block(block));
-      ra->phis[ins->dest] =
-         agx_phi_to(&b, ra->values[ins->dest], agx_num_predecessors(block));
-   }
-
-   /* Register tuples collected for operands that are only read, such as a
-    * load's base address pair, are reused by later instructions of the same
-    * block that read the same values, instead of collecting a copy each. */
-   struct {
-      uint32_t src[4];
-      unsigned width, last;
-      agx_index vector;
-   } tuples[16];
-   unsigned nr_tuples = 0;
-   agx_block *tuple_block = NULL;
-   for (unsigned i = 0; i < p->instruction_count; ++i) {
-      struct agx_apple9_vir_instr *ins = p->instructions[i];
-      struct agx_apple9_block *owner = agx_apple9_instr_block(ins);
-      agx_block *block = apple9_shared_block(ra, owner);
-      if (ins->op == AGX_APPLE9_VIR_PHI)
-         continue;
-      if (block != tuple_block) {
-         tuple_block = block;
-         nr_tuples = 0;
-      }
-      if (!block) {
-         if (ins->dest_components || ins->nr_srcs) {
-            *reason = "Apple9 synthetic control block has SSA dataflow";
-            return false;
-         }
-         continue;
-      }
-      if (ins->op == AGX_APPLE9_VIR_PHI_SRC) {
-         agx_instr *phi = ra->phis[ins->target];
-         struct agx_apple9_vir_instr const *definition =
-            agx_apple9_definition(p, ins->target);
-         agx_block *succ = apple9_shared_block(ra, definition->phi_block);
-         if (!phi || !succ) {
-            *reason = "Apple9 phi edge has no shared destination";
-            return false;
-         }
-         bool edge = false;
-         agx_foreach_predecessor(succ, pred)
-            edge |= *pred == block;
-         if (edge)
-            phi->src[agx_predecessor_index(succ, block)] = ra->values[ins->src[0]];
-         continue;
-      }
-      if (ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC_RESULT ||
-          (apple9_identity(ins) && !ins->publication_handoff))
-         continue;
-      agx_builder b = agx_init_builder(ctx, agx_after_block(block));
-      unsigned components = ins->dest_components;
-      bool pub = components && ra->publication[ins->dest];
-      agx_index dest = components > 1
-                          ? agx_vec_temp(ctx, AGX_SIZE_32, components)
-                       : components ? ra->values[ins->dest]
-                                    : agx_null();
-      if (components > 1 && !pub)
-         ra->vectors[ins->dest] = dest;
-      if (ins->op == AGX_APPLE9_VIR_IMM) {
-         agx_mov_imm_to(&b, dest, ins->immediate);
-         continue;
-      }
-      if (ins->op == AGX_APPLE9_VIR_ENTRY_REG) {
-         agx_preload_to(&b, dest, agx_register(ins->immediate * 2, AGX_SIZE_32));
-         continue;
-      }
-      if (ins->op == AGX_APPLE9_VIR_ABI_RETURN) {
-         for (unsigned k = 0; k < p->live_out_count; ++k) {
-            if (p->live_out_reg[k] != AGX_APPLE9_PHYS_INVALID)
-               agx_export(&b, ra->values[p->live_out[k]],
-                          p->live_out_reg[k] * 2);
-         }
-      }
-      agx_index sources[AGX_APPLE9_MAX_VIR_SRCS];
-      unsigned first_source[AGX_APPLE9_MAX_VIR_SRCS], nr_srcs = 0;
-      for (unsigned s = 0; s < ins->nr_srcs;) {
-         unsigned width = apple9_source_width(ins, s);
-         first_source[nr_srcs] = s;
-         if (width == 1) {
-            sources[nr_srcs] = ra->values[ins->src[s]];
-         } else {
-            /* A destroyed operand needs a private tuple. A load's base pair
-             * may be a longer tuple's leading components, such as a loaded
-             * descriptor's address; its split components share those
-             * registers and may outlive the tuple, so the load retains them
-             * (EXP-M4-63 validates retained pointer pairs). */
-            const struct agx_apple9_operand_constraint *operand =
-               apple9_source_constraint(ins, s);
-            const bool load = ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT ||
-                              ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_POINTER;
-            agx_index vector = ra->vectors[ins->src[s]];
-            bool tuple = !(operand && (operand->flags & AGX_APPLE9_OPERAND_CLOBBER)) &&
-                         (load ? agx_channels(vector) >= width
-                               : agx_channels(vector) == width);
-            for (unsigned c = 1; c < width; ++c)
-               tuple &= ins->src[s + c] == ins->src[s] + c;
-            const bool shared =
-               !(operand && (operand->flags & AGX_APPLE9_OPERAND_CLOBBER)) &&
-               width <= 4;
-            bool reused = false;
-            if (!tuple && shared) {
-               for (unsigned t = 0; t < nr_tuples && !reused; ++t) {
-                  if (tuples[t].width != width)
-                     continue;
-                  bool same = true;
-                  for (unsigned c = 0; c < width; ++c)
-                     same &= tuples[t].src[c] == ins->src[s + c];
-                  /* Only for a nearby reader: holding the tuple across a long
-                   * stretch adds register pressure to save two copies. */
-                  if (same && i - tuples[t].last <= 128) {
-                     vector = tuples[t].vector;
-                     tuples[t].last = i;
-                     reused = true;
-                  }
-               }
-            }
-            if (!tuple && !reused) {
-               vector = agx_vec_temp(ctx, AGX_SIZE_32, width);
-               agx_instr *collect = agx_collect_to(&b, vector, width);
-               for (unsigned c = 0; c < width; ++c)
-                  collect->src[c] = ra->values[ins->src[s + c]];
-               if (shared && nr_tuples < ARRAY_SIZE(tuples)) {
-                  tuples[nr_tuples].width = width;
-                  for (unsigned c = 0; c < width; ++c)
-                     tuples[nr_tuples].src[c] = ins->src[s + c];
-                  tuples[nr_tuples].last = i;
-                  tuples[nr_tuples++].vector = vector;
-               }
-            } else if (tuple && load) {
-               const uint32_t retain = BITFIELD_RANGE(s, width);
-               if ((ins->retain_mask & retain) != retain)
-                  ins->retain_mask |= retain;
-            }
-            sources[nr_srcs] = vector;
-         }
-         ++nr_srcs;
-         s += width;
-      }
-      bool pure = components && !pub && !ins->publication_handoff &&
-                  !ins->memory_volatile &&
-                  ins->op != AGX_APPLE9_VIR_DEVICE_ATOMIC &&
-                  ins->op != AGX_APPLE9_VIR_SHARED_ATOMIC;
-      agx_instr *common =
-         agx_alloc_instr(&b,
-                         ins->op == AGX_APPLE9_VIR_COLLECT ? AGX_OPCODE_COLLECT
-                         : apple9_after_logical_end(ins) ? AGX_OPCODE_APPLE9_CF
-                         : pure ? AGX_OPCODE_APPLE9_PURE
-                                                         : AGX_OPCODE_APPLE9,
-                         components && !pub ? 1 : 0, nr_srcs);
-      common->apple9 = ins;
-      if (common->nr_dests)
-         common->dest[0] = dest;
-      for (unsigned s = 0; s < nr_srcs; ++s)
-         common->src[s] = sources[s];
-      if (common->op != AGX_OPCODE_COLLECT) {
-         common->reg_constraints = rzalloc_array(
-            ctx, struct agx_reg_constraint, common->nr_dests + nr_srcs);
-         if (common->nr_dests)
-            common->reg_constraints[0] = apple9_register_constraint(
-               ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC
-                  ? agx_apple9_find_operand(AGX_APPLE9_ENC_DEVICE_ATOMIC_RESULT,
-                                            AGX_APPLE9_OPERAND_SRC0)
-                  : agx_apple9_find_operand(ins->encoding,
-                                            AGX_APPLE9_OPERAND_DEST));
-         /* The register-table form extends the destination at bit 153.
-          * The 14-byte immediate form has only six measured GPR bits. */
-         if (common->nr_dests && ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE &&
-             (ins->texture_bindless || ins->sampler_bindless))
-            common->reg_constraints[0].max =
-               AGX_APPLE9_HALF_REGISTER_COUNT - 2;
-         if (common->nr_dests &&
-             (ins->op == AGX_APPLE9_VIR_SHARED_LOAD ||
-              ins->op == AGX_APPLE9_VIR_DEVICE_LOAD) &&
-             components > 1)
-            common->reg_constraints[0].max =
-               2 * (AGX_APPLE9_GPR_COUNT - components);
-         if (common->nr_dests && ins->op == AGX_APPLE9_VIR_PRIVATE_LOAD &&
-             components > 1)
-            common->reg_constraints[0].max = 2 * (64 - components);
-         /* A synchronous instruction reads its sources before publishing its
-          * result, also when it releases them, and a memory load reads them
-          * at issue, so a scalar result may be written over a source that
-          * dies here. */
-         if (common->nr_dests)
-            common->reg_constraints[0].reuse_killed =
-               components == 1 &&
-               (!apple9_async(ins) ||
-                (apple9_reads_sources_at_issue(ins) &&
-                 ins->op != AGX_APPLE9_VIR_DEVICE_ATOMIC)) &&
-               common->op != AGX_OPCODE_APPLE9_CF &&
-               ins->op != AGX_APPLE9_VIR_DEVICE_ATOMIC &&
-               !agx_apple9_encoding_info(ins->encoding)->split_result;
-         for (unsigned s = 0; s < nr_srcs; ++s) {
-            unsigned source = first_source[s];
-            struct agx_reg_constraint c =
-               apple9_register_constraint(apple9_source_constraint(ins, source));
-            if (source == 0) {
-               if ((ins->encoding == AGX_APPLE9_ENC_SHARED_STORE ||
-                    ins->op == AGX_APPLE9_VIR_DEVICE_STORE) &&
-                   agx_apple9_mem_data_gprs(ins) > 1)
-                  c.max = 2 * (AGX_APPLE9_GPR_COUNT - agx_apple9_mem_data_gprs(ins));
-               else if (ins->op == AGX_APPLE9_VIR_PRIVATE_STORE &&
-                        agx_apple9_mem_data_gprs(ins) > 1)
-                  c.max = 2 * (64 - agx_apple9_mem_data_gprs(ins));
-               else if (ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC &&
-                        ins->memory_components > 1)
-                  c.max = 2 * (AGX_APPLE9_GPR_COUNT - ins->memory_components);
-            }
-            if (ins->op == AGX_APPLE9_VIR_MMA) {
-               unsigned w = apple9_source_width(ins, source);
-               if (w > 1)
-                  c.max = MIN2(c.max, 2 * (AGX_APPLE9_GPR_COUNT - w));
-            }
-            unsigned fixed = p->fixed_phys[ins->src[source]];
-            if (fixed != AGX_APPLE9_PHYS_INVALID && !ra->publication[ins->src[source]])
-               c.min = c.max = fixed * 2;
-            common->reg_constraints[common->nr_dests + s] = c;
-         }
-      }
-      agx_builder_insert(&b.cursor, common);
-      if (components > 1 && !pub) {
-         agx_instr *split = agx_split(&b, components, dest);
-         for (unsigned c = 0; c < components; ++c)
-            split->dest[c] = ra->values[ins->dest + c];
-      }
-   }
-   agx_validate(ctx, "Apple9 shared allocation input");
-   return true;
-}
-
-/* Canonical physical operands occupy separate GPR and publication ranges. */
-#define SPILL_INDEX_REG 2
-#define PUB_BASE  AGX_APPLE9_GPR_COUNT
-#define COPY_REG  1
-#define SPILL_TAG 6
+#define PUB_BASE AGX_APPLE9_GPR_COUNT
 
 static bool
 apple9_emit_physical(struct agx_apple9_vir_program *out,
@@ -774,212 +122,6 @@ apple9_physical_instruction(enum agx_apple9_vir_opcode op,
    };
 }
 
-static bool
-apple9_physical_copy(struct agx_apple9_vir_program *out, unsigned dst,
-                     unsigned src, unsigned wait)
-{
-   if (dst == src && wait == AGX_APPLE9_SCOREBOARD_SLOT_NONE)
-      return true;
-   struct agx_apple9_vir_instr ins = apple9_physical_instruction(
-      AGX_APPLE9_VIR_IOR, AGX_APPLE9_ENC_LOGIC_EXTENDED, dst);
-   ins.src[0] = ins.src[1] = src;
-   ins.nr_srcs = 2;
-   ins.live_after_mask = 3;
-   ins.scoreboard_slot = wait;
-   return apple9_emit_physical(out, &ins);
-}
-
-static bool
-apple9_physical_xor(struct agx_apple9_vir_program *out, unsigned dst,
-                    unsigned a, unsigned b)
-{
-   struct agx_apple9_vir_instr ins = apple9_physical_instruction(
-      AGX_APPLE9_VIR_IXOR, AGX_APPLE9_ENC_LOGIC_EXTENDED, dst);
-   ins.src[0] = a;
-   ins.src[1] = b;
-   ins.nr_srcs = 2;
-   ins.live_after_mask = 3;
-   return apple9_emit_physical(out, &ins);
-}
-
-static bool
-apple9_physical_immediate(struct agx_apple9_vir_program *out, unsigned dst,
-                          uint32_t value)
-{
-   /* Rematerialization and PHI copies happen after constrained allocation.
-    * The long immediate form has six destination bits; a constant for a
-    * higher register goes through the copy register, reserved only for
-    * allocations that need it (apple9_needs_copy_register). */
-   if (dst >= 64) {
-      assert(out->reserved_gprs[COPY_REG]);
-      return apple9_physical_immediate(out, COPY_REG, value) &&
-             apple9_physical_copy(out, dst, COPY_REG,
-                                  AGX_APPLE9_SCOREBOARD_SLOT_NONE);
-   }
-   struct agx_apple9_vir_instr ins = apple9_physical_instruction(
-      AGX_APPLE9_VIR_IMM,
-      dst < 16 && value < 0x80 ? AGX_APPLE9_ENC_MOV_IMM_COMPACT
-                              : AGX_APPLE9_ENC_MOV_IMM32, dst);
-   ins.immediate = value;
-   return apple9_emit_physical(out, &ins);
-}
-
-/* Spill slots start frame_base words into the invocation frame. */
-static bool
-apple9_physical_move(struct agx_apple9_vir_program *out, agx_index dst,
-                     agx_index src, unsigned frame_base)
-{
-   assert(dst.type == AGX_INDEX_REGISTER && dst.size == AGX_SIZE_32);
-   if (src.type == AGX_INDEX_IMMEDIATE)
-      return apple9_physical_immediate(out, dst.value / 2, src.value);
-   assert(src.type == AGX_INDEX_REGISTER && src.size == AGX_SIZE_32);
-   assert(agx_channels(dst) == agx_channels(src));
-   if ((dst.memory || src.memory) && agx_channels(dst) > 1) {
-      /* The shared spiller moves whole tuples. SAVE/FILL transfer one word,
-       * so lower every component of the allocated memory/register range. */
-      unsigned channels = agx_channels(dst);
-      dst.channels_m1 = src.channels_m1 = 0;
-      for (unsigned c = 0; c < channels; ++c) {
-         if (!apple9_physical_move(out, dst, src, frame_base))
-            return false;
-         dst.value += 2;
-         src.value += 2;
-      }
-      return true;
-   }
-   if (!dst.memory && !src.memory)
-      return apple9_physical_copy(out, dst.value / 2, src.value / 2,
-                                  AGX_APPLE9_SCOREBOARD_SLOT_NONE);
-   assert(!dst.memory || !src.memory);
-   const unsigned word = frame_base + (src.memory ? src : dst).value / 2;
-   if (src.memory && word >= AGX_APPLE9_FILL_WORD_COUNT) {
-      /* The compact FILL encoding aliases offsets above 4 KiB. Indexed
-       * private loads cover the full frame but only address low-bank GPRs.
-       * Use the reserved copy register for both the zero index and result,
-       * then move the completed word to its allocated destination. */
-      struct agx_apple9_vir_instr load = apple9_physical_instruction(
-         AGX_APPLE9_VIR_PRIVATE_LOAD, AGX_APPLE9_ENC_PRIVATE_LOAD, COPY_REG);
-      load.src[0] = COPY_REG;
-      load.nr_srcs = 1;
-      load.immediate = word;
-      load.producer_scoreboard_slot = SPILL_TAG;
-      return apple9_physical_immediate(out, COPY_REG, 0) &&
-             apple9_emit_physical(out, &load) &&
-             apple9_physical_copy(out, dst.value / 2, COPY_REG,
-                                  AGX_APPLE9_SCOREBOARD_SLOT_NONE);
-   }
-   if (src.memory) {
-      struct agx_apple9_vir_instr load = apple9_physical_instruction(
-         AGX_APPLE9_VIR_SPILL_LOAD, AGX_APPLE9_ENC_SPILL_LOAD, dst.value / 2);
-      load.immediate = word;
-      load.producer_scoreboard_slot = SPILL_TAG;
-      return apple9_emit_physical(out, &load);
-   }
-   if (word >= AGX_APPLE9_SAVE_WORD_COUNT) {
-      /* Compact SAVE aliases above 8 KiB. Preserve its source through the
-       * copy temporary and use a separate reserved zero index for the full
-       * frame's indexed store. Parallel-copy cycle registers exclude both. */
-      struct agx_apple9_vir_instr store = apple9_physical_instruction(
-         AGX_APPLE9_VIR_PRIVATE_STORE, AGX_APPLE9_ENC_PRIVATE_STORE,
-         AGX_APPLE9_VREG_INVALID);
-      store.src[0] = COPY_REG;
-      store.src[1] = SPILL_INDEX_REG;
-      store.nr_srcs = 2;
-      store.live_after_mask = 2;
-      store.immediate = word;
-      return apple9_physical_copy(out, COPY_REG, src.value / 2,
-                                  AGX_APPLE9_SCOREBOARD_SLOT_NONE) &&
-             apple9_physical_immediate(out, SPILL_INDEX_REG, 0) &&
-             apple9_emit_physical(out, &store);
-   }
-   /* SAVE releases its input. A last use can consume the allocated GPR;
-    * otherwise preserve the live definition through the copy temporary. */
-   struct agx_apple9_vir_instr save = apple9_physical_instruction(
-      AGX_APPLE9_VIR_SPILL_STORE, AGX_APPLE9_ENC_SPILL_STORE,
-      AGX_APPLE9_VREG_INVALID);
-   save.src[0] = src.kill ? src.value / 2 : COPY_REG;
-   save.nr_srcs = 1;
-   save.immediate = word;
-   save.producer_scoreboard_slot = SPILL_TAG;
-   return (src.kill || apple9_physical_copy(out, COPY_REG, src.value / 2,
-                                           AGX_APPLE9_SCOREBOARD_SLOT_NONE)) &&
-          apple9_emit_physical(out, &save);
-}
-
-static bool
-apple9_physical_selected(struct apple9_shared_ra *ra,
-                         struct agx_apple9_vir_program *out, agx_instr *common,
-                         struct agx_apple9_block **blocks, const char **reason)
-{
-   const struct agx_apple9_vir_instr *original = common->apple9;
-   struct agx_apple9_vir_instr ins = *original;
-   bool pub = apple9_publication(original);
-   ins.dest = ins.dest_components
-                 ? pub ? PUB_BASE + ra->program->phys[original->dest]
-                       : common->dest[0].value / 2
-                 : AGX_APPLE9_VREG_INVALID;
-   bool dead_dest = ins.dest_components && !pub && agx_is_null(common->dest[0]);
-   /* Unused texture channels keep an allocated destination (see
-    * apple9_allocate_candidate) for the read that releases their publication. */
-   assert(!(dead_dest && ins.publication_handoff));
-   if (dead_dest && ins.op != AGX_APPLE9_VIR_SHARED_ATOMIC) {
-      assert(ins.op == AGX_APPLE9_VIR_DEVICE_ATOMIC);
-      ins.atomic_discard = true;
-      ins.dest_components = 0;
-      ins.dest = AGX_APPLE9_VREG_INVALID;
-   }
-   ins.live_after_mask = 0;
-   /* Operands beyond the encoded sources only extend register lifetimes. */
-   for (unsigned s = 0, source = 0;
-        s < common->nr_srcs && source < original->nr_srcs; ++s) {
-      unsigned width = apple9_source_width(original, source);
-      for (unsigned c = 0; c < width; ++c, ++source) {
-         ins.src[source] = ra->publication[original->src[source]]
-                              ? PUB_BASE + ra->program->phys[original->src[source]]
-                              : common->src[s].value / 2 + c;
-         if (!common->src[s].kill)
-            ins.live_after_mask |= BITFIELD_BIT(source);
-      }
-   }
-   ins.live_after_mask |= original->retain_mask;
-   if (dead_dest && ins.op == AGX_APPLE9_VIR_SHARED_ATOMIC) {
-      /* Shared atomics always return a value. The allocator gives their
-       * consumed data a private dead copy, so reuse that register as the
-       * unused result destination and retire it through normal completion.
-       */
-      ins.dest = ins.src[0];
-   }
-   /* Indexed shader-local arrays follow the allocator's spill region.
-    * Spill reloads emitted by physical_move already address that region. */
-   if (ins.op == AGX_APPLE9_VIR_PRIVATE_LOAD ||
-       ins.op == AGX_APPLE9_VIR_PRIVATE_STORE)
-      ins.immediate += ALIGN_POT(ra->ctx->scratch_size_B, 16) / 4;
-   if (ins.branch_target)
-      ins.branch_target = blocks[ins.branch_target->index];
-   ins.phi_block = NULL;
-   ins.phi_edge = ins.completion_consumer = NULL;
-   ins.scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_NONE;
-   ins.device_load_index_kind =
-      ins.encoding == AGX_APPLE9_ENC_DEVICE_LOAD_POINTER
-         ? AGX_APPLE9_DEVICE_LOAD_INDEX_NONE
-      : (ins.live_after_mask & 1) ? AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR
-                                  : AGX_APPLE9_DEVICE_LOAD_INDEX_LAST_USE_GPR;
-
-   if (!apple9_emit_physical(out, &ins))
-      return false;
-   if (ins.op == AGX_APPLE9_VIR_DEVICE_ATOMIC && !ins.atomic_discard) {
-      struct agx_apple9_vir_instr result = apple9_physical_instruction(
-         AGX_APPLE9_VIR_DEVICE_ATOMIC_RESULT,
-         AGX_APPLE9_ENC_DEVICE_ATOMIC_RESULT, AGX_APPLE9_VREG_INVALID);
-      result.src[0] = ins.dest;
-      result.nr_srcs = 1;
-      result.live_after_mask = 1;
-      result.producer_scoreboard_slot = ins.producer_scoreboard_slot;
-      if (!apple9_emit_physical(out, &result))
-         return false;
-   }
-   return true;
-}
 
 static bool
 apple9_init_physical(struct agx_apple9_vir_program *out)
@@ -2162,6 +1304,16 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
       }
    }
    agx_apple9_vir_reindex(&out);
+   out.private_size = program->private_size;
+   out.spill_slots = program->spill_slots;
+   out.scratch_size = program->scratch_size;
+   out.peak_live_gprs = program->peak_live_gprs;
+   out.max_phys_gpr = MAX2(out.max_phys_gpr, program->max_phys_gpr);
+   out.publication_count = program->publication_count;
+   out.fragment_shader = program->fragment_shader;
+   out.output = program->output;
+   out.physical = program->physical;
+   out.dependencies_finalized = true;
    agx_apple9_vir_finish(program);
    *program = out;
    for (struct agx_apple9_block *block = program->allocated_blocks; block;
@@ -2188,320 +1340,6 @@ cleanup:
    return success;
 }
 
-static const char apple9_copy_register_reason[] =
-   "Apple9 allocation needs the copy register for a high-bank constant";
-
-/* Whether any immediate move after allocation targets r64 or above. */
-static bool
-apple9_needs_copy_register(agx_context *ctx)
-{
-   agx_foreach_instr_global(ctx, I) {
-      if ((I->op == AGX_OPCODE_MOV_IMM ||
-           (I->op == AGX_OPCODE_MOV && I->src[0].type == AGX_INDEX_IMMEDIATE)) &&
-          I->dest[0].type == AGX_INDEX_REGISTER && !I->dest[0].memory &&
-          I->dest[0].value / 2 >= 64)
-         return true;
-   }
-   return false;
-}
-
-/* The pop restores the mask that its push saved, so an else immediately
- * followed by its pop has no effect; native one-armed ifs are a push and a
- * pop. Only once allocation is complete is an empty arm known to stay empty,
- * since allocation can place edge copies there. */
-static bool
-apple9_remove_empty_else(struct agx_apple9_vir_program *p)
-{
-   /* A removed else is followed by a pop, which stays: one sweep finds them all. */
-   struct agx_apple9_vir_instr **remove = NULL;
-   unsigned count = 0;
-   for (unsigned i = 0; i + 1 < p->instruction_count; ++i) {
-      if (p->instructions[i]->op != AGX_APPLE9_VIR_EXEC_MASK_ELSE ||
-          p->instructions[i + 1]->op != AGX_APPLE9_VIR_EXEC_MASK_POP)
-         continue;
-      if (!remove && !(remove = malloc(p->instruction_count * sizeof(*remove))))
-         return false;
-      remove[count++] = p->instructions[i];
-   }
-   if (count)
-      agx_apple9_vir_remove_many(p, remove, count);
-   free(remove);
-   return true;
-}
-
-static bool
-apple9_returns_device_atomic(const struct agx_apple9_vir_program *program)
-{
-   for (unsigned i = 0; i < program->instruction_count; ++i) {
-      const struct agx_apple9_vir_instr *ins = program->instructions[i];
-      if (ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC && !ins->atomic_discard)
-         return true;
-   }
-   return false;
-}
-
-/* After spilling and SSA repair, cross-file MOVs cannot coalesce away.
- * Assignment and phi reconciliation can add moves, but retain these transfers
- * and their order relative to loop masks. Count only this mandatory traffic,
- * using the same loop weights as the completed-program cost.
- */
-static bool
-apple9_within_spill_budget(const agx_context *ctx, void *data)
-{
-   const struct apple9_shared_ra *ra = data;
-   if (!ctx->has_spill_pcopy_reserved)
-      return true;
-
-   /* Large frames lower SAVE/FILL to private memory instructions, which the
-    * current candidate cost does not count as spills. Decline the bound unless
-    * every possible slot fits both compact encodings. Memory allocation uses
-    * first-fit aligned windows or an already assigned slot, without live-range
-    * splitting. An allocation of width w can grow the high-water mark by less
-    * than 2w; summing over all memory SSA definitions is a conservative bound.
-    */
-   uint64_t memory_halves = ctx->scratch_size_B / 2;
-   agx_foreach_instr_global(ctx, I) {
-      agx_foreach_ssa_dest(I, d) {
-         if (!I->dest[d].memory)
-            continue;
-         if (I->op != AGX_OPCODE_MOV && I->op != AGX_OPCODE_PHI)
-            return true;
-         memory_halves += 2 * util_next_power_of_two(agx_index_size_16(I->dest[d]));
-      }
-   }
-   if (memory_halves > 2 * MIN2(AGX_APPLE9_FILL_WORD_COUNT,
-                                AGX_APPLE9_SAVE_WORD_COUNT))
-      return true;
-
-   uint64_t spills = 0;
-   unsigned nesting = 0;
-   for (struct agx_apple9_block *block = ra->program->blocks; block;
-        block = block->next) {
-      agx_block *common = ra->blocks[block->index];
-      if (!common) {
-         /* Synthetic mask-restoration blocks are emitted directly from VIR. */
-         unsigned end = block->next ? block->next->start_index
-                                    : ra->program->instruction_count;
-         for (unsigned i = block->start_index; i < end; ++i) {
-            enum agx_apple9_vir_opcode op = ra->program->instructions[i]->op;
-            if (op == AGX_APPLE9_VIR_LOOP_MASK_POP && nesting)
-               --nesting;
-            if (op == AGX_APPLE9_VIR_LOOP_MASK_PUSH)
-               ++nesting;
-         }
-         continue;
-      }
-      agx_foreach_instr_in_block(common, I) {
-         bool selected = I->op == AGX_OPCODE_APPLE9 ||
-                         I->op == AGX_OPCODE_APPLE9_PURE ||
-                         I->op == AGX_OPCODE_APPLE9_CF;
-         if (selected && I->apple9->op == AGX_APPLE9_VIR_LOOP_MASK_POP && nesting)
-            --nesting;
-         if (I->op == AGX_OPCODE_MOV &&
-             I->src[0].type == AGX_INDEX_NORMAL &&
-             I->dest[0].memory != I->src[0].memory &&
-             I->src[0].size == AGX_SIZE_32 && I->dest[0].size == AGX_SIZE_32) {
-            spills += (1u << (3 * MIN2(nesting, 3))) * agx_channels(I->dest[0]);
-         }
-         if (selected && I->apple9->op == AGX_APPLE9_VIR_LOOP_MASK_PUSH)
-            ++nesting;
-      }
-   }
-   /* Equality must finish: the secondary cost fields may still win. */
-   return spills <= ra->max_spill_cost;
-}
-
-static bool
-apple9_allocate_candidate(struct agx_apple9_vir_program *program,
-                          nir_shader *nir, bool cost_constraints, bool latency,
-                          unsigned pressure_slack, bool copy_register, bool uniform_remat,
-                          uint64_t max_spill_cost,
-                          struct agx_apple9_vir_program *result,
-                          const char **reason, bool *remat_used)
-{
-   struct apple9_shared_ra ra = {.program = program,
-                                 .max_spill_cost = max_spill_cost};
-   ra.ctx = rzalloc(NULL, agx_context);
-   struct agx_apple9_vir_program out;
-   agx_apple9_vir_init(&out);
-   bool success = false;
-   if (!ra.ctx || !apple9_shared_dataflow(&ra, nir, reason))
-      goto cleanup;
-   ra.ctx->ra_target.cost_register_constraints = cost_constraints;
-   ra.ctx->ra_target.disable_uniform_rematerialization = !uniform_remat;
-   if (max_spill_cost != UINT64_MAX) {
-      ra.ctx->ra_target.within_spill_budget = apple9_within_spill_budget;
-      ra.ctx->ra_target.spill_budget_data = &ra;
-   }
-   /* A returning device atomic stores its old value in invocation-frame word
-    * 0, which its result record then loads (agx_apple9_pack_device_atomic);
-    * that store overwrote spill slot 0. Spills and private arrays start one
-    * 16-byte frame granule above it. */
-   if (apple9_returns_device_atomic(program))
-      ra.ctx->scratch_size_B = 16;
-   if (copy_register)
-      ra.ctx->ra_target.reserved_registers = 4;
-   if (latency) {
-      ra.ctx->schedule_resources = apple9_schedule_resources;
-      ra.ctx->schedule_delay = apple9_schedule_delay;
-      ra.ctx->schedule_pressure_slack = pressure_slack;
-   }
-   agx_dce(ra.ctx, true);
-   /* Unused texture channels still need the read that releases their
-    * borrowed publication; give that read a register of its own. */
-   agx_foreach_instr_global(ra.ctx, I) {
-      if ((I->op == AGX_OPCODE_APPLE9 || I->op == AGX_OPCODE_APPLE9_PURE) &&
-          I->nr_dests == 1 && agx_is_null(I->dest[0]) &&
-          I->apple9->publication_handoff)
-         I->dest[0] = agx_temp(ra.ctx, AGX_SIZE_32);
-   }
-   agx_pressure_schedule(ra.ctx);
-   if (agx_apple9_debug_enabled(AGX_A9_DBG_SHARED_RA))
-      agx_print_shader(ra.ctx, stderr);
-   if (!agx_ra(ra.ctx)) {
-      *reason = ra.ctx->ra_error;
-      goto cleanup;
-   }
-   if (ra.ctx->scratch_size_B > AGX_APPLE9_MAX_SCRATCH_BYTES) {
-      *reason =
-         "Apple9 scratch frame exceeds the supported per-invocation size";
-      goto cleanup;
-   }
-   if (!copy_register && !ra.ctx->has_spill_pcopy_reserved &&
-       apple9_needs_copy_register(ra.ctx)) {
-      *reason = apple9_copy_register_reason;
-      goto cleanup;
-   }
-   if (!apple9_init_physical(&out))
-      goto cleanup;
-   /* Spills reserve r0..r4 (copy, index and memory-swap temporaries); the
-    * high-bank constant bridge reserves r0..r1. */
-   {
-      unsigned reserved = ra.ctx->has_spill_pcopy_reserved ? 5
-                          : copy_register                ? 2
-                                                         : 0;
-      for (unsigned r = 0; r < reserved; ++r)
-         out.reserved_gprs[r] = true;
-   }
-   unsigned count = program->last_block->index + 1;
-   struct agx_apple9_block **blocks =
-      rzalloc_array(ra.ctx, struct agx_apple9_block *, count);
-   for (struct agx_apple9_block *block = program->blocks; block;
-        block = block->next) {
-      blocks[block->index] = agx_apple9_block_create(&out);
-      if (!blocks[block->index])
-         goto cleanup;
-      /* Physical scheduling follows the logical CFG's loop edges too. */
-      blocks[block->index]->nir = block->nir;
-      blocks[block->index]->nir_exit = block->nir_exit;
-   }
-   /* Instruction indices grouped by block, in program order, for blocks
-    * emitted directly from VIR. */
-   unsigned *block_first = rzalloc_array(ra.ctx, unsigned, count + 1);
-   unsigned *block_order =
-      ralloc_array(ra.ctx, unsigned, MAX2(program->instruction_count, 1));
-   if (!block_first || !block_order)
-      goto cleanup;
-   for (unsigned i = 0; i < program->instruction_count; ++i)
-      ++block_first[agx_apple9_instr_block(program->instructions[i])->index + 1];
-   for (unsigned b = 0; b < count; ++b)
-      block_first[b + 1] += block_first[b];
-   {
-      unsigned *fill = rzalloc_array(ra.ctx, unsigned, count);
-      if (!fill)
-         goto cleanup;
-      for (unsigned i = 0; i < program->instruction_count; ++i) {
-         unsigned b = agx_apple9_instr_block(program->instructions[i])->index;
-         block_order[block_first[b] + fill[b]++] = i;
-      }
-   }
-   for (struct agx_apple9_block *block = program->blocks; block;
-        block = block->next) {
-      agx_apple9_block_begin(&out, blocks[block->index]);
-      agx_block *common = apple9_shared_block(&ra, block);
-      if (!common) {
-         for (unsigned k = block_first[block->index];
-              k < block_first[block->index + 1]; ++k) {
-            const unsigned i = block_order[k];
-            struct agx_apple9_vir_instr ins = *program->instructions[i];
-            if (ins.branch_target)
-               ins.branch_target = blocks[ins.branch_target->index];
-            if (!apple9_emit_physical(&out, &ins))
-               goto cleanup;
-         }
-         continue;
-      }
-      agx_foreach_instr_in_block(common, I) {
-         switch (I->op) {
-         case AGX_OPCODE_MOV:
-            if (!apple9_physical_move(&out, I->dest[0], I->src[0],
-                                      ra.ctx->spill_base_B / 4))
-               goto cleanup;
-            break;
-         case AGX_OPCODE_MOV_IMM:
-            if (!apple9_physical_immediate(&out, I->dest[0].value / 2, I->imm))
-               goto cleanup;
-            break;
-         case AGX_OPCODE_SWAP: {
-            /* XOR swap needs no temporary register. */
-            unsigned a = I->src[0].value / 2, b = I->src[1].value / 2;
-            if (!apple9_physical_xor(&out, a, a, b) ||
-                !apple9_physical_xor(&out, b, b, a) ||
-                !apple9_physical_xor(&out, a, a, b))
-               goto cleanup;
-            break;
-         }
-         case AGX_OPCODE_PRELOAD:
-         case AGX_OPCODE_EXPORT:
-            break;
-         case AGX_OPCODE_APPLE9:
-         case AGX_OPCODE_APPLE9_PURE:
-         case AGX_OPCODE_APPLE9_CF:
-            if (!apple9_physical_selected(&ra, &out, I, blocks, reason))
-               goto cleanup;
-            break;
-         default:
-            *reason =
-               "Unexpected shared instruction after Apple9 register allocation";
-            goto cleanup;
-         }
-      }
-   }
-   agx_apple9_vir_reindex(&out);
-   if (!apple9_remove_empty_else(&out)) {
-      *reason = "out of memory removing empty Apple9 else arms";
-      goto cleanup;
-   }
-   if (!apple9_schedule_physical(&out, reason))
-      goto cleanup;
-   unsigned spill_bytes = ALIGN_POT(ra.ctx->scratch_size_B, 16);
-   out.private_size = program->private_size;
-   out.spill_slots = (spill_bytes - ra.ctx->spill_base_B) / 4;
-   /* The atomic reservation only protects spills or private arrays. */
-   if (!out.spill_slots && !out.private_size)
-      spill_bytes = 0;
-   out.scratch_size = spill_bytes + ALIGN_POT(out.private_size, 16);
-   if (out.scratch_size > AGX_APPLE9_MAX_SCRATCH_BYTES) {
-      *reason = "Apple9 private arrays and spills exceed the scratch frame";
-      goto cleanup;
-   }
-   out.peak_live_gprs = ra.ctx->max_reg / 2 + 1;
-   out.publication_count = program->publication_count;
-   out.fragment_shader = program->fragment_shader;
-   out.dependencies_finalized = out.physical = true;
-   *result = out;
-   for (struct agx_apple9_block *block = result->allocated_blocks; block;
-        block = block->allocated_next)
-      block->program = result;
-   memset(&out, 0, sizeof(out));
-   success = true;
-cleanup:
-   if (remat_used)
-      *remat_used = ra.ctx->uniform_remat_used;
-   agx_apple9_vir_finish(&out);
-   ralloc_free(ra.ctx);
-   return success;
-}
 
 static struct agx_apple9_allocation_cost
 apple9_allocation_cost(const struct agx_apple9_vir_program *p)
@@ -2684,54 +1522,74 @@ apple9_estimate_vir_pressure(const struct agx_apple9_vir_program *program)
    return (unsigned)peak;
 }
 
+
 static bool
-apple9_run_candidate(struct agx_apple9_vir_program *program, nir_shader *nir,
-                     bool cost_constraints, bool latency, unsigned slack,
-                     bool uniform_remat, uint64_t max_spill_cost,
-                     bool *copy_register, struct agx_apple9_vir_program *out,
-                     const char **reason, bool *remat_used)
+apple9_run_native_candidate(struct agx_apple9_vir_program *program,
+                            bool cost_constraints, bool latency, unsigned slack,
+                            bool uniform_remat, bool *copy_register,
+                            struct agx_apple9_vir_program *out,
+                            const char **reason, bool *remat_used)
 {
-   if (apple9_allocate_candidate(program, nir, cost_constraints, latency, slack,
-                                 *copy_register, uniform_remat, max_spill_cost,
-                                 out, reason, remat_used))
-      return true;
-   if (*copy_register || *reason != apple9_copy_register_reason)
+   unsigned headroom = 0;
+   for (unsigned attempt = 0; attempt < 6; ++attempt) {
+      agx_apple9_vir_finish(out);
+      agx_apple9_vir_init(out);
+      if (!agx_apple9_vir_clone(out, program)) {
+         *reason = "out of memory cloning Apple9 VIR for native RA";
+         return false;
+      }
+
+      struct apple9_ra_assign_options opts = apple9_ra_assign_default_options();
+      opts.max_gprs = 0; /* Full Apple9 register file with occupancy-tier bounding */
+      opts.reserved_gprs = *copy_register ? 2u : 0u;
+      opts.cost_register_constraints = cost_constraints;
+      opts.latency_schedule = latency;
+      opts.pressure_slack = slack;
+      opts.disable_uniform_remat = !uniform_remat;
+      const uint64_t dbg = agx_get_compiler_debug();
+      opts.skip_physical_schedule = true;
+      opts.spill_headroom = headroom;
+      opts.force_spill = !!(dbg & AGX_DBG_SPILL);
+#ifndef NDEBUG
+      opts.validate = !(dbg & AGX_DBG_NOVALIDATE);
+#endif
+
+      struct apple9_ra_assign_result res;
+      if (apple9_ra_allocate_native(out, &opts, &res)) {
+         if (remat_used)
+            *remat_used = res.uniform_remat_used;
+         if (!apple9_schedule_physical(out, reason))
+            return false;
+         return true;
+      }
+
+      if (!*copy_register && res.needs_copy_register) {
+         *copy_register = true;
+         continue;
+      }
+      if (res.needs_spill_headroom && headroom < 16u) {
+         headroom += 4u;
+         continue;
+      }
+
+      if (res.validate_err.failed) {
+         static _Thread_local char validate_msg[256];
+         snprintf(validate_msg, sizeof(validate_msg), "%s",
+                  res.validate_err.message);
+         *reason = validate_msg;
+      } else {
+         *reason = res.error ? res.error
+                             : "native Apple9 register allocation failed";
+      }
       return false;
-   agx_apple9_vir_finish(out);
-   agx_apple9_vir_init(out);
-   *copy_register = true;
-   return apple9_allocate_candidate(program, nir, cost_constraints, latency,
-                                    slack, true, uniform_remat, max_spill_cost,
-                                    out, reason, remat_used);
+   }
+   return false;
 }
 
-bool
-agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
-                           nir_shader *nir, const char **reason)
+static bool
+apple9_allocate_native_driver(struct agx_apple9_vir_program *program,
+                              const char **reason)
 {
-   /* Reject unsafe U0 repetition before allocation or scheduling can insert
-    * waits that would disguise it as an ordered, but still unqualified, form. */
-   agx_apple9_vir_reindex(program);
-   if (!agx_apple9_validate_mesh_control(program, reason))
-      return false;
-
-   /* Apple9 bypasses agx_compile_shader_nir, which initializes these flags
-    * for the older backend. The shared allocator still consumes them. */
-   agx_compiler_debug = agx_get_compiler_debug();
-
-   if (!agx_apple9_allocate_publications(program, reason))
-      return false;
-
-   /* Choose the allocation policy directly from estimated peak GPR pressure
-    * and long-latency op count:
-    *  - High pressure (> 104 GPRs): enable bank-cost constraints immediately,
-    *    avoiding latency-driven live-range expansion.
-    *  - Lower pressure with >= 2 long-latency ops: enable latency scheduling
-    *    with slack bounded strictly inside the current occupancy tier.
-    *  - Otherwise: plain allocation.
-    * Non-spilling shaders complete in a single RA pass. Only when spills occur
-    * do we run at most one bank-cost fallback (if not already enabled) and, if
-    * uniform rematerialization fired, one remat-off comparison. */
    const unsigned peak_gprs = apple9_estimate_vir_pressure(program);
    unsigned long_dependencies = 0;
    for (unsigned i = 0; i < program->instruction_count; ++i)
@@ -2744,8 +1602,9 @@ agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
    if (first_latency) {
       struct agx_occupancy tier =
          agx_occupancy_for_register_count(2 * MAX2(peak_gprs, 1));
-      if (tier.max_registers > 2 * peak_gprs + 2)
-         first_slack = MIN2(16u, tier.max_registers - 2 * peak_gprs - 2);
+      unsigned tier_gprs = tier.max_registers / 2;
+      if (tier_gprs > peak_gprs + 1)
+         first_slack = MIN2(8u, tier_gprs - peak_gprs - 1);
    }
 
    struct agx_apple9_vir_program best, alternative;
@@ -2755,15 +1614,16 @@ agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
    bool remat_used = false;
    bool used_banks = first_banks;
 
-   bool ok = apple9_run_candidate(program, nir, first_banks, first_latency,
-                                  first_slack, true, UINT64_MAX, &copy_register,
-                                  &best, reason, &remat_used);
+   bool ok = apple9_run_native_candidate(program, first_banks, first_latency,
+                                         first_slack, true, &copy_register,
+                                         &best, reason, &remat_used);
    if (!ok && (!first_banks || first_latency)) {
       agx_apple9_vir_finish(&best);
       agx_apple9_vir_init(&best);
       used_banks = true;
-      ok = apple9_run_candidate(program, nir, true, false, 0, true, UINT64_MAX,
-                                &copy_register, &best, reason, &remat_used);
+      ok = apple9_run_native_candidate(program, true, false, 0, true,
+                                       &copy_register, &best, reason,
+                                       &remat_used);
    }
    if (!ok) {
       agx_apple9_vir_finish(&best);
@@ -2777,9 +1637,9 @@ agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
          const char *unused_reason = NULL;
          bool alt_remat = false;
          bool alt_copy = copy_register;
-         if (apple9_run_candidate(program, nir, true, false, 0, true,
-                                  cost.spills, &alt_copy, &alternative,
-                                  &unused_reason, &alt_remat)) {
+         if (apple9_run_native_candidate(program, true, false, 0, true,
+                                         &alt_copy, &alternative,
+                                         &unused_reason, &alt_remat)) {
             struct agx_apple9_allocation_cost alt_cost =
                apple9_allocation_cost(&alternative);
             if (agx_apple9_allocation_cheaper(alt_cost, cost)) {
@@ -2796,9 +1656,9 @@ agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
       if (cost.spills && remat_used) {
          const char *unused_reason = NULL;
          bool alt_copy = copy_register;
-         if (apple9_run_candidate(program, nir, true, false, 0, false,
-                                  cost.spills, &alt_copy, &alternative,
-                                  &unused_reason, NULL)) {
+         if (apple9_run_native_candidate(program, true, false, 0, false,
+                                         &alt_copy, &alternative,
+                                         &unused_reason, NULL)) {
             struct agx_apple9_allocation_cost alt_cost =
                apple9_allocation_cost(&alternative);
             if (agx_apple9_allocation_cheaper(alt_cost, cost)) {
@@ -2816,4 +1676,23 @@ agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
         block = block->allocated_next)
       block->program = program;
    return true;
+}
+
+
+bool
+agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
+                           nir_shader *nir, const char **reason)
+{
+   (void)nir;
+
+   /* Reject unsafe U0 repetition before allocation or scheduling can insert
+    * waits that would disguise it as an ordered, but still unqualified, form. */
+   agx_apple9_vir_reindex(program);
+   if (!agx_apple9_validate_mesh_control(program, reason))
+      return false;
+
+   if (!agx_apple9_allocate_publications(program, reason))
+      return false;
+
+   return apple9_allocate_native_driver(program, reason);
 }
