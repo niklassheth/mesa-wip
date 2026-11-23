@@ -923,3 +923,12 @@ option(
   value : true,
   description : 'Build panfrost disassemblers. Explicitly setting this option to false will cause the panfrost stack to build without disassemblers. This should be left enabled for distro builds.'
 )
+
+option('hk-long-wait-watchdog', type : 'boolean', value : false,
+       description : 'Enable five-second driver wait diagnostics in HK test builds')
+
+option('hk-cpu-sub-timing', type : 'boolean', value : false,
+       description : 'Build HK_CPU_TIMING per-draw sub-step timers (sub_* fields; small per-draw cost)')
+
+option('hk-gpu-busy-counters', type : 'boolean', value : true,
+       description : 'Build HK firmware-timestamp GPU busy intervals (runtime: HK_GPU_BUSY_FILE)')
