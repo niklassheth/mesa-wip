@@ -10126,6 +10126,118 @@ apple9_compile_dag_tail(nir_shader *nir, struct agx_shader_part *out,
                                  NULL, false, NULL, reason);
 }
 
+/* Fold exact integer -> f32 -> integer round-trips when the integer source is
+ * provably within the IEEE-754 binary32 exact integer range (<= 24 bits):
+ * every uint in [0, 2^24] and sint in [-2^24, 2^24] converts losslessly to
+ * float32 and back even when the conversions are marked exact. */
+static bool
+apple9_src_fits_u24(nir_scalar s, unsigned depth)
+{
+   s = nir_scalar_resolved(s.def, s.comp);
+   if (s.def->bit_size <= 24)
+      return true;
+   if (nir_scalar_is_const(s))
+      return nir_scalar_as_uint(s) <= 0x01000000u;
+   if (!nir_scalar_is_alu(s) || depth >= 4)
+      return false;
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_u2u32:
+      return nir_scalar_chase_alu_src(s, 0).def->bit_size <= 16;
+   case nir_op_iand: {
+      nir_scalar a = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar b = nir_scalar_chase_alu_src(s, 1);
+      if (nir_scalar_is_const(a) && nir_scalar_as_uint(a) <= 0x00ffffffu)
+         return true;
+      if (nir_scalar_is_const(b) && nir_scalar_as_uint(b) <= 0x00ffffffu)
+         return true;
+      return apple9_src_fits_u24(a, depth + 1) ||
+             apple9_src_fits_u24(b, depth + 1);
+   }
+   case nir_op_ushr: {
+      nir_scalar sh = nir_scalar_chase_alu_src(s, 1);
+      const unsigned bits = s.def->bit_size;
+      if (nir_scalar_is_const(sh) && (bits == 32u || bits == 64u) &&
+          (nir_scalar_as_uint(sh) & (bits - 1u)) >= bits - 24u)
+         return true;
+      return apple9_src_fits_u24(nir_scalar_chase_alu_src(s, 0), depth + 1);
+   }
+   case nir_op_bcsel:
+      return apple9_src_fits_u24(nir_scalar_chase_alu_src(s, 1), depth + 1) &&
+             apple9_src_fits_u24(nir_scalar_chase_alu_src(s, 2), depth + 1);
+   default:
+      return false;
+   }
+}
+
+static bool
+apple9_src_fits_s24(nir_scalar s, unsigned depth)
+{
+   s = nir_scalar_resolved(s.def, s.comp);
+   if (s.def->bit_size <= 16)
+      return true;
+   if (nir_scalar_is_const(s)) {
+      int64_t v = nir_scalar_as_int(s);
+      return v >= -0x01000000 && v <= 0x01000000;
+   }
+   if (!nir_scalar_is_alu(s) || depth >= 4)
+      return false;
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_i2i32:
+      return nir_scalar_chase_alu_src(s, 0).def->bit_size <= 16;
+   case nir_op_ishr: {
+      nir_scalar sh = nir_scalar_chase_alu_src(s, 1);
+      const unsigned bits = s.def->bit_size;
+      if (nir_scalar_is_const(sh) && (bits == 32u || bits == 64u) &&
+          (nir_scalar_as_uint(sh) & (bits - 1u)) >= bits - 24u)
+         return true;
+      return apple9_src_fits_s24(nir_scalar_chase_alu_src(s, 0), depth + 1);
+   }
+   case nir_op_bcsel:
+      return apple9_src_fits_s24(nir_scalar_chase_alu_src(s, 1), depth + 1) &&
+             apple9_src_fits_s24(nir_scalar_chase_alu_src(s, 2), depth + 1);
+   default:
+      return false;
+   }
+}
+
+static bool
+apple9_opt_exact_int_float_roundtrip(nir_builder *b, nir_alu_instr *alu,
+                                     UNUSED void *data)
+{
+   if (alu->def.bit_size != 32 || alu->def.num_components != 1)
+      return false;
+   if (alu->op != nir_op_f2u32 && alu->op != nir_op_f2i32)
+      return false;
+   nir_scalar inner = nir_scalar_resolved(alu->src[0].src.ssa,
+                                          alu->src[0].swizzle[0]);
+   if (!nir_scalar_is_alu(inner))
+      return false;
+   nir_op inner_op = nir_scalar_alu_op(inner);
+   if (inner_op != nir_op_u2f32 && inner_op != nir_op_i2f32)
+      return false;
+   nir_scalar src = nir_scalar_chase_alu_src(inner, 0);
+
+   bool match = false;
+   bool signed_ext = false;
+   if (inner_op == nir_op_u2f32) {
+      /* Values in [0, 2^24] are exact in f32 and non-negative in both u32/i32. */
+      match = apple9_src_fits_u24(src, 0);
+      signed_ext = false;
+   } else if (alu->op == nir_op_f2i32) {
+      match = apple9_src_fits_s24(src, 0);
+      signed_ext = true;
+   }
+   if (!match)
+      return false;
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *val = nir_mov_scalar(b, src);
+   if (val->bit_size != 32)
+      val = signed_ext ? nir_i2i32(b, val) : nir_u2u32(b, val);
+   nir_def_replace(&alu->def, val);
+   return true;
+}
+
 /* Internal shaders can arrive with generic Asahi options. Preserve operations
  * handled by this backend when running algebraic cleanup after legalization. */
 static bool
@@ -10147,6 +10259,8 @@ apple9_opt_algebraic(nir_shader *nir)
    options.has_bfe = false;
    nir->options = &options;
    bool progress = nir_opt_algebraic(nir);
+   progress |= nir_shader_alu_pass(nir, apple9_opt_exact_int_float_roundtrip,
+                                   nir_metadata_control_flow, NULL);
    nir->options = saved;
    return progress;
 }
@@ -12358,9 +12472,116 @@ apple9_lower_xfb(nir_shader *nir, const struct agx_apple9_vertex_layout *layout)
 
 struct apple9_vertex_lower {
    const struct agx_apple9_vertex_layout *layout;
+   uint16_t entry_read_mask;
    bool software;
    bool valid;
 };
+
+static unsigned
+apple9_vertex_format_component_align(enum pipe_format format)
+{
+   if (format == PIPE_FORMAT_NONE || !agx_apple9_vertex_format_supported(format))
+      return 0;
+   const struct util_format_description *desc = util_format_description(format);
+   unsigned align = 0;
+   for (unsigned c = 0; c < 4; ++c) {
+      unsigned swizzle = desc->swizzle[c];
+      if (swizzle >= PIPE_SWIZZLE_0)
+         continue;
+      const struct util_format_channel_description *ch = &desc->channel[swizzle];
+      bool packed = (ch->size % 8) || (ch->shift % 8);
+      unsigned bytes = packed ? 4u : ch->size / 8u;
+      align = MAX2(align, bytes);
+   }
+   return align;
+}
+
+/* Vulkan guarantees only component-size alignment for unpacked 8/16-bit vertex
+ * formats (1B / 2B), even with dynamic stride or dynamic buffer offsets. A
+ * widened 16-bit or 32-bit load is provably aligned to target_align iff:
+ *  1. attr_off is a multiple of target_align (so ro_sink + attr_off is too),
+ *  2. static stride (when not dynamic) is a multiple of target_align, and
+ *  3. some unconditionally-read attribute `a` on the same binding & divisor
+ *     has Vulkan component alignment >= target_align, has the same offset
+ *     congruence mod target_align, and ends at or before this attribute's end
+ *     (so whenever this attribute is in-bounds, `a` is guaranteed in-bounds
+ *     and therefore buffer_address + base_off + offset[a] is target_align-
+ *     aligned on that invocation). */
+static bool
+apple9_vertex_attr_proven_align(const struct apple9_vertex_lower *lower,
+                                unsigned attribute, unsigned target_align)
+{
+   const struct agx_apple9_vertex_layout *layout = lower->layout;
+   if (!layout || target_align <= 1u)
+      return true;
+   const uint64_t attr_off = layout->offset[attribute];
+   if ((attr_off % target_align) != 0)
+      return false;
+   if (!layout->dynamic_stride && (layout->stride[attribute] % target_align) != 0)
+      return false;
+
+   const unsigned binding = layout->buffer[attribute];
+   const unsigned divisor = layout->divisor[attribute];
+   const uint64_t attr_end =
+      attr_off + util_format_description(layout->format[attribute])->block.bits / 8u;
+
+   for (unsigned a = 0; a < 16; ++a) {
+      if (!(lower->entry_read_mask & (1u << a)))
+         continue;
+      if (layout->buffer[a] != binding || layout->divisor[a] != divisor)
+         continue;
+      unsigned anchor_align = apple9_vertex_format_component_align(layout->format[a]);
+      if (anchor_align < target_align)
+         continue;
+      const uint64_t anchor_off = layout->offset[a];
+      if ((anchor_off % target_align) != 0)
+         continue;
+      const uint64_t anchor_end =
+         anchor_off + util_format_description(layout->format[a])->block.bits / 8u;
+      if (anchor_end <= attr_end)
+         return true;
+   }
+   return false;
+}
+
+static nir_def *
+apple9_convert_vertex_channel(nir_builder *b, nir_def *value,
+                              const struct util_format_channel_description *ch)
+{
+   if (ch->type == UTIL_FORMAT_TYPE_FLOAT) {
+      if (ch->size == 16)
+         return apple9_unpack_half(b, nir_u2u32(b, value));
+      if (ch->size == 10 || ch->size == 11) {
+         /* Unsigned packed floats share the half-float exponent bias.
+          * Insert the missing low mantissa bits and a zero sign bit.
+          */
+         return apple9_unpack_half(b, nir_ishl_imm(b, value, 15 - ch->size));
+      }
+      return value;
+   }
+   if (ch->pure_integer) {
+      return ch->type == UTIL_FORMAT_TYPE_SIGNED ? nir_i2i32(b, value)
+                                                 : nir_u2u32(b, value);
+   }
+   unsigned bits = ch->size;
+   if (ch->type == UTIL_FORMAT_TYPE_SIGNED) {
+      value = nir_i2f32(b, nir_i2i32(b, value));
+      if (ch->normalized)
+         value = nir_fmax(b, nir_fmul_imm(b, value,
+            1.0 / ((UINT64_C(1) << (bits - 1)) - 1)), nir_imm_float(b, -1));
+      return value;
+   }
+   value = nir_u2f32(b, nir_u2u32(b, value));
+   if (ch->normalized)
+      value = nir_fmul_imm(b, value, 1.0 / ((UINT64_C(1) << bits) - 1));
+   return value;
+}
+
+static nir_def *
+apple9_vertex_addr_with_disp(nir_builder *b, nir_def *base, uint64_t disp)
+{
+   return disp ? nir_iadd_imm(b, base, disp) : base;
+}
 
 static bool
 apple9_lower_vertex_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -12408,9 +12629,99 @@ apple9_lower_vertex_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       lower->valid = false;
       return false;
    }
-   const struct util_format_description *desc =
-      util_format_description(lower->layout->format[attribute]);
+   const enum pipe_format format = lower->layout->format[attribute];
+   const struct util_format_description *desc = util_format_description(format);
+   const unsigned block_bytes = desc->block.bits / 8;
+   assert(block_bytes > 0);
    b->cursor = nir_before_instr(&intr->instr);
+
+   /* Classify requested non-constant channels to select a single wide load
+    * whenever the format layout allows it. */
+   bool any_mem_channel = false;
+   bool any_packed_channel = false;
+   unsigned uniform_bits = 0;
+   bool uniform_bits_ok = true;
+   unsigned min_byte = UINT_MAX, max_byte = 0;
+   for (unsigned c = 0; c < intr->num_components; ++c) {
+      unsigned component = nir_intrinsic_component(intr) + c;
+      unsigned swizzle = desc->swizzle[component];
+      if (swizzle >= PIPE_SWIZZLE_0)
+         continue;
+      any_mem_channel = true;
+      const struct util_format_channel_description *ch = &desc->channel[swizzle];
+      bool packed = (ch->size % 8) || (ch->shift % 8);
+      unsigned bytes = packed ? 4 : ch->size / 8;
+      unsigned add = lower->layout->offset[attribute] + (packed ? 0 : ch->shift / 8);
+      if (!bytes || (!lower->layout->buffer_descriptor_ubo &&
+                     ((lower->layout->stride[attribute] % bytes) || (add % bytes)))) {
+         lower->valid = false;
+         return false;
+      }
+      if (packed) {
+         any_packed_channel = true;
+         uniform_bits_ok = false;
+      } else {
+         if (!uniform_bits)
+            uniform_bits = ch->size;
+         else if (uniform_bits != ch->size)
+            uniform_bits_ok = false;
+         unsigned byte_off = ch->shift / 8;
+         min_byte = MIN2(min_byte, byte_off);
+         max_byte = MAX2(max_byte, byte_off + bytes);
+      }
+   }
+
+   if (!any_mem_channel) {
+      nir_def *components[4];
+      bool pure_int = util_format_is_pure_integer(format);
+      for (unsigned c = 0; c < intr->num_components; ++c) {
+         unsigned swizzle = desc->swizzle[nir_intrinsic_component(intr) + c];
+         unsigned value = swizzle == PIPE_SWIZZLE_1;
+         components[c] = pure_int ? nir_imm_int(b, value)
+                                  : nir_imm_float(b, value);
+      }
+      nir_def_rewrite_uses(&intr->def, nir_vec(b, components, intr->num_components));
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+
+   /* Choose vectorized load mode on the descriptor path (and for 32-bit
+    * aligned arrays on the legacy UBO path). */
+   enum {
+      VTX_LOAD_SCALAR,
+      VTX_LOAD_PACKED32,
+      VTX_LOAD_ARRAY32,
+      VTX_LOAD_ARRAY16_U32,
+      VTX_LOAD_ARRAY8_U32,
+      VTX_LOAD_ARRAY8_U16,
+   } load_mode = VTX_LOAD_SCALAR;
+   unsigned load_align = 1;
+
+   if (any_packed_channel && block_bytes == 4) {
+      load_mode = VTX_LOAD_PACKED32;
+      load_align = 4;
+   } else if (uniform_bits_ok && uniform_bits == 32) {
+      load_mode = VTX_LOAD_ARRAY32;
+      load_align = 4;
+   } else if (lower->layout->buffer_descriptor_ubo && uniform_bits_ok &&
+              uniform_bits == 16 && (block_bytes == 4 || block_bytes == 8) &&
+              apple9_vertex_attr_proven_align(lower, attribute, 4)) {
+      load_mode = VTX_LOAD_ARRAY16_U32;
+      load_align = 4;
+   } else if (lower->layout->buffer_descriptor_ubo && uniform_bits_ok &&
+              uniform_bits == 8 && block_bytes == 4 &&
+              apple9_vertex_attr_proven_align(lower, attribute, 4)) {
+      load_mode = VTX_LOAD_ARRAY8_U32;
+      load_align = 4;
+   } else if (lower->layout->buffer_descriptor_ubo && uniform_bits_ok &&
+              uniform_bits == 8 && block_bytes == 2 &&
+              apple9_vertex_attr_proven_align(lower, attribute, 2)) {
+      load_mode = VTX_LOAD_ARRAY8_U16;
+      load_align = 2;
+   } else if (uniform_bits_ok && uniform_bits > 0) {
+      load_align = uniform_bits / 8;
+   }
+
    unsigned divisor = lower->layout->divisor[attribute];
    nir_def *index = divisor == AGX_APPLE9_VERTEX_DIVISOR_ZERO ? nir_imm_int(b, 0)
                   : divisor ? nir_udiv_imm(b, nir_load_instance_id(b), divisor)
@@ -12429,7 +12740,8 @@ apple9_lower_vertex_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    nir_def *offset = nir_iadd_imm(b,
       nir_imul_imm(b, index, lower->layout->stride[attribute]),
       lower->layout->offset[attribute]);
-   nir_def *buffer_address = NULL, *buffer_size = NULL, *offset64 = NULL;
+   nir_def *safe_base = NULL;
+   uint64_t safe_disp = 0;
    if (lower->layout->buffer_descriptor_ubo) {
       unsigned descriptor_size = lower->layout->dynamic_stride ? 32 : 16;
       unsigned descriptor_offset =
@@ -12438,10 +12750,12 @@ apple9_lower_vertex_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          nir_imm_int(b, lower->layout->buffer_descriptor_ubo),
          nir_imm_int(b, descriptor_offset), .align_mul = 16,
          .range_base = descriptor_offset, .range = 16);
-      buffer_address = nir_pack_64_2x32_split(b, nir_channel(b, descriptor, 0),
-                                                nir_channel(b, descriptor, 1));
-      buffer_size = nir_pack_64_2x32_split(b, nir_channel(b, descriptor, 2),
-                                             nir_channel(b, descriptor, 3));
+      nir_def *buffer_address =
+         nir_pack_64_2x32_split(b, nir_channel(b, descriptor, 0),
+                                nir_channel(b, descriptor, 1));
+      nir_def *buffer_size =
+         nir_pack_64_2x32_split(b, nir_channel(b, descriptor, 2),
+                                nir_channel(b, descriptor, 3));
       nir_def *stride;
       if (lower->layout->dynamic_stride) {
          stride = nir_load_ubo(b, 1, 32,
@@ -12451,8 +12765,12 @@ apple9_lower_vertex_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       } else {
          stride = nir_imm_int(b, lower->layout->stride[attribute]);
       }
-      offset64 = nir_iadd_imm(b, nir_imul(b, index64, nir_u2u64(b, stride)),
-                              lower->layout->offset[attribute]);
+      /* Share base_off and vertex_base across all attributes in the binding. */
+      nir_def *base_off = nir_imul(b, index64, nir_u2u64(b, stride));
+      nir_def *vertex_base = nir_iadd(b, buffer_address, base_off);
+      const uint64_t attr_off = lower->layout->offset[attribute];
+      const uint64_t attr_end = attr_off + block_bytes;
+
       /* Robust vertex input treats a whole attribute as out of bounds when
        * any byte of it is. Such an attribute reads the zero sink instead of
        * its buffer, so every component loads unconditionally.
@@ -12463,83 +12781,220 @@ apple9_lower_vertex_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
        * lies inside the zero page; otherwise the check stays.
        */
       bool unbounded = lower->layout->unbounded && lower->layout->dynamic_stride &&
-                       lower->layout->offset[attribute] + desc->block.bits / 8 <=
-                          AGX_ZERO_PAGE_SIZE;
-      if (!unbounded) {
-         nir_def *end = nir_iadd_imm(b, offset64, desc->block.bits / 8);
-         nir_def *valid = nir_uge(b, buffer_size, end);
-         buffer_address = nir_bcsel(b, valid, buffer_address,
-                                    nir_load_ro_sink_address_poly(b));
-         offset64 = nir_bcsel(b, valid, offset64, nir_imm_int64(b, 0));
+                       attr_end <= AGX_ZERO_PAGE_SIZE;
+      if (unbounded) {
+         safe_base = vertex_base;
+         safe_disp = attr_off;
+      } else {
+         /* Overflow-safe uniform bound limit: base_off + attr_end <= buffer_size
+          * iff base_off < usub_sat(buffer_size, attr_end - 1). Because
+          * buffer_size is uniform and attr_end is constant, limit hoists into
+          * the preamble, avoiding per-attribute 64-bit end additions in main. */
+         nir_def *end_m1 = nir_imm_int64(b, attr_end - 1);
+         nir_def *limit = nir_bcsel(b, nir_uge(b, buffer_size, end_m1),
+                                    nir_isub(b, buffer_size, end_m1),
+                                    nir_imm_int64(b, 0));
+         nir_def *valid = nir_ult(b, base_off, limit);
+         nir_def *ro_sink = nir_load_ro_sink_address_poly(b);
+         /* When attr_off is aligned to load_align and attr_end lies inside the
+          * 16 KB zero page, keep attr_off as a constant displacement past the
+          * bcsel so DEVICE_LOAD folds it directly into its immediate offset. */
+         if ((attr_off % load_align) == 0 && attr_end <= AGX_ZERO_PAGE_SIZE) {
+            safe_base = nir_bcsel(b, valid, vertex_base, ro_sink);
+            safe_disp = attr_off;
+         } else {
+            nir_def *attr_addr = apple9_vertex_addr_with_disp(b, vertex_base, attr_off);
+            safe_base = nir_bcsel(b, valid, attr_addr, ro_sink);
+            safe_disp = 0;
+         }
       }
    }
+
+   /* Emit the single vectorized load (when applicable) before unpacking. */
+   nir_def *loaded_vec = NULL;
+   unsigned vec_base_unit = 0;
+   nir_def *unpacked_4x8 = NULL;
+   nir_def *unpacked_2x16[2] = {NULL, NULL};
+   bool packed_norm_4x8 = false;
+   bool packed_norm_2x16 = false;
+   bool packed_half_2x16 = false;
+
+   if (load_mode == VTX_LOAD_PACKED32) {
+      if (safe_base) {
+         loaded_vec = nir_load_global_constant(
+            b, 1, 32, apple9_vertex_addr_with_disp(b, safe_base, safe_disp),
+            .align_mul = 4);
+      } else {
+         loaded_vec = nir_load_ubo(
+            b, 1, 32, nir_imm_int(b, 32 + lower->layout->buffer[attribute]),
+            offset, .align_mul = 4, .range = ~0u);
+      }
+   } else if (load_mode == VTX_LOAD_ARRAY32) {
+      unsigned min_ch = min_byte / 4;
+      unsigned max_ch = (max_byte - 1) / 4;
+      unsigned comps = max_ch - min_ch + 1;
+      vec_base_unit = min_ch;
+      if (safe_base) {
+         loaded_vec = nir_load_global_constant(
+            b, comps, 32,
+            apple9_vertex_addr_with_disp(b, safe_base, safe_disp + min_ch * 4),
+            .align_mul = 4);
+      } else {
+         loaded_vec = nir_load_ubo(
+            b, comps, 32, nir_imm_int(b, 32 + lower->layout->buffer[attribute]),
+            nir_iadd_imm(b, offset, min_ch * 4), .align_mul = 4, .range = ~0u);
+      }
+   } else if (load_mode == VTX_LOAD_ARRAY16_U32) {
+      unsigned min_w = min_byte / 4;
+      unsigned max_w = (max_byte - 1) / 4;
+      unsigned words = max_w - min_w + 1;
+      vec_base_unit = min_w;
+      loaded_vec = nir_load_global_constant(
+         b, words, 32,
+         apple9_vertex_addr_with_disp(b, safe_base, safe_disp + min_w * 4),
+         .align_mul = 4);
+      /* Use native 2x16 unpack instructions for FLOAT16 / UNORM16 / SNORM16. */
+      int first_ch = util_format_get_first_non_void_channel(format);
+      if (first_ch >= 0) {
+         const struct util_format_channel_description *ch0 = &desc->channel[first_ch];
+         bool same = true;
+         for (unsigned i = 0; i < desc->nr_channels; ++i) {
+            if (desc->channel[i].type == UTIL_FORMAT_TYPE_VOID)
+               continue;
+            if (desc->channel[i].type != ch0->type ||
+                desc->channel[i].normalized != ch0->normalized ||
+                desc->channel[i].pure_integer != ch0->pure_integer) {
+               same = false;
+               break;
+            }
+         }
+         if (same && ch0->type == UTIL_FORMAT_TYPE_FLOAT) {
+            packed_half_2x16 = true;
+            for (unsigned w = 0; w < words; ++w)
+               unpacked_2x16[min_w + w] = nir_unpack_half_2x16(b, nir_channel(b, loaded_vec, w));
+         } else if (same && ch0->normalized && !ch0->pure_integer &&
+                    (ch0->type == UTIL_FORMAT_TYPE_UNSIGNED ||
+                     ch0->type == UTIL_FORMAT_TYPE_SIGNED)) {
+            packed_norm_2x16 = true;
+            for (unsigned w = 0; w < words; ++w) {
+               nir_def *wd = nir_channel(b, loaded_vec, w);
+               unpacked_2x16[min_w + w] = ch0->type == UTIL_FORMAT_TYPE_SIGNED
+                                             ? nir_unpack_snorm_2x16(b, wd)
+                                             : nir_unpack_unorm_2x16(b, wd);
+            }
+         }
+      }
+   } else if (load_mode == VTX_LOAD_ARRAY8_U32) {
+      loaded_vec = nir_load_global_constant(
+         b, 1, 32, apple9_vertex_addr_with_disp(b, safe_base, safe_disp),
+         .align_mul = 4);
+      int first_ch = util_format_get_first_non_void_channel(format);
+      if (first_ch >= 0) {
+         const struct util_format_channel_description *ch0 = &desc->channel[first_ch];
+         bool same = ch0->normalized && !ch0->pure_integer &&
+                     (ch0->type == UTIL_FORMAT_TYPE_UNSIGNED ||
+                      ch0->type == UTIL_FORMAT_TYPE_SIGNED);
+         for (unsigned i = 0; same && i < desc->nr_channels; ++i) {
+            if (desc->channel[i].type == UTIL_FORMAT_TYPE_VOID)
+               continue;
+            if (desc->channel[i].type != ch0->type ||
+                desc->channel[i].normalized != ch0->normalized ||
+                desc->channel[i].pure_integer != ch0->pure_integer)
+               same = false;
+         }
+         if (same) {
+            packed_norm_4x8 = true;
+            unpacked_4x8 = ch0->type == UTIL_FORMAT_TYPE_SIGNED
+                              ? nir_unpack_snorm_4x8(b, loaded_vec)
+                              : nir_unpack_unorm_4x8(b, loaded_vec);
+         }
+      }
+   } else if (load_mode == VTX_LOAD_ARRAY8_U16) {
+      loaded_vec = nir_u2u32(
+         b, nir_load_global_constant(
+               b, 1, 16, apple9_vertex_addr_with_disp(b, safe_base, safe_disp),
+               .align_mul = 2));
+   }
+
    nir_def *components[4];
    for (unsigned c = 0; c < intr->num_components; ++c) {
       unsigned component = nir_intrinsic_component(intr) + c;
       unsigned swizzle = desc->swizzle[component];
       if (swizzle >= PIPE_SWIZZLE_0) {
          unsigned value = swizzle == PIPE_SWIZZLE_1;
-         components[c] = util_format_is_pure_integer(lower->layout->format[attribute])
+         components[c] = util_format_is_pure_integer(format)
                             ? nir_imm_int(b, value) : nir_imm_float(b, value);
          continue;
       }
       const struct util_format_channel_description *ch = &desc->channel[swizzle];
-      bool packed = (ch->size % 8) || (ch->shift % 8);
-      unsigned bytes = packed ? 4 : ch->size / 8;
-      unsigned add = lower->layout->offset[attribute] + (packed ? 0 : ch->shift / 8);
-      /* Vulkan aligns the effective address, including the bound buffer
-       * offset. An attribute offset alone need not be naturally aligned.
-       * The descriptor path loads from that complete address.
-       */
-      if (!bytes || (!buffer_address &&
-                     ((lower->layout->stride[attribute] % bytes) || (add % bytes)))) {
-         lower->valid = false;
-         return false;
-      }
-      unsigned bit_size = packed ? 32 : ch->size;
-      nir_def *value;
-      if (buffer_address) {
-         nir_def *component_offset = nir_iadd_imm(b, offset64, packed ? 0 : ch->shift / 8);
-         value = nir_load_global_constant(b, 1, bit_size,
-            nir_iadd(b, buffer_address, component_offset), .align_mul = bytes);
-      } else {
-         value = nir_load_ubo(b, 1, bit_size,
-            nir_imm_int(b, 32 + lower->layout->buffer[attribute]),
-            nir_iadd_imm(b, offset, packed ? 0 : ch->shift / 8),
-            .align_mul = bytes, .range = ~0u);
-      }
-      if (packed) {
-         value = nir_ushr_imm(b, value, ch->shift);
+      nir_def *value = NULL;
+      if (load_mode == VTX_LOAD_PACKED32) {
+         value = nir_ushr_imm(b, loaded_vec, ch->shift);
          value = ch->type == UTIL_FORMAT_TYPE_SIGNED
                     ? nir_ishr_imm(b, nir_ishl_imm(b, value, 32 - ch->size), 32 - ch->size)
                     : nir_iand_imm(b, value, BITFIELD_MASK(ch->size));
-      }
-      if (ch->type == UTIL_FORMAT_TYPE_FLOAT) {
-         if (ch->size == 16)
-            value = apple9_unpack_half(b, nir_u2u32(b, value));
-         else if (ch->size == 10 || ch->size == 11) {
-            /* Unsigned packed floats share the half-float exponent bias.
-             * Insert the missing low mantissa bits and a zero sign bit.
-             */
-            value = apple9_unpack_half(b, nir_ishl_imm(b, value, 15 - ch->size));
-         }
-      } else if (ch->pure_integer) {
-         value = ch->type == UTIL_FORMAT_TYPE_SIGNED ? nir_i2i32(b, value)
-                                                    : nir_u2u32(b, value);
-      } else {
-         unsigned bits = ch->size;
-         if (ch->type == UTIL_FORMAT_TYPE_SIGNED) {
-            value = nir_i2i32(b, value);
-            value = nir_i2f32(b, value);
-            if (ch->normalized)
-               value = nir_fmax(b, nir_fmul_imm(b, value,
-                  1.0 / ((UINT64_C(1) << (bits - 1)) - 1)), nir_imm_float(b, -1));
+         value = apple9_convert_vertex_channel(b, value, ch);
+      } else if (load_mode == VTX_LOAD_ARRAY32) {
+         unsigned ch_idx = (ch->shift / 32) - vec_base_unit;
+         value = nir_channel(b, loaded_vec, ch_idx);
+         value = apple9_convert_vertex_channel(b, value, ch);
+      } else if (load_mode == VTX_LOAD_ARRAY16_U32) {
+         unsigned w_idx = ch->shift / 32;
+         unsigned half = (ch->shift / 16) & 1;
+         if (packed_half_2x16 || packed_norm_2x16) {
+            value = nir_channel(b, unpacked_2x16[w_idx], half);
          } else {
-            value = nir_u2u32(b, value);
-            value = nir_u2f32(b, value);
-            if (ch->normalized)
-               value = nir_fmul_imm(b, value, 1.0 / ((UINT64_C(1) << bits) - 1));
+            nir_def *word = nir_channel(b, loaded_vec, w_idx - vec_base_unit);
+            if (ch->type == UTIL_FORMAT_TYPE_SIGNED) {
+               value = half ? nir_ishr_imm(b, word, 16)
+                            : nir_ishr_imm(b, nir_ishl_imm(b, word, 16), 16);
+            } else {
+               value = half ? nir_ushr_imm(b, word, 16)
+                            : nir_iand_imm(b, word, 0xffff);
+            }
+            value = apple9_convert_vertex_channel(b, value, ch);
          }
+      } else if (load_mode == VTX_LOAD_ARRAY8_U32) {
+         unsigned byte_idx = ch->shift / 8;
+         if (packed_norm_4x8) {
+            value = nir_channel(b, unpacked_4x8, byte_idx);
+         } else {
+            if (ch->type == UTIL_FORMAT_TYPE_SIGNED) {
+               value = byte_idx < 3 ? nir_ishl_imm(b, loaded_vec, (3 - byte_idx) * 8)
+                                    : loaded_vec;
+               value = nir_ishr_imm(b, value, 24);
+            } else {
+               value = byte_idx ? nir_ushr_imm(b, loaded_vec, byte_idx * 8)
+                                : loaded_vec;
+               if (byte_idx < 3)
+                  value = nir_iand_imm(b, value, 0xff);
+            }
+            value = apple9_convert_vertex_channel(b, value, ch);
+         }
+      } else if (load_mode == VTX_LOAD_ARRAY8_U16) {
+         unsigned byte_idx = ch->shift / 8;
+         if (ch->type == UTIL_FORMAT_TYPE_SIGNED) {
+            value = nir_ishr_imm(b, nir_ishl_imm(b, loaded_vec, (3 - byte_idx) * 8), 24);
+         } else {
+            value = byte_idx ? nir_iand_imm(b, nir_ushr_imm(b, loaded_vec, 8), 0xff)
+                             : nir_iand_imm(b, loaded_vec, 0xff);
+         }
+         value = apple9_convert_vertex_channel(b, value, ch);
+      } else {
+         unsigned bytes = ch->size / 8;
+         if (safe_base) {
+            value = nir_load_global_constant(
+               b, 1, ch->size,
+               apple9_vertex_addr_with_disp(b, safe_base, safe_disp + ch->shift / 8),
+               .align_mul = bytes);
+         } else {
+            value = nir_load_ubo(
+               b, 1, ch->size,
+               nir_imm_int(b, 32 + lower->layout->buffer[attribute]),
+               nir_iadd_imm(b, offset, ch->shift / 8),
+               .align_mul = bytes, .range = ~0u);
+         }
+         value = apple9_convert_vertex_channel(b, value, ch);
       }
       components[c] = value;
    }
@@ -12555,6 +13010,37 @@ agx_nir_lower_apple9_vertex_inputs(
    struct apple9_vertex_lower lower = {
       .layout = layout, .software = software, .valid = true,
    };
+   if (layout) {
+      nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+      nir_block *entry = nir_start_block(impl);
+      nir_foreach_instr(instr, entry) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_input)
+            continue;
+         unsigned attribute = nir_intrinsic_base(intr);
+         if (attribute >= 16 || intr->def.bit_size != 32 ||
+             intr->num_components < 1 || intr->num_components > 4 ||
+             nir_intrinsic_component(intr) + intr->num_components > 4 ||
+             !nir_src_is_const(intr->src[0]) || nir_src_as_uint(intr->src[0]) ||
+             layout->buffer[attribute] >= 32 ||
+             layout->format[attribute] == PIPE_FORMAT_NONE ||
+             !agx_apple9_vertex_format_supported(layout->format[attribute]))
+            continue;
+         const struct util_format_description *desc =
+            util_format_description(layout->format[attribute]);
+         bool reads_mem = false;
+         for (unsigned c = 0; c < intr->num_components; ++c) {
+            if (desc->swizzle[nir_intrinsic_component(intr) + c] < PIPE_SWIZZLE_0) {
+               reads_mem = true;
+               break;
+            }
+         }
+         if (reads_mem)
+            lower.entry_read_mask |= (uint16_t)(1u << attribute);
+      }
+   }
    nir_shader_intrinsics_pass(nir, apple9_lower_vertex_input,
                               nir_metadata_control_flow, &lower);
    return lower.valid;
