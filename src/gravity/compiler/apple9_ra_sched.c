@@ -35,7 +35,7 @@ apple9_ra_liveness_finish(struct apple9_ra_liveness_info *info)
 bool
 apple9_ra_after_logical_end(const struct agx_apple9_vir_instr *ins)
 {
-   if (ins->local_control)
+   if (!ins || ins->local_control)
       return false;
    switch (ins->op) {
    case AGX_APPLE9_VIR_EXEC_MASK_PUSH:
