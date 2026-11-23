@@ -2543,6 +2543,11 @@ store("uvs_agx", [1], [], [CAN_REORDER])
 intrinsic("load_uvs_index_agx", dest_comp = 1, bit_sizes=[16],
           indices=[IO_SEMANTICS], flags=[CAN_ELIMINATE, CAN_REORDER])
 
+# Tile x/y indices for AGX end-of-tile fragment shaders. These are uniform
+# within a tile and measured in tiles, not pixels or compute workgroups.
+intrinsic("load_tile_id_agx", dest_comp=2, bit_sizes=[32],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
 # Load/store a pixel in local memory. This operation is formatted, with
 # conversion between the specified format and the implied register format of the
 # source/destination (for store/loads respectively). This mostly matters for
@@ -2566,6 +2571,9 @@ intrinsic("load_uvs_index_agx", dest_comp = 1, bit_sizes=[16],
 # src[] = { sample mask }
 # base = offset
 load("local_pixel_agx", [1], [BASE, FORMAT], [CAN_REORDER, CAN_ELIMINATE])
+# Explicit tile coordinates: packed uint32 (x in low 16 bits, y in high 16).
+# Apple9 currently requires a nonzero constant sample mask in the low four bits.
+load("tile_pixel_agx", [1, 1], [BASE, FORMAT], [CAN_REORDER, CAN_ELIMINATE])
 # src[] = { value, sample mask, coordinates }
 # base = offset
 store("local_pixel_agx", [1, -1], [BASE, WRITE_MASK, FORMAT, EXPLICIT_COORD], [CAN_REORDER])
@@ -2642,6 +2650,19 @@ intrinsic("sample_mask_agx", src_comp=[1, 1])
 # load the 32-bit stipple pattern for that row.
 intrinsic("load_polygon_stipple_agx", src_comp=[1], dest_comp=1, bit_sizes=[32],
           flags=[CAN_REORDER, CAN_ELIMINATE])
+
+# Line stipple state: pattern in bits 0..15, repeat factor (1..256) above.
+system_value("line_stipple_agx", 1)
+
+# Geometry shader input position of an arbitrary vertex of the current
+# instance's input stream (software input assembly), for strip-continuous
+# line stipple.
+intrinsic("load_strip_position_poly", src_comp=[1], dest_comp=4, bit_sizes=[32],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
+# The same for any vertex shader output, named by its I/O semantics.
+intrinsic("load_strip_output_poly", src_comp=[1], dest_comp=0, bit_sizes=[32],
+          indices=[IO_SEMANTICS], flags=[CAN_ELIMINATE, CAN_REORDER])
 
 # The fixed-function sample mask specified in the API (e.g. glSampleMask)
 system_value("api_sample_mask_agx", 1, bit_sizes=[16])
@@ -2721,6 +2742,12 @@ load("helper_arg_hi_agx", [], [], [CAN_ELIMINATE])
 # indexed GPRs starting at BASE. Exports must not overlap within a shader part.
 # Must only appear in the last block of the shader part.
 intrinsic("export_agx", [0], indices=[BASE])
+
+# Pack an RGB(A) FP32 colour into one 32-bit word of the given packed format
+# (R11G11B10_FLOAT or R10G10B10A2_UNORM, component 0 in the low bits), as the
+# Apple9 single-instruction format pack does.
+intrinsic("pack_format_agx", src_comp=[0], dest_comp=1, bit_sizes=[32],
+          indices=[FORMAT], flags=[CAN_ELIMINATE, CAN_REORDER])
 
 # Load an exported vector at the beginning of the shader part from GPRs starting
 # at BASE. Must only appear in the first block of the shader part.
@@ -3340,3 +3367,60 @@ system_value("is_depth_clamp_emulated_kk", 1, bit_sizes=[1])
 system_value("is_viewport_z_transform_emulated_kk", 1, bit_sizes=[1])
 # Loads the viewport Z range for a given viewport index.
 load("viewport_z_range_kk", [1], [], [CAN_ELIMINATE, CAN_REORDER])
+
+# Apple9 native storage write. src0 is a USC-relative 32-byte PBE index;
+# src1 is (x, y, layer) with layer used when IMAGE_ARRAY is set; src2 is data.
+intrinsic("image_store_apple9_agx", [1, 3, 4], indices=[ACCESS, SRC_TYPE, IMAGE_ARRAY])
+# Apple9: drain the invocation's image_store_apple9_agx writes to memory (0x0650).
+intrinsic("fence_image_write_apple9_agx")
+# Apple9: invalidate the texture cache so later texture reads see written memory (0x06d0).
+intrinsic("fence_tex_invalidate_apple9_agx")
+
+# Apple9 native mesh/task stage-body IO. BASE names a local-root selector,
+# not a captured value or GPR. Offsets are byte offsets, and output stores
+# remain side effects across optimization and scheduling. Store offsets are
+# 32-bit byte offsets, lowered to a displacement and/or an element GPR index
+# independently of the stored data type.
+# BIT_SIZE is the access width. Wider values are truncated; narrower unsigned
+# values are zero-extended. The physical GPR width is independent of the access.
+intrinsic("store_local_apple9_agx", [1, 1], indices=[BASE, BIT_SIZE])
+intrinsic("load_local_apple9_agx", [1], 1, indices=[BASE], bit_sizes=[32], flags=[CAN_ELIMINATE])
+intrinsic("load_mesh_primitive_base_apple9_agx", dest_comp=2, bit_sizes=[32], flags=[CAN_ELIMINATE, CAN_REORDER])
+# Read a native entry pointer from the uniform pair starting at BASE.
+intrinsic("load_native_pointer_apple9_agx", dest_comp=2, indices=[BASE], bit_sizes=[32], flags=[CAN_ELIMINATE, CAN_REORDER])
+# Collective task completion remains distinct from STOP. Its final call/frame
+# ABI is not part of stage-body compilation.
+intrinsic("end_task_apple9_agx")
+
+# One invocation of the collective three-word object grid export. The final
+# task completion wrapper supplies the helper's invocation/frame contract.
+intrinsic("export_mesh_grid_word_apple9_agx", [1])
+intrinsic("fence_mesh_grid_apple9_agx")
+
+# Collectively publish the three uint32 mesh group counts stored at byte
+# RANGE_BASE in local root BASE. All 16 object invocations must participate
+# after the producer's workgroup barrier. This is a side effect, not a load or
+# a workgroup barrier itself. Selection supplies a compiler-owned leaf call;
+# it must not be speculated, duplicated or replaced with an inline export.
+intrinsic("launch_mesh_workgroups_apple9_agx", indices=[BASE, RANGE_BASE])
+
+# Closed, compiler-owned object leaf region, introduced after NIR optimization.
+# Its ordinary NIR body is selected in logical execution order, allocated with
+# the caller, then moved out of line. No SSA value may cross the boundary.
+intrinsic("begin_object_call_apple9_agx")
+intrinsic("end_object_call_apple9_agx")
+
+# Mesh-engine side effects. None may be eliminated, reordered, duplicated or
+# speculated as an ordinary ALU expression. src0 of CONTROL is the actual
+# primitive count (u16); the hardware reads and clears its allocated halfword.
+# src1 is an explicitly provisional u16 auxiliary input. BASE is control42 in
+# the bounded register form, not a register descriptor or a capacity formula.
+intrinsic("mesh_control_apple9_agx", [1, 1], indices=[BASE])
+# Sources are (channel selector, byte offset within the local output root).
+# The compiler constructs their register tuple during normal allocation.
+intrinsic("mesh_submit_channel_apple9_agx", [1, 1])
+# The scalar input is source-derived; its general count/arity interpretation
+# remains unqualified outside the development V3/P1 triangle class.
+# Both words are read from a contiguous 32-bit register pair. src1 has no
+# qualified semantic interpretation; native completion supplies measured-safe 0.
+intrinsic("mesh_submit_scalar_apple9_agx", [1, 1])

@@ -234,6 +234,8 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
       break;
 
    /* Intrinsics which are always uniform */
+   case nir_intrinsic_load_mesh_primitive_base_apple9_agx:
+   case nir_intrinsic_load_native_pointer_apple9_agx:
    case nir_intrinsic_load_preamble:
    case nir_intrinsic_load_push_constant_zink:
    case nir_intrinsic_load_work_dim:
@@ -600,6 +602,10 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
          UNREACHABLE("Invalid stage for load_primitive_tess_level_*");
       break;
 
+   case nir_intrinsic_load_tile_id_agx:
+      assert(stage == MESA_SHADER_FRAGMENT);
+      break;
+
    case nir_intrinsic_load_shared_base_ptr:
    case nir_intrinsic_load_workgroup_index:
    case nir_intrinsic_load_workgroup_id:
@@ -665,6 +671,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
                      load_may_tear(state, instr);
       break;
 
+   case nir_intrinsic_load_local_apple9_agx:
    case nir_intrinsic_load_shared:
    case nir_intrinsic_load_shared_ir3:
    case nir_intrinsic_load_shared_nv:
@@ -744,6 +751,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
       break;
 
    case nir_intrinsic_optimization_barrier_vgpr_amd:
+   case nir_intrinsic_pack_format_agx:
       is_divergent = src_divergent(instr->src[0], state);
       break;
 
