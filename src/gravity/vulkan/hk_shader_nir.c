@@ -1176,6 +1176,7 @@ hk_apple9_peak_live_words(nir_shader *nir)
  */
 struct hk_vectorize_policy {
    bool windowed;
+   bool soft_fault;
 };
 
 static bool hk_apple9_vectorize_cb(unsigned align_mul, unsigned align_offset,
@@ -1186,13 +1187,17 @@ static bool hk_apple9_vectorize_cb(unsigned align_mul, unsigned align_offset,
 /* Peak of live words after vectorizing a copy of the shader with or
  * without the windows. */
 static unsigned
-hk_apple9_vectorized_peak(const nir_shader *nir, bool windowed)
+hk_apple9_vectorized_peak(const nir_shader *nir, bool windowed, bool soft_fault)
 {
    nir_shader *clone = nir_shader_clone(NULL, nir);
-   struct hk_vectorize_policy policy = {.windowed = windowed};
+   struct hk_vectorize_policy policy = {
+      .windowed = windowed,
+      .soft_fault = soft_fault,
+   };
    nir_opt_load_store_vectorize(clone,
                                 &(const nir_load_store_vectorize_options){
                                    .modes = nir_var_mem_global,
+                                   .robust_modes = nir_var_mem_global,
                                    .bounds_checked_modes = nir_var_mem_global,
                                    .callback = hk_apple9_vectorize_cb,
                                    .cb_data = &policy,
@@ -1204,6 +1209,123 @@ hk_apple9_vectorized_peak(const nir_shader *nir, bool windowed)
 
 /* Below this peak of live 32-bit words, loads merge without windows. */
 #define HK_APPLE9_VECTORIZE_PRESSURE_BUDGET 96
+
+/* Compute the proven power-of-two stride modulo 2^32 and constant remainder of
+ * a 32-bit offset expression (returning 0 when the offset is constant). Only
+ * power-of-two factors survive 32-bit wrap-around in Z/2^32 Z. */
+static uint32_t
+hk_apple9_offset_pow2_stride(nir_scalar s, uint32_t *const_out, unsigned depth)
+{
+   s = nir_scalar_resolved(s.def, s.comp);
+   if (nir_scalar_is_const(s)) {
+      *const_out = nir_scalar_as_uint(s);
+      return 0;
+   }
+   if (!nir_scalar_is_alu(s) || depth >= 8) {
+      *const_out = 0;
+      return 1;
+   }
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_iadd: {
+      uint32_t ca = 0, cb = 0;
+      uint32_t sa = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 0),
+                                                 &ca, depth + 1);
+      uint32_t sb = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 1),
+                                                 &cb, depth + 1);
+      *const_out = ca + cb;
+      if (sa == 0)
+         return sb;
+      if (sb == 0)
+         return sa;
+      return MIN2(sa, sb);
+   }
+   case nir_op_ior: {
+      uint32_t ca = 0, cb = 0;
+      uint32_t sa = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 0),
+                                                 &ca, depth + 1);
+      uint32_t sb = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 1),
+                                                 &cb, depth + 1);
+      if (sb == 0 && sa > 0 && (cb & (sa - 1)) == cb && (ca & cb) == 0) {
+         *const_out = ca | cb;
+         return sa;
+      }
+      if (sa == 0 && sb > 0 && (ca & (sb - 1)) == ca && (cb & ca) == 0) {
+         *const_out = ca | cb;
+         return sb;
+      }
+      *const_out = 0;
+      return 1;
+   }
+   case nir_op_imul: {
+      uint32_t ca = 0, cb = 0;
+      uint32_t sa = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 0),
+                                                 &ca, depth + 1);
+      uint32_t sb = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 1),
+                                                 &cb, depth + 1);
+      if (sb == 0) {
+         if (cb == 0) {
+            *const_out = 0;
+            return 0;
+         }
+         *const_out = ca * cb;
+         if (sa == 0)
+            return 0;
+         uint32_t p = cb & -cb;
+         uint64_t r = (uint64_t)sa * p;
+         return r >= (1ULL << 32) ? 0u : (uint32_t)r;
+      }
+      if (sa == 0) {
+         if (ca == 0) {
+            *const_out = 0;
+            return 0;
+         }
+         *const_out = ca * cb;
+         uint32_t p = ca & -ca;
+         uint64_t r = (uint64_t)sb * p;
+         return r >= (1ULL << 32) ? 0u : (uint32_t)r;
+      }
+      *const_out = 0;
+      return 1;
+   }
+   case nir_op_ishl: {
+      uint32_t ca = 0, cb = 0;
+      uint32_t sa = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 0),
+                                                 &ca, depth + 1);
+      uint32_t sb = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 1),
+                                                 &cb, depth + 1);
+      if (sb == 0) {
+         unsigned sh = cb & 31u;
+         *const_out = ca << sh;
+         if (sa == 0)
+            return 0;
+         uint64_t r = (uint64_t)sa << sh;
+         return r >= (1ULL << 32) ? 0u : (uint32_t)r;
+      }
+      *const_out = 0;
+      return 1;
+   }
+   case nir_op_iand: {
+      uint32_t ca = 0, cb = 0;
+      uint32_t sa = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 0),
+                                                 &ca, depth + 1);
+      uint32_t sb = hk_apple9_offset_pow2_stride(nir_scalar_chase_alu_src(s, 1),
+                                                 &cb, depth + 1);
+      if (sb == 0) {
+         *const_out = 0;
+         return cb == 0 ? 0u : (cb & -cb);
+      }
+      if (sa == 0) {
+         *const_out = 0;
+         return ca == 0 ? 0u : (ca & -ca);
+      }
+      *const_out = 0;
+      return 1;
+   }
+   default:
+      *const_out = 0;
+      return 1;
+   }
+}
 
 static bool
 hk_apple9_vectorize_cb(unsigned align_mul, unsigned align_offset,
@@ -1237,12 +1359,38 @@ hk_apple9_vectorize_cb(unsigned align_mul, unsigned align_offset,
    }
 
    /* A merged bounded load may read past the end of its buffer when only
-    * its first components are in bounds. Natural alignment keeps that read
-    * inside one aligned block, so it cannot cross into another page. */
+    * its first components are in bounds. Without soft faults, natural
+    * alignment keeps that read inside one aligned block so it cannot cross
+    * into another page. With soft faults enabled, 4-byte-aligned 32-bit
+    * vec2/vec3/vec4 loads are safe even across page boundaries. */
    if (bounded) {
-      unsigned bytes = util_next_power_of_two(num_components * bit_size / 8);
-      if (hole_size > 0 || align_mul < bytes || align_offset % bytes)
+      /* Never widen, narrow, or overlap bounded loads past their original
+       * robustness check unit (e.g. u8vec3@0 + u8vec3@3, u32@0 + u16vec2@4,
+       * or overlapping u16vec2@0 + u16@1). */
+      if (hole_size != 0 || low->def.bit_size != bit_size ||
+          high->def.bit_size != bit_size)
          return false;
+      unsigned total_bytes = num_components * bit_size / 8;
+      unsigned bytes = util_next_power_of_two(total_bytes);
+      unsigned req_align = (policy->soft_fault && bit_size == 32) ? 4 : bytes;
+      if (align_mul < req_align || align_offset % req_align)
+         return false;
+      /* Ensure the 32-bit dynamic offset cannot wrap modulo 2^32 across the
+       * merged span (e.g. non-power-of-two stride 20*0x33333333 == 0xfffffffc
+       * wraps at +4). */
+      if (low->src[1].ssa->bit_size != 32)
+         return false;
+      uint32_t off_const = 0;
+      uint32_t off_stride = hk_apple9_offset_pow2_stride(
+         nir_get_scalar(low->src[1].ssa, 0), &off_const, 0);
+      if (off_stride == 0) {
+         if ((uint64_t)off_const + total_bytes > (1ULL << 32))
+            return false;
+      } else {
+         uint32_t rem = off_const & (off_stride - 1);
+         if ((uint64_t)rem + total_bytes > off_stride)
+            return false;
+      }
    }
    return true;
 }
@@ -1253,39 +1401,55 @@ struct hk_bounded_lowering {
    bool per_component;
 };
 
+static nir_def *
+hk_soft_fault_bounds_check_dyn(nir_builder *b, nir_def *data, nir_def *offset,
+                               unsigned end_bytes, nir_def *bound)
+{
+   assert(end_bytes >= 1);
+   /* Overflow-safe unsigned check: offset + end_bytes <= bound iff
+    * offset < usub_sat(bound, end_bytes - 1). Because bound is typically
+    * uniform, usub_sat(bound, end_bytes - 1) hoists into the preamble and
+    * is shared across loads from the same buffer. */
+   nir_def *limit =
+      end_bytes == 1 ? bound : nir_usub_sat(b, bound, nir_imm_int(b, end_bytes - 1));
+   return nir_bcsel(b, nir_ult(b, offset, limit), data,
+                    nir_imm_zero(b, data->num_components, data->bit_size));
+}
+
 static bool
 lower_load_global_constant_offset_instr(nir_builder *b,
                                         nir_intrinsic_instr *intrin, void *data)
 {
    const struct hk_bounded_lowering *opts = data;
-   const bool *has_soft_fault = &opts->soft_fault;
+   const bool has_soft_fault = opts->soft_fault;
+   const bool is_const_bounded =
+      intrin->intrinsic == nir_intrinsic_load_global_constant_bounded;
+   const bool is_ssbo_bounded =
+      intrin->intrinsic == nir_intrinsic_load_global_bounded;
+   const bool is_bounded = is_const_bounded || is_ssbo_bounded;
 
-   if (intrin->intrinsic == nir_intrinsic_load_global_bounded ||
-       (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded &&
-        !(*has_soft_fault))) {
+   if (intrin->intrinsic != nir_intrinsic_load_global_constant_offset &&
+       !is_bounded)
+      return false;
 
+   const bool is_volatile =
+      (nir_intrinsic_access(intrin) & ACCESS_VOLATILE) != 0;
+
+   if (is_bounded && (!has_soft_fault || (is_ssbo_bounded && is_volatile))) {
       lower_load_global_bounded(b, intrin, opts->per_component);
       return true;
    }
-
-   if (intrin->intrinsic != nir_intrinsic_load_global_constant_offset &&
-       intrin->intrinsic != nir_intrinsic_load_global_constant_bounded)
-      return false;
 
    b->cursor = nir_before_instr(&intrin->instr);
 
    nir_def *base_addr = intrin->src[0].ssa;
    nir_def *offset = intrin->src[1].ssa;
-   nir_def *bound = NULL;
+   nir_def *bound = is_bounded ? intrin->src[2].ssa : NULL;
 
    unsigned bit_size = intrin->def.bit_size;
    assert(bit_size >= 8 && bit_size % 8 == 0);
    unsigned byte_size = bit_size / 8;
    unsigned load_size = byte_size * intrin->num_components;
-
-   if (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded) {
-      bound = intrin->src[2].ssa;
-   }
 
    unsigned align_mul = nir_intrinsic_align_mul(intrin);
    unsigned align_offset = nir_intrinsic_align_offset(intrin);
@@ -1299,13 +1463,17 @@ lower_load_global_constant_offset_instr(nir_builder *b,
    if (intrin->intrinsic == nir_intrinsic_load_global_constant_offset)
       access |= ACCESS_IN_BOUNDS;
 
-   nir_def *val = nir_load_global_constant(
-      b, intrin->def.num_components, intrin->def.bit_size,
-      nir_iadd(b, base_addr, nir_u2u64(b, offset)), .align_mul = align_mul,
-      .align_offset = align_offset, .access = access);
+   nir_def *addr = nir_iadd(b, base_addr, nir_u2u64(b, offset));
+   nir_def *val = is_ssbo_bounded
+      ? nir_load_global(b, intrin->def.num_components, intrin->def.bit_size,
+                        addr, .align_mul = align_mul,
+                        .align_offset = align_offset, .access = access)
+      : nir_load_global_constant(b, intrin->def.num_components,
+                                 intrin->def.bit_size, addr,
+                                 .align_mul = align_mul,
+                                 .align_offset = align_offset, .access = access);
 
-   if (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded &&
-       opts->per_component && intrin->def.num_components > 1) {
+   if (is_bounded && opts->per_component && intrin->def.num_components > 1) {
       /* A vector merged from separate robust fields (bounds_checked_modes)
        * returns each in-bounds component, as in lower_load_global_bounded:
        * checking only its last byte would zero the in-bounds fields too. A
@@ -1315,28 +1483,52 @@ lower_load_global_constant_offset_instr(nir_builder *b,
        */
       nir_scalar offs = nir_scalar_resolved(offset, 0);
       nir_def *comps[NIR_MAX_VEC_COMPONENTS];
-      for (unsigned c = 0; c < intrin->def.num_components; ++c) {
-         nir_def *end = nir_scalar_is_const(offs)
-            ? nir_imm_int(b, nir_scalar_as_uint(offs) + (c + 1) * byte_size)
-            : nir_iadd_imm(b, offset, (c + 1) * byte_size);
-         comps[c] = bounds_check(b, nir_channel(b, val, c), end, bound);
+      if (nir_scalar_is_const(offs)) {
+         uint32_t offs_imm = nir_scalar_as_uint(offs);
+         if (offs_imm <= UINT32_MAX - load_size &&
+             offs_imm + load_size > UINT8_MAX) {
+            /* Compute remaining bytes once (preamble-hoistable for uniform
+             * bounds) so every component compares against an 8-bit literal. */
+            nir_def *rem = nir_usub_sat(b, bound, nir_imm_int(b, offs_imm));
+            for (unsigned c = 0; c < intrin->def.num_components; ++c) {
+               comps[c] = bounds_check(b, nir_channel(b, val, c),
+                                       nir_imm_int(b, (c + 1) * byte_size), rem);
+            }
+         } else {
+            for (unsigned c = 0; c < intrin->def.num_components; ++c) {
+               unsigned end_c = (c + 1) * byte_size;
+               if (offs_imm > UINT32_MAX - end_c) {
+                  comps[c] = nir_imm_zero(b, 1, intrin->def.bit_size);
+               } else {
+                  comps[c] = bounds_check(b, nir_channel(b, val, c),
+                                          nir_imm_int(b, offs_imm + end_c),
+                                          bound);
+               }
+            }
+         }
+      } else {
+         for (unsigned c = 0; c < intrin->def.num_components; ++c) {
+            comps[c] = hk_soft_fault_bounds_check_dyn(
+               b, nir_channel(b, val, c), offset, (c + 1) * byte_size, bound);
+         }
       }
       val = nir_vec(b, comps, intrin->def.num_components);
-   } else if (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded) {
+   } else if (is_bounded) {
       nir_scalar offs = nir_scalar_resolved(offset, 0);
       if (nir_scalar_is_const(offs)) {
-         /* Calculate last byte loaded */
-         unsigned offs_imm = nir_scalar_as_uint(offs) + load_size;
-
-         /* Compare the last byte loaded against the bound exactly. Bounds
-          * are the descriptor's exact range, not rounded to 64 B, so rounding
-          * the offset down would let loads past a short range through
-          * (robustness2 uniform_buffer len_4..len_60).
-          */
-         val = bounds_check(b, val, nir_imm_int(b, offs_imm), bound);
+         uint32_t offs_imm = nir_scalar_as_uint(offs);
+         if (offs_imm > UINT32_MAX - load_size) {
+            val = nir_imm_zero(b, val->num_components, val->bit_size);
+         } else {
+            /* Compare the last byte loaded against the bound exactly. Bounds
+             * are the descriptor's exact range, not rounded to 64 B, so
+             * rounding the offset down would let loads past a short range
+             * through (robustness2 uniform_buffer len_4..len_60). */
+            val = bounds_check(b, val, nir_imm_int(b, offs_imm + load_size),
+                               bound);
+         }
       } else {
-         offset = nir_iadd_imm(b, offset, load_size);
-         val = bounds_check(b, val, offset, bound);
+         val = hk_soft_fault_bounds_check_dyn(b, val, offset, load_size, bound);
       }
    }
 
@@ -3593,13 +3785,16 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    /* Below the pressure budget, merge without windows, unless that
     * raises the shader's peak of live words over windowed merging.
     */
+   const bool soft_fault = agx_has_soft_fault(&dev->dev);
    unsigned peak = hk_apple9_peak_live_words(nir);
    struct hk_vectorize_policy policy = {
-      .windowed = peak > HK_APPLE9_VECTORIZE_PRESSURE_BUDGET};
+      .windowed = peak > HK_APPLE9_VECTORIZE_PRESSURE_BUDGET,
+      .soft_fault = soft_fault,
+   };
    unsigned peak_windowed = 0, peak_free = 0;
    if (!policy.windowed) {
-      peak_windowed = hk_apple9_vectorized_peak(nir, true);
-      peak_free = hk_apple9_vectorized_peak(nir, false);
+      peak_windowed = hk_apple9_vectorized_peak(nir, true, soft_fault);
+      peak_free = hk_apple9_vectorized_peak(nir, false, soft_fault);
       policy.windowed = peak_free > peak_windowed;
    }
    if (agx_apple9_debug_enabled(AGX_A9_DBG_PRESSURE))
@@ -3610,6 +3805,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_opt_load_store_vectorize,
             &(const nir_load_store_vectorize_options){
                .modes = nir_var_mem_global,
+               .robust_modes = nir_var_mem_global,
                .bounds_checked_modes = nir_var_mem_global,
                .callback = hk_apple9_vectorize_cb,
                .cb_data = &policy,

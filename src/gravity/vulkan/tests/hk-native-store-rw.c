@@ -760,6 +760,339 @@ test_gpl_sw_needed(void)
    return 0;
 }
 
+static int
+test_soft_fault_ssbo_and_4b_vectorize(void)
+{
+   /* Verify 1) soft-fault load_global_bounded emits nir_load_global without
+    * zero-page redirection (AGX_ZERO_PAGE_ADDRESS) and uses overflow-safe
+    * usub_sat bounds checks, while volatile loads retain zero-page fallback;
+    * 2) high constant UBO offsets (>255) share one usub_sat(bound, offs_imm)
+    * across all vector components. */
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                  &agx_nir_options,
+                                                  "soft_fault_ssbo");
+   nir_def *base = nir_imm_int64(&b, 0x100000);
+   nir_def *dyn_off = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *bound = nir_load_global_constant(&b, 1, 32, nir_imm_int64(&b, 0x20000),
+                                             .align_mul = 4);
+   nir_def *ssbo = nir_load_global_bounded(&b, 4, 32, base, dyn_off, bound,
+                                           .align_mul = 4, .align_offset = 0);
+   nir_def *ubo = nir_load_global_constant_bounded(&b, 4, 32, base,
+                                                   nir_imm_int(&b, 512), bound,
+                                                   .align_mul = 4, .align_offset = 0);
+   nir_store_global(&b, nir_iadd(&b, ssbo, ubo), nir_imm_int64(&b, 0x80000),
+                    .write_mask = 0xf, .align_mul = 4);
+
+   CHECK(hk_lower_bounded_global_loads(b.shader, true, true));
+
+   unsigned global_loads = 0, const_loads = 0, usub_sats = 0, bcsel_64 = 0;
+   nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_global)
+               global_loads++;
+            else if (intr->intrinsic == nir_intrinsic_load_global_constant)
+               const_loads++;
+         } else if (instr->type == nir_instr_type_alu) {
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op == nir_op_usub_sat)
+               usub_sats++;
+            else if (alu->op == nir_op_bcsel && alu->def.bit_size == 64)
+               bcsel_64++;
+         }
+      }
+   }
+   CHECK(global_loads == 1);
+   CHECK(const_loads == 2); /* bound load + UBO vec4 load */
+   CHECK(bcsel_64 == 0);    /* no 64-bit zero-page base redirection */
+   CHECK(usub_sats == 5);   /* 4 dynamic SSBO component limits + 1 shared UBO rem */
+   ralloc_free(b.shader);
+
+   /* Verify vectorizer robustness with soft faults enabled:
+    * 1) Two scalar u32 load_global_bounded at x and iadd(x, 4) (potentially
+    *    wrapping 32-bit x=0xfffffffc) MUST NOT merge because robust_modes
+    *    includes nir_var_mem_global.
+    * 2) Two adjacent 4B-aligned u32 load_global_bounded at constant offsets
+    *    4 and 8 DO merge into a single vec2 load_global.
+    * 3) Narrow <32-bit loads (u16 at byte 4 + u16vec3 at byte 6) MUST NOT be
+    *    widened into 32-bit robustness units under the 4B relaxation. */
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_physical_device pdev = {0};
+   CHECK(dev);
+   dev->vk.base.type = VK_OBJECT_TYPE_DEVICE;
+   dev->vk.physical = &pdev.vk;
+   dev->dev.chip = pdev.dev.chip = AGX_CHIP_G16G;
+   dev->dev.params.features = DRM_ASAHI_FEATURE_SOFT_FAULTS;
+   const struct vk_pipeline_robustness_state rs = vk_robustness_disabled;
+
+   /* Case A: potential 32-bit wrap at x and iadd(x, 4) stays unmerged. */
+   nir_builder wb = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                   &agx_nir_options,
+                                                   "bounded_wrap_no_merge");
+   nir_def *wbase = nir_imm_int64(&wb, 0x100000);
+   nir_def *wx = nir_channel(&wb, nir_load_global_invocation_id(&wb, 32), 0);
+   nir_def *wbound = nir_imm_int(&wb, 4);
+   nir_def *w0 = nir_load_global_bounded(&wb, 1, 32, wbase, wx, wbound,
+                                         .align_mul = 4, .align_offset = 0);
+   nir_def *w1 = nir_load_global_bounded(&wb, 1, 32, wbase, nir_iadd_imm(&wb, wx, 4),
+                                         wbound, .align_mul = 4, .align_offset = 0);
+   nir_store_global(&wb, nir_vec2(&wb, w0, w1), nir_imm_int64(&wb, 0x80000),
+                    .write_mask = 0x3, .align_mul = 4);
+   nir_shader_gather_info(wb.shader, nir_shader_get_entrypoint(wb.shader));
+   hk_lower_nir(dev, wb.shader, &rs, false, 0, NULL, 0);
+   unsigned w_loads = 0, w_vec_loads = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(wb.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global) {
+               w_loads++;
+               if (intr->def.num_components > 1)
+                  w_vec_loads++;
+            }
+         }
+      }
+   }
+   CHECK(w_loads == 2 && w_vec_loads == 0);
+   ralloc_free(wb.shader);
+
+   /* Case B: safe 4B-aligned u32 pair at offsets 4 and 8 merges into vec2. */
+   nir_builder mb = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                   &agx_nir_options,
+                                                   "bounded_4b_u32_merge");
+   nir_def *mbase = nir_imm_int64(&mb, 0x100000);
+   nir_def *mbound = nir_load_global_constant(&mb, 1, 32, nir_imm_int64(&mb, 0x20000),
+                                              .align_mul = 4);
+   nir_def *m0 = nir_load_global_bounded(&mb, 1, 32, mbase, nir_imm_int(&mb, 4),
+                                         mbound, .align_mul = 4, .align_offset = 0);
+   nir_def *m1 = nir_load_global_bounded(&mb, 1, 32, mbase, nir_imm_int(&mb, 8),
+                                         mbound, .align_mul = 4, .align_offset = 0);
+   nir_store_global(&mb, nir_vec2(&mb, m0, m1), nir_imm_int64(&mb, 0x80000),
+                    .write_mask = 0x3, .align_mul = 4);
+   nir_shader_gather_info(mb.shader, nir_shader_get_entrypoint(mb.shader));
+   hk_lower_nir(dev, mb.shader, &rs, false, 0, NULL, 0);
+   unsigned m_loads = 0, m_vec2 = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(mb.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global) {
+               m_loads++;
+               if (intr->def.num_components == 2 && intr->def.bit_size == 32)
+                  m_vec2++;
+            }
+         }
+      }
+   }
+   CHECK(m_loads == 1 && m_vec2 == 1);
+   ralloc_free(mb.shader);
+
+   /* Case C: narrow u16 at byte 4 + u16vec3 at byte 6 MUST NOT widen to 32-bit. */
+   nir_builder nb = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                   &agx_nir_options,
+                                                   "bounded_u16_no_widen");
+   nir_def *nbase = nir_imm_int64(&nb, 0x100000);
+   nir_def *nbound = nir_imm_int(&nb, 6);
+   nir_def *n0 = nir_load_global_bounded(&nb, 1, 16, nbase, nir_imm_int(&nb, 4),
+                                         nbound, .align_mul = 4, .align_offset = 0);
+   nir_def *n1 = nir_load_global_bounded(&nb, 3, 16, nbase, nir_imm_int(&nb, 6),
+                                         nbound, .align_mul = 4, .align_offset = 2);
+   nir_def *nvec = nir_vec4(&nb, n0, nir_channel(&nb, n1, 0),
+                            nir_channel(&nb, n1, 1), nir_channel(&nb, n1, 2));
+   nir_store_global(&nb, nvec, nir_imm_int64(&nb, 0x80000),
+                    .write_mask = 0xf, .align_mul = 2);
+   nir_shader_gather_info(nb.shader, nir_shader_get_entrypoint(nb.shader));
+   hk_lower_nir(dev, nb.shader, &rs, false, 0, NULL, 0);
+   unsigned n_loads32 = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(nb.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global &&
+                intr->def.bit_size == 32)
+               n_loads32++;
+         }
+      }
+   }
+   CHECK(n_loads32 == 0);
+   ralloc_free(nb.shader);
+
+   /* Case D (HIGH #2): naturally aligned narrow bounded loads MUST NOT widen:
+    * u8vec3@0 + u8vec3@3 (bound=3) must stay 8-bit, and u32@0 + u16vec2@4
+    * (bound=6) must not widen the u16vec2 into a 32-bit robustness unit. */
+   nir_builder b8 = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                   &agx_nir_options,
+                                                   "bounded_u8vec3_no_widen");
+   nir_def *b8_base = nir_imm_int64(&b8, 0x100000);
+   nir_def *b8_bound = nir_imm_int(&b8, 3);
+   nir_def *b8_0 = nir_load_global_bounded(&b8, 3, 8, b8_base, nir_imm_int(&b8, 0),
+                                           b8_bound, .align_mul = 8, .align_offset = 0);
+   nir_def *b8_1 = nir_load_global_bounded(&b8, 3, 8, b8_base, nir_imm_int(&b8, 3),
+                                           b8_bound, .align_mul = 8, .align_offset = 3);
+   nir_store_global(&b8, nir_iadd(&b8, b8_0, b8_1), nir_imm_int64(&b8, 0x80000),
+                    .write_mask = 0x7, .align_mul = 1);
+   nir_shader_gather_info(b8.shader, nir_shader_get_entrypoint(b8.shader));
+   hk_lower_nir(dev, b8.shader, &rs, false, 0, NULL, 0);
+   unsigned b8_widened = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(b8.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global &&
+                intr->def.bit_size > 8)
+               b8_widened++;
+         }
+      }
+   }
+   CHECK(b8_widened == 0);
+   ralloc_free(b8.shader);
+
+   nir_builder b32_16 = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                       &agx_nir_options,
+                                                       "bounded_u32_u16vec2_no_widen");
+   nir_def *m32_base = nir_imm_int64(&b32_16, 0x100000);
+   nir_def *m32_bound = nir_imm_int(&b32_16, 6);
+   nir_def *m32_0 = nir_load_global_bounded(&b32_16, 1, 32, m32_base, nir_imm_int(&b32_16, 0),
+                                            m32_bound, .align_mul = 8, .align_offset = 0);
+   nir_def *m32_1 = nir_load_global_bounded(&b32_16, 2, 16, m32_base, nir_imm_int(&b32_16, 4),
+                                            m32_bound, .align_mul = 8, .align_offset = 4);
+   nir_def *m32_out = nir_vec3(&b32_16, m32_0,
+                               nir_u2u32(&b32_16, nir_channel(&b32_16, m32_1, 0)),
+                               nir_u2u32(&b32_16, nir_channel(&b32_16, m32_1, 1)));
+   nir_store_global(&b32_16, m32_out, nir_imm_int64(&b32_16, 0x80000),
+                    .write_mask = 0x7, .align_mul = 4);
+   nir_shader_gather_info(b32_16.shader, nir_shader_get_entrypoint(b32_16.shader));
+   hk_lower_nir(dev, b32_16.shader, &rs, false, 0, NULL, 0);
+   unsigned m32_loads = 0, m32_u32_1 = 0, m32_u16_2 = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(b32_16.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global) {
+               m32_loads++;
+               if (intr->def.bit_size == 32 && intr->def.num_components == 1)
+                  m32_u32_1++;
+               if (intr->def.bit_size == 16 && intr->def.num_components == 2)
+                  m32_u16_2++;
+            }
+         }
+      }
+   }
+   /* Must stay separate (neither widened to u32vec2 nor narrowed to u16vec4). */
+   CHECK(m32_loads == 2 && m32_u32_1 == 1 && m32_u16_2 == 1);
+   ralloc_free(b32_16.shader);
+
+   /* Case E (MEDIUM #6): non-power-of-two stride 20*i wraps at 20*0x33333333 ==
+    * 0xfffffffc (+4 -> 0) and MUST NOT merge, while 16*i + 4 vec2/vec3 (4+12<=16)
+    * is provably wrap-free and DOES merge into vec3. */
+   nir_builder s20 = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                    &agx_nir_options,
+                                                    "bounded_stride20_no_merge");
+   nir_def *s20_base = nir_imm_int64(&s20, 0x100000);
+   nir_def *s20_i = nir_channel(&s20, nir_load_global_invocation_id(&s20, 32), 0);
+   nir_def *s20_off = nir_imul_imm(&s20, s20_i, 20);
+   nir_def *s20_bound = nir_imm_int(&s20, 4);
+   nir_def *s20_0 = nir_load_global_bounded(&s20, 1, 32, s20_base, s20_off,
+                                            s20_bound, .align_mul = 4, .align_offset = 0);
+   nir_def *s20_1 = nir_load_global_bounded(&s20, 1, 32, s20_base,
+                                            nir_iadd_imm(&s20, s20_off, 4),
+                                            s20_bound, .align_mul = 4, .align_offset = 0);
+   nir_store_global(&s20, nir_vec2(&s20, s20_0, s20_1), nir_imm_int64(&s20, 0x80000),
+                    .write_mask = 0x3, .align_mul = 4);
+   nir_shader_gather_info(s20.shader, nir_shader_get_entrypoint(s20.shader));
+   hk_lower_nir(dev, s20.shader, &rs, false, 0, NULL, 0);
+   unsigned s20_loads = 0, s20_vec = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(s20.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global) {
+               s20_loads++;
+               if (intr->def.num_components > 1)
+                  s20_vec++;
+            }
+         }
+      }
+   }
+   CHECK(s20_loads == 2 && s20_vec == 0);
+   ralloc_free(s20.shader);
+
+   nir_builder s16 = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                    &agx_nir_options,
+                                                    "bounded_stride16_off4_merge");
+   nir_def *s16_base = nir_imm_int64(&s16, 0x100000);
+   nir_def *s16_i = nir_channel(&s16, nir_load_global_invocation_id(&s16, 32), 0);
+   nir_def *s16_off = nir_imul_imm(&s16, s16_i, 16);
+   nir_def *s16_bound = nir_load_global_constant(&s16, 1, 32, nir_imm_int64(&s16, 0x20000),
+                                                 .align_mul = 4);
+   nir_def *s16_0 = nir_load_global_bounded(&s16, 1, 32, s16_base,
+                                            nir_iadd_imm(&s16, s16_off, 4),
+                                            s16_bound, .align_mul = 4, .align_offset = 0);
+   nir_def *s16_1 = nir_load_global_bounded(&s16, 1, 32, s16_base,
+                                            nir_iadd_imm(&s16, s16_off, 8),
+                                            s16_bound, .align_mul = 4, .align_offset = 0);
+   nir_store_global(&s16, nir_vec2(&s16, s16_0, s16_1),
+                    nir_imm_int64(&s16, 0x80000), .write_mask = 0x3, .align_mul = 4);
+   nir_shader_gather_info(s16.shader, nir_shader_get_entrypoint(s16.shader));
+   hk_lower_nir(dev, s16.shader, &rs, false, 0, NULL, 0);
+   unsigned s16_loads = 0, s16_vec2 = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(s16.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global) {
+               s16_loads++;
+               if (intr->def.num_components == 2 && intr->def.bit_size == 32)
+                  s16_vec2++;
+            }
+         }
+      }
+   }
+   CHECK(s16_loads == 1 && s16_vec2 == 1);
+   ralloc_free(s16.shader);
+
+   /* 32*i + 4 vec4 (4 + 16 <= 32) is provably wrap-free and merges into vec4. */
+   nir_builder s32 = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                    &agx_nir_options,
+                                                    "bounded_stride32_off4_vec4");
+   nir_def *s32_base = nir_imm_int64(&s32, 0x100000);
+   nir_def *s32_i = nir_channel(&s32, nir_load_global_invocation_id(&s32, 32), 0);
+   nir_def *s32_off = nir_imul_imm(&s32, s32_i, 32);
+   nir_def *s32_bound = nir_load_global_constant(&s32, 1, 32, nir_imm_int64(&s32, 0x20000),
+                                                 .align_mul = 4);
+   nir_def *s32_offs[4], *s32_c[4];
+   for (unsigned k = 0; k < 4; ++k)
+      s32_offs[k] = nir_iadd_imm(&s32, s32_off, 4 + 4 * k);
+   for (unsigned k = 0; k < 4; ++k) {
+      s32_c[k] = nir_load_global_bounded(&s32, 1, 32, s32_base, s32_offs[k],
+                                         s32_bound, .align_mul = 4, .align_offset = 0);
+   }
+   nir_store_global(&s32, nir_vec(&s32, s32_c, 4),
+                    nir_imm_int64(&s32, 0x80000), .write_mask = 0xf, .align_mul = 4);
+   nir_shader_gather_info(s32.shader, nir_shader_get_entrypoint(s32.shader));
+   hk_lower_nir(dev, s32.shader, &rs, false, 0, NULL, 0);
+   unsigned s32_loads = 0, s32_vec4 = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(s32.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global) {
+               s32_loads++;
+               if (intr->def.num_components == 4 && intr->def.bit_size == 32)
+                  s32_vec4++;
+            }
+         }
+      }
+   }
+   CHECK(s32_loads == 1 && s32_vec4 == 1);
+   ralloc_free(s32.shader);
+   free(dev);
+
+   puts("soft-fault SSBO & UBO bounded lowering + robust vectorize: pass");
+   return 0;
+}
+
 int
 main(void)
 {
@@ -832,6 +1165,7 @@ main(void)
 
    CHECK(test_branchless_storage_and_tbuf() == 0);
    CHECK(test_gpl_sw_needed() == 0);
+   CHECK(test_soft_fault_ssbo_and_4b_vectorize() == 0);
 
    glsl_type_singleton_decref();
    return 0;

@@ -2978,8 +2978,10 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
          unsigned word = nir_intrinsic_base(intr) + scalar.comp;
          if (word >= AGX_APPLE9_UNIFORM_COUNT)
             return AGX_APPLE9_VREG_INVALID;
-         value = apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR_UNIFORM,
-                                 AGX_APPLE9_ENC_UNIFORM_MOVE, NULL, 0, word);
+         /* Rematerialize immutable uniform reads at use time rather than
+          * pinning GPRs from the entry block across the whole shader. */
+         return apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR_UNIFORM,
+                                AGX_APPLE9_ENC_UNIFORM_MOVE, NULL, 0, word);
       } else if (intr &&
                  intr->intrinsic == nir_intrinsic_load_local_apple9_agx) {
          uint32_t address =
@@ -3371,17 +3373,20 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
              word >= AGX_APPLE9_UNIFORM_COUNT - lower->preamble_base)
             return AGX_APPLE9_VREG_INVALID;
          /* A uniform move reads the word without a zero register
-          * (AGX_APPLE9_NO_UNIFORM_MOVE=1 keeps the zero-sourced OR). */
+          * (AGX_APPLE9_NO_UNIFORM_MOVE=1 keeps the zero-sourced OR).
+          * Rematerialize immutable uniform imports at each use so bindless
+          * handles do not pin GPRs across the entire shader; in-block CSE
+          * and inline uniform folding clean up repeated uses. */
          static int no_move = -1;
          if (no_move < 0)
             no_move = debug_get_option_cached_agx_apple9_no_uniform_move() != NULL;
          if (no_move) {
             uint32_t zero = apple9_dag_zero(lower);
-            value = apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR_UNIFORM,
+            return apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR_UNIFORM,
                AGX_APPLE9_ENC_LOGIC_UNIFORM, &zero, 1,
                lower->preamble_base + word);
          } else {
-            value = apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR_UNIFORM,
+            return apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR_UNIFORM,
                AGX_APPLE9_ENC_UNIFORM_MOVE, NULL, 0,
                lower->preamble_base + word);
          }
@@ -5856,6 +5861,12 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
           (def->bit_size != 8 && def->bit_size != 16 && def->bit_size != 32 &&
            def->bit_size != 64))
          continue;
+      if (instr->type == nir_instr_type_intrinsic) {
+         nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+         if (op == nir_intrinsic_load_preamble ||
+             op == nir_intrinsic_load_native_pointer_apple9_agx)
+            continue;
+      }
 
       const bool volatile_load = instr->type == nir_instr_type_intrinsic &&
          nir_intrinsic_has_access(nir_instr_as_intrinsic(instr)) &&
@@ -6881,6 +6892,18 @@ static bool
 apple9_record_width(nir_def *def, void *data)
 {
    unsigned *width = data;
+   nir_instr *instr = nir_def_instr(def);
+   /* Constants, undefs, and rematerialized uniform imports do not occupy
+    * persistent GPRs across hoisted texture lifetimes. */
+   if (instr->type == nir_instr_type_load_const ||
+       instr->type == nir_instr_type_undef ||
+       (instr->type == nir_instr_type_intrinsic &&
+        (nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_preamble ||
+         nir_instr_as_intrinsic(instr)->intrinsic ==
+            nir_intrinsic_load_native_pointer_apple9_agx))) {
+      width[def->index] = 0;
+      return true;
+   }
    width[def->index] = def->num_components * DIV_ROUND_UP(def->bit_size, 32);
    return true;
 }
@@ -7059,51 +7082,76 @@ agx_nir_hoist_apple9_samples(nir_shader *nir)
       if (jump && jump->type != nir_instr_type_jump)
          jump = NULL;
 
-      nir_foreach_instr(instr, block) {
-         if (instr->type == nir_instr_type_phi || instr == jump ||
-             BITSET_TEST(s.emitted, instr->index))
-            continue;
-
-         /* Before an ordinary instruction, pull later samples of the same
-          * region forward while there is room. */
-         if (!apple9_hoist_fence(instr)) {
-            unsigned inflight = apple9_hoist_inflight(&s, words);
-            unsigned scanned = 0;
-            for (nir_instr *next = nir_instr_next(instr);
-                 next && next != jump && inflight < limit &&
-                 scanned < horizon && !apple9_hoist_fence(next);
-                 next = nir_instr_next(next), ++scanned) {
-               if (!apple9_hoist_sample(next) ||
-                   BITSET_TEST(s.emitted, next->index))
-                  continue;
-               ++s.query;
-               if (!nir_foreach_src(next, apple9_hoist_ready_src, &s))
-                  continue;
-               apple9_hoist_emit(&s, next);
-               BITSET_SET(s.pending, next->index);
-               ++inflight;
-               block_progress = true;
-            }
-         }
-
-         if (BITSET_TEST(s.emitted, instr->index))
-            continue;
-         apple9_hoist_emit(&s, instr);
-         if (apple9_hoist_sample(instr))
-            BITSET_SET(s.pending, instr->index);
-      }
-
-      /* Samples still pending are consumed in later blocks. */
-      memset(s.pending, 0, (words + 1) * sizeof(BITSET_WORD));
-
-      if (!block_progress)
-         continue;
-      assert(original_count == s.count);
       unsigned orig_pressure =
          apple9_schedule_pressure(block, original, original_count, width, live, live_words);
-      if (orig_pressure >= 100 ||
-          apple9_schedule_pressure(block, s.order, s.count, width, live, live_words) >
-             orig_pressure)
+      if (orig_pressure >= 100)
+         continue;
+      /* Keep hoisted texture waves within the 52-GPR (1024-thread) occupancy
+       * tier whenever the unhoisted block fits, stepping down the in-flight
+       * cap (8 -> 4 -> 2) if a wider wave increases peak pressure. */
+      const unsigned limits[] = {
+         orig_pressure > 36 ? 4u : limit,
+         orig_pressure > 36 ? 2u : 4u,
+         2u,
+      };
+      bool accepted = false;
+      for (unsigned attempt = 0; attempt < ARRAY_SIZE(limits); ++attempt) {
+         unsigned cur_limit = limits[attempt];
+         if (attempt > 0 && cur_limit == limits[attempt - 1])
+            continue;
+         s.count = 0;
+         block_progress = false;
+         memset(s.emitted, 0, (words + 1) * sizeof(BITSET_WORD));
+         memset(s.pending, 0, (words + 1) * sizeof(BITSET_WORD));
+
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_phi || instr == jump ||
+                BITSET_TEST(s.emitted, instr->index))
+               continue;
+
+            /* Before an ordinary instruction, pull later samples of the same
+             * region forward while there is room. */
+            if (!apple9_hoist_fence(instr)) {
+               unsigned inflight = apple9_hoist_inflight(&s, words);
+               unsigned scanned = 0;
+               for (nir_instr *next = nir_instr_next(instr);
+                    next && next != jump && inflight < cur_limit &&
+                    scanned < horizon && !apple9_hoist_fence(next);
+                    next = nir_instr_next(next), ++scanned) {
+                  if (!apple9_hoist_sample(next) ||
+                      BITSET_TEST(s.emitted, next->index))
+                     continue;
+                  ++s.query;
+                  if (!nir_foreach_src(next, apple9_hoist_ready_src, &s))
+                     continue;
+                  apple9_hoist_emit(&s, next);
+                  BITSET_SET(s.pending, next->index);
+                  ++inflight;
+                  block_progress = true;
+               }
+            }
+
+            if (BITSET_TEST(s.emitted, instr->index))
+               continue;
+            apple9_hoist_emit(&s, instr);
+            if (apple9_hoist_sample(instr))
+               BITSET_SET(s.pending, instr->index);
+         }
+
+         /* Samples still pending are consumed in later blocks. */
+         memset(s.pending, 0, (words + 1) * sizeof(BITSET_WORD));
+
+         if (!block_progress)
+            break;
+         assert(original_count == s.count);
+         unsigned new_pressure =
+            apple9_schedule_pressure(block, s.order, s.count, width, live, live_words);
+         if (new_pressure <= orig_pressure) {
+            accepted = true;
+            break;
+         }
+      }
+      if (!accepted)
          continue;
 
       progress = true;
