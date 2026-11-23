@@ -321,7 +321,7 @@ lower_images(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 
    case nir_intrinsic_bindless_image_size:
    case nir_intrinsic_bindless_image_samples:
-      nir_def_rewrite_uses(
+      nir_def_replace(
          &intr->def,
          txs_for_image(
             b, intr, intr->def.num_components, intr->def.bit_size,
@@ -329,7 +329,7 @@ lower_images(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
       return true;
 
    case nir_intrinsic_bindless_image_texel_address:
-      nir_def_rewrite_uses(&intr->def, image_texel_address(b, intr, false));
+      nir_def_replace(&intr->def, image_texel_address(b, intr, false));
       return true;
 
    case nir_intrinsic_is_sparse_texels_resident:
