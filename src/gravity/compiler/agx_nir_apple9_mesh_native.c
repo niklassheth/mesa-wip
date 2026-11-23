@@ -823,6 +823,7 @@ agx_nir_lower_apple9_native_mesh(
        * for the final partial subgroup and keeps logical IDs and values live
        * across barriers. Completion is appended only after this transform. */
       nir_lower_system_values(nir);
+      agx_nir_lower_apple9_mesh_global_id(nir);
       nir_lower_halt_to_return(nir);
       nir_lower_returns(nir);
       nir_lower_workgroup_size(nir, physical_threads);

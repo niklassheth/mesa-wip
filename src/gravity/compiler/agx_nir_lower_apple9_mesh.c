@@ -337,6 +337,30 @@ validate(nir_shader *nir, const struct agx_apple9_mesh_key *key,
 }
 
 static bool
+lower_global_invocation_id(nir_builder *b, nir_intrinsic_instr *intr,
+                           UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_global_invocation_id)
+      return false;
+   unsigned bit_size = intr->def.bit_size;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *group_size = nir_u2uN(b, nir_load_workgroup_size(b), bit_size);
+   nir_def *group_id = nir_u2uN(b, nir_load_workgroup_id(b), bit_size);
+   nir_def *local_id = nir_u2uN(b, nir_load_local_invocation_id(b), bit_size);
+   nir_def *global_id =
+      nir_iadd(b, nir_imul(b, group_id, group_size), local_id);
+   nir_def_replace(&intr->def, global_id);
+   return true;
+}
+
+bool
+agx_nir_lower_apple9_mesh_global_id(nir_shader *nir)
+{
+   return nir_shader_intrinsics_pass(nir, lower_global_invocation_id,
+                                     nir_metadata_control_flow, NULL);
+}
+
+static bool
 freeze_logical_workgroup(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    unsigned threads = *(const unsigned *)data;
@@ -516,7 +540,12 @@ agx_nir_mask_apple9_mesh_body(nir_shader *nir,
          reason, "expanded native mesh nested barriers need the output layout");
 
    /* Flatten the physical launch without changing the application's 3D IDs,
-    * WorkgroupSize, or subgroup count. Freeze newly inserted size loads too. */
+    * GlobalInvocationID, WorkgroupSize, or subgroup count. Because
+    * agx_nir_options.has_cs_global_id is true, nir_lower_compute_system_values
+    * leaves load_global_invocation_id intact, which would read the physical
+    * launch stride instead of the logical workgroup size. */
+   nir_lower_system_values(nir);
+   agx_nir_lower_apple9_mesh_global_id(nir);
    nir_lower_compute_system_values_options options = {
       .lower_cs_local_id_to_index = true,
    };

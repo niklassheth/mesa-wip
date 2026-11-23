@@ -3039,6 +3039,105 @@ TEST(Apple9MeshNativeExpand, ClipDistancePreservedAcrossCullPrimitiveAndSerializ
    }
 }
 
+TEST(Apple9MeshNativeExpand, GlobalInvocationIdLogicalStride)
+{
+   struct {
+      uint16_t wg[3];
+      unsigned physical;
+      unsigned max_v, max_p;
+      bool rounds;
+   } cases[] = {
+      {{8, 1, 1}, 32, 24, 8, true},
+      {{4, 2, 1}, 16, 3, 1, false},
+      {{8, 4, 1}, 32, 24, 8, true},
+      {{64, 1, 1}, 32, 24, 8, true},
+      {{8, 8, 1}, 32, 24, 8, true},
+   };
+
+   for (const auto &c : cases) {
+      SCOPED_TRACE(::testing::Message()
+                   << "wg=" << c.wg[0] << "x" << c.wg[1] << "x" << c.wg[2]
+                   << " T=" << c.physical);
+      auto build = [&]() {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_MESH, &agx_nir_options, "global_id_mesh");
+         nir_shader *nir = b.shader;
+         nir->info.io_lowered = true;
+         memcpy(nir->info.workgroup_size, c.wg, sizeof(c.wg));
+         nir->info.mesh.max_vertices_out = c.max_v;
+         nir->info.mesh.max_primitives_out = c.max_p;
+         nir->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+
+         nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 3),
+                                            nir_imm_int(&b, 1),
+                                            nir_imm_int(&b, 0));
+         nir_def *gid = nir_load_global_invocation_id(&b, 32);
+         nir_def *lane = nir_load_local_invocation_index(&b);
+         nir_push_if(&b, nir_ult_imm(&b, lane, 3));
+         nir_def *pos = nir_vec4(&b, nir_u2f32(&b, nir_channel(&b, gid, 0)),
+                                 nir_u2f32(&b, nir_channel(&b, gid, 1)),
+                                 nir_u2f32(&b, nir_channel(&b, gid, 2)),
+                                 nir_imm_float(&b, 1.0f));
+         nir_store_per_vertex_output(&b, pos, lane, nir_imm_int(&b, 0),
+                                     .write_mask = 0xf,
+                                     .src_type = nir_type_float32,
+                                     .io_semantics = {
+                                        .location = VARYING_SLOT_POS,
+                                        .num_slots = 1,
+                                     });
+         nir_pop_if(&b, NULL);
+         nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
+         nir_store_per_primitive_output(
+            &b, nir_imm_ivec3(&b, 0, 1, 2), nir_imm_int(&b, 0),
+            nir_imm_int(&b, 0), .write_mask = 0x7, .src_type = nir_type_uint32,
+            .io_semantics = {
+               .location = VARYING_SLOT_PRIMITIVE_INDICES,
+               .num_slots = 1,
+            });
+         nir_pop_if(&b, NULL);
+         nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+         return nir;
+      };
+
+      agx_apple9_native_mesh_options opts = {};
+      opts.physical_threads = c.physical;
+      opts.packed_index_publication = c.rounds;
+      opts.publication_rounds = c.rounds;
+      opts.attributes = true;
+
+      nir_shader *lowered = build();
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_nir_lower_apple9_native_mesh(lowered, true, &opts, &info,
+                                                   &reason))
+         << (reason ?: "");
+      bool saw_global_id = false, saw_wg_id = false;
+      nir_foreach_block(block, nir_shader_get_entrypoint(lowered)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            if (op == nir_intrinsic_load_global_invocation_id)
+               saw_global_id = true;
+            if (op == nir_intrinsic_load_workgroup_id)
+               saw_wg_id = true;
+         }
+      }
+      EXPECT_FALSE(saw_global_id);
+      EXPECT_TRUE(saw_wg_id);
+      ralloc_free(lowered);
+
+      nir_shader *nir = build();
+      agx_shader_part code = {};
+      ASSERT_TRUE(agx_compile_apple9_native_mesh(nir, true, &opts, &code, &info,
+                                                 &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(code.binary && code.info.binary_size > 0);
+      free(code.binary);
+      ralloc_free(nir);
+   }
+}
+
 TEST(Apple9MeshNativeExpand, CullingRegionAlignmentIs16ByteAligned)
 {
    for (unsigned max_p : {1u, 2u, 3u, 4u, 5u, 8u, 17u}) {

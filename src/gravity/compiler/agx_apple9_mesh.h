@@ -180,6 +180,11 @@ bool agx_nir_lower_apple9_mesh(nir_shader *nir,
                                struct agx_apple9_mesh_body_info *info,
                                const char **reason);
 
+/* Lower load_global_invocation_id to workgroup_id * workgroup_size +
+ * local_invocation_id before rewriting logical workgroup dimensions to a
+ * different physical launch width or 1D flattened shape. */
+bool agx_nir_lower_apple9_mesh_global_id(nir_shader *nir);
+
 /* Preserve logical workgroup system values while masking extra completion
  * invocations between converged workgroup barriers. Call after IO/return
  * lowering and before ordinary compilation. Returns success, not progress.
