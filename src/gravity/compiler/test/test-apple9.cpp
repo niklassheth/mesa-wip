@@ -18294,19 +18294,24 @@ TEST(Apple9Vir, MmaSharedRaForcedSpill)
    b0->nir = &logical;
    agx_apple9_block_begin(&program, b0);
 
-   /* Load 94 independent non-rematerializable values to force spilling across MMA. */
+   /* Load 100 independent non-rematerializable values before a memory store so
+    * pre-RA scheduling cannot sink them below the MMAs, forcing >96 GPR
+    * pressure and genuine spilling across both MMAs. */
    agx_apple9_device_load_contract contract = {
       .index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR,
       .flags = 0,
       .raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_1100,
    };
-   uint32_t live[94];
+   uint32_t live[100];
    for (unsigned i = 0; i < ARRAY_SIZE(live); ++i) {
       uint32_t idx = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IMM,
                                          AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, i);
       live[i] = agx_apple9_vir_emit_device_load(&program, 0, idx, &contract);
       ASSERT_NE(live[i], AGX_APPLE9_VREG_INVALID);
    }
+   uint32_t fence_idx = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IMM,
+                                            AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 1);
+   ASSERT_TRUE(agx_apple9_vir_emit_device_store(&program, 0, fence_idx, &live[99], 1, 32));
 
    uint32_t sa[2] = {live[0], live[1]};
    uint32_t sb[2] = {live[2], live[3]};
