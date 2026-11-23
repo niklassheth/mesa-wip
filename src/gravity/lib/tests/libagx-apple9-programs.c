@@ -30,15 +30,6 @@ test_libagx_num_programs(void)
 bool
 test_libagx_expected_to_fail(unsigned program)
 {
-   switch (program) {
-   /* G13 compression metadata. Apple9 never decompresses in place: there are
-    * no shared compressed resources and render targets are never spilled.
-    */
-   case LIBAGX_DECOMPRESS_0:
-   case LIBAGX_DECOMPRESS_1:
-   case LIBAGX_DECOMPRESS_2:
-      return true;
-   default:
-      return false;
-   }
+   (void)program;
+   return false;
 }

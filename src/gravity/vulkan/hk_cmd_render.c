@@ -27,7 +27,6 @@
 #include "hk_shader.h"
 
 #include "gravity/genxml/agx_pack.h"
-#include "gravity/libcl/compression.h"
 #include "gravity/libcl/libagx.h"
 #include "gravity/libcl/mesh.h"
 #include "gravity/libcl/query.h"
@@ -145,41 +144,6 @@ hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
     */
    cmd->state.gfx.descriptors.root.draw.view_index = 0;
    cmd->state.gfx.descriptors.root_dirty = true;
-}
-
-void
-hk_cmd_invalidate_graphics_state(struct hk_cmd_buffer *cmd)
-{
-   hk_cmd_buffer_dirty_all(cmd);
-
-   /* From the Vulkan 1.3.275 spec:
-    *
-    *    "...There is one exception to this rule - if the primary command
-    *    buffer is inside a render pass instance, then the render pass and
-    *    subpass state is not disturbed by executing secondary command
-    *    buffers."
-    *
-    * We need to reset everything EXCEPT the render pass state.
-    */
-   struct hk_rendering_state render_save = cmd->state.gfx.render;
-   memset(&cmd->state.gfx, 0, sizeof(cmd->state.gfx));
-   cmd->state.gfx.render = render_save;
-}
-
-static void
-hk_attachment_use_implicit_sync(struct hk_cmd_buffer *cmd,
-                                const struct hk_attachment *att)
-{
-   if (att->iview) {
-      hk_cmd_use_implicit_sync(
-         cmd, container_of(att->iview->vk.image, struct hk_image, vk)
-                 ->implicit_sync_res);
-   }
-   if (att->resolve_iview) {
-      hk_cmd_use_implicit_sync(
-         cmd, container_of(att->resolve_iview->vk.image, struct hk_image, vk)
-                 ->implicit_sync_res);
-   }
 }
 
 static void
@@ -858,13 +822,10 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    for (uint32_t i = 0; i < render->color_att_count; i++) {
       hk_attachment_init(&render->color_att[i],
                          &pRenderingInfo->pColorAttachments[i]);
-      hk_attachment_use_implicit_sync(cmd, &render->color_att[i]);
    }
 
    hk_attachment_init(&render->depth_att, pRenderingInfo->pDepthAttachment);
    hk_attachment_init(&render->stencil_att, pRenderingInfo->pStencilAttachment);
-   hk_attachment_use_implicit_sync(cmd, &render->depth_att);
-   hk_attachment_use_implicit_sync(cmd, &render->stencil_att);
 
    for (uint32_t i = 0; i < render->color_att_count; i++) {
       hk_merge_render_iview(render, render->color_att[i].iview, false);
@@ -906,17 +867,6 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
     */
    render->tilebuffer = agx_build_tilebuffer_layout(
       formats, render->color_att_count, render->tilebuffer.nr_samples, true);
-
-   unsigned bytes = 0;
-   for (unsigned rt = 0; rt < render->color_att_count; ++rt) {
-      render->tilebuffer._offset_B[rt] = bytes;
-      bytes += 4 * agx_apple9_color_words(formats[rt]);
-      render->tilebuffer.spilled[rt] = false;
-   }
-   render->tilebuffer.sample_size_B = ALIGN_POT(
-      agx_apple9_tile_sample_bytes(bytes, render->tilebuffer.nr_samples), 8);
-   render->tilebuffer.tile_size = render->tilebuffer.nr_samples == 4
-                                    ? 32 * 16 : 32 * 32;
 
    if (cmd->feedback_decompress) {
       /* A self-blit must retire each whole compression block before another
@@ -1166,51 +1116,6 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          cmd->current_cs.cs->sync_stages == HK_SYNC_ALL))) {
       hk_cs_end_hint(cmd, HK_CS_END_BEGIN_RENDER);
       hk_cmd_buffer_end_compute(cmd);
-   }
-
-   /* If we spill colour attachments, we need to decompress them. This happens
-    * at the start of the render; it is not re-emitted when resuming
-    * secondaries. It could be hoisted to the start of the command buffer but
-    * we're not that clever yet.
-    */
-   if (agx_tilebuffer_spills(&render->tilebuffer)) {
-      perf_debug(cmd, "eMRT render pass");
-
-      for (unsigned i = 0; i < render->color_att_count; ++i) {
-         struct hk_image_view *view = render->color_att[i].iview;
-         if (view) {
-            struct hk_image *image =
-               container_of(view->vk.image, struct hk_image, vk);
-
-            /* TODO: YCbCr interaction? */
-            uint8_t plane = 0;
-            uint8_t image_plane = view->planes[plane].image_plane;
-            struct ail_layout *layout = &image->planes[image_plane].layout;
-
-            if (ail_is_level_logically_compressed(layout,
-                                                  view->vk.base_mip_level)) {
-
-               perf_debug(cmd, "Decompressing in-place");
-
-               unsigned level = view->vk.base_mip_level;
-               unsigned layer = view->vk.base_array_layer;
-               uint64_t base = hk_image_base_address(image, image_plane);
-
-               struct libagx_decompress_images imgs = {
-                  .compressed = view->planes[plane].emrt_texture,
-                  .uncompressed = view->planes[plane].emrt_pbe,
-               };
-
-               struct agx_grid grid =
-                  agx_3d(ail_metadata_width_tl(layout, level) * 32,
-                         ail_metadata_height_tl(layout, level), layer_count);
-
-               libagx_decompress(cmd, grid, AGX_BARRIER_ALL | AGX_PREGFX,
-                                 layout, layer, level, base,
-                                 hk_pool_upload(cmd, &imgs, sizeof(imgs), 64));
-            }
-         }
-      }
    }
 
    uint32_t clear_count = 0;

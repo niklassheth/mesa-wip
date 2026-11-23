@@ -34,12 +34,9 @@ extern "C" {
 /* Linear sampled textures encode (row_bytes / 16) - 1 in 16 bits. */
 #define AGX_APPLE9_MAX_LINEAR_STRIDE (1u << 20)
 
-bool agx_apple9_texture_format_supported(enum pipe_format format);
-
 struct agx_device;
 struct agx_bo;
 struct agx_shader_body;
-struct agx_pool;
 struct agx_apple9_graphics;
 
 /* Graphics launch programs of one compiled stage, built on first use for each
@@ -370,12 +367,6 @@ bool agx_apple9_prepare_draw_alloc(
    struct agx_apple9_uniform_draw *draw,
    const struct agx_apple9_uniform_draw *previous);
 
-bool agx_apple9_prepare_draw(struct agx_device *dev, struct agx_pool *usc_pool,
-                             struct agx_pool *context_pool,
-                             const struct agx_apple9_render_pipeline *pipeline,
-                             struct agx_apple9_uniform_draw *draw,
-                             const struct agx_apple9_uniform_draw *previous);
-
 /* Update only resource-table bindings of an already prepared draw. All shader,
  * texture/sampler, interpolation and raster state must remain unchanged.
  * GPU allocations remain immutable. Failure leaves the CPU draw unchanged.
@@ -396,49 +387,6 @@ bool agx_apple9_update_draw_tables_alloc(
 #define AGX_APPLE9_RENDER_CONTEXT_BASE UINT64_C(0x1000000000)
 
 size_t agx_apple9_compute_launch_size(
-   const struct agx_apple9_compute_profile *profile);
-
-unsigned agx_apple9_compute_resource_count(
-   const struct agx_apple9_compute_profile *profile);
-
-/* Exact per-dispatch resource-record footprint selected by the package ABI.
- * The direct-buffer ABI uses one 0x100-byte record containing one hidden
- * pointer, up to eighteen visible pointers, and inline group counts. */
-size_t agx_apple9_compute_resource_record_size(
-   const struct agx_apple9_compute_profile *profile);
-
-/* Exact total threadgroup-memory requirement carried by this profile.  The
- * value is validated against the selected opaque package ABI. */
-uint32_t agx_apple9_compute_required_threadgroup_memory_bytes(
-   const struct agx_apple9_compute_profile *profile);
-
-/* Map a package argument record to the caller's logical buffer namespace and
- * binding.  Compiler-generated profiles may mix UBO inputs with SSBO inputs
- * and outputs without changing native package argument order. */
-enum agx_apple9_compute_resource_kind agx_apple9_compute_resource_kind(
-   const struct agx_apple9_compute_profile *profile, unsigned argument);
-
-unsigned agx_apple9_compute_resource_binding(
-   const struct agx_apple9_compute_profile *profile, unsigned argument);
-
-uint32_t
-agx_apple9_compute_read_mask(const struct agx_apple9_compute_profile *profile);
-
-uint32_t
-agx_apple9_compute_write_mask(const struct agx_apple9_compute_profile *profile);
-
-
-/*
- * Direct CDM geometry is dispatch state.  Fixed-local-size profiles require
- * the compiled tuple, while variable-local-size profiles validate the tuple
- * supplied by the dispatch command.
- */
-bool agx_apple9_compute_grid_supported(
-   const struct agx_apple9_compute_profile *profile, const uint32_t global[3],
-   const uint32_t local[3]);
-
-/* Indirect dispatch is a launch/package ABI property. */
-bool agx_apple9_compute_indirect_dispatch_supported(
    const struct agx_apple9_compute_profile *profile);
 
 enum agx_apple9_compute_geometry_mode {
@@ -489,13 +437,6 @@ bool agx_apple9_compute_launch_template(
    struct agx_apple9_launch_template *tmpl,
    const struct agx_apple9_compute_profile *profile, uint64_t usc_exec_base,
    uint64_t preamble_address);
-
-bool agx_apple9_prepare_compute_dispatch(
-   struct agx_device *dev, struct agx_pool *usc_pool, struct agx_bo *body,
-   const struct agx_apple9_compute_profile *profile, const uint64_t *resources,
-   unsigned resource_count, uint64_t textures, uint64_t samplers,
-   const struct agx_apple9_compute_geometry *geometry,
-   uint64_t preamble_address, uint64_t *launch_address);
 
 /* Record-size constants include the optional trailing CDM barrier. Without
  * it, the emitted launch is one uint32_t shorter; the caller supplies the next
@@ -548,18 +489,10 @@ bool agx_apple9_translate_pbe(void *out, const struct agx_pbe_packed *state,
                             unsigned layer_count, bool layered,
                             unsigned dimension);
 
-bool agx_apple9_translate_sampler(void *out,
-                                  const struct agx_sampler_packed *state);
-
-void agx_apple9_pack_r32f_texture(void *out, uint64_t address, uint32_t width,
-                                  uint32_t height, uint32_t stride_B);
-
-bool agx_apple9_sampler_wrap_supported(unsigned wrap);
 void agx_apple9_pack_sampler(void *out, bool min_linear, bool mag_linear,
                               unsigned mip_filter, float min_lod, float max_lod,
                          unsigned wrap_s, unsigned wrap_t, unsigned max_anisotropy);
 void agx_apple9_pack_fetch_sampler(void *out);
-void agx_apple9_pack_nearest_sampler(void *out);
 
 /*
  * Apple9 command and shader ABIs are intentionally kept outside the older

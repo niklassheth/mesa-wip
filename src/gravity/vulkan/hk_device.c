@@ -118,20 +118,11 @@ hk_init_internal_shaders(struct hk_internal_shaders *s)
 
 static void
 hk_destroy_internal_shaders(struct hk_device *dev,
-                            struct hk_internal_shaders *s, bool part)
+                            struct hk_internal_shaders *s)
 {
    hash_table_foreach(s->ht, ent) {
-      if (part) {
-         struct agx_shader_part *part = ent->data;
-         free(part->binary);
-
-         /* The agx_shader_part itself is ralloc'd against the hash table so
-          * will be freed.
-          */
-      } else {
-         struct hk_api_shader *obj = ent->data;
-         hk_api_shader_destroy(&dev->vk, &obj->vk, NULL);
-      }
+      struct hk_api_shader *obj = ent->data;
+      hk_api_shader_destroy(&dev->vk, &obj->vk, NULL);
    }
 
    _mesa_hash_table_destroy(s->ht, NULL);
@@ -590,7 +581,7 @@ fail_queues:
       struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
       hk_queue_finish(dev, queue);
    }
-   hk_destroy_internal_shaders(dev, &dev->kernels, false);
+   hk_destroy_internal_shaders(dev, &dev->kernels);
 fail_bg_eot:
    agx_bg_eot_cleanup(&dev->bg_eot);
 fail_rodata:
@@ -633,7 +624,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    hk_apple9_fs_epilogs_finish(dev);
    hk_apple9_bodies_finish(dev);
    hk_apple9_tile_helpers_finish(dev);
-   hk_destroy_internal_shaders(dev, &dev->kernels, false);
+   hk_destroy_internal_shaders(dev, &dev->kernels);
 
    vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
 

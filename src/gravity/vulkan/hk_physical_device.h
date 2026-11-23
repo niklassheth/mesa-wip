@@ -53,8 +53,6 @@ struct hk_physical_device {
 
    struct wsi_device wsi_device;
 
-   uint8_t device_uuid[VK_UUID_SIZE];
-
    // TODO: add mapable VRAM heap if possible
    struct hk_memory_heap mem_heaps[3];
    VkMemoryType mem_types[3];
@@ -65,7 +63,6 @@ struct hk_physical_device {
     * as descriptor pools). UINT8_MAX when absent. Only buffers with a
     * descriptor-buffer usage may (and must) use it. */
    uint8_t apple9_descriptor_mem_type;
-   uint64_t sysmem;
 
    struct hk_queue_family queue_families[3];
    uint8_t queue_family_count;

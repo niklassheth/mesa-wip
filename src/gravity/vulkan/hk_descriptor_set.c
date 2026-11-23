@@ -24,13 +24,6 @@
 #include "hk_sampler.h"
 #include "hk_descriptor_buffer.h"
 
-static inline uint32_t
-align_u32(uint32_t v, uint32_t a)
-{
-   assert(a != 0 && a == (a & -a));
-   return (v + a - 1) & ~(a - 1);
-}
-
 static inline void
 hk_advance_binding(const struct hk_descriptor_set_layout *layout,
                    uint32_t *binding, uint32_t *elem)

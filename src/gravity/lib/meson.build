@@ -20,7 +20,6 @@ libgravity_lib_files = files(
   'agx_nir_lower_vbo.c',
   'agx_nir_prolog_epilog.c',
   'agx_va.c',
-  'pool.c',
 )
 
 gravity_libcl_shaders = custom_target(
@@ -89,7 +88,6 @@ if with_tests
         'tests/test-border.cpp',
         'tests/test-apple9-cdm.cpp',
         'tests/test-apple9-launch-template.cpp',
-        'tests/test-tilebuffer.cpp',
         'tests/test-primitive-count.cpp',
         'tests/test-poly-indirect-size.cpp',
         'tests/poly-indirect-size.c',

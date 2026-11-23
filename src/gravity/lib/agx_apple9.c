@@ -7,7 +7,6 @@
 #include "agx_apple9.h"
 #include "gravity/compiler/agx_apple9_encoding.h"
 #include "gravity/compiler/agx_apple9_ir.h"
-#include "gravity/lib/pool.h"
 #include "pipe/p_defines.h"
 #include "agx_apple9_launch.h"
 
@@ -203,16 +202,6 @@ apple9_put_u16(void *ptr, uint16_t value)
 }
 
 static inline void
-apple9_put_u24(void *ptr, uint32_t value)
-{
-   assert(value <= 0xffffff);
-   uint8_t *bytes = ptr;
-   bytes[0] = value;
-   bytes[1] = value >> 8;
-   bytes[2] = value >> 16;
-}
-
-static inline void
 apple9_put_u32(void *ptr, uint32_t value)
 {
    memcpy(ptr, &value, sizeof(value));
@@ -351,16 +340,6 @@ agx_apple9_compute_launch_size(const struct agx_apple9_compute_profile *profile)
    return abi ? AGX_APPLE9_COMPUTE_LAUNCH_SIZE : 0;
 }
 
-unsigned
-agx_apple9_compute_resource_count(
-   const struct agx_apple9_compute_profile *profile)
-{
-   const struct apple9_compute_abi_desc *abi = apple9_compute_abi(profile);
-   return abi && apple9_compute_profile_valid(profile, abi)
-             ? profile->resource_binding_count
-             : 0;
-}
-
 static size_t
 apple9_compute_resource_record_size_for_abi(
    const struct apple9_compute_abi_desc *abi)
@@ -370,102 +349,8 @@ apple9_compute_resource_record_size_for_abi(
              : AGX_APPLE9_COMPUTE_RESOURCE_STRIDE;
 }
 
-size_t
-agx_apple9_compute_resource_record_size(
-   const struct agx_apple9_compute_profile *profile)
-{
-   const struct apple9_compute_abi_desc *abi = apple9_compute_abi(profile);
-   return abi && apple9_compute_profile_valid(profile, abi)
-             ? apple9_compute_resource_record_size_for_abi(abi)
-             : 0;
-}
-
-uint32_t
-agx_apple9_compute_required_threadgroup_memory_bytes(
-   const struct agx_apple9_compute_profile *profile)
-{
-   const struct apple9_compute_abi_desc *abi = apple9_compute_abi(profile);
-   return abi && apple9_compute_profile_valid(profile, abi)
-             ? profile->required_threadgroup_memory_bytes
-             : 0;
-}
-
-unsigned
-agx_apple9_compute_resource_binding(
-   const struct agx_apple9_compute_profile *profile, unsigned argument)
-{
-   const struct apple9_compute_abi_desc *abi = apple9_compute_abi(profile);
-   if (!abi || argument >= profile->resource_binding_count)
-      return UINT8_MAX;
-
-   return profile->resource_binding[argument];
-}
-
-enum agx_apple9_compute_resource_kind
-agx_apple9_compute_resource_kind(
-   const struct agx_apple9_compute_profile *profile, unsigned argument)
-{
-   const struct apple9_compute_abi_desc *abi = apple9_compute_abi(profile);
-   if (!abi || argument >= profile->resource_binding_count)
-      return AGX_APPLE9_COMPUTE_RESOURCE_SSBO;
-
-   return profile->resource_kind[argument];
-}
-
-uint32_t
-agx_apple9_compute_read_mask(const struct agx_apple9_compute_profile *profile)
-{
-   const struct apple9_compute_abi_desc *abi = apple9_compute_abi(profile);
-   return abi ? profile->resource_read_mask : 0;
-}
-
-uint32_t
-agx_apple9_compute_write_mask(const struct agx_apple9_compute_profile *profile)
-{
-   const struct apple9_compute_abi_desc *abi = apple9_compute_abi(profile);
-   return abi ? profile->resource_write_mask : 0;
-}
-
-bool
-agx_apple9_compute_grid_supported(
-   const struct agx_apple9_compute_profile *profile, const uint32_t global[3],
-   const uint32_t local[3])
-{
-   const struct apple9_compute_abi_desc *abi = apple9_compute_abi(profile);
-   if (!abi || !global || !local)
-      return false;
-
-   /* CMD-8 and EXP-0092 establish that direct CDM geometry is dispatch state,
-    * not part of either launch/archive ABI.  Keep the hardware's public M4
-    * threadgroup limit explicit and reject zero axes before encoding. */
-   uint64_t threads_per_group = 1;
-   for (unsigned d = 0; d < 3; ++d) {
-      if (!global[d] || !local[d] ||
-          (!profile->variable_local_size &&
-           local[d] != profile->local_size[d]))
-         return false;
-      if (local[d] > 1024 / threads_per_group)
-         return false;
-      /* Direct geometry counts threads in 32 bits. The API's 65535-group
-       * limit does not bind driver-internal dispatches. */
-      threads_per_group *= local[d];
-   }
-
-   return true;
-}
-
-bool
-agx_apple9_compute_indirect_dispatch_supported(
-   const struct agx_apple9_compute_profile *profile)
-{
-   const struct apple9_compute_abi_desc *abi = apple9_compute_abi(profile);
-   return abi && abi->supports_indirect_dispatch;
-}
-
 static bool apple9_build_body_entry(uint8_t *out, uint64_t entry,
                                     uint64_t body);
-static bool apple9_build_linked_entry(uint8_t *out, uint64_t entry,
-                                      uint64_t first, uint64_t second);
 
 void
 agx_apple9_initialize_entries(struct agx_device *dev)
@@ -702,26 +587,6 @@ agx_apple9_prepare_compute_dispatch_alloc_tmpl(
    return true;
 }
 
-static struct agx_ptr
-apple9_pool_alloc(void *pool, size_t size, size_t alignment)
-{
-   return agx_pool_alloc_aligned(pool, size, alignment);
-}
-
-bool
-agx_apple9_prepare_compute_dispatch(
-   struct agx_device *dev, struct agx_pool *usc_pool, struct agx_bo *body,
-   const struct agx_apple9_compute_profile *profile, const uint64_t *resources,
-   unsigned resource_count, uint64_t textures, uint64_t samplers,
-   const struct agx_apple9_compute_geometry *geometry,
-   uint64_t preamble_address, uint64_t *launch_address)
-{
-   return agx_apple9_prepare_compute_dispatch_alloc(
-      dev, usc_pool, apple9_pool_alloc, &body->apple9_body, profile, resources,
-      resource_count,
-      textures, samplers, geometry, preamble_address, launch_address);
-}
-
 void
 agx_apple9_set_compute_barrier(void *record, unsigned record_size)
 {
@@ -826,97 +691,6 @@ agx_apple9_emit_indirect_dispatch(
    if (barrier)
       apple9_put_u32(record + (indirect_local ? 0x18 : 0x24), abi->cdm_tail);
    return true;
-}
-
-void
-agx_apple9_pack_r32f_texture(void *out, uint64_t address, uint32_t width,
-                             uint32_t height, uint32_t stride_B)
-{
-   assert((address & 0xf) == 0);
-   assert(width > 0 && width <= 0x4000 && height > 0 && height <= 0x4000);
-   /* The linear R32F profile has an implicit tightly-packed row stride. */
-   assert(stride_B == width * 4);
-   uint32_t w = width - 1, h = height - 1;
-   uint64_t units = address >> 4;
-   uint32_t words[8] = {
-      0x09688862 | ((w & 0xf) << 28),
-      ((w >> 4) & 0x3ff) | (h << 10),
-      units,
-      (units >> 32) & 0xfff,
-   };
-   memcpy(out, words, sizeof(words));
-}
-
-bool
-agx_apple9_texture_format_supported(enum pipe_format format)
-{
-   if (agx_apple9_color_is_wide(format) || agx_apple9_color_is_packed(format) ||
-       agx_apple9_color_is_normalized(format))
-      return true;
-   switch (format) {
-   case PIPE_FORMAT_R8_SNORM:
-   case PIPE_FORMAT_R8G8_SNORM:
-   case PIPE_FORMAT_R8G8B8A8_SNORM:
-   case PIPE_FORMAT_R8G8B8X8_SNORM:
-   case PIPE_FORMAT_R9G9B9E5_FLOAT:
-   case PIPE_FORMAT_R8_UNORM:
-   case PIPE_FORMAT_R8G8_UNORM:
-   case PIPE_FORMAT_R8G8B8A8_UNORM:
-   case PIPE_FORMAT_R8G8B8X8_UNORM:
-   case PIPE_FORMAT_B8G8R8A8_UNORM:
-   case PIPE_FORMAT_B8G8R8X8_UNORM:
-   case PIPE_FORMAT_R8G8B8A8_SRGB:
-   case PIPE_FORMAT_R8G8B8X8_SRGB:
-   case PIPE_FORMAT_B8G8R8A8_SRGB:
-   case PIPE_FORMAT_B8G8R8X8_SRGB:
-   case PIPE_FORMAT_B5G6R5_UNORM:
-   case PIPE_FORMAT_R16G16B16A16_FLOAT:
-   case PIPE_FORMAT_R16_FLOAT:
-   case PIPE_FORMAT_R16G16_FLOAT:
-   case PIPE_FORMAT_R32G32B32A32_FLOAT:
-   case PIPE_FORMAT_R32_FLOAT:
-   case PIPE_FORMAT_Z32_FLOAT:
-   /* The transfer helper stores these as depth32f and separate stencil;
-    * sampling the logical combined format reads its depth component. */
-   case PIPE_FORMAT_Z24X8_UNORM:
-   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
-   case PIPE_FORMAT_Z32_FLOAT_S8X24_UINT:
-   case PIPE_FORMAT_R16_UNORM:
-   case PIPE_FORMAT_R16_SNORM:
-   case PIPE_FORMAT_R16G16_UNORM:
-   case PIPE_FORMAT_R16G16_SNORM:
-   case PIPE_FORMAT_Z16_UNORM:
-   /* BC block formats sample natively, as in Honeykrisp. Without them Gallium
-    * decompresses S3TC/RGTC to RGBA8 on upload and cannot offer BPTC. */
-   case PIPE_FORMAT_DXT1_RGB:
-   case PIPE_FORMAT_DXT1_RGBA:
-   case PIPE_FORMAT_DXT1_SRGB:
-   case PIPE_FORMAT_DXT1_SRGBA:
-   case PIPE_FORMAT_DXT3_RGBA:
-   case PIPE_FORMAT_DXT3_SRGBA:
-   case PIPE_FORMAT_DXT5_RGBA:
-   case PIPE_FORMAT_DXT5_SRGBA:
-   case PIPE_FORMAT_RGTC1_UNORM:
-   case PIPE_FORMAT_RGTC1_SNORM:
-   case PIPE_FORMAT_RGTC2_UNORM:
-   case PIPE_FORMAT_RGTC2_SNORM:
-   case PIPE_FORMAT_BPTC_RGB_FLOAT:
-   case PIPE_FORMAT_BPTC_RGB_UFLOAT:
-   case PIPE_FORMAT_BPTC_RGBA_UNORM:
-   case PIPE_FORMAT_BPTC_SRGBA:
-      return true;
-   default:
-      return false;
-   }
-}
-
-bool
-agx_apple9_sampler_wrap_supported(unsigned wrap)
-{
-   return wrap == PIPE_TEX_WRAP_CLAMP_TO_EDGE || wrap == PIPE_TEX_WRAP_REPEAT ||
-          wrap == PIPE_TEX_WRAP_MIRROR_REPEAT || wrap == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
-          wrap == PIPE_TEX_WRAP_CLAMP ||
-          wrap == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE;
 }
 
 static unsigned
@@ -1137,13 +911,6 @@ agx_apple9_pack_sampler_state(void *out, const struct AGX_SAMPLER *state)
    return true;
 }
 
-bool
-agx_apple9_translate_sampler(void *out, const struct agx_sampler_packed *state)
-{
-   agx_unpack(stderr, state, SAMPLER, sampler);
-   return agx_apple9_pack_sampler_state(out, &sampler);
-}
-
 /* Texel fetches return zero outside the image, as image robustness
  * requires: clamp every axis to the transparent black border.
  */
@@ -1159,18 +926,6 @@ agx_apple9_pack_fetch_sampler(void *out)
    memcpy((uint8_t *)out + 4, &modes, 4);
 }
 
-void
-agx_apple9_pack_nearest_sampler(void *out)
-{
-   agx_apple9_pack_sampler(out, false, false, 0, 0, 14,
-                            PIPE_TEX_WRAP_CLAMP_TO_EDGE, PIPE_TEX_WRAP_CLAMP_TO_EDGE, 1);
-}
-
-/* The default coefficient table occupies the end of the graphics resource
- * page, after per-draw argument records. Draw-specific tables live in their
- * own slots on the following pages so mixed interpolation can use one
- * descriptor per scalar without overwriting the next draw's roots. */
-#define APPLE9_CF_BINDINGS 0x203d00u
 #define APPLE9_CF_BINDINGS_SIZE AGX_APPLE9_CF_BINDINGS_SIZE
 /* One binding per user scalar in the worst case, then 1/W, primitive ID,
  * Z, point coordinates, two barycentric pairs, per-vertex inputs, optional
@@ -1427,44 +1182,26 @@ apple9_build_direct_bind_group(uint8_t *page, unsigned varying_components)
    static const struct {
       uint16_t offset;
       uint32_t value;
-   } common[] = {
-      {0x00, 0x00800000}, {0x04, 0x00010100}, {0x08, 0x0000c9c0},
-      {0x10, 0x01000000}, {0x14, 0x00066420}, {0x1c, 0x0c0a0000},
-      {0x20, 0x00010000}, {0x2c, 0x00000006}, {0x30, 0x010000b4},
+   } g16_static[] = {
+      {0x00, 0x00800000}, {0x10, 0x01000000}, {0x14, 0x00008c19},
+      {0x1c, 0x0c0a0000}, {0x20, 0x00010000}, {0x30, 0x010000b4},
       {0x34, 0x00040200}, {0x38, 0x07200f00}, {0x3c, 0x0e000000},
       {0x40, 0x07200f00}, {0x44, 0x0e000000}, {0x4c, 0x02000048},
       {0x50, 0x00000200}, {0x54, 0x07e00000}, {0x58, 0x07e00000},
-      {0x5c, 0x0000000f}, {0x60, 0x00410000}, {0x68, 0x00000080},
+      {0x5c, 0x0001ffff}, {0x60, 0x00410000}, {0x68, 0x00000080},
       {0x6c, 0x00200000}, {0x70, 0x00000480},
    };
 
    memset(page, 0, 0x80);
-   for (unsigned i = 0; i < ARRAY_SIZE(common); ++i)
-      apple9_put_u32(page + common[i].offset, common[i].value);
+   for (unsigned i = 0; i < ARRAY_SIZE(g16_static); ++i)
+      apple9_put_u32(page + g16_static[i].offset, g16_static[i].value);
 
-   /* T8140 direct-render deltas reused by Apple9. */
-   apple9_put_u32(page + 0x04, 0);
-   apple9_put_u32(page + 0x08, 0);
-   apple9_put_u32(page + 0x14, 0x00004e19);
-   apple9_put_u32(page + 0x20, 0);
-   apple9_put_u32(page + 0x2c, 4);
-   apple9_put_u32(page + 0x5c, 0x0001ffff);
-
-   /* Small G16 packing deltas established independently on T8132. */
-   page[0x05] = 0x01;
-   page[0x06] = 0x02;
-   page[0x08] = 0x80;
-   page[0x09] = 0x04;
-   page[0x15] = 0x8c;
-   page[0x22] = 0x01;
    assert(varying_components <= AGX_APPLE9_MAX_VARYING_COMPONENTS);
-   page[0x2c] = 4 + varying_components;
-   /* G16's fragment-state layout moves the coefficient pointer ahead of
-    * the pipeline words. EXP-M4-59 confirms the public binding descriptors. */
+   /* Draw prep fills +0x08 (draw->coefficients) and +0x14 (fragment launch). */
    apple9_put_u32(page + 0x04,
                   0x100 | (apple9_cf_binding_count(varying_components) << 16));
-   apple9_put_u32(page + 0x08, APPLE9_CF_BINDINGS);
    apple9_put_u32(page + 0x18, varying_components / 8);
+   apple9_put_u32(page + 0x2c, 4 + varying_components);
 }
 
 bool
@@ -2187,18 +1924,6 @@ agx_apple9_update_draw_tables_alloc(
    apple9_put_u32(draw->ppp_record + 0x54, launch[1] / 0x40);
    draw->ppp = ppp;
    return true;
-}
-
-bool
-agx_apple9_prepare_draw(struct agx_device *dev, struct agx_pool *usc_pool,
-                        struct agx_pool *context_pool,
-                        const struct agx_apple9_render_pipeline *pipeline,
-                        struct agx_apple9_uniform_draw *draw,
-                        const struct agx_apple9_uniform_draw *previous)
-{
-   return agx_apple9_prepare_draw_alloc(dev, usc_pool, apple9_pool_alloc,
-                                        context_pool, apple9_pool_alloc,
-                                        pipeline, draw, previous);
 }
 
 struct agx_apple9_ppp_update {

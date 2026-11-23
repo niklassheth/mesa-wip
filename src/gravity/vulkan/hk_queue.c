@@ -297,11 +297,6 @@ asahi_fill_sync(struct drm_asahi_sync *sync, struct vk_sync *vk_sync,
    }
 }
 
-union drm_asahi_cmd {
-   struct drm_asahi_cmd_compute compute;
-   struct drm_asahi_cmd_render render;
-};
-
 /* Batch up to the kernel's per-submission command limit so a submission uses
  * one ioctl, preserves intra-submit barrier indices, and avoids forced
  * cross-engine joins on mixed-engine batches.
@@ -937,12 +932,8 @@ hk_resolve_sync(struct hk_cmd_buffer *cmd, struct hk_sync_state *state,
  * in order, and fragment work waits for the same render completions as
  * before. Without that flag the firmware holds the render's tiling until the
  * previous render's fragment work completes, so renders never overlap.
- * HK_APPLE9_FRAGMENT_BARRIER=0 keeps every render dependency before tiling.
- */
-DEBUG_GET_ONCE_BOOL_OPTION(hk_apple9_fragment_barrier,
-                           "HK_APPLE9_FRAGMENT_BARRIER", true)
-
-/* A barrier into pre-rasterization stages (as applications commonly write
+ *
+ * A barrier into pre-rasterization stages (as applications commonly write
  * for render targets read by "any shader") orders the render's tiling after
  * earlier renders. That order is observable only through memory the tiling
  * work reads; vertex pipelines do not store (vertexPipelineStoresAndAtomics
@@ -956,11 +947,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(hk_apple9_fragment_barrier,
  * A buffer aliasing an attachment's memory observes the render's writes
  * only for linear attachments (an optimally tiled image's contents are
  * undefined through a buffer alias), so renders storing a linear colour
- * attachment count as writers too. HK_APPLE9_NO_TILING_ELISION=1 disables
- * the elision.
+ * attachment count as writers too.
  */
-DEBUG_GET_ONCE_BOOL_OPTION(hk_apple9_no_tiling_elision,
-                           "HK_APPLE9_NO_TILING_ELISION", false)
 
 /* HK_TILING_ELISION_STATS=1 (diagnostic): how renders with an earlier
  * render dependency were classified, printed every 4096 such renders. */
@@ -971,7 +959,6 @@ enum hk_tiling_class {
    HK_TILING_UNKNOWN,       /* kept: unclassified pre-rasterization shader */
    HK_TILING_INTERNAL,      /* kept: meta, XFB, tessellation or geometry */
    HK_TILING_WRITER,        /* kept: reads buffers while a writer may run */
-   HK_TILING_OFF,           /* kept: elision disabled */
    HK_TILING_CLASSES,
 };
 
@@ -991,12 +978,12 @@ hk_tiling_stat(enum hk_tiling_class cls, bool meta)
    if (++total % 4096 == 0)
       fprintf(stderr, "HK_TILING renders=%" PRIu64 " fragment_only=%" PRIu64
               " elided=%" PRIu64 " images=%" PRIu64 " unknown=%" PRIu64
-              " internal=%" PRIu64 " writer=%" PRIu64 " off=%" PRIu64
+              " internal=%" PRIu64 " writer=%" PRIu64
               " meta_elided=%" PRIu64 " meta_kept=%" PRIu64 "\n", total,
               counts[HK_TILING_FRAGMENT_ONLY], counts[HK_TILING_ELIDED],
               counts[HK_TILING_IMAGES], counts[HK_TILING_UNKNOWN],
               counts[HK_TILING_INTERNAL],
-              counts[HK_TILING_WRITER], counts[HK_TILING_OFF], meta_elided,
+              counts[HK_TILING_WRITER], meta_elided,
               meta_kept);
 }
 
@@ -1005,12 +992,10 @@ hk_defer_render_wait(struct hk_device *dev, struct hk_queue *queue,
                      const struct hk_cs *cs, const struct hk_sync_stream *s)
 {
    if (!(dev->dev.params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIER) ||
-       !debug_get_option_hk_apple9_fragment_barrier() ||
        s->wait.engine[HK_SYNC_RENDER] == HK_SYNC_NONE)
       return false;
    enum hk_tiling_class cls =
       s->wait_tiling.engine[HK_SYNC_RENDER] == HK_SYNC_NONE ? HK_TILING_FRAGMENT_ONLY
-      : debug_get_option_hk_apple9_no_tiling_elision()     ? HK_TILING_OFF
       : (cs->pre_raster_reads & HK_READS_INTERNAL)         ? HK_TILING_INTERNAL
       : (cs->pre_raster_reads & HK_READS_UNKNOWN)          ? HK_TILING_UNKNOWN
       : (cs->pre_raster_reads & HK_READS_IMAGES)           ? HK_TILING_IMAGES
@@ -1044,11 +1029,14 @@ hk_ioctl_barrier(uint32_t index, uint32_t submitted)
    return rebased == HK_SYNC_NONE ? DRM_ASAHI_BARRIER_NONE : rebased;
 }
 
+DEBUG_GET_ONCE_BOOL_OPTION(hk_abort_before_submit, "HK_ABORT_BEFORE_SUBMIT", false)
+DEBUG_GET_ONCE_BOOL_OPTION(hk_null_submit, "HK_NULL_SUBMIT", false)
+
 static VkResult
 queue_submit(struct hk_device *dev, struct hk_queue *queue,
              struct vk_queue_submit *submit)
 {
-   if (debug_get_bool_option("HK_ABORT_BEFORE_SUBMIT", false)) {
+   if (debug_get_option_hk_abort_before_submit()) {
       fprintf(stderr, "hk-replay: HK_ABORT_BEFORE_SUBMIT, exiting before the "
                       "first queue submit\n");
       _exit(3);
@@ -1074,7 +1062,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
     * all. Command buffers are dropped; fences and semaphores signal as for an
     * empty submit.
     */
-   if (debug_get_bool_option("HK_NULL_SUBMIT", false))
+   if (debug_get_option_hk_null_submit())
       return queue_submit_empty(dev, queue, submit);
 
    unsigned command_count = 0;

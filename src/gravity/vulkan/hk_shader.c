@@ -97,7 +97,6 @@ static once_flag hk_compiler_env_hash_once = ONCE_FLAG_INIT;
  */
 static const char *const hk_codegen_env[] = {
    "AGX_MESA_DEBUG",
-   "AGX_SPILL_COALESCE",
    "AGX_APPLE9_NO_COMPARE_LITERAL",
    "AGX_APPLE9_NO_DESCRIPTOR_HOIST",
    "AGX_APPLE9_NO_POINTER_LOAD",
@@ -120,11 +119,9 @@ static const char *const hk_codegen_env[] = {
  * compiled, or command recording/submission. They do not change shader code.
  * Keep them available for runtime investigations without splitting caches. */
 static const char *const hk_ignored_env[] = {
-   "HK_APPLE9_DUMP_FRAGMENT_DIR",    "HK_APPLE9_SPARSE_SCRATCH",
-   "HK_APPLE9_TESS_BATCH",           "HK_APPLE9_TESS_SCAN_BLOCK",
-   "HK_APPLE9_FRAGMENT_BARRIER",     "HK_APPLE9_NO_TILING_ELISION",
+   "HK_APPLE9_DUMP_FRAGMENT_DIR",
    "HK_APPLE9_MESH_ROUTE_LOG",       "HK_APPLE9_GS_ROUTE_LOG",
-   "HK_APPLE9_TESS_ROUTE_LOG",       "HK_APPLE9_TESS_FOLD",
+   "HK_APPLE9_TESS_ROUTE_LOG",
    "HK_APPLE9_NATIVE_BLOCKS",        "HK_APPLE9_NATIVE_LANES",
    "HK_APPLE9_NATIVE_BATCH_LOG",     "HK_APPLE9_NATIVE_RENDER_PRIMITIVES",
    "AGX_VA_QUARANTINE_STATS",
@@ -892,27 +889,6 @@ hk_shader_get_executable_statistics(
    return vk_outarray_status(&out);
 }
 
-static bool
-write_ir_text(VkPipelineExecutableInternalRepresentationKHR *ir,
-              const char *data)
-{
-   ir->isText = VK_TRUE;
-
-   size_t data_len = strlen(data) + 1;
-
-   if (ir->pData == NULL) {
-      ir->dataSize = data_len;
-      return true;
-   }
-
-   strncpy(ir->pData, data, ir->dataSize);
-   if (ir->dataSize < data_len)
-      return false;
-
-   ir->dataSize = data_len;
-   return true;
-}
-
 static VkResult
 hk_shader_get_executable_internal_representations(
    UNUSED struct vk_device *device, const struct vk_shader *vk_shader,
@@ -922,21 +898,8 @@ hk_shader_get_executable_internal_representations(
    VK_OUTARRAY_MAKE_TYPED(VkPipelineExecutableInternalRepresentationKHR, out,
                           internal_representations,
                           internal_representation_count);
-   bool incomplete_text = false;
-
    assert(executable_index == 0);
-
-   /* TODO */
-#if 0
-   vk_outarray_append_typed(VkPipelineExecutableInternalRepresentationKHR, &out, ir) {
-      VK_COPY_STR(ir->name, "AGX assembly");
-      VK_COPY_STR(ir->description, "AGX assembly");
-      if (!write_ir_text(ir, TODO))
-         incomplete_text = true;
-   }
-#endif
-
-   return incomplete_text ? VK_INCOMPLETE : vk_outarray_status(&out);
+   return vk_outarray_status(&out);
 }
 
 const struct vk_shader_ops hk_shader_ops = {

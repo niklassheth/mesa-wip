@@ -40,9 +40,9 @@ struct hk_image_view {
       uint32_t alias_width_el;
 
       struct agx_texture_packed ia, sampled, ro_storage, background,
-         layered_background, emrt_texture;
+         layered_background;
 
-      struct agx_pbe_packed storage, eot, layered_eot, emrt_pbe;
+      struct agx_pbe_packed storage, eot, layered_eot;
 
       /* Immutable descriptor bodies. Residency is resolved at the write,
        * since image memory can be bound after creating a view. */

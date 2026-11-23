@@ -216,7 +216,6 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
               mem->bo->va ? mem->bo->va->addr : 0);
    }
 
-   mem->implicit_sync = false;
    if (!hk_memory_init_va_tracking(dev, mem)) {
       agx_bo_unreference(&dev->dev, mem->bo);
       result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);

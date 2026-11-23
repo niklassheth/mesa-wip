@@ -140,7 +140,6 @@ hk_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage _image,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    hk_cmd_flush_empty_clears(cmd);
    VK_FROM_HANDLE(hk_image, image, _image);
-   hk_cmd_use_implicit_sync(cmd, image->implicit_sync_res);
 
    unsigned saved_scope = cmd->sync_scope;
    VkPipelineStageFlags2 saved_move = cmd->merge_move_stage;
@@ -167,7 +166,6 @@ hk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage _image,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    hk_cmd_flush_empty_clears(cmd);
    VK_FROM_HANDLE(hk_image, image, _image);
-   hk_cmd_use_implicit_sync(cmd, image->implicit_sync_res);
 
    unsigned saved_scope = cmd->sync_scope;
    VkPipelineStageFlags2 saved_move = cmd->merge_move_stage;

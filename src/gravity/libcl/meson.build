@@ -25,7 +25,6 @@ gravity_libcl_spv = custom_target(
     '-I' + join_paths(meson.project_source_root(), 'src/poly/cl'),
     '-I' + join_paths(meson.current_source_dir(), '.'),
     '-I' + join_paths(meson.current_source_dir(), '../../'),
-    '-I' + join_paths(meson.current_source_dir(), 'shaders'),
     '-I' + join_paths(meson.current_build_dir(), '../genxml'),
     cl_args,
     ],

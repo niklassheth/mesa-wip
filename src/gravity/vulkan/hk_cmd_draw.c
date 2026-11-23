@@ -27,7 +27,6 @@
 #include "hk_shader.h"
 
 #include "gravity/genxml/agx_pack.h"
-#include "gravity/libcl/compression.h"
 #include "gravity/libcl/libagx.h"
 #include "gravity/libcl/mesh.h"
 #include "gravity/libcl/query.h"
@@ -62,48 +61,7 @@
 
 #include "hk_cmd_draw_priv.h"
 
-DEBUG_GET_ONCE_OPTION(cached_hk_apple9_tess_batch, "HK_APPLE9_TESS_BATCH", NULL)
 DEBUG_GET_ONCE_BOOL_OPTION(mesh_route_log, "HK_APPLE9_MESH_ROUTE_LOG", false)
-DEBUG_GET_ONCE_OPTION(cached_hk_apple9_tess_scan_block,
-                      "HK_APPLE9_TESS_SCAN_BLOCK", NULL)
-
-
-/* CTS coverage of indirect draws is pretty bad, so it's helpful to be able to
- * get some extra smoke testing.
- */
-/* Read once: the environment is scanned linearly, which on every draw cost
- * 50-100 ns in a typical Proton environment. */
-DEBUG_GET_ONCE_BOOL_OPTION(hk_test_indirects, "HK_TEST_INDIRECTS", false)
-#define HK_TEST_INDIRECTS debug_get_option_hk_test_indirects()
-
-UNUSED static inline void
-print_draw(struct agx_draw d, FILE *fp)
-{
-   if (agx_is_indirect(d.b))
-      fprintf(fp, "indirect (buffer %" PRIx64 "):", d.b.ptr);
-   else
-      fprintf(fp, "direct (%ux%u):", d.b.count[0], d.b.count[1]);
-
-   if (d.index_size)
-      fprintf(fp, " index_size=%u", agx_index_size_to_B(d.index_size));
-   else
-      fprintf(fp, " non-indexed");
-
-   if (d.restart)
-      fprintf(fp, " restart");
-
-   if (d.index_bias)
-      fprintf(fp, " index_bias=%u", d.index_bias);
-
-   if (d.start)
-      fprintf(fp, " start=%u", d.start);
-
-   if (d.start_instance)
-      fprintf(fp, " start_instance=%u", d.start_instance);
-
-   fprintf(fp, "\n");
-}
-
 
 /* The geometry heap's map in the read-only data. */
 static struct poly_heap *
@@ -1032,14 +990,8 @@ hk_apple9_launch_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw,
     * neighbouring tessellated draws: record them into the stage lanes (see
     * hk_tess_batch_flush). The stage order within each draw is kept by the
     * barrier after every lane.
-    */
-   /* HK_APPLE9_TESS_BATCH=0 turns batching off. */
-   static int batch_env = -1;
-   if (batch_env < 0) {
-      const char *env = debug_get_option_cached_hk_apple9_tess_batch();
-      batch_env = !env || strcmp(env, "0") != 0;
-   }
-   /* Only small draws are latency-bound enough to gain from overlapping;
+    *
+    * Only small draws are latency-bound enough to gain from overlapping;
     * a large one fills the GPU on its own and is kept inline, which also
     * keeps its passes out of the stream-end lanes.
     */
@@ -1054,7 +1006,7 @@ hk_apple9_launch_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw,
     * hk_cmd_buffer_end_graphics flushes the lanes into the ending render's
     * own pre_gfx stream, so they still complete before its tiling. */
    bool batch =
-      batch_env && (!native || hk_apple9_native_lanes(hk_cmd_buffer_device(cmd))) &&
+      (!native || hk_apple9_native_lanes(hk_cmd_buffer_device(cmd))) &&
       !agx_is_indirect(draw.b) &&
       batch_patches <= max_batch_patches &&
       !hk_stat_enabled(hk_pipeline_stat_addr(
@@ -1100,14 +1052,7 @@ hk_apple9_launch_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw,
    /* One workgroup walking every patch takes milliseconds for large draws,
     * so direct draws past a few blocks scan blocks in parallel instead.
     */
-   /* HK_APPLE9_TESS_SCAN_BLOCK=<n> sets the block size, so that tests with
-    * small draws reach the blocked path too.
-    */
-   static unsigned block_patches = 0;
-   if (!block_patches) {
-      const char *env = debug_get_option_cached_hk_apple9_tess_scan_block();
-      block_patches = env ? MAX2(strtoul(env, NULL, 0), 1) : 8192;
-   }
+   const unsigned block_patches = 8192;
    unsigned nr_patches =
       agx_is_indirect(draw.b) ? 0
                               : ((struct poly_tess_params *)tess_args.cpu)->nr_patches;
@@ -2472,24 +2417,11 @@ hk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
            uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
-   struct agx_draw draw;
-
-   if (HK_TEST_INDIRECTS) {
-      uint32_t data[] = {
-         vertexCount,
-         instanceCount,
-         firstVertex,
-         firstInstance,
-      };
-
-      draw = agx_draw_indirect(hk_pool_upload(cmd, data, sizeof(data), 4));
-   } else {
-      draw = (struct agx_draw){
-         .b = agx_3d(vertexCount, instanceCount, 1),
-         .start = firstVertex,
-         .start_instance = firstInstance,
-      };
-   }
+   struct agx_draw draw = {
+      .b = agx_3d(vertexCount, instanceCount, 1),
+      .start = firstVertex,
+      .start_instance = firstInstance,
+   };
 
    hk_draw(cmd, 0, draw);
 }
@@ -2521,21 +2453,10 @@ hk_draw_indexed(VkCommandBuffer commandBuffer, uint16_t draw_id,
                 uint32_t firstInstance)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
-   struct agx_draw draw;
    struct hk_addr_range buf = cmd->state.gfx.index.buffer;
-
-   if (HK_TEST_INDIRECTS && draw_id == 0) {
-      uint32_t data[] = {
-         indexCount, instanceCount, firstIndex, vertexOffset, firstInstance,
-      };
-      uint64_t addr = hk_pool_upload(cmd, data, sizeof(data), 4);
-
-      draw = agx_draw_indexed_indirect(addr, buf.addr, buf.range, 0, 0);
-   } else {
-      draw =
-         agx_draw_indexed(indexCount, instanceCount, firstIndex, vertexOffset,
-                          firstInstance, buf.addr, buf.range, 0, 0);
-   }
+   struct agx_draw draw =
+      agx_draw_indexed(indexCount, instanceCount, firstIndex, vertexOffset,
+                       firstInstance, buf.addr, buf.range, 0, 0);
 
    hk_draw(cmd, draw_id, draw);
 }

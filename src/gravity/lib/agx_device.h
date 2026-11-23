@@ -24,29 +24,15 @@
 #include "libagx_dgc.h"
 
 enum agx_dbg {
-   AGX_DBG_TRACE = BITFIELD_BIT(0),
-   AGX_DBG_BODUMP = BITFIELD_BIT(1),
-   AGX_DBG_NO16 = BITFIELD_BIT(2),
-   AGX_DBG_DIRTY = BITFIELD_BIT(3),
-   AGX_DBG_PRECOMPILE = BITFIELD_BIT(4),
-   AGX_DBG_PERF = BITFIELD_BIT(5),
-   AGX_DBG_NOCOMPRESS = BITFIELD_BIT(6),
-   AGX_DBG_NOCLUSTER = BITFIELD_BIT(7),
-   AGX_DBG_SYNC = BITFIELD_BIT(8),
-   AGX_DBG_STATS = BITFIELD_BIT(9),
-   AGX_DBG_RESOURCE = BITFIELD_BIT(10),
-   AGX_DBG_BATCH = BITFIELD_BIT(11),
-   AGX_DBG_NOWC = BITFIELD_BIT(12),
-   AGX_DBG_SYNCTVB = BITFIELD_BIT(13),
-   AGX_DBG_SMALLTILE = BITFIELD_BIT(14),
-   AGX_DBG_NOMSAA = BITFIELD_BIT(15),
-   AGX_DBG_NOSHADOW = BITFIELD_BIT(16),
-   AGX_DBG_BODUMPVERBOSE = BITFIELD_BIT(17),
-   AGX_DBG_SCRATCH = BITFIELD_BIT(18),
-   AGX_DBG_NOSOFT = BITFIELD_BIT(19),
-   AGX_DBG_FEEDBACK = BITFIELD_BIT(20),
-   AGX_DBG_1QUEUE = BITFIELD_BIT(21),
-   AGX_DBG_NOMERGE = BITFIELD_BIT(22),
+   AGX_DBG_BODUMP = BITFIELD_BIT(0),
+   AGX_DBG_PERF = BITFIELD_BIT(1),
+   AGX_DBG_NOCOMPRESS = BITFIELD_BIT(2),
+   AGX_DBG_NOCLUSTER = BITFIELD_BIT(3),
+   AGX_DBG_SYNC = BITFIELD_BIT(4),
+   AGX_DBG_BODUMPVERBOSE = BITFIELD_BIT(5),
+   AGX_DBG_NOSOFT = BITFIELD_BIT(6),
+   AGX_DBG_1QUEUE = BITFIELD_BIT(7),
+   AGX_DBG_NOMERGE = BITFIELD_BIT(8),
 };
 
 /* How many power-of-two levels in the BO cache do we want? 2^14 minimum chosen
@@ -93,9 +79,6 @@ int agx_bind_timestamps(struct agx_device *dev, struct agx_bo *bo,
 
 struct agx_device {
    uint32_t debug;
-
-   /* Environment options captured at device creation, immutable while in use. */
-   bool apple9_trace;
 
    char name[64];
    struct drm_asahi_params_global params;
@@ -272,7 +255,6 @@ bool agx_apple9_entry_back(struct agx_device *dev, uint32_t end_B);
 /* Write size bytes at offset in the backed shader entry arena. */
 void agx_apple9_entry_write(struct agx_device *dev, uint32_t offset,
                             const void *data, uint32_t size);
-bool agx_bo_sync_cpu_read(struct agx_bo *bo);
 
 /* A separate mapping of the first size bytes of a BO, at fixed_addr unless
  * NULL, owned and unmapped by the caller. API memory maps use this so that
@@ -336,7 +318,6 @@ int agx_create_command_queue(struct agx_device *dev,
 int agx_destroy_command_queue(struct agx_device *dev, uint32_t queue_id);
 
 int agx_import_sync_file(struct agx_device *dev, struct agx_bo *bo, int fd);
-int agx_syncobj_error(struct agx_device *dev, uint32_t syncobj);
 
 uint64_t agx_get_gpu_timestamp(struct agx_device *dev);
 

@@ -50,31 +50,15 @@ asahi_simple_ioctl(struct agx_device *dev, unsigned cmd, void *req)
 
 /* clang-format off */
 static const struct debug_named_value agx_debug_options[] = {
-   {"trace",     AGX_DBG_TRACE,    "Trace the command stream"},
-   {"bodump",    AGX_DBG_BODUMP,   "Periodically dump live BOs"},
-   {"no16",      AGX_DBG_NO16,     "Disable 16-bit support"},
-   {"perf",      AGX_DBG_PERF,     "Print performance warnings"},
-#ifndef NDEBUG
-   {"dirty",     AGX_DBG_DIRTY,    "Disable dirty tracking"},
-#endif
-   {"precompile",AGX_DBG_PRECOMPILE,"Precompile shaders for shader-db"},
-   {"nocompress",AGX_DBG_NOCOMPRESS,"Disable lossless compression"},
-   {"nocluster", AGX_DBG_NOCLUSTER,"Disable vertex clustering"},
-   {"sync",      AGX_DBG_SYNC,     "Synchronously wait for all submissions"},
-   {"stats",     AGX_DBG_STATS,    "Show command execution statistics"},
-   {"resource",  AGX_DBG_RESOURCE, "Log resource operations"},
-   {"batch",     AGX_DBG_BATCH,    "Log batches"},
-   {"nowc",      AGX_DBG_NOWC,     "Disable write-combining"},
-   {"synctvb",   AGX_DBG_SYNCTVB,  "Synchronous TVB growth"},
-   {"smalltile", AGX_DBG_SMALLTILE,"Force 16x16 tiles"},
-   {"feedback",  AGX_DBG_FEEDBACK, "Debug feedback loops"},
-   {"nomsaa",    AGX_DBG_NOMSAA,   "Force disable MSAA"},
-   {"noshadow",  AGX_DBG_NOSHADOW, "Force disable resource shadowing"},
-   {"scratch",   AGX_DBG_SCRATCH,  "Debug scratch memory usage"},
-   {"1queue",    AGX_DBG_1QUEUE,   "Force usage of a single queue for multiple contexts"},
-   {"nosoft",    AGX_DBG_NOSOFT,   "Disable soft fault optimizations"},
-   {"nomerge",   AGX_DBG_NOMERGE,  "Disable control stream merging"},
-   {"bodumpverbose", AGX_DBG_BODUMPVERBOSE,   "Include extra info with dumps"},
+   {"bodump",        AGX_DBG_BODUMP,        "Periodically dump live BOs"},
+   {"perf",          AGX_DBG_PERF,          "Print performance warnings"},
+   {"nocompress",    AGX_DBG_NOCOMPRESS,    "Disable lossless compression"},
+   {"nocluster",     AGX_DBG_NOCLUSTER,     "Disable vertex clustering"},
+   {"sync",          AGX_DBG_SYNC,          "Synchronously wait for all submissions"},
+   {"1queue",        AGX_DBG_1QUEUE,        "Force usage of a single queue for multiple contexts"},
+   {"nosoft",        AGX_DBG_NOSOFT,        "Disable soft fault optimizations"},
+   {"nomerge",       AGX_DBG_NOMERGE,       "Disable control stream merging"},
+   {"bodumpverbose", AGX_DBG_BODUMPVERBOSE, "Include extra info with dumps"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -774,8 +758,6 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
    glsl_type_singleton_init_or_ref();
 
-   dev->apple9_trace = agx_apple9_trace_enabled();
-
    simple_mtx_init(&dev->apple9_entry_back_lock, mtx_plain);
    simple_mtx_init(&dev->apple9_entry_lock, mtx_plain);
    list_inithead(&dev->apple9_entry_lru);
@@ -1047,26 +1029,6 @@ agx_import_sync_file(struct agx_device *dev, struct agx_bo *bo, int fd)
    assert(ret >= 0);
 
    return ret;
-}
-
-/* Error status of a signalled binary syncobj's fence: negative errno if the
- * work it tracks failed (GPU fault, timeout, or a banned queue), 0 otherwise.
- * The kernel completes failed work's fences with an error rather than leaving
- * them pending, so waits return; this is how a client learns about it.
- */
-int
-agx_syncobj_error(struct agx_device *dev, uint32_t syncobj)
-{
-   int fd = -1;
-   if (drmSyncobjExportSyncFile(dev->fd, syncobj, &fd) || fd < 0)
-      return 0;
-
-   struct sync_file_info info = {0};
-   int status = 0;
-   if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) == 0 && info.status < 0)
-      status = info.status;
-   close(fd);
-   return status;
 }
 
 uint64_t

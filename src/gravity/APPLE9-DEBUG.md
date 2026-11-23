@@ -13,13 +13,8 @@ shader cache explicitly when a cached shader would otherwise suppress output.
 | `trace` | `AGX_APPLE9_TRACE` | Presence |
 | `nir` | `AGX_APPLE9_TRACE_NIR` | Presence |
 | `final_nir` | `AGX_APPLE9_TRACE_FINAL_NIR` | Presence |
-| `shared_ra` | `AGX_APPLE9_TRACE_SHARED_RA` | Presence |
-| `ra_audit` | `AGX_APPLE9_RA_AUDIT` | Presence |
-| `ra_webs` | `AGX_APPLE9_RA_WEBS` | Presence; also enable `ra_audit` |
-| `spill_loops` | `AGX_SPILL_TRACE_LOOPS` | Boolean |
 | `pressure` | `HK_APPLE9_PRESSURE_STATS` | Presence |
 | `vectorize` | `HK_APPLE9_TRACE_VECTORIZE` | Presence |
-| `eager` | `HK_APPLE9_EAGER_TRACE` | Presence |
 | `merge` | `HK_APPLE9_MERGE_TRACE` | Boolean |
 | `tiling` | `HK_TILING_ELISION_STATS` | Boolean |
 | `launch_check` | `HK_APPLE9_LAUNCH_CHECK` | Boolean |
@@ -40,9 +35,7 @@ semantics. Do not add code-generation controls to `AGX_APPLE9_DEBUG`.
 
 ## Shipping defaults and retired experiments
 
-Spill-home coalescing has been enabled by default since `ca623583d40`. Focused
-and corpus gates must use that shipping default, rather than setting
-`AGX_SPILL_COALESCE=1`. The explicit opt-out remains for active research.
+Spill-home coalescing is always enabled; `AGX_SPILL_COALESCE` has been retired.
 `AGX_APPLE9_NO_BFE` and both of its conflicting readers were already removed
 in `6beee3d9a7f`; there is no remaining parsing discrepancy to fix.
 

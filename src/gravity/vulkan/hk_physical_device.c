@@ -55,186 +55,213 @@ hk_get_device_extensions(const struct hk_instance *instance,
                          struct vk_device_extension_table *ext)
 {
    *ext = (struct vk_device_extension_table){
-      .KHR_8bit_storage = true,
+      /* Vulkan 1.1 */
       .KHR_16bit_storage = true,
       .KHR_bind_memory2 = true,
-      .KHR_buffer_device_address = true,
-      .KHR_calibrated_timestamps = true,
-      .KHR_copy_commands2 = true,
-      .KHR_create_renderpass2 = true,
       .KHR_dedicated_allocation = true,
-      .KHR_depth_stencil_resolve = true,
       .KHR_descriptor_update_template = true,
       .KHR_device_group = true,
-      .KHR_draw_indirect_count = true,
-      .KHR_driver_properties = true,
-      .KHR_dynamic_rendering = true,
-      .KHR_dynamic_rendering_local_read = true,
       .KHR_external_fence = true,
       .KHR_external_fence_fd = true,
       .KHR_external_memory = true,
       .KHR_external_memory_fd = true,
       .KHR_external_semaphore = true,
       .KHR_external_semaphore_fd = true,
-      .KHR_format_feature_flags2 = true,
-      .KHR_fragment_shader_barycentric = false,
       .KHR_get_memory_requirements2 = true,
-      .KHR_global_priority = true,
-      .KHR_image_format_list = true,
-      .KHR_imageless_framebuffer = true,
-#ifdef HK_USE_WSI_PLATFORM
-      .KHR_incremental_present = true,
-#endif
-      .KHR_index_type_uint8 = true,
-      .KHR_line_rasterization = true,
-      .KHR_load_store_op_none = true,
       .KHR_maintenance1 = true,
       .KHR_maintenance2 = true,
       .KHR_maintenance3 = true,
+      .KHR_multiview = true,
+      .KHR_relaxed_block_layout = true,
+      .KHR_sampler_ycbcr_conversion = true,
+      .KHR_shader_draw_parameters = true,
+      .KHR_storage_buffer_storage_class = true,
+      .KHR_variable_pointers = true,
+
+      /* Vulkan 1.2 */
+      .KHR_8bit_storage = true,
+      .EXT_descriptor_indexing = true,
+      .KHR_draw_indirect_count = true,
+      .KHR_shader_float16_int8 = true,
+      .KHR_buffer_device_address = true,
+      .KHR_create_renderpass2 = true,
+      .KHR_depth_stencil_resolve = true,
+      .KHR_driver_properties = true,
+      .KHR_image_format_list = true,
+      .KHR_imageless_framebuffer = true,
+      .KHR_sampler_mirror_clamp_to_edge = true,
+      .KHR_separate_depth_stencil_layouts = true,
+      .KHR_shader_float_controls = true,
+      .KHR_spirv_1_4 = true,
+      .KHR_timeline_semaphore = true,
+      .KHR_uniform_buffer_standard_layout = true,
+      .KHR_vulkan_memory_model = true,
+      .EXT_host_query_reset = true,
+      .EXT_scalar_block_layout = true,
+      .EXT_separate_stencil_usage = true,
+      .EXT_shader_viewport_index_layer = true,
+
+      /* Vulkan 1.3 */
+      .KHR_copy_commands2 = true,
+      .KHR_dynamic_rendering = true,
+      .KHR_format_feature_flags2 = true,
       .KHR_maintenance4 = true,
+      .KHR_shader_integer_dot_product = true,
+      .KHR_shader_non_semantic_info = true,
+      .KHR_shader_terminate_invocation = true,
+      .KHR_synchronization2 = true,
+      .KHR_zero_initialize_workgroup_memory = true,
+      .EXT_4444_formats = true,
+      .EXT_extended_dynamic_state = true,
+      .EXT_extended_dynamic_state2 = true,
+      .EXT_image_robustness = true,
+      .EXT_inline_uniform_block = true,
+      .EXT_pipeline_creation_cache_control = true,
+      .EXT_pipeline_creation_feedback = true,
+      .EXT_private_data = true,
+      .EXT_shader_demote_to_helper_invocation = true,
+      .EXT_subgroup_size_control = true,
+      .EXT_texel_buffer_alignment = true,
+      .EXT_tooling_info = true,
+
+      /* Vulkan 1.4 */
+      .KHR_dynamic_rendering_local_read = true,
+      .KHR_global_priority = true,
+      .KHR_index_type_uint8 = true,
+      .KHR_line_rasterization = true,
       .KHR_maintenance5 = true,
       .KHR_maintenance6 = true,
+      .KHR_push_descriptor = true,
+      .KHR_shader_float_controls2 = true,
+      .KHR_shader_subgroup_rotate = true,
+      .KHR_vertex_attribute_divisor = true,
+      .EXT_global_priority = true,
+      .EXT_global_priority_query = true,
+      .EXT_index_type_uint8 = true,
+      .EXT_line_rasterization = true,
+      .EXT_pipeline_robustness = true,
+      .EXT_robustness2 = true,
+      .KHR_robustness2 = true,
+      .EXT_transform_feedback = true,
+      .EXT_vertex_attribute_divisor = true,
+
+      /* Other extensions implemented by the common runtime or CPU paths */
+      .KHR_calibrated_timestamps = true,
+      .KHR_cooperative_matrix = true,
       .KHR_maintenance7 = true,
+      .KHR_shader_maximal_reconvergence = true,
+      .KHR_shader_quad_control = true,
+      .KHR_workgroup_memory_explicit_layout = true,
       .KHR_maintenance8 = true,
       .KHR_maintenance9 = true,
-      .KHR_map_memory2 = true,
-      .KHR_multiview = true,
-      .KHR_pipeline_binary = true,
       .KHR_pipeline_executable_properties = true,
+      .KHR_shader_subgroup_extended_types = true,
+      .EXT_color_write_enable = true,
+      .EXT_debug_marker = true,
+      .EXT_hdr_metadata = true,
+      .EXT_map_memory_placed = true,
+      /* Process usage of each heap and a budget from available system
+       * memory, as on other unified-memory drivers. */
+      .EXT_memory_budget = true,
+      /* Priority is a residency hint; all memory stays resident. */
+      .EXT_memory_priority = true,
+      .EXT_shader_replicated_composites = true,
+      .EXT_depth_bias_control = true,
+      .EXT_depth_clip_control = true,
+      .EXT_image_2d_view_of_3d = true,
+      /* Storage query bounds are separate from native texture geometry. */
+      .EXT_image_sliced_view_of_3d = true,
+      /* Native custom border colours need the border format: the sampler
+       * record holds the colour in the format's encoding. Without
+       * customBorderColorWithoutFormat, DXVK passes the view format and
+       * vkd3d-proton keeps the standard colours. */
+      .EXT_custom_border_color = true,
+      .EXT_border_color_swizzle = true,
+      .EXT_primitive_topology_list_restart = true,
+      .EXT_provoking_vertex = true,
+      .EXT_mutable_descriptor_type = true,
+      .EXT_shader_subgroup_ballot = true,
+      .EXT_shader_subgroup_vote = true,
+      .VALVE_mutable_descriptor_type = true,
+      .KHR_shader_relaxed_extended_instruction = true,
+      /* GENERAL remains correct and uses the same path as before. Explicit
+       * read-only depth/stencil layouts additionally allow store elision,
+       * render merging and barrier hoisting. GENERAL-layout clients such as
+       * DXVK/vkd3d with unified layouts do not get those read-only shortcuts.
+       * Feedback comes from the feedback loop state (see
+       * hk_attachment_may_be_sampled).
+       */
+      .KHR_unified_image_layouts = true,
+      .KHR_shader_subgroup_uniform_control_flow = true,
+      .EXT_attachment_feedback_loop_layout = true,
+      .EXT_calibrated_timestamps = true,
+      .EXT_dynamic_rendering_unused_attachments = true,
+      .EXT_multi_draw = true,
+      .EXT_non_seamless_cube_map = true,
+      .EXT_shader_module_identifier = true,
+      .EXT_shader_stencil_export = true,
+      .KHR_load_store_op_none = true,
+      .KHR_map_memory2 = true,
+      .KHR_shader_expect_assume = true,
+      .EXT_buffer_device_address = true,
+      .EXT_depth_clip_enable = true,
+      .EXT_external_memory_dma_buf = true,
+      .EXT_image_drm_format_modifier = true,
+      .EXT_load_store_op_none = true,
+      .EXT_physical_device_drm = true,
+      .EXT_queue_family_foreign = true,
+      .GOOGLE_decorate_string = true,
+      .GOOGLE_hlsl_functionality1 = true,
+      .GOOGLE_user_type = true,
+      .EXT_pipeline_protected_access = true,
+      .EXT_image_view_min_lod = true,
+      .KHR_compute_shader_derivatives = true,
+      .EXT_blend_operation_advanced = true,
+      /* Deferred shaders compile vertex fetch for the bound input state. */
+      .EXT_vertex_input_dynamic_state = true,
+      .EXT_extended_dynamic_state3 = true,
+      .EXT_graphics_pipeline_library = true,
       .KHR_pipeline_library = true,
+      .EXT_shader_object = true,
+      .EXT_sample_locations = true,
+      .EXT_shader_uniform_buffer_unsized_array = true,
+      .KHR_pipeline_binary = true,
+      /* Host copies use the same ail tiling as GPU sampling; host transfer
+       * images are never compressed. */
+      .EXT_host_image_copy = true,
+      .EXT_shader_atomic_float = true,
+      .EXT_attachment_feedback_loop_dynamic_state = true,
+      .EXT_depth_clamp_zero_one = true,
+      .EXT_depth_clamp_control = true,
+      .EXT_ycbcr_2plane_444_formats = true,
+      .EXT_ycbcr_image_arrays = true,
+      /* Resolves are vk_meta blits, which honor the transfer function
+       * flags. */
+      .KHR_maintenance10 = true,
+
+      /* Apple9 native / emulated feature extensions */
+      .EXT_mesh_shader = true,
+      .EXT_fragment_shader_interlock = true,
+      .KHR_fragment_shader_barycentric = true,
+      .EXT_conditional_rendering = true,
+      .EXT_primitives_generated_query = true,
+      .EXT_descriptor_buffer = true,
+
+      /* WSI */
 #ifdef HK_USE_WSI_PLATFORM
+      .KHR_incremental_present = true,
       .KHR_present_id = true,
       .KHR_present_id2 = true,
       .KHR_present_wait = true,
       .KHR_present_wait2 = true,
-#endif
-      .KHR_push_descriptor = true,
-      .KHR_relaxed_block_layout = true,
-      .KHR_robustness2 = true,
-      .KHR_sampler_mirror_clamp_to_edge = true,
-      .KHR_sampler_ycbcr_conversion = true,
-      .KHR_separate_depth_stencil_layouts = true,
-      .KHR_shader_atomic_int64 = false,
-      .KHR_shader_clock = false,
-      .KHR_shader_draw_parameters = true,
-      .KHR_shader_expect_assume = true,
-      .KHR_shader_float_controls = true,
-      .KHR_shader_subgroup_extended_types = true,
-      .EXT_shader_viewport_index_layer = false,
-      .KHR_shader_float_controls2 = true,
-      .KHR_shader_float16_int8 = true,
-      .KHR_shader_integer_dot_product = true,
-      .KHR_shader_maximal_reconvergence = true,
-      .KHR_shader_non_semantic_info = true,
-      .KHR_shader_quad_control = true,
-      .KHR_shader_relaxed_extended_instruction = true,
-      .KHR_shader_subgroup_extended_types = true,
-      .KHR_shader_subgroup_rotate = true,
-      .KHR_shader_subgroup_uniform_control_flow = true,
-      .KHR_shader_terminate_invocation = true,
-      .KHR_spirv_1_4 = true,
-      .KHR_storage_buffer_storage_class = true,
-      .KHR_timeline_semaphore = true,
-#ifdef HK_USE_WSI_PLATFORM
       .KHR_swapchain = true,
-      .KHR_swapchain_maintenance1 = true,
       .KHR_swapchain_mutable_format = true,
-#endif
-      .KHR_synchronization2 = true,
-      .KHR_uniform_buffer_standard_layout = true,
-      .KHR_variable_pointers = true,
-      .KHR_vertex_attribute_divisor = true,
-      .KHR_vulkan_memory_model = true,
-      .KHR_workgroup_memory_explicit_layout = true,
-      .KHR_zero_initialize_workgroup_memory = true,
-      .EXT_4444_formats = true,
-      .EXT_attachment_feedback_loop_layout = true,
-      .EXT_blend_operation_advanced = true,
-      .EXT_border_color_swizzle = true,
-      .EXT_buffer_device_address = true,
-      .EXT_calibrated_timestamps = true,
-      .EXT_conditional_rendering = false,
-      .EXT_color_write_enable = true,
-      .EXT_custom_border_color = true,
-      .EXT_debug_marker = true,
-      .EXT_depth_bias_control = true,
-      .EXT_depth_clip_control = false,
-      .EXT_depth_clip_enable = true,
-      .EXT_descriptor_indexing = true,
-#ifdef VK_USE_PLATFORM_DISPLAY_KHR
-      .EXT_display_control = false,
-#endif
-      .EXT_dynamic_rendering_unused_attachments = true,
-      .EXT_extended_dynamic_state = true,
-      .EXT_extended_dynamic_state2 = true,
-      .EXT_extended_dynamic_state3 = true,
-      .EXT_external_memory_dma_buf = true,
-      .EXT_global_priority = true,
-      .EXT_global_priority_query = true,
-      .EXT_graphics_pipeline_library = true,
-      .EXT_hdr_metadata = true,
-      .EXT_host_query_reset = true,
-      .EXT_host_image_copy = true,
-      .EXT_image_2d_view_of_3d = true,
-      .EXT_image_drm_format_modifier = true,
-      .EXT_image_robustness = true,
-      .EXT_image_sliced_view_of_3d = false,
-      .EXT_image_view_min_lod = instance->drirc.misc.image_view_min_lod,
-      .EXT_index_type_uint8 = true,
-      .EXT_inline_uniform_block = true,
-      .EXT_line_rasterization = true,
-      .EXT_load_store_op_none = true,
-      .EXT_map_memory_placed = true,
-      .EXT_memory_budget = false,
-      .EXT_multi_draw = true,
-      .EXT_mutable_descriptor_type = true,
-      .EXT_non_seamless_cube_map = true,
-      .EXT_pipeline_creation_cache_control = true,
-      .EXT_pipeline_creation_feedback = true,
-      .EXT_pipeline_protected_access = true,
-      .EXT_pipeline_robustness = true,
-      .EXT_physical_device_drm = true,
-#ifdef HK_USE_WSI_PLATFORM
-      .EXT_present_timing = true,
-#endif
-      .EXT_primitive_topology_list_restart = true,
-      .EXT_private_data = true,
-      .EXT_primitives_generated_query = false,
-      .EXT_provoking_vertex = true,
-      .EXT_queue_family_foreign = true,
-      .EXT_robustness2 = true,
-      .EXT_sample_locations = true,
-      .EXT_sampler_filter_minmax = false,
-      .EXT_scalar_block_layout = true,
-      .EXT_separate_stencil_usage = true,
-      .EXT_shader_image_atomic_int64 = false,
-      .EXT_shader_demote_to_helper_invocation = true,
-      .EXT_shader_module_identifier = true,
-      .EXT_shader_object = true,
-      .EXT_shader_replicated_composites = true,
-      .EXT_shader_stencil_export = true,
-      .EXT_shader_subgroup_ballot = true,
-      .EXT_shader_subgroup_vote = true,
-      .EXT_shader_uniform_buffer_unsized_array = true,
-      .EXT_shader_viewport_index_layer = true,
-      .EXT_subgroup_size_control = true,
-#ifdef HK_USE_WSI_PLATFORM
+      .KHR_swapchain_maintenance1 = true,
       .EXT_swapchain_maintenance1 = true,
+      .EXT_present_timing = true,
+      .GOOGLE_display_timing = wsi_instance_supports_google_display_timing(
+         &instance->vk, &instance->drirc.options),
 #endif
-      .EXT_texel_buffer_alignment = true,
-      .EXT_tooling_info = true,
-      .EXT_transform_feedback = true,
-      .EXT_vertex_attribute_divisor = true,
-      .EXT_vertex_input_dynamic_state = true,
-      .EXT_ycbcr_2plane_444_formats = true,
-      .EXT_ycbcr_image_arrays = true,
-      .GOOGLE_decorate_string = true,
-#ifdef HK_USE_WSI_PLATFORM
-      .GOOGLE_display_timing = wsi_instance_supports_google_display_timing(&instance->vk, &instance->drirc.options),
-#endif
-      .GOOGLE_hlsl_functionality1 = true,
-      .GOOGLE_user_type = true,
-      .VALVE_mutable_descriptor_type = true,
    };
 }
 
@@ -1244,27 +1271,9 @@ hk_physical_device_free_disk_cache(struct hk_physical_device *pdev)
 static uint64_t
 hk_get_sysmem_heap_size(struct hk_physical_device *pdev)
 {
-   if (pdev->sysmem)
-      return pdev->sysmem;
-
    struct hk_instance *instance = hk_physical_device_instance(pdev);
    return os_get_gpu_heap_size(instance->drirc.misc.heap_memory_percent,
                                &instance->drirc.misc.heap_memory_percent);
-}
-
-static uint64_t
-hk_get_sysmem_heap_available(struct hk_physical_device *pdev)
-{
-   assert(pdev->sysmem);
-
-   uint64_t total_used = 0;
-   for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
-      const struct hk_memory_heap *heap = &pdev->mem_heaps[i];
-      uint64_t used = p_atomic_read(&heap->used);
-      total_used += used;
-   }
-
-   return pdev->sysmem - total_used;
 }
 
 /* The native Apple9 path implements a subset of Honeykrisp's Apple8 feature
@@ -1272,215 +1281,14 @@ hk_get_sysmem_heap_available(struct hk_physical_device *pdev)
  * new Apple8 capability never silently exposes it on Apple9.
  */
 static void
-hk_apple9_restrict_caps(struct vk_device_extension_table *ext,
-                        struct vk_features *feat, struct vk_properties *props)
+hk_apple9_restrict_caps(struct vk_features *feat, struct vk_properties *props)
 {
-   const struct vk_device_extension_table all = *ext;
    const struct vk_features all_feat = *feat;
 
    /* The 3D sampler uses only eleven depth bits, unlike the array layer
     * count. Copies can address deeper slices, but normalized samples cannot.
     */
    props->maxImageDimension3D = AGX_APPLE9_MAX_3D_TEXTURE_DIMENSION;
-
-   *ext = (struct vk_device_extension_table){
-      /* Vulkan 1.1 */
-      .KHR_16bit_storage = true,
-      .KHR_bind_memory2 = true,
-      .KHR_dedicated_allocation = true,
-      .KHR_descriptor_update_template = true,
-      .KHR_device_group = true,
-      .KHR_external_fence = true,
-      .KHR_external_fence_fd = true,
-      .KHR_external_memory = true,
-      .KHR_external_memory_fd = true,
-      .KHR_external_semaphore = true,
-      .KHR_external_semaphore_fd = true,
-      .KHR_get_memory_requirements2 = true,
-      .KHR_maintenance1 = true,
-      .KHR_maintenance2 = true,
-      .KHR_maintenance3 = true,
-      .KHR_multiview = true,
-      .KHR_relaxed_block_layout = true,
-      .KHR_sampler_ycbcr_conversion = true,
-      .KHR_shader_draw_parameters = true,
-      .KHR_storage_buffer_storage_class = true,
-      .KHR_variable_pointers = true,
-
-      /* Vulkan 1.2 */
-      .KHR_8bit_storage = true,
-      .EXT_descriptor_indexing = true,
-      .KHR_draw_indirect_count = true,
-      .KHR_shader_float16_int8 = true,
-      .KHR_buffer_device_address = true,
-      .KHR_create_renderpass2 = true,
-      .KHR_depth_stencil_resolve = true,
-      .KHR_driver_properties = true,
-      .KHR_image_format_list = true,
-      .KHR_imageless_framebuffer = true,
-      .KHR_sampler_mirror_clamp_to_edge = true,
-      .KHR_separate_depth_stencil_layouts = true,
-      .KHR_shader_float_controls = true,
-      .KHR_spirv_1_4 = true,
-      .KHR_timeline_semaphore = true,
-      .KHR_uniform_buffer_standard_layout = true,
-      .KHR_vulkan_memory_model = true,
-      .EXT_host_query_reset = true,
-      .EXT_scalar_block_layout = true,
-      .EXT_separate_stencil_usage = true,
-      .EXT_shader_viewport_index_layer = true,
-
-      /* Vulkan 1.3 */
-      .KHR_copy_commands2 = true,
-      .KHR_dynamic_rendering = true,
-      .KHR_format_feature_flags2 = true,
-      .KHR_maintenance4 = true,
-      .KHR_shader_integer_dot_product = true,
-      .KHR_shader_non_semantic_info = true,
-      .KHR_shader_terminate_invocation = true,
-      .KHR_synchronization2 = true,
-      .KHR_zero_initialize_workgroup_memory = true,
-      .EXT_4444_formats = true,
-      .EXT_extended_dynamic_state = true,
-      .EXT_extended_dynamic_state2 = true,
-      .EXT_image_robustness = true,
-      .EXT_inline_uniform_block = true,
-      .EXT_pipeline_creation_cache_control = true,
-      .EXT_pipeline_creation_feedback = true,
-      .EXT_private_data = true,
-      .EXT_shader_demote_to_helper_invocation = true,
-      .EXT_subgroup_size_control = true,
-      .EXT_texel_buffer_alignment = true,
-      .EXT_tooling_info = true,
-
-      /* Vulkan 1.4 */
-      .KHR_dynamic_rendering_local_read = true,
-      .KHR_global_priority = true,
-      .KHR_index_type_uint8 = true,
-      .KHR_line_rasterization = true,
-      .KHR_maintenance5 = true,
-      .KHR_maintenance6 = true,
-      .KHR_push_descriptor = true,
-      .KHR_shader_float_controls2 = true,
-      .KHR_shader_subgroup_rotate = true,
-      .KHR_vertex_attribute_divisor = true,
-      .EXT_global_priority = true,
-      .EXT_global_priority_query = true,
-      .EXT_index_type_uint8 = true,
-      .EXT_line_rasterization = true,
-      .EXT_pipeline_robustness = true,
-      .EXT_robustness2 = true,
-      .KHR_robustness2 = true,
-      .EXT_transform_feedback = true,
-      .EXT_vertex_attribute_divisor = true,
-
-      /* Other extensions implemented by the common runtime or CPU paths */
-      .KHR_calibrated_timestamps = true,
-      .KHR_cooperative_matrix = true,
-      .KHR_maintenance7 = true,
-      .KHR_shader_maximal_reconvergence = true,
-      .KHR_shader_quad_control = true,
-      .KHR_workgroup_memory_explicit_layout = true,
-      .KHR_maintenance8 = true,
-      .KHR_maintenance9 = true,
-      .KHR_pipeline_executable_properties = true,
-      .KHR_shader_subgroup_extended_types = true,
-      .EXT_color_write_enable = true,
-      .EXT_debug_marker = true,
-      .EXT_hdr_metadata = true,
-      .EXT_map_memory_placed = true,
-      /* Process usage of each heap and a budget from available system
-       * memory, as on other unified-memory drivers. */
-      .EXT_memory_budget = true,
-      /* Priority is a residency hint; all memory stays resident. */
-      .EXT_memory_priority = true,
-      .EXT_shader_replicated_composites = true,
-      .EXT_depth_bias_control = true,
-      .EXT_depth_clip_control = true,
-      .EXT_image_2d_view_of_3d = true,
-      /* Storage query bounds are separate from native texture geometry. */
-      .EXT_image_sliced_view_of_3d = true,
-      /* Native custom border colours need the border format: the sampler
-       * record holds the colour in the format's encoding. Without
-       * customBorderColorWithoutFormat, DXVK passes the view format and
-       * vkd3d-proton keeps the standard colours. */
-      .EXT_custom_border_color = true,
-      .EXT_border_color_swizzle = true,
-      .EXT_primitive_topology_list_restart = true,
-      .EXT_provoking_vertex = true,
-      .EXT_mutable_descriptor_type = true,
-      .EXT_shader_subgroup_ballot = true,
-      .EXT_shader_subgroup_vote = true,
-      .VALVE_mutable_descriptor_type = true,
-      .KHR_shader_relaxed_extended_instruction = true,
-      /* GENERAL remains correct and uses the same path as before. Explicit
-       * read-only depth/stencil layouts additionally allow store elision,
-       * render merging and barrier hoisting. GENERAL-layout clients such as
-       * DXVK/vkd3d with unified layouts do not get those read-only shortcuts.
-       * Feedback comes from the feedback loop state (see
-       * hk_attachment_may_be_sampled).
-       */
-      .KHR_unified_image_layouts = true,
-      .KHR_shader_subgroup_uniform_control_flow = true,
-      .EXT_attachment_feedback_loop_layout = true,
-      .EXT_calibrated_timestamps = true,
-      .EXT_dynamic_rendering_unused_attachments = true,
-      .EXT_multi_draw = true,
-      .EXT_non_seamless_cube_map = true,
-      .EXT_shader_module_identifier = true,
-      .EXT_shader_stencil_export = true,
-      .KHR_load_store_op_none = true,
-      .KHR_map_memory2 = true,
-      .KHR_shader_expect_assume = true,
-      .EXT_buffer_device_address = true,
-      .EXT_depth_clip_enable = true,
-      .EXT_external_memory_dma_buf = true,
-      .EXT_image_drm_format_modifier = true,
-      .EXT_load_store_op_none = true,
-      .EXT_physical_device_drm = true,
-      .EXT_queue_family_foreign = true,
-      .GOOGLE_decorate_string = true,
-      .GOOGLE_hlsl_functionality1 = true,
-      .GOOGLE_user_type = true,
-      .EXT_pipeline_protected_access = true,
-      .EXT_image_view_min_lod = true,
-      .KHR_compute_shader_derivatives = true,
-      .EXT_blend_operation_advanced = true,
-      /* Deferred shaders compile vertex fetch for the bound input state. */
-      .EXT_vertex_input_dynamic_state = true,
-      .EXT_extended_dynamic_state3 = true,
-      .EXT_graphics_pipeline_library = true,
-      .KHR_pipeline_library = true,
-      .EXT_shader_object = true,
-      .EXT_sample_locations = true,
-      .EXT_shader_uniform_buffer_unsized_array = true,
-      .KHR_pipeline_binary = true,
-      /* Host copies use the same ail tiling as GPU sampling; host transfer
-       * images are never compressed. */
-      .EXT_host_image_copy = true,
-      .EXT_shader_atomic_float = true,
-      .EXT_attachment_feedback_loop_dynamic_state = true,
-      .EXT_depth_clamp_zero_one = true,
-      .EXT_depth_clamp_control = true,
-      .EXT_ycbcr_2plane_444_formats = true,
-      .EXT_ycbcr_image_arrays = true,
-      /* Resolves are vk_meta blits, which honor the transfer function
-       * flags. */
-      .KHR_maintenance10 = true,
-
-      /* WSI */
-      .KHR_incremental_present = all.KHR_incremental_present,
-      .KHR_present_id = all.KHR_present_id,
-      .KHR_present_id2 = all.KHR_present_id2,
-      .KHR_present_wait = all.KHR_present_wait,
-      .KHR_present_wait2 = all.KHR_present_wait2,
-      .KHR_swapchain = all.KHR_swapchain,
-      .KHR_swapchain_mutable_format = all.KHR_swapchain_mutable_format,
-      .KHR_swapchain_maintenance1 = all.KHR_swapchain_maintenance1,
-      .EXT_swapchain_maintenance1 = all.EXT_swapchain_maintenance1,
-      .EXT_present_timing = all.EXT_present_timing,
-      .GOOGLE_display_timing = all.GOOGLE_display_timing,
-   };
 
 #define KEEP(x) .x = all_feat.x
    *feat = (struct vk_features){
@@ -1753,7 +1561,6 @@ hk_apple9_restrict_caps(struct vk_device_extension_table *ext,
     * by task/mesh kernels before the deferred availability write, using the
     * same query-pool machinery as other graphics stages.
     */
-   ext->EXT_mesh_shader = true;
    feat->meshShader = true;
    feat->taskShader = true;
    feat->multiviewMeshShader = true;
@@ -1769,7 +1576,6 @@ hk_apple9_restrict_caps(struct vk_device_extension_table *ext,
     * bit orders whole microtiles, so pixel interlock is reported only where
     * the driconf hk_enable_pixel_interlock asks for it.
     */
-   ext->EXT_fragment_shader_interlock = true;
    feat->fragmentShaderSampleInterlock = true;
    feat->fragmentShaderPixelInterlock = false;
 
@@ -1777,21 +1583,18 @@ hk_apple9_restrict_caps(struct vk_device_extension_table *ext,
     * written by the stage feeding the rasterizer, exact for primitives clipped
     * at the 1.5w guard band.
     */
-   ext->KHR_fragment_shader_barycentric = true;
    feat->fragmentShaderBarycentric = true;
 
    /* Predicated draws, dispatches and attachment clears read zeroed indirect
     * arguments when the predicate fails. Secondary command buffers are
     * replayed into the primary, so they inherit its predicate.
     */
-   ext->EXT_conditional_rendering = true;
    feat->conditionalRendering = true;
    feat->inheritedConditionalRendering = true;
 
    /* Primitives generated queries count in the passthrough geometry shader,
     * which runs before rasterizer discard and sees every vertex stream.
     */
-   ext->EXT_primitives_generated_query = true;
    feat->primitivesGeneratedQuery = true;
    feat->primitivesGeneratedQueryWithRasterizerDiscard = true;
    feat->primitivesGeneratedQueryWithNonZeroStreams = feat->geometryStreams;
@@ -2041,8 +1844,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    struct vk_properties properties;
    hk_get_device_properties(&pdev->dev, instance, &properties);
 
-   hk_apple9_restrict_caps(&supported_extensions, &supported_features,
-                           &properties);
+   hk_apple9_restrict_caps(&supported_features, &properties);
    /* Sample positions are per render and a change splits the render, so
     * they can vary within a subpass, but DXVK would centre samples for
     * every MultisampleEnable=FALSE draw: report it only where the
@@ -2058,7 +1860,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       hk_sparse_unbound_unmapped(&pdev->dev);
 
    /* VK_EXT_descriptor_buffer, with its USC-aperture memory type. */
-   supported_extensions.EXT_descriptor_buffer = true;
    supported_features.descriptorBuffer = true;
    supported_features.descriptorBufferPushDescriptors = true;
    supported_features.descriptorBufferCaptureReplay = true;
@@ -2083,14 +1884,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    pdev->disable_native_stages = instance->drirc.misc.disable_native_stages;
 
    hk_physical_device_init_pipeline_cache(pdev);
-
-   const char *hk_sysmem = os_get_option("HK_SYSMEM");
-   if (hk_sysmem) {
-      uint64_t sysmem = strtoll(hk_sysmem, NULL, 10);
-      if (sysmem != LLONG_MIN && sysmem != LLONG_MAX) {
-         pdev->sysmem = sysmem;
-      }
-   }
 
    uint64_t sysmem_size_B = hk_get_sysmem_heap_size(pdev);
    if (sysmem_size_B == 0) {
@@ -2221,9 +2014,6 @@ hk_GetPhysicalDeviceMemoryProperties2(
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT: {
          VkPhysicalDeviceMemoryBudgetPropertiesEXT *p = ext;
 
-         uint64_t sysmem_budget =
-            pdev->sysmem ? hk_get_sysmem_heap_available(pdev) : 0;
-
          for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
             const struct hk_memory_heap *heap = &pdev->mem_heaps[i];
             uint64_t used = p_atomic_read(&hk_process_heap_used[i]);
@@ -2239,22 +2029,11 @@ hk_GetPhysicalDeviceMemoryProperties2(
              */
             p->heapUsage[i] = used;
 
-            /* Set the budget at 90% to avoid thrashing. */
-            float percent = 0.9f;
-
-            uint64_t budget;
-            if (sysmem_budget) {
-               budget = MIN2(sysmem_budget + used, heap->size);
-               budget = ROUND_DOWN_TO((uint64_t)(budget * percent), 1 << 20);
-            } else {
-               /* Scale the budget the same way the heap was scaled. */
-               percent *= instance->drirc.misc.heap_memory_percent;
-
-               budget = vk_physical_device_heap_budget_from_system(
-                  &pdev->vk, percent, heap->size, used);
-            }
-
-            p->heapBudget[i] = budget;
+            /* Set the budget at 90% to avoid thrashing, scaled the same way
+             * the heap was scaled. */
+            float percent = 0.9f * instance->drirc.misc.heap_memory_percent;
+            p->heapBudget[i] = vk_physical_device_heap_budget_from_system(
+               &pdev->vk, percent, heap->size, used);
          }
 
          /* From the Vulkan 1.3.278 spec:

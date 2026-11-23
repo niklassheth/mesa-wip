@@ -41,8 +41,6 @@ struct hk_buffer {
    struct list_head sparse_link;
 
    /* Virtio resource id of bound implicit-sync (WSI) memory, or 0. */
-   uint32_t implicit_sync_res;
-
    /* Tracking for hk_device_memory VA-alias / full-flush CDM guard. */
    uint64_t va_bind_bo_key;
    uint64_t va_bind_id;

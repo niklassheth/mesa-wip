@@ -784,15 +784,7 @@ agx_bo_finish_create(struct agx_device *dev, struct agx_bo *bo,
    }
 }
 
-/* Native DRM mappings are coherent; the remote shim needs an explicit pull. */
-bool
-agx_bo_sync_cpu_read(struct agx_bo *bo)
-{
-   typedef int (*read_fn)(int, uint32_t);
-   read_fn read = (read_fn)dlsym(RTLD_DEFAULT, "asahi_m1n1_cpu_read");
-   return !read || read(bo->dev->fd, bo->uapi_handle) == 0;
-}
-
+/* Native DRM mappings are coherent; the remote shim needs an explicit hook. */
 typedef void (*agx_note_cpu_write_fn)(int, uint32_t, uint64_t, uint64_t);
 static agx_note_cpu_write_fn agx_note_cpu_write_cb;
 static once_flag agx_note_cpu_write_once = ONCE_FLAG_INIT;

@@ -59,10 +59,6 @@ struct hk_device_memory {
    /* Per-BO GPU VA aliasing tracker (owned ref until hk_FreeMemory). */
    struct hk_va_bo *va_bo;
 
-   /* Virtio: WSI memory, which the host compositor accesses with implicit
-    * sync. Submissions using it list it as an external resource. */
-   bool implicit_sync;
-
    /* The API mapping, which the memory object owns. */
    void *map;
    size_t map_size;

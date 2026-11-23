@@ -158,27 +158,3 @@ agx_set_null_pbe(struct agx_pbe_packed *pbe)
       cfg.buffer = AGX_SCRATCH_PAGE_ADDRESS;
    }
 }
-
-static struct libagx_decompress_args
-agx_fill_decompress_args(struct ail_layout *layout, unsigned layer,
-                         unsigned level, uint64_t ptr, uint64_t images)
-{
-   return (struct libagx_decompress_args){
-      .images = images,
-      .tile_uncompressed = ail_tile_mode_uncompressed(layout->format),
-      .metadata = ptr + layout->metadata_offset_B +
-                  layout->level_offsets_compressed_B[level] +
-                  (layer * layout->compression_layer_stride_B),
-      .metadata_layer_stride_tl = layout->compression_layer_stride_B / 8,
-      .metadata_width_tl = ail_metadata_width_tl(layout, level),
-      .metadata_height_tl = ail_metadata_height_tl(layout, level),
-   };
-}
-
-#undef libagx_decompress
-#define libagx_decompress(context, grid, barrier, layout, layer, level, ptr,   \
-                          images)                                              \
-   libagx_decompress_struct(                                                   \
-      context, grid, barrier,                                                  \
-      agx_fill_decompress_args(layout, layer, level, ptr, images),             \
-      util_logbase2(layout->sample_count_sa))

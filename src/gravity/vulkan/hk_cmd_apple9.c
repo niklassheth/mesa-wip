@@ -62,17 +62,19 @@ struct hk_apple9_tile_helper {
    struct agx_apple9_stage_launch_cache launch;
 };
 
-static uint32_t
-hk_apple9_tile_helper_hash(const void *key)
-{
-   return _mesa_hash_data(key, sizeof(struct agx_apple9_tilebuffer_key));
-}
+#define HK_DEFINE_KEY_HASH_EQ(prefix, key_type)                                \
+   static uint32_t                                                             \
+   prefix##_hash(const void *key)                                              \
+   {                                                                           \
+      return _mesa_hash_data(key, sizeof(key_type));                           \
+   }                                                                           \
+   static bool                                                                 \
+   prefix##_equal(const void *a, const void *b)                                \
+   {                                                                           \
+      return !memcmp(a, b, sizeof(key_type));                                  \
+   }
 
-static bool
-hk_apple9_tile_helper_equal(const void *a, const void *b)
-{
-   return !memcmp(a, b, sizeof(struct agx_apple9_tilebuffer_key));
-}
+HK_DEFINE_KEY_HASH_EQ(hk_apple9_tile_helper, struct agx_apple9_tilebuffer_key)
 
 static struct hk_apple9_tile_helper *
 hk_apple9_tile_helper(struct hk_device *dev,
@@ -164,17 +166,7 @@ struct hk_apple9_vs_prolog {
    uint8_t atomic_frame_size;
 };
 
-static uint32_t
-hk_apple9_vs_prolog_hash(const void *key)
-{
-   return _mesa_hash_data(key, sizeof(struct agx_apple9_vertex_prolog_key));
-}
-
-static bool
-hk_apple9_vs_prolog_equal(const void *a, const void *b)
-{
-   return !memcmp(a, b, sizeof(struct agx_apple9_vertex_prolog_key));
-}
+HK_DEFINE_KEY_HASH_EQ(hk_apple9_vs_prolog, struct agx_apple9_vertex_prolog_key)
 
 static struct hk_apple9_vs_prolog *
 hk_apple9_get_vs_prolog(struct hk_device *dev,
@@ -270,17 +262,7 @@ struct hk_apple9_fs_epilog {
    bool writes_depth;
 };
 
-static uint32_t
-hk_apple9_fs_epilog_hash(const void *key)
-{
-   return _mesa_hash_data(key, sizeof(struct agx_apple9_fs_epilog_key));
-}
-
-static bool
-hk_apple9_fs_epilog_equal(const void *a, const void *b)
-{
-   return !memcmp(a, b, sizeof(struct agx_apple9_fs_epilog_key));
-}
+HK_DEFINE_KEY_HASH_EQ(hk_apple9_fs_epilog, struct agx_apple9_fs_epilog_key)
 
 static struct hk_apple9_fs_epilog *
 hk_apple9_get_fs_epilog(struct hk_device *dev,
@@ -379,17 +361,7 @@ struct hk_apple9_cull_prolog {
    struct agx_apple9_stage_launch_cache launch_cache;
 };
 
-static uint32_t
-hk_apple9_cull_prolog_hash(const void *key)
-{
-   return _mesa_hash_data(key, sizeof(struct agx_apple9_cull_prolog_key));
-}
-
-static bool
-hk_apple9_cull_prolog_equal(const void *a, const void *b)
-{
-   return !memcmp(a, b, sizeof(struct agx_apple9_cull_prolog_key));
-}
+HK_DEFINE_KEY_HASH_EQ(hk_apple9_cull_prolog, struct agx_apple9_cull_prolog_key)
 
 static struct hk_apple9_cull_prolog *
 hk_apple9_get_cull_prolog(struct hk_device *dev,
@@ -489,17 +461,7 @@ struct hk_apple9_stipple_prolog {
    struct agx_apple9_stage_launch_cache launch_cache;
 };
 
-static uint32_t
-hk_apple9_stipple_prolog_hash(const void *key)
-{
-   return _mesa_hash_data(key, sizeof(struct agx_apple9_stipple_prolog_key));
-}
-
-static bool
-hk_apple9_stipple_prolog_equal(const void *a, const void *b)
-{
-   return !memcmp(a, b, sizeof(struct agx_apple9_stipple_prolog_key));
-}
+HK_DEFINE_KEY_HASH_EQ(hk_apple9_stipple_prolog, struct agx_apple9_stipple_prolog_key)
 
 static struct hk_apple9_stipple_prolog *
 hk_apple9_get_stipple_prolog(struct hk_device *dev,
@@ -686,17 +648,7 @@ struct hk_apple9_sw_vs_prolog {
    struct agx_apple9_compute_profile profile;
 };
 
-static uint32_t
-hk_apple9_sw_vs_prolog_hash(const void *key)
-{
-   return _mesa_hash_data(key, sizeof(struct agx_apple9_sw_vs_prolog_key));
-}
-
-static bool
-hk_apple9_sw_vs_prolog_equal(const void *a, const void *b)
-{
-   return !memcmp(a, b, sizeof(struct agx_apple9_sw_vs_prolog_key));
-}
+HK_DEFINE_KEY_HASH_EQ(hk_apple9_sw_vs_prolog, struct agx_apple9_sw_vs_prolog_key)
 
 static struct hk_apple9_sw_vs_prolog *
 hk_apple9_get_sw_vs_prolog(struct hk_device *dev,
@@ -844,17 +796,7 @@ struct hk_apple9_linked_entry {
    struct list_head lru_link;
 };
 
-static uint32_t
-hk_apple9_linked_entry_hash(const void *key)
-{
-   return _mesa_hash_data(key, sizeof(struct hk_apple9_linked_entry_key));
-}
-
-static bool
-hk_apple9_linked_entry_equal(const void *a, const void *b)
-{
-   return !memcmp(a, b, sizeof(struct hk_apple9_linked_entry_key));
-}
+HK_DEFINE_KEY_HASH_EQ(hk_apple9_linked_entry, struct hk_apple9_linked_entry_key)
 
 static void
 hk_apple9_linked_entry_destroy(struct agx_device *dev,
@@ -1051,18 +993,8 @@ struct hk_apple9_per_sample_trampoline {
    struct list_head lru_link;
 };
 
-static uint32_t
-hk_apple9_per_sample_trampoline_hash(const void *key)
-{
-   return _mesa_hash_data(
-      key, sizeof(struct hk_apple9_per_sample_trampoline_key));
-}
-
-static bool
-hk_apple9_per_sample_trampoline_equal(const void *a, const void *b)
-{
-   return !memcmp(a, b, sizeof(struct hk_apple9_per_sample_trampoline_key));
-}
+HK_DEFINE_KEY_HASH_EQ(hk_apple9_per_sample_trampoline,
+                      struct hk_apple9_per_sample_trampoline_key)
 
 static void
 hk_apple9_per_sample_trampoline_destroy(struct agx_device *dev,
@@ -1357,17 +1289,7 @@ struct hk_apple9_vs_vary_variant {
    struct agx_apple9_stage_launch_cache launch_cache;
 };
 
-static uint32_t
-hk_apple9_vs_vary_hash(const void *key)
-{
-   return _mesa_hash_data(key, sizeof(struct hk_apple9_vs_vary_key));
-}
-
-static bool
-hk_apple9_vs_vary_equal(const void *a, const void *b)
-{
-   return !memcmp(a, b, sizeof(struct hk_apple9_vs_vary_key));
-}
+HK_DEFINE_KEY_HASH_EQ(hk_apple9_vs_vary, struct hk_apple9_vs_vary_key)
 
 static struct hk_apple9_vs_vary_variant *
 hk_apple9_get_vs_vary_variant(struct hk_device *dev,

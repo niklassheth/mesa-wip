@@ -78,38 +78,6 @@ libagx_reset_query(global uint32_t *availability, global uint64_t *results,
    }
 }
 
-/* TODO: Share with Gallium... */
-enum pipe_query_value_type {
-   PIPE_QUERY_TYPE_I32,
-   PIPE_QUERY_TYPE_U32,
-   PIPE_QUERY_TYPE_I64,
-   PIPE_QUERY_TYPE_U64,
-};
-
-KERNEL(1)
-libagx_copy_query_gl(global uint64_t *query, global uint64_t *dest,
-                     ushort value_type, ushort bool_size)
-{
-   uint64_t value = *query;
-
-   if (bool_size == 4) {
-      value = (uint32_t)value;
-   }
-
-   if (bool_size) {
-      value = value != 0;
-   }
-
-   if (value_type <= PIPE_QUERY_TYPE_U32) {
-      global uint32_t *dest32 = (global uint32_t *)dest;
-      bool u32 = (value_type == PIPE_QUERY_TYPE_U32);
-
-      *dest32 = u32 ? convert_uint_sat(value) : convert_int_sat((int64_t)value);
-   } else {
-      *dest = value;
-   }
-}
-
 KERNEL(4)
 libagx_copy_xfb_counters(constant struct libagx_xfb_counter_copy *push)
 {

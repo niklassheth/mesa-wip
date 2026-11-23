@@ -29,7 +29,6 @@ enum hk_desc_usage {
    HK_DESC_USAGE_INPUT,
    HK_DESC_USAGE_BG_EOT,
    HK_DESC_USAGE_LAYERED_BG_EOT,
-   HK_DESC_USAGE_EMRT,
 };
 
 static bool
@@ -56,7 +55,7 @@ static enum agx_texture_dimension
 translate_image_view_type(VkImageViewType view_type, bool msaa, bool layered,
                           enum hk_desc_usage usage)
 {
-   if (usage == HK_DESC_USAGE_EMRT || usage == HK_DESC_USAGE_INPUT ||
+   if (usage == HK_DESC_USAGE_INPUT ||
        (usage == HK_DESC_USAGE_LAYERED_BG_EOT && layered)) {
       return msaa ? AGX_TEXTURE_DIMENSION_2D_ARRAY_MULTISAMPLED
                   : AGX_TEXTURE_DIMENSION_2D_ARRAY;
@@ -583,7 +582,7 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
             cfg.samples = agx_translate_sample_count(image->vk.samples);
       }
 
-      if (layout->compressed && usage != HK_DESC_USAGE_EMRT) {
+      if (layout->compressed) {
          cfg.compressed = true;
          cfg.extended = true;
 
@@ -594,8 +593,7 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
       /* When the descriptor isn't extended architecturally, we use
        * the last 8 bytes as a sideband to accelerate image atomics.
        */
-      if (!cfg.extended &&
-          (layout->writeable_image || usage == HK_DESC_USAGE_EMRT)) {
+      if (!cfg.extended && layout->writeable_image) {
 
          if (msaa) {
             assert(denom.x == 1 && "no MSAA of block-compressed");
@@ -867,14 +865,12 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
       pack_texture(view, p, HK_DESC_USAGE_SAMPLED, &view->planes[p].sampled);
       pack_texture(view, p, HK_DESC_USAGE_STORAGE, &view->planes[p].ro_storage);
       pack_texture(view, p, HK_DESC_USAGE_INPUT, &view->planes[p].ia);
-      pack_texture(view, p, HK_DESC_USAGE_EMRT, &view->planes[p].emrt_texture);
       pack_texture(view, p, HK_DESC_USAGE_BG_EOT, &view->planes[p].background);
       pack_texture(view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
                    &view->planes[p].layered_background);
 
       pack_pbe(dev, view, p, HK_DESC_USAGE_STORAGE, &view->planes[p].storage);
       pack_pbe(dev, view, p, HK_DESC_USAGE_BG_EOT, &view->planes[p].eot);
-      pack_pbe(dev, view, p, HK_DESC_USAGE_EMRT, &view->planes[p].emrt_pbe);
       pack_pbe(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
                &view->planes[p].layered_eot);
    }

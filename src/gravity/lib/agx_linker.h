@@ -15,14 +15,6 @@ struct nir_builder;
 struct nir_def;
 struct nir_shader;
 
-/* These parts of the vertex element affect the generated code */
-struct agx_velem_key {
-   uint32_t divisor;
-   uint16_t stride;
-   uint8_t format;
-   bool instanced;
-};
-
 /* Line stipple emulation: an internal passthrough GS forwards each segment's
  * start and direction in this flat varying, and the fragment shader discards
  * from the window-space distance along the segment's major axis. */

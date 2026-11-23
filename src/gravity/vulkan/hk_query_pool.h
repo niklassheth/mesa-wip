@@ -19,7 +19,6 @@ struct hk_query_pool {
    uint32_t query_stride;
 
    struct agx_bo *bo;
-   void *bo_map;
 
    /* For timestamp queries, the kernel-assigned timestamp buffer handle. Unused
     * for all other query types

@@ -55,7 +55,7 @@ static void
 hk_fini_cmd_buffer_storage(struct hk_cmd_buffer *cmd)
 {
    struct util_dynarray *arrays[] = {
-      &cmd->large_bos, &cmd->implicit_sync_res, &cmd->query_adds,
+      &cmd->large_bos, &cmd->query_adds,
       &cmd->query_writes, &cmd->occlusion_accum, &cmd->sync_events,
       &cmd->sync_remap, &cmd->sync_first_event, &cmd->empty_barriers,
       &cmd->feedback_raw, &cmd->cdm_narrow_barriers,
@@ -110,7 +110,6 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd, bool release)
    hk_apple9_unpin_entries(cmd);
 
    util_dynarray_clear(&cmd->large_bos);
-   util_dynarray_clear(&cmd->implicit_sync_res);
    util_dynarray_clear(&cmd->query_adds);
    util_dynarray_clear(&cmd->query_writes);
    util_dynarray_clear(&cmd->occlusion_accum);
@@ -210,7 +209,6 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    }
 
    cmd->large_bos = UTIL_DYNARRAY_INIT;
-   cmd->implicit_sync_res = UTIL_DYNARRAY_INIT;
    cmd->query_adds = UTIL_DYNARRAY_INIT;
    cmd->query_writes = UTIL_DYNARRAY_INIT;
    cmd->occlusion_accum = UTIL_DYNARRAY_INIT;

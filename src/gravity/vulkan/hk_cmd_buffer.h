@@ -73,8 +73,6 @@ struct hk_root_descriptor_table {
          float clip_z_coeff;
 
          /* Vertex input state */
-         uint64_t attrib_base[AGX_MAX_VBUFS];
-         uint32_t attrib_clamps[AGX_MAX_VBUFS];
          uint32_t attrib_strides[AGX_MAX_VBUFS];
 
          /* Mask of outputs flowing VS->TCS, VS->GS, or TES->GS . */
@@ -158,7 +156,7 @@ struct hk_root_descriptor_table {
 
 /* Bumped whenever hk_root_descriptor_table offsets change: compiled shaders
  * bake them, so pipeline and disk cache keys include it. */
-#define HK_ROOT_LAYOUT_VERSION 6
+#define HK_ROOT_LAYOUT_VERSION 7
 
 /* helper macro for computing root descriptor byte offsets */
 #define hk_root_descriptor_offset(member)                                      \
@@ -994,10 +992,6 @@ struct hk_cmd_buffer {
    struct util_dynarray cdm_narrow_barriers;
    uint32_t cdm_narrow_upgraded;
 
-   /* Virtio resource ids (uint32_t) of implicit-sync (WSI) memory this
-    * recording accesses; submissions list them as external resources. */
-   struct util_dynarray implicit_sync_res;
-
    /* Apple9 shader bodies whose arena entries this recording may encode, each
     * referenced and pinned once until reset, and the last two pinned. */
    struct set *apple9_pinned;
@@ -1119,18 +1113,6 @@ void hk_cmd_sync_barrier(struct hk_cmd_buffer *cmd,
                          VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst,
                          VkAccessFlags2 src_access, VkAccessFlags2 dst_access);
 void hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs);
-
-static inline void
-hk_cmd_use_implicit_sync(struct hk_cmd_buffer *cmd, uint32_t res)
-{
-   if (!res)
-      return;
-   util_dynarray_foreach(&cmd->implicit_sync_res, uint32_t, r) {
-      if (*r == res)
-         return;
-   }
-   util_dynarray_append(&cmd->implicit_sync_res, res);
-}
 void hk_cdm_compute_barrier(struct hk_device *dev, struct hk_cs *cs);
 
 static inline void
@@ -1573,9 +1555,6 @@ void hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
 void hk_cmd_buffer_begin_compute(struct hk_cmd_buffer *cmd,
                                  const VkCommandBufferBeginInfo *pBeginInfo);
 
-void hk_cmd_invalidate_graphics_state(struct hk_cmd_buffer *cmd);
-void hk_cmd_invalidate_compute_state(struct hk_cmd_buffer *cmd);
-
 void hk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
                          const mesa_shader_stage *stages,
                          struct vk_shader **const shaders);
@@ -1641,9 +1620,6 @@ void hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
 
 void hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
                     bool after_gfx);
-
-void agx_fill_velem_keys(const struct vk_vertex_input_state *vi,
-                         uint64_t attribs_read, struct agx_velem_key *keys);
 
 struct agx_robustness hk_prolog_robustness(struct hk_device *dev);
 

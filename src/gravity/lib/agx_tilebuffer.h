@@ -27,22 +27,13 @@ struct nir_def;
 struct nir_builder;
 
 struct agx_tilebuffer_layout {
-   /* Logical format of each render target. Use agx_tilebuffer_physical_format
-    * to get the physical format.
-    */
+   /* Logical format of each render target. */
    enum pipe_format logical_format[AGX_MAX_RENDER_TARGETS];
 
-   /* Which render targets are spilled. */
-   bool spilled[AGX_MAX_RENDER_TARGETS];
-
-   /* Offset into the sample of each render target. If a render target is
-    * spilled, its offset is UNDEFINED. Use agx_tilebuffer_offset_B to access.
-    */
+   /* Offset into the sample of each render target. */
    uint8_t _offset_B[AGX_MAX_RENDER_TARGETS];
 
-   /* Total bytes per sample, rounded up as needed. Spilled render targets do
-    * not count against this.
-    */
+   /* Total bytes per sample, rounded up to 8-byte alignment. */
    uint8_t sample_size_B;
 
    /* Number of samples per pixel */
@@ -51,7 +42,7 @@ struct agx_tilebuffer_layout {
    /* If layered rendering is used */
    bool layered;
 
-   /* Selected tile size in pixels. Either 32*32, 32*16, or 16*16. */
+   /* Selected tile size in pixels. Either 32*32 or 32*16. */
    uint16_t tile_size;
 };
 
@@ -61,17 +52,6 @@ agx_tilebuffer_set_drm_cmd(struct drm_asahi_cmd_render *c,
 {
    c->utile_width_px = layout->tile_size >= 32 * 16 ? 32 : 16;
    c->utile_height_px = layout->tile_size <= 32 * 16 ? 16 : 32;
-}
-
-static inline bool
-agx_tilebuffer_spills(struct agx_tilebuffer_layout *layout)
-{
-   for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt) {
-      if (layout->spilled[rt])
-         return true;
-   }
-
-   return false;
 }
 
 struct agx_tilebuffer_layout
@@ -85,8 +65,6 @@ bool agx_nir_lower_monolithic_msaa(struct nir_shader *shader,
 
 bool agx_nir_lower_sample_intrinsics(struct nir_shader *shader,
                                      bool ignore_sample_mask_without_msaa);
-
-uint32_t agx_tilebuffer_total_size(struct agx_tilebuffer_layout *tib);
 
 #ifdef __cplusplus
 } /* extern C */

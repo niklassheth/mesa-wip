@@ -28,9 +28,6 @@
 #include "vk_meta.h"
 #include "vk_queue.h"
 
-DEBUG_GET_ONCE_OPTION(cached_hk_apple9_sparse_scratch,
-                      "HK_APPLE9_SPARSE_SCRATCH", NULL)
-
 struct hash_table_u64;
 struct hk_physical_device;
 struct nir_builder;
@@ -271,13 +268,12 @@ void hk_sampler_heap_remove(struct hk_device *dev, struct hk_rc_sampler *rc);
 /* With soft faults, accesses to unmapped GPU pages read zero and drop
  * writes, which is strict sparse residency. Apple9 then leaves unbound
  * sparse ranges unmapped instead of mapping the shared scratch page, whose
- * contents reads would observe. HK_APPLE9_SPARSE_SCRATCH=1 restores scratch.
+ * contents reads would observe.
  */
 static inline bool
 hk_sparse_unbound_unmapped(const struct agx_device *dev)
 {
-   return agx_has_soft_fault((struct agx_device *)dev) &&
-          !debug_get_option_cached_hk_apple9_sparse_scratch();
+   return agx_has_soft_fault((struct agx_device *)dev);
 }
 /* Debug only: HK_CPU_TIMING, see hk_cpu_timing.c */
 struct vk_device_dispatch_table;

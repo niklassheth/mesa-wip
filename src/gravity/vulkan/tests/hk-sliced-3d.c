@@ -240,7 +240,6 @@ check_view(struct hk_device *dev, VkExtent3D extent, unsigned levels, unsigned l
    CHECK(!memcmp(&f->planes[0].background, &s->planes[0].background, sizeof(f->planes[0].background)));
    CHECK(!memcmp(&f->planes[0].eot, &s->planes[0].eot, sizeof(f->planes[0].eot)));
    CHECK(!memcmp(&f->planes[0].layered_eot, &s->planes[0].layered_eot, sizeof(f->planes[0].layered_eot)));
-   CHECK(!memcmp(&f->planes[0].emrt_pbe, &s->planes[0].emrt_pbe, sizeof(f->planes[0].emrt_pbe)));
    struct hk_apple9_image_part full_sampled, sliced_sampled;
    get_descriptor(dev, full, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &full_sampled);
    get_descriptor(dev, sliced, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &sliced_sampled);

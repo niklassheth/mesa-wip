@@ -30,7 +30,6 @@
 #include "hk_shader_priv.h"
 
 #include "gravity/genxml/agx_pack.h"
-#include "gravity/libcl/compression.h"
 #include "gravity/libcl/libagx.h"
 #include "gravity/libcl/mesh.h"
 #include "gravity/libcl/query.h"

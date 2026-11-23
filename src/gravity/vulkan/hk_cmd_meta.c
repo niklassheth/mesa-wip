@@ -1461,10 +1461,6 @@ hk_CmdBlitImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    perf_debug(cmd, "Blit image");
-   hk_cmd_use_implicit_sync(
-      cmd, hk_image_from_handle(pBlitImageInfo->srcImage)->implicit_sync_res);
-   hk_cmd_use_implicit_sync(
-      cmd, hk_image_from_handle(pBlitImageInfo->dstImage)->implicit_sync_res);
 
    struct hk_meta_save save;
    hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
@@ -1479,10 +1475,6 @@ hk_CmdResolveImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    perf_debug(cmd, "Resolve");
-   hk_cmd_use_implicit_sync(
-      cmd, hk_image_from_handle(pResolveImageInfo->srcImage)->implicit_sync_res);
-   hk_cmd_use_implicit_sync(
-      cmd, hk_image_from_handle(pResolveImageInfo->dstImage)->implicit_sync_res);
 
    struct hk_meta_save save;
    hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
@@ -1570,10 +1562,6 @@ hk_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info)
    /* Buffer destinations may alias image storage or its compression metadata. */
    hk_feedback_invalidate(cmd);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   hk_cmd_use_implicit_sync(
-      cmd, hk_buffer_from_handle(info->srcBuffer)->implicit_sync_res);
-   hk_cmd_use_implicit_sync(
-      cmd, hk_buffer_from_handle(info->dstBuffer)->implicit_sync_res);
 
    for (unsigned i = 0; i < info->regionCount; i++) {
       const VkBufferCopy2 *region = &info->pRegions[i];
@@ -1591,7 +1579,7 @@ hk_copy_requires_gfx(struct hk_image *img)
    return img->planes[0].layout.compressed;
 }
 
-static bool
+static VkPipelineBindPoint
 hk_bind_point(bool gfx)
 {
    return gfx ? VK_PIPELINE_BIND_POINT_GRAPHICS
@@ -1605,9 +1593,6 @@ hk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(hk_image, dst_image, pCopyBufferToImageInfo->dstImage);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   hk_cmd_use_implicit_sync(cmd, dst_image->implicit_sync_res);
-   hk_cmd_use_implicit_sync(
-      cmd, hk_buffer_from_handle(pCopyBufferToImageInfo->srcBuffer)->implicit_sync_res);
 
    bool gfx = hk_copy_requires_gfx(dst_image);
    VkPipelineBindPoint bind_point = hk_bind_point(gfx);
@@ -1636,9 +1621,6 @@ hk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    VK_FROM_HANDLE(hk_image, src_image, pCopyImageToBufferInfo->srcImage);
-   hk_cmd_use_implicit_sync(cmd, src_image->implicit_sync_res);
-   hk_cmd_use_implicit_sync(
-      cmd, hk_buffer_from_handle(pCopyImageToBufferInfo->dstBuffer)->implicit_sync_res);
 
    struct hk_meta_save save;
    hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
@@ -1662,8 +1644,6 @@ hk_CmdCopyImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_image, src_image, pCopyImageInfo->srcImage);
    VK_FROM_HANDLE(hk_image, dst_image, pCopyImageInfo->dstImage);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   hk_cmd_use_implicit_sync(cmd, src_image->implicit_sync_res);
-   hk_cmd_use_implicit_sync(cmd, dst_image->implicit_sync_res);
    bool gfx = hk_copy_requires_gfx(dst_image);
    bool sampled_copy = src_image->planes[0].layout.compressed ||
                        src_image->planes[0].sparse_map != NULL;
@@ -1696,7 +1676,6 @@ hk_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
    /* Buffer destinations may alias image storage or its compression metadata. */
    hk_feedback_invalidate(cmd);
    VK_FROM_HANDLE(hk_buffer, buffer, dstBuffer);
-   hk_cmd_use_implicit_sync(cmd, buffer->implicit_sync_res);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
    size_t range = vk_buffer_range(&buffer->vk, dstOffset, dstRange);
@@ -1744,7 +1723,6 @@ hk_CmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
    /* Buffer destinations may alias image storage or its compression metadata. */
    hk_feedback_invalidate(cmd);
    VK_FROM_HANDLE(hk_buffer, buffer, dstBuffer);
-   hk_cmd_use_implicit_sync(cmd, buffer->implicit_sync_res);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    size_t range = vk_buffer_range(&buffer->vk, dstOffset, dstRange);
 
