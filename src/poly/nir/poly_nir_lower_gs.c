@@ -716,6 +716,7 @@ strip_side_effect_from_main(nir_builder *b, nir_intrinsic_instr *intr,
    case nir_intrinsic_image_atomic_swap:
    case nir_intrinsic_bindless_image_atomic:
    case nir_intrinsic_bindless_image_atomic_swap:
+   case nir_intrinsic_image_load_apple9_agx:
       if (list_is_empty(&intr->def.uses)) {
          nir_instr_remove(&intr->instr);
          return true;
@@ -726,7 +727,11 @@ strip_side_effect_from_main(nir_builder *b, nir_intrinsic_instr *intr,
    case nir_intrinsic_store_global:
    case nir_intrinsic_image_store:
    case nir_intrinsic_bindless_image_store:
+   case nir_intrinsic_image_store_apple9_agx:
    case nir_intrinsic_fence_pbe_to_tex_agx:
+   case nir_intrinsic_fence_mem_to_tex_agx:
+   case nir_intrinsic_fence_image_write_apple9_agx:
+   case nir_intrinsic_fence_tex_invalidate_apple9_agx:
       if (data) {
          nir_instr_remove(&intr->instr);
          return true;
