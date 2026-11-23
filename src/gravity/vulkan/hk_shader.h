@@ -32,6 +32,7 @@
 /* Compiler-only research: no native GS draw routing is enabled. */
 struct hk_apple9_graphics_key;
 nir_shader *hk_nir_gs_mesh(const nir_shader *source, const char **reason);
+nir_shader *hk_nir_gs_mesh_take(nir_shader *nir, const char **reason);
 bool hk_apple9_compile_gs_mesh_program(
    const nir_shader *source, const struct hk_apple9_graphics_key *key,
    struct agx_shader_part *out, struct agx_apple9_mesh_body_info *info,
@@ -39,6 +40,7 @@ bool hk_apple9_compile_gs_mesh_program(
 
 /* Position-only TES realization over the existing tessellator index stream. */
 nir_shader *hk_nir_tes_mesh(const nir_shader *source, const char **reason);
+nir_shader *hk_nir_tes_mesh_take(nir_shader *nir, const char **reason);
 nir_shader *hk_nir_tes_mesh_object(void);
 bool hk_apple9_compile_tes_mesh_program(
    const nir_shader *source, const struct hk_apple9_graphics_key *key,
@@ -183,6 +185,17 @@ static inline bool
 hk_per_vertex_copies_used(const struct hk_per_vertex_copies *map)
 {
    return map->count || map->bary[0] || map->bary[1];
+}
+
+/* Map a per-vertex copy base slot and API vertex index (0..2) to its varying
+ * slot. The third dedicated base VARYING_SLOT_BFC0 wraps vertex 2 onto
+ * VARYING_SLOT_CLIP_VERTEX because BFC0..BFC1 only span two slots. */
+static inline unsigned
+hk_per_vertex_copy_slot(uint8_t base, unsigned vertex)
+{
+   if (base == VARYING_SLOT_BFC0 && vertex == 2)
+      return VARYING_SLOT_CLIP_VERTEX;
+   return base + vertex;
 }
 
 struct hk_pp_info;

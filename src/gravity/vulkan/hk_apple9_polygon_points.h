@@ -36,3 +36,10 @@ void hk_apple9_pp_emit_triangle(struct nir_builder *b,
                                 hk_pp_load_fn load, void *data,
                                 nir_def *provoking, nir_def *prim,
                                 nir_def *only);
+
+/* Split the two-component VARYING_SLOT_FOGC store emitted by
+ * hk_apple9_pp_emit_triangle into separate VARYING_SLOT_FOGC (facing) and
+ * VARYING_SLOT_PRIMITIVE_ID scalar stores. */
+bool hk_apple9_split_pp_face_prim(struct nir_builder *b,
+                                  nir_intrinsic_instr *intr,
+                                  void *data);

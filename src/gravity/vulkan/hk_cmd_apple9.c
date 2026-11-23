@@ -1216,14 +1216,6 @@ hk_apple9_dispatch_sw_vs_prolog(
    agx_shader_body_unreference(&dev->dev, &linked->body);
 }
 
-static inline unsigned
-hk_apple9_per_vertex_copy_slot(uint8_t base, unsigned vertex)
-{
-   if (base == VARYING_SLOT_BFC0 && vertex == 2)
-      return VARYING_SLOT_CLIP_VERTEX;
-   return base + vertex;
-}
-
 struct hk_shader *
 hk_apple9_select_mesh_rast(struct hk_cmd_buffer *cmd,
                            struct hk_api_shader *mesh)
@@ -1260,7 +1252,7 @@ hk_apple9_select_mesh_rast(struct hk_cmd_buffer *cmd,
       }
       for (unsigned j = 0; j < fs->info.fs.per_vertex_copies; ++j) {
          for (unsigned k = 0; k < 3; ++k) {
-            unsigned slot = hk_apple9_per_vertex_copy_slot(
+            unsigned slot = hk_per_vertex_copy_slot(
                fs->info.fs.per_vertex_copy_base[j], k);
             if (!mesh_rast->b.info.apple9_varyings.mask[slot])
                need_meta = true;

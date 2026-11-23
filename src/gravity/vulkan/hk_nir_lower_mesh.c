@@ -655,36 +655,6 @@ hk_mesh_pp_load(nir_builder *b, void *data, unsigned vertex, unsigned location,
    return nir_channels(b, value, BITFIELD_RANGE(component, comps));
 }
 
-static bool
-hk_mesh_split_pp_face_prim(nir_builder *b, nir_intrinsic_instr *intr,
-                           UNUSED void *data)
-{
-   if (intr->intrinsic != nir_intrinsic_store_output ||
-       nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_FOGC ||
-       intr->src[0].ssa->num_components < 2)
-      return false;
-   b->cursor = nir_before_instr(&intr->instr);
-   nir_def *val = intr->src[0].ssa;
-   nir_store_output(b, nir_channel(b, val, 0), nir_imm_int(b, 0),
-                    .write_mask = 0x1, .src_type = nir_type_uint32,
-                    .io_semantics = {.location = VARYING_SLOT_FOGC,
-                                     .num_slots = 1});
-   nir_store_output(b, nir_channel(b, val, 1), nir_imm_int(b, 0),
-                    .write_mask = 0x1, .src_type = nir_type_uint32,
-                    .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_ID,
-                                     .num_slots = 1});
-   nir_instr_remove(&intr->instr);
-   return true;
-}
-
-static inline unsigned
-hk_mesh_per_vertex_copy_slot(uint8_t base, unsigned vertex)
-{
-   if (base == VARYING_SLOT_BFC0 && vertex == 2)
-      return VARYING_SLOT_CLIP_VERTEX;
-   return base + vertex;
-}
-
 /* Polygon mode POINT: each triangle draws HK_PP_MAX_VERTICES points, one per
  * vertex of the clipped polygon, the others behind the eye.
  */
@@ -773,7 +743,7 @@ hk_nir_mesh_rast_pp(const nir_shader *mesh, const struct hk_mesh_info *info,
          : nir_imm_int(&b, 0);
    hk_apple9_pp_emit_triangle(&b, &pp_out, hk_mesh_pp_load, &pp, provoking,
                               prim_id, point);
-   nir_shader_intrinsics_pass(s, hk_mesh_split_pp_face_prim,
+   nir_shader_intrinsics_pass(s, hk_apple9_split_pp_face_prim,
                               nir_metadata_control_flow, NULL);
 
    if (memory) {
@@ -938,7 +908,7 @@ hk_nir_mesh_rast(const nir_shader *mesh, const struct hk_mesh_info *info,
             value = nir_pad_vector_imm_int(&b, value, 0, 4);
          }
 
-         unsigned copy = hk_mesh_per_vertex_copy_slot(copies->copy_base[j], k);
+         unsigned copy = hk_per_vertex_copy_slot(copies->copy_base[j], k);
          nir_store_output(&b, value, nir_imm_int(&b, 0), .write_mask = 0xf,
                           .src_type = nir_type_float32,
                           .io_semantics.location = copy,

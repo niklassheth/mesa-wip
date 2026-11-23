@@ -308,14 +308,6 @@ hk_barycentric_for_coord(nir_builder *b, nir_intrinsic_instr *intr)
    }
 }
 
-static inline unsigned
-hk_per_vertex_copy_slot(uint8_t base, unsigned vertex)
-{
-   if (base == VARYING_SLOT_BFC0 && vertex == 2)
-      return VARYING_SLOT_CLIP_VERTEX;
-   return base + vertex;
-}
-
 bool
 hk_apple9_lower_per_vertex_copies(nir_shader *fs, uint64_t producer_outputs,
                                   struct hk_per_vertex_copies *map)

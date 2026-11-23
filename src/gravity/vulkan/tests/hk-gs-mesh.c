@@ -259,6 +259,20 @@ main(void)
       lower_immutable(src, false);
       ralloc_free(src);
    }
+   /* Consuming entrypoint lowers in place without a second clone and frees on reject. */
+   {
+      nir_shader *owned = source(3, 0, false);
+      const char *reason = NULL;
+      nir_shader *mesh = hk_nir_gs_mesh_take(owned, &reason);
+      CHECK(mesh == owned);
+      CHECK(mesh->info.stage == MESA_SHADER_MESH);
+      ralloc_free(mesh);
+
+      nir_shader *bad = source(3, 0, false);
+      bad->info.writes_memory = true;
+      CHECK(hk_nir_gs_mesh_take(bad, &reason) == NULL);
+      CHECK(reason != NULL);
+   }
    compile(3, false);
    compile(4, false);
    compile(3, true);

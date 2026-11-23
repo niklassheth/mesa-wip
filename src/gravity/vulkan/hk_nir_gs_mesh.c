@@ -260,22 +260,12 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
-nir_shader *
-hk_nir_gs_mesh(const nir_shader *source, const char **reason)
+static void
+hk_nir_gs_mesh_lower(nir_shader *nir)
 {
-   if (reason)
-      *reason = NULL;
-   if (!supported(source, reason))
-      return NULL;
-   nir_shader *nir = nir_shader_clone(NULL, source);
-   if (!nir) {
-      if (reason)
-         *reason = "out of memory cloning GS mesh probe";
-      return NULL;
-   }
    NIR_PASS(_, nir, nir_lower_returns);
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
-   unsigned vertices = source->info.gs.vertices_out;
+   unsigned vertices = nir->info.gs.vertices_out;
    /* Packing covers the qualified per-triangle shapes V3/P1 and V4/P2. */
    const unsigned pack =
       hk_apple9_native_gs_pack_enabled() && (vertices == 3 || vertices == 4)
@@ -291,7 +281,7 @@ hk_nir_gs_mesh(const nir_shader *source, const char **reason)
       .align_mul = 4);
    /* One logical GS run per (input triangle, invocation), invocations of a
     * triangle consecutive, so output order is API order. */
-   const unsigned invocations = MAX2(source->info.gs.invocations, 1);
+   const unsigned invocations = MAX2(nir->info.gs.invocations, 1);
    nir_def *run = pack > 1 ? nir_iadd(&b, nir_imul_imm(&b, group, pack), lane) : group;
    struct gs_mesh_state s = {
       .invocation = invocations > 1 ? nir_umod_imm(&b, run, invocations) : nir_imm_int(&b, 0),
@@ -417,5 +407,36 @@ hk_nir_gs_mesh(const nir_shader *source, const char **reason)
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    nir_shader_gather_info(nir, impl);
    nir_validate_shader(nir, "GS mesh emission lowering");
+}
+
+nir_shader *
+hk_nir_gs_mesh_take(nir_shader *nir, const char **reason)
+{
+   if (reason)
+      *reason = NULL;
+   if (!nir)
+      return NULL;
+   if (!supported(nir, reason)) {
+      ralloc_free(nir);
+      return NULL;
+   }
+   hk_nir_gs_mesh_lower(nir);
+   return nir;
+}
+
+nir_shader *
+hk_nir_gs_mesh(const nir_shader *source, const char **reason)
+{
+   if (reason)
+      *reason = NULL;
+   if (!supported(source, reason))
+      return NULL;
+   nir_shader *nir = nir_shader_clone(NULL, source);
+   if (!nir) {
+      if (reason)
+         *reason = "out of memory cloning GS mesh probe";
+      return NULL;
+   }
+   hk_nir_gs_mesh_lower(nir);
    return nir;
 }

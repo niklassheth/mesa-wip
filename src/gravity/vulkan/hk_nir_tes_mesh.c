@@ -175,20 +175,9 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 }
 
-nir_shader *
-hk_nir_tes_mesh(const nir_shader *source, const char **reason)
+static void
+hk_nir_tes_mesh_lower(nir_shader *nir, unsigned vertices_in)
 {
-   if (reason)
-      *reason = NULL;
-   unsigned vertices_in;
-   if (!supported(source, &vertices_in, reason))
-      return NULL;
-   nir_shader *nir = nir_shader_clone(NULL, source);
-   if (!nir) {
-      if (reason)
-         *reason = "out of memory cloning TES mesh probe";
-      return NULL;
-   }
    NIR_PASS(_, nir, nir_lower_returns);
    /* Preserve the existing index winding, coordinate and TCS-buffer ABI. */
    NIR_PASS(_, nir, poly_nir_lower_tes, false);
@@ -276,5 +265,38 @@ hk_nir_tes_mesh(const nir_shader *source, const char **reason)
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    nir_shader_gather_info(nir, impl);
    nir_validate_shader(nir, "TES mesh lowering");
+}
+
+nir_shader *
+hk_nir_tes_mesh_take(nir_shader *nir, const char **reason)
+{
+   if (reason)
+      *reason = NULL;
+   if (!nir)
+      return NULL;
+   unsigned vertices_in;
+   if (!supported(nir, &vertices_in, reason)) {
+      ralloc_free(nir);
+      return NULL;
+   }
+   hk_nir_tes_mesh_lower(nir, vertices_in);
+   return nir;
+}
+
+nir_shader *
+hk_nir_tes_mesh(const nir_shader *source, const char **reason)
+{
+   if (reason)
+      *reason = NULL;
+   unsigned vertices_in;
+   if (!supported(source, &vertices_in, reason))
+      return NULL;
+   nir_shader *nir = nir_shader_clone(NULL, source);
+   if (!nir) {
+      if (reason)
+         *reason = "out of memory cloning TES mesh probe";
+      return NULL;
+   }
+   hk_nir_tes_mesh_lower(nir, vertices_in);
    return nir;
 }

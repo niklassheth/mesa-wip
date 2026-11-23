@@ -183,6 +183,17 @@ polygon_points_no_position(void)
       nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
       CHECK(b.shader->info.outputs_written & VARYING_BIT_POS);
       CHECK(b.shader->info.outputs_written & VARYING_BIT_FOGC);
+      CHECK(nir_shader_intrinsics_pass(b.shader, hk_apple9_split_pp_face_prim,
+                                       nir_metadata_control_flow, NULL));
+      nir_validate_shader(b.shader, "gs_pp_with_pos_split");
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      CHECK(b.shader->info.outputs_written & VARYING_BIT_FOGC);
+      CHECK(b.shader->info.outputs_written & VARYING_BIT_PRIMITIVE_ID);
+      CHECK(hk_per_vertex_copy_slot(VARYING_SLOT_TEX0, 0) == VARYING_SLOT_TEX0);
+      CHECK(hk_per_vertex_copy_slot(VARYING_SLOT_TEX0, 2) == VARYING_SLOT_TEX2);
+      CHECK(hk_per_vertex_copy_slot(VARYING_SLOT_BFC0, 0) == VARYING_SLOT_BFC0);
+      CHECK(hk_per_vertex_copy_slot(VARYING_SLOT_BFC0, 1) == VARYING_SLOT_BFC1);
+      CHECK(hk_per_vertex_copy_slot(VARYING_SLOT_BFC0, 2) == VARYING_SLOT_CLIP_VERTEX);
       ralloc_free(b.shader);
    }
 

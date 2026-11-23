@@ -580,6 +580,20 @@ main(void)
    object_grid();
    rejections();
    levels();
+   /* Consuming entrypoint lowers in place without a second clone and frees on reject. */
+   {
+      nir_shader *owned = source(false, false, false);
+      const char *reason = NULL;
+      nir_shader *mesh = hk_nir_tes_mesh_take(owned, &reason);
+      CHECK(mesh == owned);
+      CHECK(mesh->info.stage == MESA_SHADER_MESH);
+      ralloc_free(mesh);
+
+      nir_shader *bad = source(false, false, false);
+      bad->info.writes_memory = true;
+      CHECK(hk_nir_tes_mesh_take(bad, &reason) == NULL);
+      CHECK(reason != NULL);
+   }
    printf(
       "%u bounds/winding/partial-output cases, 15 immutable rejections, tess-level bounds, 8 native compilations, 10 object grid cases + object compilation passed\n",
       bounds_cases);

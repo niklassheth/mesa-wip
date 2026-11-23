@@ -100,14 +100,6 @@ struct hk_apple9_passthrough_suffix {
  * i-th vertex.
  */
 
-static inline unsigned
-hk_ptgs_per_vertex_copy_slot(uint8_t base, unsigned vertex)
-{
-   if (base == VARYING_SLOT_BFC0 && vertex == 2)
-      return VARYING_SLOT_CLIP_VERTEX;
-   return base + vertex;
-}
-
 static void
 hk_apple9_write_per_vertex_copies(nir_shader *s,
                                   const struct hk_apple9_passthrough_suffix *suffix)
@@ -152,7 +144,7 @@ hk_apple9_write_per_vertex_copies(nir_shader *s,
                   },
                   .dest_type = nir_type_uint32);
                unsigned copy =
-                  hk_ptgs_per_vertex_copy_slot(suffix->per_vertex_copy_base[j], k);
+                  hk_per_vertex_copy_slot(suffix->per_vertex_copy_base[j], k);
                for (unsigned c = 0; c < 4; ++c) {
                   nir_store_output(&b, nir_channel(&b, value, c), nir_imm_int(&b, 0),
                                    .io_semantics = {.location = copy, .num_slots = 1},
@@ -324,28 +316,6 @@ hk_pp_gs_load(nir_builder *b, void *data, unsigned vertex, unsigned location,
       .io_semantics = {.location = location, .num_slots = num_slots});
 }
 
-static bool
-hk_ptgs_split_pp_face_prim(nir_builder *b, nir_intrinsic_instr *intr,
-                           UNUSED void *data)
-{
-   if (intr->intrinsic != nir_intrinsic_store_output ||
-       nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_FOGC ||
-       intr->src[0].ssa->num_components < 2)
-      return false;
-   b->cursor = nir_before_instr(&intr->instr);
-   nir_def *val = intr->src[0].ssa;
-   nir_store_output(b, nir_channel(b, val, 0), nir_imm_int(b, 0),
-                    .write_mask = 0x1, .src_type = nir_type_uint32,
-                    .io_semantics = {.location = VARYING_SLOT_FOGC,
-                                     .num_slots = 1});
-   nir_store_output(b, nir_channel(b, val, 1), nir_imm_int(b, 0),
-                    .write_mask = 0x1, .src_type = nir_type_uint32,
-                    .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_ID,
-                                     .num_slots = 1});
-   nir_instr_remove(&intr->instr);
-   return true;
-}
-
 /*
  * Polygon mode POINT for vertex and evaluation shader pipelines: a generated
  * geometry shader draws each input triangle's clipped vertices as points,
@@ -403,7 +373,7 @@ hk_apple9_polygon_point_gs(nir_builder *b,
    nir_def *provoking = nir_bcsel(b, last, nir_imm_int(b, 2), nir_imm_int(b, 0));
    hk_apple9_pp_emit_triangle(b, &info, hk_pp_gs_load, &l, provoking,
                               nir_load_primitive_id(b), NULL);
-   nir_shader_intrinsics_pass(s, hk_ptgs_split_pp_face_prim,
+   nir_shader_intrinsics_pass(s, hk_apple9_split_pp_face_prim,
                               nir_metadata_control_flow, NULL);
 }
 
@@ -587,7 +557,7 @@ hk_apple9_mesh_rast_meta(struct hk_device *dev,
       for (unsigned j = 0; j < key.per_vertex_copies; ++j) {
          for (unsigned k = 0; k < 3; ++k) {
             key.fs_interp[0] |= BITFIELD64_BIT(
-               hk_ptgs_per_vertex_copy_slot(key.per_vertex_copy_base[j], k));
+               hk_per_vertex_copy_slot(key.per_vertex_copy_base[j], k));
          }
       }
       if (key.per_vertex_bary[1])
@@ -798,7 +768,7 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
       for (unsigned j = 0; j < suffix.per_vertex_copies; ++j) {
          for (unsigned k = 0; k < 3; ++k) {
             suffix.fs_interp[0] |= BITFIELD64_BIT(
-               hk_ptgs_per_vertex_copy_slot(suffix.per_vertex_copy_base[j], k));
+               hk_per_vertex_copy_slot(suffix.per_vertex_copy_base[j], k));
          }
       }
       if (suffix.per_vertex_bary[1])

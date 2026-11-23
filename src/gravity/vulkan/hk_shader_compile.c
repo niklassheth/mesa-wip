@@ -897,14 +897,6 @@ hk_apple9_compile_tes_mesh_program(
    return compiled;
 }
 
-static inline unsigned
-hk_compile_per_vertex_copy_slot(uint8_t base, unsigned vertex)
-{
-   if (base == VARYING_SLOT_BFC0 && vertex == 2)
-      return VARYING_SLOT_CLIP_VERTEX;
-   return base + vertex;
-}
-
 static unsigned
 hk_apple9_output_publications(const nir_shader *nir)
 {
@@ -953,28 +945,6 @@ hk_apple9_psiz_fits(const nir_shader *nir)
    if (nir->info.outputs_written & VARYING_BIT_PSIZ)
       return true;
    return hk_apple9_slot_fits(nir, 1);
-}
-
-static bool
-hk_compile_split_pp_face_prim(nir_builder *b, nir_intrinsic_instr *intr,
-                              UNUSED void *data)
-{
-   if (intr->intrinsic != nir_intrinsic_store_output ||
-       nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_FOGC ||
-       intr->src[0].ssa->num_components < 2)
-      return false;
-   b->cursor = nir_before_instr(&intr->instr);
-   nir_def *val = intr->src[0].ssa;
-   nir_store_output(b, nir_channel(b, val, 0), nir_imm_int(b, 0),
-                    .write_mask = 0x1, .src_type = nir_type_uint32,
-                    .io_semantics = {.location = VARYING_SLOT_FOGC,
-                                     .num_slots = 1});
-   nir_store_output(b, nir_channel(b, val, 1), nir_imm_int(b, 0),
-                    .write_mask = 0x1, .src_type = nir_type_uint32,
-                    .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_ID,
-                                     .num_slots = 1});
-   nir_instr_remove(&intr->instr);
-   return true;
 }
 
 static bool
@@ -1291,7 +1261,7 @@ hk_apple9_lower_gs_polygon_points(nir_shader *gs, struct hk_pp_info info,
    util_dynarray_fini(&todo);
 
    if (info.face_slot == VARYING_SLOT_FOGC) {
-      nir_shader_intrinsics_pass(gs, hk_compile_split_pp_face_prim,
+      nir_shader_intrinsics_pass(gs, hk_apple9_split_pp_face_prim,
                                  nir_metadata_control_flow, NULL);
    }
    gs->info.gs.output_primitive = MESA_PRIM_POINTS;
@@ -1628,8 +1598,7 @@ hk_apple9_native_gs_check(const nir_shader *source,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    NIR_PASS(_, normalized, nir_shader_intrinsics_pass, hk_apple9_lower_roots,
             nir_metadata_control_flow, NULL);
-   nir_shader *mesh = hk_nir_gs_mesh(normalized, reason);
-   ralloc_free(normalized);
+   nir_shader *mesh = hk_nir_gs_mesh_take(normalized, reason);
    if (!mesh) {
       if (debug_get_option_gs_native_log())
          fprintf(stderr, "HK_GS_CAP accepted=0 reason=%s\n", *reason ?: "lowering");
@@ -1689,8 +1658,7 @@ hk_apple9_native_tess_check(const nir_shader *source,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    NIR_PASS(_, normalized, nir_shader_intrinsics_pass, hk_apple9_lower_roots,
             nir_metadata_control_flow, NULL);
-   nir_shader *mesh = hk_nir_tes_mesh(normalized, reason);
-   ralloc_free(normalized);
+   nir_shader *mesh = hk_nir_tes_mesh_take(normalized, reason);
    if (!mesh) {
       if (debug_get_option_tess_native_log())
          fprintf(stderr, "HK_TESS_CAP accepted=0 reason=%s\n",
@@ -2832,7 +2800,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             for (unsigned j = 0; copies_from_gs && j < per_vertex.count; ++j) {
                for (unsigned k = 0; k < 3; ++k) {
                   unsigned slot =
-                     hk_compile_per_vertex_copy_slot(per_vertex.copy_base[j], k);
+                     hk_per_vertex_copy_slot(per_vertex.copy_base[j], k);
                   if (!varyings.mask[slot]) {
                      varyings.mask[slot] = 0xf;
                      varyings.group[slot] = 1;

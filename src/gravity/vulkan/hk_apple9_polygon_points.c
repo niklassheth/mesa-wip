@@ -318,3 +318,25 @@ hk_apple9_pp_emit_triangle(nir_builder *b, const struct hk_pp_info *info,
       nir_pop_if(b, NULL);
 #undef FLAG
 }
+
+bool
+hk_apple9_split_pp_face_prim(nir_builder *b, nir_intrinsic_instr *intr,
+                             UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output ||
+       nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_FOGC ||
+       intr->src[0].ssa->num_components < 2)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *val = intr->src[0].ssa;
+   nir_store_output(b, nir_channel(b, val, 0), nir_imm_int(b, 0),
+                    .write_mask = 0x1, .src_type = nir_type_uint32,
+                    .io_semantics = {.location = VARYING_SLOT_FOGC,
+                                     .num_slots = 1});
+   nir_store_output(b, nir_channel(b, val, 1), nir_imm_int(b, 0),
+                    .write_mask = 0x1, .src_type = nir_type_uint32,
+                    .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_ID,
+                                     .num_slots = 1});
+   nir_instr_remove(&intr->instr);
+   return true;
+}
