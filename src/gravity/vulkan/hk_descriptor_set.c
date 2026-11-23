@@ -178,7 +178,7 @@ hk_pack_storage_image(struct hk_device *dev, void *out,
    struct hk_apple9_storage_descriptor *ext = out;
    if (view) {
       *ext = view->apple9_storage;
-      hk_gpu_busy_storage_format(view->vk.format, 0);
+      hk_gpu_busy_storage_format(view->vk.format, ext->native_ok);
    } else {
       *ext = (struct hk_apple9_storage_descriptor){0};
       agx_set_null_pbe(&ext->pbe_sw);

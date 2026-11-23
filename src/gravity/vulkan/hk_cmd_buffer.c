@@ -488,10 +488,16 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
 
    list_for_each_entry_safe(struct hk_cs, cs, &cmd->control_streams, node) {
       if (cs->type == HK_CS_CDM && last && last->type == HK_CS_CDM &&
-          !last->timestamp.end.handle) {
+          !last->timestamp.end.handle &&
+          last->end_reason != HK_CS_END_PASS_SPLIT) {
 
          hk_cs_merge_cdm(last, cs, hk_cmd_buffer_device(cmd));
          last->sync_stages |= cs->sync_stages;
+         if (!last->pass_code && cs->pass_code) {
+            last->pass_code = cs->pass_code;
+            memcpy(last->pass_grid, cs->pass_grid, sizeof(last->pass_grid));
+         }
+         last->pass_count += cs->pass_count;
          *util_dynarray_element(&cmd->sync_remap, uint32_t, cs->sync_id) =
             last->sync_id;
          hk_sync_remap_first_event(cmd->sync_first_event.data, cs->sync_id,

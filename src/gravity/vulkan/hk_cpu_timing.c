@@ -52,6 +52,7 @@
  *   sub_<step>_ns=... sub_<step>_n=...
  */
 
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -410,13 +411,17 @@ hk_cpu_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR *i)
 /* Device destruction prints the final counters. */
 /* A destructor rather than atexit: the loader may unload the driver before
  * the process exits. */
+static pthread_mutex_t hk_cpu_install_lock = PTHREAD_MUTEX_INITIALIZER;
+
 __attribute__((destructor)) static void
 hk_cpu_report_unload(void)
 {
+   pthread_mutex_lock(&hk_cpu_install_lock);
    if (hk_cpu_level && hk_cpu_out) {
       hk_cpu_report(true);
       fflush(hk_cpu_out);
    }
+   pthread_mutex_unlock(&hk_cpu_install_lock);
 }
 
 static PFN_vkDestroyDevice hk_cpu_orig_DestroyDevice;
@@ -441,6 +446,8 @@ hk_cpu_timing_install(struct vk_device_dispatch_table *t)
    const char *level = getenv("HK_CPU_TIMING");
    if (!level || !atoi(level))
       return;
+
+   pthread_mutex_lock(&hk_cpu_install_lock);
    hk_cpu_level = atoi(level);
 
    if (!hk_cpu_out) {
@@ -481,6 +488,7 @@ hk_cpu_timing_install(struct vk_device_dispatch_table *t)
    HK_INSTALL(CmdPushConstants);
    HK_INSTALL(CmdBindVertexBuffers2);
    HK_INSTALL(CmdBindIndexBuffer);
+   pthread_mutex_unlock(&hk_cpu_install_lock);
 }
 
 void

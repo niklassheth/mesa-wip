@@ -52,51 +52,10 @@ struct busy_pass {
    bool used;
    uint64_t commands, ns[4];
 };
-static struct busy_pass passes[PASS_SLOTS];
-static uint64_t passes_dropped, pass_next_dump_ns;
-static struct busy_pass_key pending_pass;
-
-static void
-pass_add(const struct busy_pass_key *key, unsigned engine, uint64_t ns, bool first)
-{
-   /* Hash the whole key: code addresses are page aligned and render keys have
-    * no grid or count, so a key-derived index lands most passes in a few
-    * probe chains, and later passes are dropped once those fill. */
-   uint32_t h = _mesa_hash_data(key, sizeof(*key));
-   for (unsigned probe = 0; probe < 64; ++probe) {
-      struct busy_pass *p = &passes[(h + probe) % PASS_SLOTS];
-      if (!p->used) {
-         p->used = true;
-         p->key = *key;
-      } else if (memcmp(&p->key, key, sizeof(*key))) {
-         continue;
-      }
-      p->ns[engine] += ns;
-      p->commands += first;
-      return;
-   }
-   passes_dropped++;
-}
 
 struct busy_device;
 static void busy_printf(struct busy_device *d, const char *fmt, ...)
    __attribute__((format(printf, 2, 3)));
-
-static void
-pass_dump(struct busy_device *f, uint64_t now)
-{
-   busy_printf(f, "GPU_PASS_BEGIN cpu_ns=%" PRIu64 " dropped=%" PRIu64 "\n", now, passes_dropped);
-   for (unsigned i = 0; i < PASS_SLOTS; ++i) {
-      struct busy_pass *p = &passes[i];
-      if (!p->used)
-         continue;
-      busy_printf(f, "GPU_PASS code=0x%" PRIx64 " grid=%u,%u,%u count=%u flags=%u commands=%" PRIu64
-              " vertex_ns=%" PRIu64 " fragment_ns=%" PRIu64 " compute_ns=%" PRIu64 "\n",
-              p->key.code, p->key.grid[0], p->key.grid[1], p->key.grid[2], p->key.count, p->key.flags,
-              p->commands, p->ns[1], p->ns[2], p->ns[3]);
-   }
-   busy_printf(f, "GPU_PASS_END cpu_ns=%" PRIu64 "\n", now);
-}
 
 struct busy_bin {
    uint64_t second, revision, pairs;
@@ -113,6 +72,7 @@ struct hk_gpu_busy_queue {
    volatile uint64_t *map;
    uint32_t handle;
    uint64_t submit_cpu_ns;
+   struct busy_pass_key pending_pass;
    struct busy_slot slots[BUSY_SLOTS];
    unsigned free_slots[BUSY_SLOTS], free_count;
 };
@@ -130,13 +90,73 @@ struct busy_device {
    size_t out_len, out_cap;
    uint64_t next_sample_ns;
    struct busy_bin bins[BUSY_SECONDS];
+   struct busy_pass *passes;
+   uint64_t passes_dropped, pass_next_dump_ns;
    uint64_t pairs_requested, pairs_written, pairs_collected;
    uint64_t app_pairs, full_pairs, initial_pairs, invalid_pairs, late_pairs;
    uint64_t queries, query_errors;
    bool timeline_clock_calibrated;
 };
 
+static void
+pass_add(struct busy_device *d, const struct busy_pass_key *key,
+         unsigned engine, uint64_t ns, bool first)
+{
+   if (!d->passes)
+      return;
+   /* Hash the whole key: code addresses are page aligned and render keys have
+    * no grid or count, so a key-derived index lands most passes in a few
+    * probe chains, and later passes are dropped once those fill. */
+   uint32_t h = _mesa_hash_data(key, sizeof(*key));
+   for (unsigned probe = 0; probe < 64; ++probe) {
+      struct busy_pass *p = &d->passes[(h + probe) % PASS_SLOTS];
+      if (!p->used) {
+         p->used = true;
+         p->key = *key;
+      } else if (memcmp(&p->key, key, sizeof(*key))) {
+         continue;
+      }
+      p->ns[engine] += ns;
+      p->commands += first;
+      return;
+   }
+   d->passes_dropped++;
+}
+
+static void
+pass_dump(struct busy_device *f, uint64_t now)
+{
+   if (!f->passes)
+      return;
+   busy_printf(f, "GPU_PASS_BEGIN cpu_ns=%" PRIu64 " dropped=%" PRIu64 "\n", now,
+               f->passes_dropped);
+   for (unsigned i = 0; i < PASS_SLOTS; ++i) {
+      struct busy_pass *p = &f->passes[i];
+      if (!p->used)
+         continue;
+      busy_printf(f, "GPU_PASS code=0x%" PRIx64 " grid=%u,%u,%u count=%u flags=%u commands=%" PRIu64
+              " vertex_ns=%" PRIu64 " fragment_ns=%" PRIu64 " compute_ns=%" PRIu64 "\n",
+              p->key.code, p->key.grid[0], p->key.grid[1], p->key.grid[2], p->key.count, p->key.flags,
+              p->commands, p->ns[1], p->ns[2], p->ns[3]);
+   }
+   busy_printf(f, "GPU_PASS_END cpu_ns=%" PRIu64 "\n", now);
+}
+
 static pthread_mutex_t busy_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t collector_cond;
+static pthread_once_t collector_cond_once = PTHREAD_ONCE_INIT;
+static pthread_t collector_thread;
+static bool collector_running, collector_stop, collector_stopping;
+
+static void
+init_collector_cond(void)
+{
+   pthread_condattr_t attr;
+   pthread_condattr_init(&attr);
+   pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+   pthread_cond_init(&collector_cond, &attr);
+   pthread_condattr_destroy(&attr);
+}
 
 static void
 busy_printf(struct busy_device *d, const char *fmt, ...)
@@ -178,15 +198,21 @@ write_all(int fd, const char *data, size_t len)
 
 /* HK_GPU_BUSY_FILE enables busy counters, pass identity and shader identity;
  * without it every entry point returns at once. Read once. */
+static bool busy_enabled_flag;
+static pthread_once_t busy_enabled_once = PTHREAD_ONCE_INIT;
+
+static void
+busy_enabled_init(void)
+{
+   const char *file = getenv("HK_GPU_BUSY_FILE");
+   busy_enabled_flag = file && *file;
+}
+
 static bool
 busy_enabled(void)
 {
-   static int enabled = -1;
-   if (enabled < 0) {
-      const char *file = getenv("HK_GPU_BUSY_FILE");
-      enabled = file && *file;
-   }
-   return enabled;
+   pthread_once(&busy_enabled_once, busy_enabled_init);
+   return busy_enabled_flag;
 }
 static struct busy_device *devices;
 
@@ -355,7 +381,7 @@ collect(struct busy_device *d, uint64_t now)
                          agx_gpu_timestamp_to_ns(&d->dev->dev, start),
                          agx_gpu_timestamp_to_ns(&d->dev->dev, end));
             if (start && end > start)
-               pass_add(&slot->pass, engine,
+               pass_add(d, &slot->pass, engine,
                         agx_gpu_timestamp_to_ns(&d->dev->dev, end) -
                            agx_gpu_timestamp_to_ns(&d->dev->dev, start),
                         engine != FRAG);
@@ -365,8 +391,8 @@ collect(struct busy_device *d, uint64_t now)
       }
    }
    flush_log(d, now);
-   if (now >= pass_next_dump_ns) {
-      pass_next_dump_ns = now + 5 * SECOND_NS;
+   if (now >= d->pass_next_dump_ns) {
+      d->pass_next_dump_ns = now + 5 * SECOND_NS;
       pass_dump(d, now);
    }
 }
@@ -375,10 +401,11 @@ void
 hk_gpu_busy_set_pass(struct hk_queue *queue, uint64_t code,
                      const uint32_t grid[3], uint32_t count, uint32_t flags)
 {
-   if (!queue->gpu_busy)
+   struct hk_gpu_busy_queue *q = queue->gpu_busy;
+   if (!q)
       return;
    pthread_mutex_lock(&busy_lock);
-   pending_pass = (struct busy_pass_key){
+   q->pending_pass = (struct busy_pass_key){
       .code = code, .grid = {grid[0], grid[1], grid[2]}, .count = count, .flags = flags, .reserved = 0};
    pthread_mutex_unlock(&busy_lock);
 }
@@ -413,12 +440,31 @@ hk_gpu_busy_shader(uint64_t address, const void *code, uint32_t size,
 void
 hk_gpu_busy_storage_format(unsigned vk_format, unsigned store_encode)
 {
-   static bool seen[1024];
-   if (!busy_enabled() || vk_format >= ARRAY_SIZE(seen) || seen[vk_format])
+   if (!busy_enabled())
       return;
+   static struct {
+      uint64_t key;
+      bool used;
+   } seen[1024];
+   uint64_t key = ((uint64_t)vk_format << 8) | (store_encode & 0xffu);
+   uint32_t h = _mesa_hash_data(&key, sizeof(key));
    pthread_mutex_lock(&busy_lock);
-   if (!seen[vk_format]) {
-      seen[vk_format] = true;
+   bool found = false;
+   bool inserted = false;
+   for (unsigned probe = 0; probe < 64; ++probe) {
+      unsigned idx = (h + probe) % ARRAY_SIZE(seen);
+      if (!seen[idx].used) {
+         seen[idx].used = true;
+         seen[idx].key = key;
+         inserted = true;
+         break;
+      }
+      if (seen[idx].key == key) {
+         found = true;
+         break;
+      }
+   }
+   if (!found && inserted) {
       for (struct busy_device *d = devices; d; d = d->next) {
          busy_printf(d, "GPU_STORAGE_FORMAT vk=%u store_encode=%u\n",
                      vk_format, store_encode);
@@ -497,56 +543,108 @@ hk_gpu_busy_sample(struct hk_queue *queue)
 }
 
 /* Once a second: collect every device under busy_lock, then write what was
- * formatted with the lock dropped. */
+ * formatted with the lock dropped. Loop in batches so >8 devices never starve. */
 static void *
 collector_main(void *arg)
 {
-   for (;;) {
-      struct timespec second = {.tv_sec = 1};
-      while (nanosleep(&second, &second) && errno == EINTR)
-         ;
-      struct pending {
-         int fd;
-         char *data;
-         size_t len;
-      } pending[8];
-      unsigned count = 0;
-      pthread_mutex_lock(&busy_lock);
+   pthread_mutex_lock(&busy_lock);
+   while (!collector_stop) {
+      struct timespec wake;
+      clock_gettime(CLOCK_MONOTONIC, &wake);
+      wake.tv_sec += 1;
+      int wret = pthread_cond_timedwait(&collector_cond, &busy_lock, &wake);
+      if (collector_stop)
+         break;
+      if (wret != 0 && wret != ETIMEDOUT)
+         continue;
+
       uint64_t now = os_time_get_nano();
       for (struct busy_device *d = devices; d; d = d->next) {
          if (now >= d->next_sample_ns) {
             d->next_sample_ns = now + SECOND_NS;
             collect(d, now);
          }
-         if (!d->out_len || count == ARRAY_SIZE(pending))
-            continue;
-         int fd = dup(d->fd);
-         if (fd < 0)
-            continue;
-         pending[count++] = (struct pending){fd, d->out, d->out_len};
-         d->out = NULL;
-         d->out_len = d->out_cap = 0;
       }
-      pthread_mutex_unlock(&busy_lock);
-      for (unsigned i = 0; i < count; ++i) {
-         write_all(pending[i].fd, pending[i].data, pending[i].len);
-         close(pending[i].fd);
-         free(pending[i].data);
+
+      for (;;) {
+         struct pending {
+            int fd;
+            char *data;
+            size_t len;
+         } pending[8];
+         unsigned count = 0;
+         for (struct busy_device *d = devices; d && count < ARRAY_SIZE(pending);
+              d = d->next) {
+            if (!d->out_len)
+               continue;
+            int fd = dup(d->fd);
+            if (fd < 0)
+               continue;
+            pending[count++] = (struct pending){fd, d->out, d->out_len};
+            d->out = NULL;
+            d->out_len = d->out_cap = 0;
+         }
+         if (!count)
+            break;
+         pthread_mutex_unlock(&busy_lock);
+         for (unsigned i = 0; i < count; ++i) {
+            write_all(pending[i].fd, pending[i].data, pending[i].len);
+            close(pending[i].fd);
+            free(pending[i].data);
+         }
+         pthread_mutex_lock(&busy_lock);
+         if (count < ARRAY_SIZE(pending))
+            break;
       }
    }
+   pthread_mutex_unlock(&busy_lock);
    return NULL;
 }
 
 static void
-start_collector(void)
+start_collector_locked(void)
 {
-   pthread_t thread;
-   pthread_attr_t attr;
-   pthread_attr_init(&attr);
-   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-   if (pthread_create(&thread, &attr, collector_main, NULL))
+   pthread_once(&collector_cond_once, init_collector_cond);
+   while (collector_stopping)
+      pthread_cond_wait(&collector_cond, &busy_lock);
+   if (collector_running)
+      return;
+   collector_stop = false;
+   if (pthread_create(&collector_thread, NULL, collector_main, NULL)) {
       fprintf(stderr, "HK GPU busy collector thread unavailable\n");
-   pthread_attr_destroy(&attr);
+      return;
+   }
+   collector_running = true;
+}
+
+static void
+stop_collector_locked(void)
+{
+   if (!collector_running)
+      return;
+   if (collector_stopping) {
+      while (collector_stopping)
+         pthread_cond_wait(&collector_cond, &busy_lock);
+      return;
+   }
+   collector_stop = true;
+   collector_stopping = true;
+   pthread_t thread = collector_thread;
+   pthread_cond_broadcast(&collector_cond);
+   pthread_mutex_unlock(&busy_lock);
+   pthread_join(thread, NULL);
+   pthread_mutex_lock(&busy_lock);
+   collector_running = false;
+   collector_stopping = false;
+   pthread_cond_broadcast(&collector_cond);
+}
+
+__attribute__((destructor)) static void
+hk_gpu_busy_unload(void)
+{
+   pthread_mutex_lock(&busy_lock);
+   stop_collector_locked();
+   pthread_mutex_unlock(&busy_lock);
 }
 
 static bool
@@ -584,7 +682,7 @@ instrument(struct hk_queue *queue, struct drm_asahi_timestamps *first,
    }
    unsigned index = q->free_slots[--q->free_count];
    q->slots[index] = (struct busy_slot){
-      .pass = pending_pass,
+      .pass = q->pending_pass,
       .point = queue->drm.timeline_value,
       .submit_cpu_ns = q->submit_cpu_ns,
       .engines =
@@ -661,6 +759,7 @@ hk_gpu_busy_init(struct hk_queue *queue)
          pthread_mutex_unlock(&busy_lock);
          goto fail;
       }
+      d->passes = calloc(PASS_SLOTS, sizeof(*d->passes));
       d->dev = dev;
       d->next = devices;
       devices = d;
@@ -693,9 +792,8 @@ hk_gpu_busy_init(struct hk_queue *queue)
    q->next = d->queues;
    d->queues = q;
    queue->gpu_busy = q;
+   start_collector_locked();
    pthread_mutex_unlock(&busy_lock);
-   static pthread_once_t collector_once = PTHREAD_ONCE_INIT;
-   pthread_once(&collector_once, start_collector);
    return;
 fail:
    fprintf(stderr, "HK GPU busy counters unavailable for queue %u\n",
@@ -734,7 +832,10 @@ hk_gpu_busy_finish(struct hk_queue *queue)
       write_all(d->fd, d->out, d->out_len);
       close(d->fd);
       free(d->out);
+      free(d->passes);
       free(d);
+      if (!devices)
+         stop_collector_locked();
    }
    pthread_mutex_unlock(&busy_lock);
    struct hk_device *dev = hk_queue_device(queue);
