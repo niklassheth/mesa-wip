@@ -1128,7 +1128,8 @@ hk_gs_pp_load(nir_builder *b, void *data, unsigned vertex, unsigned location,
 static bool
 hk_apple9_gs_polygon_points_ok(const nir_shader *gs)
 {
-   if (gs->info.gs.output_primitive != MESA_PRIM_TRIANGLE_STRIP)
+   if (gs->info.gs.output_primitive != MESA_PRIM_TRIANGLE_STRIP ||
+       !(gs->info.outputs_written & VARYING_BIT_POS))
       return false;
    unsigned per_triangle = 3 + 3 + gs->info.clip_distance_array_size;
    unsigned triangles =
