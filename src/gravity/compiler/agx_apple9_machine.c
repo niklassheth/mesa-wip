@@ -1548,6 +1548,7 @@ static const struct agx_apple9_encoding_info encodings[] = {
       {
          .name = "exec_mask_push",
          .length = 4,
+         .dependency_layout = AGX_APPLE9_DEPENDENCY_MASK_12_17,
          .operand_count = 0,
          .allocator_safe = true,
          .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
@@ -2249,9 +2250,12 @@ static const struct agx_apple9_encoding_info encodings[] = {
          .operand_count = 0,
          .allocator_safe = true,
          .requires_prior_completion = true,
-         /* Native fragments open the test domain with the coverage
-          * publication still pending; the coverage instruction waits. */
-         .prior_completion_exempt = AGX_APPLE9_COMPLETION_PUBLICATION,
+         /* Native fragments open tile access with pending coverage publications,
+          * memory loads, and texture loads still in flight; TILE_STORE/COVERAGE
+          * fold the wait directly. */
+         .prior_completion_exempt = AGX_APPLE9_COMPLETION_PUBLICATION |
+                                    AGX_APPLE9_COMPLETION_MEMORY |
+                                    AGX_APPLE9_COMPLETION_TEXTURE,
          .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
       },
    [AGX_APPLE9_ENC_TILE_LOAD] =
@@ -2269,6 +2273,7 @@ static const struct agx_apple9_encoding_info encodings[] = {
       {
          .name = "tile_store",
          .length = 12,
+         .dependency_layout = AGX_APPLE9_DEPENDENCY_MASK_12_17,
          .operand_count = 1,
          .allocator_safe = true,
          .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,

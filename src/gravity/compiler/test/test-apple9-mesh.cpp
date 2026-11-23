@@ -1596,6 +1596,8 @@ TEST(Apple9MemEncoding, NativeImageWrite3DCube16BitFragmentAndFences)
       {AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP, 0x00, {0x07, 0x14, 0x54, 0x51, 0x0e, 0x00}},
       {AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP, 0x06, {0x07, 0x64, 0x54, 0x51, 0x0e, 0x00}},
       {AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP, 0x00, {0x07, 0x04, 0x54, 0xd1, 0x0e, 0x00}},
+      {AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP_MEM, 0x06, {0x07, 0x64, 0x54, 0x50, 0x0e, 0x00}},
+      {AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP_MEM, 0x00, {0x07, 0x04, 0x54, 0xd0, 0x0e, 0x00}},
    };
    const uint8_t zero_phys[] = {0};
    for (const auto &f : fences) {
@@ -1609,6 +1611,129 @@ TEST(Apple9MemEncoding, NativeImageWrite3DCube16BitFragmentAndFences)
          << (reason ?: "");
       ASSERT_EQ(packed.length, 6u);
       EXPECT_EQ(memcmp(packed.bytes, f.expected, 6), 0);
+   }
+
+   /* Scope-matched workgroup barriers (0x0961, 0x0941, 0x0885) and zero-byte
+    * compiler barrier. */
+   const struct {
+      enum agx_apple9_workgroup_barrier_mode mode;
+      uint8_t expected[6];
+   } wg_bars[] = {
+      {AGX_APPLE9_WORKGROUP_BARRIER_SHARED, {0x07, 0x04, 0x54, 0x61, 0x09, 0x00}},
+      {AGX_APPLE9_WORKGROUP_BARRIER_NONE,   {0x07, 0x04, 0x54, 0x41, 0x09, 0x00}},
+      {AGX_APPLE9_WORKGROUP_BARRIER_DEVICE, {0x07, 0x04, 0x54, 0x85, 0x08, 0x00}},
+   };
+   for (const auto &wb : wg_bars) {
+      agx_apple9_vir_instr I = {};
+      I.op = AGX_APPLE9_VIR_WORKGROUP_BARRIER;
+      I.encoding = AGX_APPLE9_ENC_WORKGROUP_BARRIER;
+      I.dest = AGX_APPLE9_VREG_INVALID;
+      I.immediate = wb.mode;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&I, zero_phys, &packed, &reason))
+         << (reason ?: "");
+      ASSERT_EQ(packed.length, 6u);
+      EXPECT_EQ(memcmp(packed.bytes, wb.expected, 6), 0);
+   }
+   {
+      agx_apple9_vir_instr cb = {};
+      cb.op = AGX_APPLE9_VIR_DEVICE_FENCE;
+      cb.encoding = AGX_APPLE9_ENC_PSEUDO;
+      cb.dest = AGX_APPLE9_VREG_INVALID;
+      cb.immediate = AGX_APPLE9_FENCE_COMPILER_BARRIER;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&cb, zero_phys, &packed, &reason))
+         << (reason ?: "");
+      EXPECT_EQ(packed.length, 0u);
+   }
+   /* EXEC_MASK_PUSH wait folding (Metal: 0f 15 54 21 / 0f 05 56 21). */
+   {
+      agx_apple9_vir_instr push = {};
+      push.op = AGX_APPLE9_VIR_EXEC_MASK_PUSH;
+      push.encoding = AGX_APPLE9_ENC_EXEC_MASK_PUSH;
+      push.dest = AGX_APPLE9_VREG_INVALID;
+      push.immediate = AGX_APPLE9_EXEC_MASK_SOURCE(0) | AGX_APPLE9_EXEC_MASK_INVERT;
+      push.scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&push, zero_phys, &packed, &reason))
+         << (reason ?: "");
+      const uint8_t exp_slot1[] = {0x0f, 0x15, 0x54, 0x21};
+      ASSERT_EQ(packed.length, 4u);
+      EXPECT_EQ(memcmp(packed.bytes, exp_slot1, 4), 0);
+      push.scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_6;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&push, zero_phys, &packed, &reason))
+         << (reason ?: "");
+      const uint8_t exp_slot6[] = {0x0f, 0x05, 0x56, 0x21};
+      ASSERT_EQ(packed.length, 4u);
+      EXPECT_EQ(memcmp(packed.bytes, exp_slot6, 4), 0);
+   }
+
+   /* Verify agx_apple9_validate_vir_allocation() accepts all new barrier/fence
+    * forms (0x0941, 0x0885, 0x0e50, 0x0ed0, 0-byte COMPILER_BARRIER) and folded
+    * scoreboard waits on EXEC_MASK_PUSH. */
+   {
+      agx_apple9_vir_program vp;
+      agx_apple9_vir_init(&vp);
+      auto *blk = agx_apple9_block_create(&vp);
+      ASSERT_NE(blk, nullptr);
+      agx_apple9_block_begin(&vp, blk);
+      ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+         &vp, AGX_APPLE9_VIR_WORKGROUP_BARRIER, AGX_APPLE9_ENC_WORKGROUP_BARRIER,
+         nullptr, 0, AGX_APPLE9_WORKGROUP_BARRIER_NONE));
+      ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+         &vp, AGX_APPLE9_VIR_WORKGROUP_BARRIER, AGX_APPLE9_ENC_WORKGROUP_BARRIER,
+         nullptr, 0, AGX_APPLE9_WORKGROUP_BARRIER_DEVICE));
+      ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+         &vp, AGX_APPLE9_VIR_DEVICE_FENCE, AGX_APPLE9_ENC_DEVICE_FENCE,
+         nullptr, 0, AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP_MEM));
+      ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+         &vp, AGX_APPLE9_VIR_DEVICE_FENCE, AGX_APPLE9_ENC_DEVICE_FENCE,
+         nullptr, 0, AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP_MEM));
+      ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+         &vp, AGX_APPLE9_VIR_DEVICE_FENCE, AGX_APPLE9_ENC_PSEUDO,
+         nullptr, 0, AGX_APPLE9_FENCE_COMPILER_BARRIER));
+      ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+         &vp, AGX_APPLE9_VIR_EXEC_MASK_PUSH, AGX_APPLE9_ENC_EXEC_MASK_PUSH,
+         nullptr, 0, AGX_APPLE9_EXEC_MASK_SOURCE(0)));
+      vp.instructions[vp.instruction_count - 1]->scoreboard_slot =
+         AGX_APPLE9_SCOREBOARD_SLOT_1;
+      ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+         &vp, AGX_APPLE9_VIR_EXEC_MASK_POP, AGX_APPLE9_ENC_EXEC_MASK_POP,
+         nullptr, 0, 0));
+      ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+         &vp, AGX_APPLE9_VIR_HALT, AGX_APPLE9_ENC_HALT, nullptr, 0, 0));
+      vp.phys = (uint8_t *)calloc(1, 1);
+      vp.phys_capacity = 1;
+      vp.publication = (bool *)calloc(1, sizeof(bool));
+      vp.publication_capacity = 1;
+      vp.dependencies_finalized = true;
+      reason = nullptr;
+      EXPECT_TRUE(agx_apple9_validate_vir_allocation(&vp, &reason))
+         << (reason ?: "");
+
+      /* Negative contract checks (MEDIUM #7): out-of-range fence_slot_mask and
+       * malformed ENC_PSEUDO on non-compiler-barrier DEVICE_FENCE must fail
+       * cleanly without aborting. */
+      vp.instructions[2]->fence_slot_mask = 0x40;
+      EXPECT_FALSE(agx_apple9_validate_vir_allocation(&vp, &reason));
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(vp.instructions[2], zero_phys,
+                                                   &packed, &reason));
+      vp.instructions[2]->fence_slot_mask = 0;
+
+      vp.instructions[3]->fence_slot_mask = 0x01;
+      EXPECT_FALSE(agx_apple9_validate_vir_allocation(&vp, &reason));
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(vp.instructions[3], zero_phys,
+                                                   &packed, &reason));
+      vp.instructions[3]->fence_slot_mask = 0;
+
+      vp.instructions[4]->fence_slot_mask = 0x01;
+      EXPECT_FALSE(agx_apple9_validate_vir_allocation(&vp, &reason));
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(vp.instructions[4], zero_phys,
+                                                   &packed, &reason));
+      vp.instructions[4]->fence_slot_mask = 0;
+
+      vp.instructions[2]->encoding = AGX_APPLE9_ENC_PSEUDO;
+      EXPECT_FALSE(agx_apple9_validate_vir_allocation(&vp, &reason));
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(vp.instructions[2], zero_phys,
+                                                   &packed, &reason));
+      agx_apple9_vir_finish(&vp);
    }
 }
 

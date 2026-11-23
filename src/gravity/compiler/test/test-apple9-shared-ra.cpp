@@ -1196,9 +1196,10 @@ TEST(Apple9SharedRa, AsyncImageStoresOverlapSixTuplesZeroJoinsAndDrainAtFence)
       EXPECT_EQ(slot_mask, BITFIELD_MASK(6));  /* All 6 slots 1..6 used. */
       EXPECT_EQ(fence_mask, BITFIELD_MASK(6)); /* FENCE_IMAGE_WRITE drains all 6 slots. */
       /* 6 back-to-back stores issue with ZERO waits between them; the 7th
-       * waits once when reusing p0..p7. All pending stores drain before 0x0650. */
+       * waits once when reusing p0..p7. 0x0650 drains all pending stores via
+       * its 6-bit mask with ZERO standalone WAIT at the fence. */
       EXPECT_EQ(waits_before_fence, count == 6 ? 0u : 1u);
-      EXPECT_EQ(waits_at_fence, 1u);
+      EXPECT_EQ(waits_at_fence, 0u);
       agx_apple9_vir_finish(&p);
       ralloc_free(nir.shader);
    }
@@ -1358,6 +1359,88 @@ TEST(Apple9SharedRa, NativeImageStoreExAndVolumeMinLodAllocateAndPack)
    }
    EXPECT_EQ(img_stores, 3u);
    EXPECT_EQ(samples, 1u);
+   agx_apple9_vir_finish(&p);
+   ralloc_free(nir.shader);
+}
+
+TEST(Apple9SharedRa, ImageFenceSlotMaskPropagatesAcrossReadFreeLoop)
+{
+   /* IMAGE_STORE #1 before a read-free loop and IMAGE_STORE #2 after the loop
+    * must both appear in the post-loop FENCE_IMAGE_WRITE fence_slot_mask, even
+    * though loop headers reset pending scoreboard state. */
+   nir_builder nir = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "img_fence_across_loop");
+   nir_block b0 = {}, b1 = {}, b_latch = {}, b2 = {};
+   b0.successors[0] = &b1;
+   b1.successors[0] = &b_latch;
+   b1.successors[1] = &b2; /* loop exit */
+   b_latch.successors[0] = &b1; /* loop backedge (no critical edge) */
+
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+   auto *blk0 = agx_apple9_block_create(&p);
+   auto *blk1 = agx_apple9_block_create(&p);
+   auto *blk_latch = agx_apple9_block_create(&p);
+   auto *blk2 = agx_apple9_block_create(&p);
+   blk0->nir = &b0;
+   blk1->nir = &b1;
+   blk_latch->nir = &b_latch;
+   blk2->nir = &b2;
+
+   agx_apple9_block_begin(&p, blk0);
+   uint32_t zero = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+      AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+   uint32_t one = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+      AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0x3f800000);
+   uint32_t coords3[] = {zero, zero, zero};
+   uint32_t rgba[] = {one, one, one, one};
+   /* Emit 2 stores before the loop so store #1 occupies slot 2 and store #2
+    * occupies slot 3; after the read-free loop, store #3 occupies slot 2 again
+    * (a distinct subset from {2, 3}), proving slot 3 was NOT dropped across the
+    * loop header! */
+   ASSERT_TRUE(agx_apple9_vir_emit_image_store_ex(
+      &p, coords3, rgba, zero, 0, 32, false, false));
+   ASSERT_TRUE(agx_apple9_vir_emit_image_store_ex(
+      &p, coords3, rgba, zero, 0, 32, false, false));
+
+   agx_apple9_block_begin(&p, blk1);
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_LOOP_MASK_PUSH, AGX_APPLE9_ENC_LOOP_MASK_PUSH,
+      nullptr, 0, 0));
+
+   agx_apple9_block_begin(&p, blk_latch);
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_LOOP_MASK_POP, AGX_APPLE9_ENC_LOOP_MASK_POP,
+      nullptr, 0, 0));
+
+   agx_apple9_block_begin(&p, blk2);
+   ASSERT_TRUE(agx_apple9_vir_emit_image_store_ex(
+      &p, coords3, rgba, zero, 0, 32, false, false));
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_DEVICE_FENCE, AGX_APPLE9_ENC_DEVICE_FENCE,
+      nullptr, 0, AGX_APPLE9_FENCE_IMAGE_WRITE));
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_HALT, AGX_APPLE9_ENC_HALT, nullptr, 0, 0));
+
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << (reason ?: "");
+
+   unsigned store_slots = 0;
+   unsigned fence_mask = 0;
+   unsigned fences = 0;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      const auto *I = p.instructions[i];
+      if (I->op == AGX_APPLE9_VIR_IMAGE_STORE)
+         store_slots |= BITFIELD_BIT(I->producer_scoreboard_slot - 1);
+      else if (I->op == AGX_APPLE9_VIR_DEVICE_FENCE &&
+               I->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE) {
+         fences++;
+         fence_mask = I->fence_slot_mask;
+      }
+   }
+   EXPECT_EQ(fences, 1u);
+   EXPECT_GE(util_bitcount(store_slots), 2u);
+   EXPECT_EQ(fence_mask & store_slots, store_slots);
    agx_apple9_vir_finish(&p);
    ralloc_free(nir.shader);
 }
@@ -1629,4 +1712,198 @@ TEST(Apple9SharedRa, TexturePublicationRotationAndBindlessHandleWarExemption)
 
    agx_apple9_vir_finish(&p);
    ralloc_free(nir.shader);
+}
+
+TEST(Apple9SharedRa, ImageFenceCfgFixpointAndReusedDeviceLoadWait)
+{
+   /* BLOCKER #1: IMAGE_STORE in block 0, conditionally fenced in block 1, then
+    * block 2 reuses the IMAGE_STORE's scoreboard slot for a DEVICE_LOAD before
+    * another FENCE_IMAGE_WRITE. Both fences must carry the reaching IMAGE_STORE
+    * slot bit via CFG fixpoint, AND block 2's FENCE_IMAGE_WRITE must NOT
+    * prematurely retire the reused DEVICE_LOAD slot. */
+   nir_builder nir = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "img_fence_cfg_reused_slot");
+   nir_block logical[4] = {};
+   logical[0].successors[0] = &logical[1];
+   logical[0].successors[1] = &logical[2];
+   logical[1].successors[0] = &logical[3];
+   logical[2].successors[0] = &logical[3];
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+
+   auto *b0 = agx_apple9_block_create(&p);
+   auto *b1 = agx_apple9_block_create(&p);
+   auto *b2 = agx_apple9_block_create(&p);
+   auto *b3 = agx_apple9_block_create(&p);
+   ASSERT_TRUE(b0 && b1 && b2 && b3);
+   b0->nir = &logical[0];
+   b1->nir = &logical[1];
+   b2->nir = &logical[2];
+   b3->nir = &logical[3];
+
+   agx_apple9_block_begin(&p, b0);
+   uint32_t gid = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+                                      AGX_APPLE9_ENC_GET_SR, nullptr, 0, 0);
+   uint32_t zero = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                       AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+   uint32_t xy[2] = {gid, zero};
+   uint32_t rgba[4] = {gid, zero, zero, zero};
+   ASSERT_TRUE(agx_apple9_vir_emit_image_store(&p, xy, rgba, zero,
+                                               AGX_APPLE9_VREG_INVALID, false));
+   ASSERT_TRUE(agx_apple9_vir_emit_branch(&p, AGX_APPLE9_VIR_JMP_EXEC_NONE,
+                                          AGX_APPLE9_ENC_JMP_EXEC_NONE, b2));
+
+   agx_apple9_block_begin(&p, b1);
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_DEVICE_FENCE, AGX_APPLE9_ENC_DEVICE_FENCE,
+      nullptr, 0, AGX_APPLE9_FENCE_IMAGE_WRITE));
+
+   agx_apple9_block_begin(&p, b2);
+   /* Else arm bypasses block 1's FENCE_IMAGE_WRITE and falls into b3. */
+
+   agx_apple9_block_begin(&p, b3);
+   agx_apple9_device_load_contract contract = {
+      .index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR,
+      .flags = AGX_APPLE9_DEVICE_LOAD_HAS_NEXT,
+      .raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_1100,
+   };
+   /* Fill the 5 non-img_slot scoreboard slots with non-sharing device atomics,
+    * then issue a DEVICE_LOAD which must evict IMAGE_STORE's slot (slot 2). */
+   uint32_t vals[6];
+   for (unsigned k = 0; k < 5; ++k) {
+      ASSERT_TRUE(agx_apple9_vir_emit_device_atomic(
+         &p, k + 1, gid, &zero, 1, AGX_APPLE9_ATOMIC_ADD, false, &vals[k]));
+   }
+   vals[5] = agx_apple9_vir_emit_device_load(&p, 6, gid, &contract);
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_DEVICE_FENCE, AGX_APPLE9_ENC_DEVICE_FENCE,
+      nullptr, 0, AGX_APPLE9_FENCE_IMAGE_WRITE));
+   uint32_t acc = vals[0];
+   for (unsigned k = 1; k < 6; ++k) {
+      uint32_t srcs[2] = {acc, vals[k]};
+      acc = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IADD,
+                                AGX_APPLE9_ENC_INT_ADD_EXTENDED, srcs, 2, 0);
+   }
+   ASSERT_TRUE(agx_apple9_vir_emit_device_store(&p, 0, gid, &acc, 1, 32));
+
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << (reason ?: "");
+
+   unsigned img_slot = 0;
+   unsigned fences = 0;
+   unsigned fence2_idx = UINT_MAX;
+   bool reused_load_seen = false;
+   bool waited_after_fence2 = false;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      const auto *I = p.instructions[i];
+      if (I->op == AGX_APPLE9_VIR_IMAGE_STORE) {
+         img_slot = I->producer_scoreboard_slot;
+         ASSERT_GE(img_slot, 1u);
+         ASSERT_LE(img_slot, 6u);
+      }
+      if (I->op == AGX_APPLE9_VIR_DEVICE_FENCE &&
+          I->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE) {
+         ++fences;
+         ASSERT_NE(img_slot, 0u);
+         EXPECT_NE(I->fence_slot_mask & BITFIELD_BIT(img_slot - 1), 0u)
+            << "fence #" << fences << " missed reaching IMAGE_STORE slot " << img_slot;
+         if (fences == 2)
+            fence2_idx = i;
+      }
+      if (fences == 1 && I->op == AGX_APPLE9_VIR_DEVICE_LOAD &&
+          I->producer_scoreboard_slot == img_slot)
+         reused_load_seen = true;
+      if (i > fence2_idx) {
+         if (I->op == AGX_APPLE9_VIR_WAIT &&
+             (I->immediate & BITFIELD_BIT(img_slot - 1)))
+            waited_after_fence2 = true;
+         if (I->scoreboard_slot == img_slot)
+            waited_after_fence2 = true;
+      }
+      agx_apple9_packed_instruction packed;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(I, p.phys, &packed, &reason))
+         << (reason ?: "");
+   }
+   EXPECT_EQ(fences, 2u);
+   EXPECT_TRUE(reused_load_seen);
+   EXPECT_TRUE(waited_after_fence2);
+
+   agx_apple9_vir_finish(&p);
+   ralloc_free(nir.shader);
+}
+
+TEST(Apple9SharedRa, CrossDomainAcquireBarrierDeviceAndShared)
+{
+   /* HIGH #4: acquire ordering across FENCE_COMPILER_BARRIER must order
+    * DEVICE_LOAD -> SHARED_LOAD and SHARED_LOAD -> DEVICE_LOAD. */
+   for (unsigned dir = 0; dir < 2; ++dir) {
+      nir_builder nir = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options,
+         dir == 0 ? "acquire_dev_to_shared" : "acquire_shared_to_dev");
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+
+      uint32_t gid = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+                                         AGX_APPLE9_ENC_GET_SR, nullptr, 0, 0);
+      agx_apple9_device_load_contract contract = {
+         .index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR,
+         .flags = AGX_APPLE9_DEVICE_LOAD_HAS_NEXT,
+         .raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_1100,
+      };
+      uint32_t first, second;
+      if (dir == 0) {
+         first = agx_apple9_vir_emit_device_load(&p, 1, gid, &contract);
+         ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+            &p, AGX_APPLE9_VIR_DEVICE_FENCE, AGX_APPLE9_ENC_PSEUDO,
+            nullptr, 0, AGX_APPLE9_FENCE_COMPILER_BARRIER));
+         second = agx_apple9_vir_emit_shared_load(&p, gid, 0, 1);
+      } else {
+         first = agx_apple9_vir_emit_shared_load(&p, gid, 0, 1);
+         ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+            &p, AGX_APPLE9_VIR_DEVICE_FENCE, AGX_APPLE9_ENC_PSEUDO,
+            nullptr, 0, AGX_APPLE9_FENCE_COMPILER_BARRIER));
+         second = agx_apple9_vir_emit_device_load(&p, 1, gid, &contract);
+      }
+      uint32_t srcs[2] = {first, second};
+      uint32_t sum = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IADD,
+                                         AGX_APPLE9_ENC_INT_ADD_EXTENDED,
+                                         srcs, 2, 0);
+      ASSERT_TRUE(agx_apple9_vir_emit_device_store(&p, 0, gid, &sum, 1, 32));
+
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason))
+         << (reason ?: "");
+
+      enum agx_apple9_vir_opcode first_op =
+         dir == 0 ? AGX_APPLE9_VIR_DEVICE_LOAD : AGX_APPLE9_VIR_SHARED_LOAD;
+      enum agx_apple9_vir_opcode second_op =
+         dir == 0 ? AGX_APPLE9_VIR_SHARED_LOAD : AGX_APPLE9_VIR_DEVICE_LOAD;
+      unsigned first_slot = 0;
+      bool waited_before_second = false, seen_second = false;
+      for (unsigned i = 0; i < p.instruction_count; ++i) {
+         const auto *I = p.instructions[i];
+         if (I->op == first_op && !first_slot)
+            first_slot = I->producer_scoreboard_slot;
+         if (first_slot && !seen_second) {
+            if (I->op == AGX_APPLE9_VIR_WAIT &&
+                (I->immediate & BITFIELD_BIT(first_slot - 1)))
+               waited_before_second = true;
+            if (I->op == second_op) {
+               if (I->scoreboard_slot == first_slot)
+                  waited_before_second = true;
+               seen_second = true;
+            }
+         }
+         agx_apple9_packed_instruction packed;
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(I, p.phys, &packed, &reason))
+            << (reason ?: "");
+      }
+      EXPECT_NE(first_slot, 0u);
+      EXPECT_TRUE(seen_second);
+      EXPECT_TRUE(waited_before_second)
+         << "dir=" << dir << " missed acquire wait for slot " << first_slot;
+
+      agx_apple9_vir_finish(&p);
+      ralloc_free(nir.shader);
+   }
 }

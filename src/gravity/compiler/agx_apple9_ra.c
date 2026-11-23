@@ -279,6 +279,8 @@ apple9_source_constraint(const struct agx_apple9_vir_instr *ins, unsigned source
                                                 : AGX_APPLE9_OPERAND_ATOMIC_DATA;
       return agx_apple9_find_operand(ins->encoding, role);
    }
+   if (ins->encoding == AGX_APPLE9_ENC_PSEUDO)
+      return NULL;
    const struct agx_apple9_encoding_info *info =
       agx_apple9_encoding_info(ins->encoding);
    for (unsigned o = 0, s = 0; o < info->operand_count; ++o) {
@@ -1021,9 +1023,6 @@ struct apple9_pending {
  * stored once, under the slot selected by its machine descriptor. */
 struct apple9_completion {
    struct apple9_pending pending[7];
-   /* Scoreboard slots of IMAGE_STORE instructions issued since the last
-    * FENCE_IMAGE_WRITE (WAIT retires register reuse, not PBE write drain). */
-   uint8_t unfenced_img_slots;
 };
 
 /* Scalar export producers complete asynchronously in the publication namespace.
@@ -1178,7 +1177,8 @@ static bool
 apple9_can_fold_wait(const struct agx_apple9_vir_instr *ins,
                      const struct agx_apple9_vir_instr *producer)
 {
-   if (ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC)
+   if (ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC ||
+       ins->encoding == AGX_APPLE9_ENC_PSEUDO)
       return false;
    if (agx_apple9_encoding_info(ins->encoding)->dependency_layout ==
        AGX_APPLE9_DEPENDENCY_NONE)
@@ -1397,22 +1397,50 @@ apple9_completion_class(const struct agx_apple9_vir_instr *producer)
    case AGX_APPLE9_VIR_SHARED_LOAD:
    case AGX_APPLE9_VIR_SHARED_ATOMIC:
       return AGX_APPLE9_COMPLETION_MEMORY;
+   case AGX_APPLE9_VIR_TEXTURE_SAMPLE:
+      return AGX_APPLE9_COMPLETION_TEXTURE;
+   case AGX_APPLE9_VIR_IMAGE_STORE:
+      return AGX_APPLE9_COMPLETION_IMAGE_STORE;
    default:
       return AGX_APPLE9_COMPLETION_OTHER;
    }
 }
 
 /* Producer classes a completion barrier leaves pending. Loop control and
- * drained block ends wait for everything, as do the fence forms other than
- * the plain device fence. */
+ * drained block ends wait for everything, as do unspecialized fences. */
 static unsigned
 apple9_completion_exempt(const struct agx_apple9_vir_instr *ins)
 {
    if (apple9_after_logical_end(ins) || ins->encoding == AGX_APPLE9_ENC_PSEUDO)
       return 0;
-   if (ins->op == AGX_APPLE9_VIR_DEVICE_FENCE &&
-       ins->immediate != AGX_APPLE9_FENCE_DEVICE)
+   if (ins->op == AGX_APPLE9_VIR_WORKGROUP_BARRIER &&
+       ins->immediate == AGX_APPLE9_WORKGROUP_BARRIER_DEVICE) {
+      /* Drain prior device reads/atomics before the workgroup device barrier
+       * so release/acquire message passing never lets an in-flight read cross
+       * the rendezvous. */
       return 0;
+   }
+   if (ins->op == AGX_APPLE9_VIR_DEVICE_FENCE) {
+      switch (ins->immediate) {
+      case AGX_APPLE9_FENCE_DEVICE:
+         return AGX_APPLE9_COMPLETION_MEMORY;
+      case AGX_APPLE9_FENCE_IMAGE_WRITE:
+      case AGX_APPLE9_FENCE_IMAGE_WRITE_FS:
+      case AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP:
+      case AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP_MEM:
+         /* FENCE_IMAGE_WRITE waits on IMAGE_STORE slots via its own 6-bit
+          * fence_slot_mask without a standalone WAIT; unrelated memory and
+          * publications stay pending while texture reads drain. */
+         return AGX_APPLE9_COMPLETION_MEMORY | AGX_APPLE9_COMPLETION_PUBLICATION |
+                AGX_APPLE9_COMPLETION_IMAGE_STORE;
+      case AGX_APPLE9_FENCE_TEX_INVALIDATE:
+      case AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP:
+      case AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP_MEM:
+         return AGX_APPLE9_COMPLETION_MEMORY | AGX_APPLE9_COMPLETION_PUBLICATION;
+      default:
+         return 0;
+      }
+   }
    return agx_apple9_encoding_info(ins->encoding)->prior_completion_exempt;
 }
 
@@ -1429,12 +1457,25 @@ static bool
 apple9_acquire_hazard(const struct agx_apple9_vir_instr *ins,
                       const struct agx_apple9_vir_instr *producer)
 {
-   return (producer->op == AGX_APPLE9_VIR_DEVICE_LOAD ||
-           (producer->op == AGX_APPLE9_VIR_DEVICE_ATOMIC &&
-            !producer->atomic_discard)) &&
-          (ins->op == AGX_APPLE9_VIR_DEVICE_LOAD ||
-           ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
-           ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE);
+   /* Acquire ordering applies across both device and threadgroup memory
+    * domains: a read (load or returning atomic) pending across a fence or
+    * compiler barrier must complete before any subsequent memory operation. */
+   const bool is_acquire_read =
+      producer->op == AGX_APPLE9_VIR_DEVICE_LOAD ||
+      (producer->op == AGX_APPLE9_VIR_DEVICE_ATOMIC &&
+       !producer->atomic_discard) ||
+      producer->op == AGX_APPLE9_VIR_SHARED_LOAD ||
+      producer->op == AGX_APPLE9_VIR_SHARED_ATOMIC;
+   if (!is_acquire_read)
+      return false;
+   return ins->op == AGX_APPLE9_VIR_DEVICE_LOAD ||
+          ins->op == AGX_APPLE9_VIR_DEVICE_STORE ||
+          ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
+          ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE ||
+          ins->op == AGX_APPLE9_VIR_IMAGE_STORE ||
+          ins->op == AGX_APPLE9_VIR_SHARED_LOAD ||
+          ins->op == AGX_APPLE9_VIR_SHARED_STORE ||
+          ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC;
 }
 
 /* The if/else arms of the linear program. Node 0 is outside every region;
@@ -1530,6 +1571,11 @@ apple9_pending_hazard(const struct agx_apple9_vir_instr *ins,
    for (unsigned i = 0; i < p->count; ++i) {
       if (barrier && !(exempt & apple9_completion_class(&p->producer[i])))
          return true;
+      /* TILE_ACCESS exempts plain async loads, never returning atomics. */
+      if (barrier && ins->op == AGX_APPLE9_VIR_TILE_ACCESS &&
+          (p->producer[i].op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
+           p->producer[i].op == AGX_APPLE9_VIR_SHARED_ATOMIC))
+         return true;
       if (apple9_resource_hazard(ins, &p->producer[i]))
          return true;
       /* Two masked writebacks from opposite arms of a region may target
@@ -1572,7 +1618,6 @@ apple9_merge_pending(struct apple9_completion *to_state,
 {
    struct apple9_pending *to = to_state->pending;
    const struct apple9_pending *from = from_state->pending;
-   to_state->unfenced_img_slots |= from_state->unfenced_img_slots;
    for (unsigned slot = 1; slot <= 6; ++slot) {
       struct apple9_pending *t = &to[slot];
       const struct apple9_pending *f = &from[slot];
@@ -1772,11 +1817,16 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
    unsigned *position = calloc(count, sizeof(*position));
    bool *header = calloc(count, sizeof(*header));
    struct apple9_completion *entry = calloc(count, sizeof(*entry));
+   unsigned *out_start = calloc(count, sizeof(*out_start));
+   unsigned *out_end = calloc(count, sizeof(*out_end));
+   uint8_t *unfenced_in = calloc(count, sizeof(*unfenced_in));
+   uint8_t *unfenced_out = calloc(count, sizeof(*unfenced_out));
    struct hash_table *nir_blocks = _mesa_pointer_hash_table_create(NULL);
    struct apple9_arms arms = {0};
    bool success = false;
-   if (!blocks || !successors || !position || !header || !entry || !nir_blocks ||
-       !apple9_build_arms(program, &arms))
+   if (!blocks || !successors || !position || !header || !entry ||
+       !out_start || !out_end || !unfenced_in || !unfenced_out ||
+       !nir_blocks || !apple9_build_arms(program, &arms))
       goto cleanup;
    /* Several physical blocks may come from one NIR block. As with the old
     * layout scan, logical successors name its last physical block. Build the
@@ -1824,6 +1874,7 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
    }
    for (struct agx_apple9_block *block = program->blocks; block; block = block->next) {
       agx_apple9_block_begin(&out, blocks[block->index]);
+      out_start[block->index] = out.instruction_count;
       struct apple9_completion state = {0};
       if (!header[block->index])
          state = entry[block->index];
@@ -1868,7 +1919,8 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
             ins.op == AGX_APPLE9_VIR_DEVICE_FENCE &&
             (ins.immediate == AGX_APPLE9_FENCE_IMAGE_WRITE ||
              ins.immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS ||
-             ins.immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP);
+             ins.immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP ||
+             ins.immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP_MEM);
          const bool barrier = apple9_completion_barrier(&ins, drain);
          unsigned fold = 0, retire = 0;
          for (unsigned slot = 1; slot <= 6; ++slot) {
@@ -1886,12 +1938,31 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
             else
                retire |= BITFIELD_BIT(slot - 1);
          }
-         if (is_img_fence) {
-            ins.fence_slot_mask = state.unfenced_img_slots;
-            state.unfenced_img_slots = 0;
-         }
          if (!apple9_retire(&out, &state, retire))
             goto cleanup;
+         /* FENCE_IMAGE_WRITE itself waits on fence_slot_mask in hardware,
+          * retiring only scoreboard slots whose currently pending producer is
+          * an IMAGE_STORE (never retiring reused non-IMAGE_STORE slots). */
+         if (is_img_fence) {
+            uint8_t active_img_slots = 0;
+            for (unsigned slot = 1; slot <= 6; ++slot) {
+               const struct apple9_pending *p = &pending[slot];
+               if (p->unknown || !p->count)
+                  continue;
+               bool all_img_store = true;
+               for (unsigned k = 0; k < p->count; ++k) {
+                  if (p->producer[k].op != AGX_APPLE9_VIR_IMAGE_STORE) {
+                     all_img_store = false;
+                     break;
+                  }
+               }
+               if (all_img_store)
+                  active_img_slots |= (uint8_t)BITFIELD_BIT(slot - 1);
+            }
+            ins.fence_slot_mask = active_img_slots;
+            if (active_img_slots)
+               apple9_complete(&state, active_img_slots);
+         }
          /* An alternate selector in the standalone wait may already have
           * completed the producer chosen for folding. */
          if (fold && !apple9_pending_active(&pending[fold]))
@@ -1970,8 +2041,6 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
                                apple9_conflicting_slots(&state, reservations)))
                goto cleanup;
             ins.producer_scoreboard_slot = slot;
-            if (ins.op == AGX_APPLE9_VIR_IMAGE_STORE)
-               state.unfenced_img_slots |= (uint8_t)BITFIELD_BIT(slot - 1);
             if (ins.op == AGX_APPLE9_VIR_DEVICE_LOAD) {
                const uint16_t tokens[] = {
                   AGX_APPLE9_DEVICE_LOAD_TOKEN_1100, AGX_APPLE9_DEVICE_LOAD_TOKEN_5100,
@@ -1996,7 +2065,9 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
          apple9_select_compact_alu(&ins);
          if (!apple9_emit_physical(&out, &ins))
             goto cleanup;
-         if (ins.op == AGX_APPLE9_VIR_DEVICE_FENCE) {
+         if (ins.op == AGX_APPLE9_VIR_DEVICE_FENCE ||
+             (ins.op == AGX_APPLE9_VIR_WORKGROUP_BARRIER &&
+              ins.immediate == AGX_APPLE9_WORKGROUP_BARRIER_DEVICE)) {
             for (unsigned slot = 1; slot <= 6; ++slot) {
                for (unsigned k = 0; k < pending[slot].count; ++k)
                   pending[slot].fenced[k] = true;
@@ -2015,10 +2086,49 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
                apple9_merge_pending(&entry[succ[i]->index], &state);
          }
       }
+      out_end[block->index] = out.instruction_count;
    }
-   /* If a FENCE_IMAGE_WRITE had no pending IMAGE_STORE slots at its point of
-    * issue (e.g. already retired across a prior barrier or CFG edge), drain
-    * the union of all IMAGE_STORE scoreboard slots in the program. */
+   /* Propagate unfenced IMAGE_STORE scoreboard slots across the complete CFG
+    * (including loop headers, backedges, and drained blocks) using the
+    * recorded per-block output ranges indexed by program->blocks indices
+    * (matching successors[]). Never clear bits already credited to
+    * active_img_slots above; only OR in additional reaching store slots. */
+   bool unfenced_changed = true;
+   while (unfenced_changed) {
+      unfenced_changed = false;
+      for (struct agx_apple9_block *b = program->blocks; b; b = b->next) {
+         uint8_t m = unfenced_in[b->index];
+         for (unsigned i = out_start[b->index]; i < out_end[b->index]; ++i) {
+            struct agx_apple9_vir_instr *ins = out.instructions[i];
+            if (ins->op == AGX_APPLE9_VIR_IMAGE_STORE &&
+                ins->producer_scoreboard_slot >= 1 &&
+                ins->producer_scoreboard_slot <= 6) {
+               m |= (uint8_t)BITFIELD_BIT(ins->producer_scoreboard_slot - 1);
+            } else if (ins->op == AGX_APPLE9_VIR_DEVICE_FENCE &&
+                       (ins->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE ||
+                        ins->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS ||
+                        ins->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP ||
+                        ins->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP_MEM)) {
+               ins->fence_slot_mask |= m;
+               m = 0;
+            }
+         }
+         if (m != unfenced_out[b->index]) {
+            unfenced_out[b->index] = m;
+            struct agx_apple9_block *const *bsucc = &successors[4 * b->index];
+            for (unsigned s = 0; s < 4; ++s) {
+               if (bsucc[s] && (unfenced_in[bsucc[s]->index] | m) !=
+                                  unfenced_in[bsucc[s]->index]) {
+                  unfenced_in[bsucc[s]->index] |= m;
+                  unfenced_changed = true;
+               }
+            }
+         }
+      }
+   }
+   /* If a FENCE_IMAGE_WRITE still has no reaching IMAGE_STORE (e.g. a barrier
+    * on a path where stores only occur in another branch), fall back to the
+    * union of all IMAGE_STORE scoreboard slots in the program. */
    unsigned all_img_store_slots = 0;
    for (unsigned i = 0; i < out.instruction_count; ++i) {
       const struct agx_apple9_vir_instr *ins = out.instructions[i];
@@ -2034,7 +2144,8 @@ apple9_schedule_physical(struct agx_apple9_vir_program *program,
              !ins->fence_slot_mask &&
              (ins->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE ||
               ins->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS ||
-              ins->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP))
+              ins->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP ||
+              ins->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP_MEM))
             ins->fence_slot_mask = (uint8_t)all_img_store_slots;
       }
    }
@@ -2054,6 +2165,10 @@ cleanup:
    free(position);
    free(header);
    free(entry);
+   free(out_start);
+   free(out_end);
+   free(unfenced_in);
+   free(unfenced_out);
    free(arms.node);
    free(arms.of);
    _mesa_hash_table_destroy(nir_blocks, NULL);
@@ -2405,6 +2520,8 @@ apple9_allocation_cost(const struct agx_apple9_vir_program *p)
       issue = earliest + 1;
       cost.spills += weight * (I->op == AGX_APPLE9_VIR_SPILL_STORE ||
                                I->op == AGX_APPLE9_VIR_SPILL_LOAD);
+      if (I->encoding == AGX_APPLE9_ENC_PSEUDO)
+         continue;
       cost.instructions += weight;
       cost.bytes += weight * agx_apple9_encoding_info(I->encoding)->length;
       cost.has_copies |= apple9_identity(I) && I->dest != I->src[0];

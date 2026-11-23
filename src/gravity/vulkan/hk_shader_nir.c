@@ -2498,6 +2498,7 @@ struct hk_apple9_storage_lowering {
    bool checked_buf;
    /* Test residency before unchecked native stores to sparse residency buffers. */
    bool buffer_residency;
+   bool has_global_fallback;
 };
 
 /* The image-write data type must be known: untyped stores (meta copies of raw
@@ -2675,17 +2676,16 @@ hk_apple9_native_store(nir_builder *b, nir_intrinsic_instr *intr,
    nir_def *index = nir_ushr_imm(b, nir_iadd_imm(b, nir_u2u32(b, desc),
       offsetof(struct hk_apple9_storage_descriptor, pbe)), 5);
    /* Wave 2: when hk_apple9_compiler_supports_native_3d_store() is true, pass
-    * .image_dim = dim for true 3D (byte9=0x08) / Cube (byte9=0x0c) PBE. */
+    * .image_dim = dim for true 3D (byte9=0x08) / Cube (byte9=0x0c) PBE.
+    * Fences for fenced shaders are inserted lazily & coalesced in
+    * hk_apple9_insert_lazy_image_fences(). */
+   (void)fence;
    nir_image_store_apple9_agx(b, index, xyz,
       nir_pad_vector_imm_int(b, data, 0, 4),
       .access = nir_intrinsic_access(intr), .src_type = type,
       .image_array = array && !(hk_apple9_compiler_supports_native_3d_store() &&
                                 (dim == GLSL_SAMPLER_DIM_3D ||
                                  dim == GLSL_SAMPLER_DIM_CUBE)));
-   if (fence) {
-      nir_fence_image_write_apple9_agx(b);
-      nir_fence_tex_invalidate_apple9_agx(b);
-   }
    if (helpers)
       nir_pop_if(b, NULL);
 }
@@ -2742,13 +2742,10 @@ hk_apple9_native_buffer_store(nir_builder *b, nir_intrinsic_instr *intr,
       nir_push_if(b, nir_ieq_imm(b,
          hk_apple9_storage_buffer_residency_code(b, desc, x), 0));
    }
+   (void)fence;
    nir_image_store_apple9_agx(b, index, xyz, nir_pad_vector_imm_int(b, data, 0, 4),
       .access = nir_intrinsic_access(intr), .src_type = type,
       .image_array = false);
-   if (fence) {
-      nir_fence_image_write_apple9_agx(b);
-      nir_fence_tex_invalidate_apple9_agx(b);
-   }
    if (residency) {
       nir_pop_if(b, NULL);
       nir_pop_if(b, NULL);
@@ -2779,7 +2776,7 @@ hk_apple9_formatless_oob_zero(nir_builder *b, nir_intrinsic_instr *intr,
 static bool
 hk_apple9_lower_formatless_storage(nir_builder *b, nir_intrinsic_instr *intr,
                                    bool load, bool sparse, bool route,
-                                   const struct hk_apple9_storage_lowering *lower)
+                                   struct hk_apple9_storage_lowering *lower)
 {
    if (nir_def_instr(intr->src[0].ssa)->type != nir_instr_type_intrinsic)
       return false;
@@ -2879,6 +2876,7 @@ hk_apple9_lower_formatless_storage(nir_builder *b, nir_intrinsic_instr *intr,
                       hk_apple9_pack_load_result(b, value, code,
                                                  intr->def.num_components,
                                                  sparse));
+      lower->has_global_fallback = true;
       b->shader->info.use_lowered_image_to_global = true;
       return true;
    }
@@ -2924,6 +2922,7 @@ hk_apple9_lower_formatless_storage(nir_builder *b, nir_intrinsic_instr *intr,
       nir_pop_if(b, NULL);
       nir_pop_if(b, NULL);
       nir_instr_remove(&intr->instr);
+      lower->has_global_fallback = true;
       b->shader->info.use_lowered_image_to_global = true;
       return true;
    }
@@ -3015,6 +3014,7 @@ hk_apple9_lower_formatless_storage(nir_builder *b, nir_intrinsic_instr *intr,
    } else {
       nir_instr_remove(&intr->instr);
    }
+   lower->has_global_fallback = true;
    b->shader->info.use_lowered_image_to_global = true;
    return true;
 }
@@ -3195,7 +3195,7 @@ static bool
 hk_apple9_lower_storage_image(nir_builder *b, nir_intrinsic_instr *intr,
                               void *data)
 {
-   const struct hk_apple9_storage_lowering *lower = data;
+   struct hk_apple9_storage_lowering *lower = data;
    bool sparse = intr->intrinsic == nir_intrinsic_bindless_image_sparse_load;
    bool load = sparse || intr->intrinsic == nir_intrinsic_bindless_image_load;
    if (!load && intr->intrinsic != nir_intrinsic_bindless_image_store)
@@ -3291,6 +3291,7 @@ hk_apple9_lower_storage_image(nir_builder *b, nir_intrinsic_instr *intr,
                       hk_apple9_pack_load_result(b, value, code,
                                                  intr->def.num_components,
                                                  sparse));
+      lower->has_global_fallback = true;
       b->shader->info.use_lowered_image_to_global = true;
       return true;
    }
@@ -3320,6 +3321,7 @@ hk_apple9_lower_storage_image(nir_builder *b, nir_intrinsic_instr *intr,
       nir_pop_if(b, NULL);
       nir_pop_if(b, NULL);
       nir_instr_remove(&intr->instr);
+      lower->has_global_fallback = true;
       b->shader->info.use_lowered_image_to_global = true;
       return true;
    }
@@ -3400,6 +3402,7 @@ hk_apple9_lower_storage_image(nir_builder *b, nir_intrinsic_instr *intr,
    } else {
       nir_instr_remove(&intr->instr);
    }
+   lower->has_global_fallback = true;
    b->shader->info.use_lowered_image_to_global = true;
    return true;
 }
@@ -3439,22 +3442,311 @@ hk_apple9_lower_storage_queries(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
-/* When every storage image access has become global memory, synchronize that
- * memory domain. Retain the texture fences if a storage image access through
- * the texture unit remains; those require their own cache-coherency
- * implementation. Sampled images and uniform texel buffers need not observe
- * writes from the same dispatch, and descriptor queries only read metadata,
- * so neither requires texture fences.
- */
+struct hk_lazy_fence_state {
+   bool pbe;
+   bool tex;
+};
+
+static bool
+hk_apple9_addr_is_printf_buf(const nir_def *def, unsigned depth)
+{
+   if (!def || depth > 4)
+      return false;
+   const nir_instr *instr = nir_def_instr((nir_def *)def);
+   if (instr->type == nir_instr_type_intrinsic) {
+      return nir_instr_as_intrinsic((nir_instr *)instr)->intrinsic ==
+             nir_intrinsic_load_printf_buffer_address;
+   }
+   if (instr->type == nir_instr_type_alu) {
+      const nir_alu_instr *alu = nir_instr_as_alu((nir_instr *)instr);
+      if (alu->op == nir_op_iadd) {
+         return hk_apple9_addr_is_printf_buf(alu->src[0].src.ssa, depth + 1) ||
+                hk_apple9_addr_is_printf_buf(alu->src[1].src.ssa, depth + 1);
+      }
+      if (alu->op == nir_op_mov)
+         return hk_apple9_addr_is_printf_buf(alu->src[0].src.ssa, depth + 1);
+   }
+   return false;
+}
+
+static struct hk_lazy_fence_state
+hk_apple9_instr_fence_need(const nir_instr *instr)
+{
+   if (instr->type == nir_instr_type_tex) {
+      if (!nir_tex_instr_is_query(nir_instr_as_tex((nir_instr *)instr)))
+         return (struct hk_lazy_fence_state){.pbe = true, .tex = true};
+      return (struct hk_lazy_fence_state){0};
+   }
+   if (instr->type != nir_instr_type_intrinsic)
+      return (struct hk_lazy_fence_state){0};
+   const nir_intrinsic_instr *intr = nir_instr_as_intrinsic((nir_instr *)instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_2x32:
+      return (struct hk_lazy_fence_state){.pbe = true};
+   case nir_intrinsic_store_global:
+   case nir_intrinsic_store_global_2x32:
+      /* Potentially aliasing global fallback stores must not race with an
+       * earlier native PBE image store (WAW); ignore libcl printf stores. */
+      if (hk_apple9_addr_is_printf_buf(intr->src[1].ssa, 0))
+         return (struct hk_lazy_fence_state){0};
+      return (struct hk_lazy_fence_state){.pbe = true};
+   case nir_intrinsic_global_atomic:
+   case nir_intrinsic_global_atomic_swap:
+   case nir_intrinsic_global_atomic_2x32:
+   case nir_intrinsic_global_atomic_swap_2x32:
+      if (hk_apple9_addr_is_printf_buf(intr->src[0].ssa, 0))
+         return (struct hk_lazy_fence_state){0};
+      return (struct hk_lazy_fence_state){.pbe = true};
+   case nir_intrinsic_barrier: {
+      unsigned modes = nir_intrinsic_memory_modes(intr);
+      unsigned scope = nir_intrinsic_memory_scope(intr);
+      if (scope == SCOPE_NONE ||
+          !(modes & (nir_var_image | nir_var_mem_global | nir_var_mem_ssbo)))
+         return (struct hk_lazy_fence_state){0};
+      return (struct hk_lazy_fence_state){.pbe = true};
+   }
+   default:
+      return (struct hk_lazy_fence_state){0};
+   }
+}
+
+static bool
+hk_apple9_cf_list_has_native_image_store(struct exec_list *cf_list)
+{
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      nir_foreach_block_in_cf_node(block, node) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_image_store_apple9_agx)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static struct hk_lazy_fence_state
+hk_apple9_cf_list_fence_need(struct exec_list *cf_list)
+{
+   struct hk_lazy_fence_state need = {0};
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      nir_foreach_block_in_cf_node(block, node) {
+         nir_foreach_instr(instr, block) {
+            struct hk_lazy_fence_state n = hk_apple9_instr_fence_need(instr);
+            need.pbe |= n.pbe;
+            need.tex |= n.tex;
+            if (need.pbe && need.tex)
+               return need;
+         }
+      }
+   }
+   return need;
+}
+
 static void
-hk_apple9_lower_image_barriers(nir_shader *nir, bool fenced)
+hk_apple9_emit_lazy_fence(nir_cursor cursor, bool flush_pbe, bool flush_tex)
+{
+   if (!flush_pbe && !flush_tex)
+      return;
+   nir_builder b = nir_builder_at(cursor);
+   if (flush_pbe)
+      nir_fence_image_write_apple9_agx(&b);
+   if (flush_tex)
+      nir_fence_tex_invalidate_apple9_agx(&b);
+}
+
+/* Lazily coalesce PBE drain (0x0650) + texture invalidate (0x06d0) fences:
+ * back-to-back native image stores overlap without per-store barriers, and
+ * PBE/tex dirty bits are tracked separately across straight-line code,
+ * branches, barriers, global stores/loads/atomics, and loop break/continue
+ * exits. Workgroup image barriers (0x0e51/0x0ed1 or 0x0e50/0x0ed0) already
+ * drain PBE + invalidate tex cache. */
+static struct hk_lazy_fence_state
+hk_apple9_fence_cf_list(struct exec_list *cf_list,
+                        struct hk_lazy_fence_state st,
+                        struct hk_lazy_fence_state in_loop_need,
+                        struct hk_lazy_fence_state *break_out)
+{
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      switch (node->type) {
+      case nir_cf_node_block: {
+         nir_block *block = nir_cf_node_as_block(node);
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_image_store_apple9_agx) {
+                  st.pbe = true;
+                  st.tex = true;
+                  continue;
+               }
+               if (intr->intrinsic == nir_intrinsic_fence_image_write_apple9_agx) {
+                  st.pbe = false;
+                  continue;
+               }
+               if (intr->intrinsic == nir_intrinsic_fence_tex_invalidate_apple9_agx) {
+                  st.tex = false;
+                  continue;
+               }
+               if (intr->intrinsic == nir_intrinsic_barrier) {
+                  unsigned modes = nir_intrinsic_memory_modes(intr);
+                  unsigned scope = nir_intrinsic_memory_scope(intr);
+                  if (scope == SCOPE_WORKGROUP && (modes & nir_var_image)) {
+                     /* Workgroup texture barrier (0x0e51/0x0e50) drains PBE
+                      * and invalidates texture cache directly. */
+                     st.pbe = false;
+                     st.tex = false;
+                     continue;
+                  }
+                  if (st.pbe && scope != SCOPE_NONE &&
+                      (modes & (nir_var_image | nir_var_mem_global |
+                                nir_var_mem_ssbo))) {
+                     /* Drain PBE writes before the barrier; leave st.tex true
+                      * so non-image barriers (e.g. memoryBarrierBuffer) still
+                      * invalidate the texture cache before a subsequent read.
+                      * Image barriers already have an explicit
+                      * fence_tex_invalidate right after them, which clears
+                      * st.tex on the next iteration. */
+                     hk_apple9_emit_lazy_fence(nir_before_instr(instr), true, false);
+                     st.pbe = false;
+                  }
+                  continue;
+               }
+            }
+            if (instr->type == nir_instr_type_jump) {
+               nir_jump_instr *jump = nir_instr_as_jump(instr);
+               if (jump->type == nir_jump_continue) {
+                  bool fp = st.pbe && in_loop_need.pbe;
+                  bool ft = st.tex && in_loop_need.tex;
+                  if (fp || ft) {
+                     hk_apple9_emit_lazy_fence(nir_before_instr(instr), fp, ft);
+                     if (fp) st.pbe = false;
+                     if (ft) st.tex = false;
+                  }
+               } else if (jump->type == nir_jump_break) {
+                  if (break_out) {
+                     break_out->pbe |= st.pbe;
+                     break_out->tex |= st.tex;
+                  }
+                  st.pbe = false;
+                  st.tex = false;
+               }
+               continue;
+            }
+            struct hk_lazy_fence_state need = hk_apple9_instr_fence_need(instr);
+            bool fp = st.pbe && need.pbe;
+            bool ft = st.tex && need.tex;
+            if (fp || ft) {
+               hk_apple9_emit_lazy_fence(nir_before_instr(instr), fp, ft);
+               if (fp) st.pbe = false;
+               if (ft) st.tex = false;
+            }
+            if (instr->type == nir_instr_type_intrinsic) {
+               const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if ((intr->intrinsic == nir_intrinsic_store_global ||
+                    intr->intrinsic == nir_intrinsic_store_global_2x32) &&
+                   !hk_apple9_addr_is_printf_buf(intr->src[1].ssa, 0))
+                  st.tex = true;
+            }
+         }
+         break;
+      }
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         struct hk_lazy_fence_state then_need =
+            hk_apple9_cf_list_fence_need(&nif->then_list);
+         struct hk_lazy_fence_state else_need =
+            hk_apple9_cf_list_fence_need(&nif->else_list);
+         bool fp = st.pbe && then_need.pbe && else_need.pbe;
+         bool ft = st.tex && then_need.tex && else_need.tex;
+         if (fp || ft) {
+            hk_apple9_emit_lazy_fence(nir_before_cf_node(node), fp, ft);
+            if (fp) st.pbe = false;
+            if (ft) st.tex = false;
+         }
+         struct hk_lazy_fence_state d_then =
+            hk_apple9_fence_cf_list(&nif->then_list, st, in_loop_need, break_out);
+         struct hk_lazy_fence_state d_else =
+            hk_apple9_fence_cf_list(&nif->else_list, st, in_loop_need, break_out);
+         st.pbe = d_then.pbe || d_else.pbe;
+         st.tex = d_then.tex || d_else.tex;
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         bool loop_stores = hk_apple9_cf_list_has_native_image_store(&loop->body);
+         struct hk_lazy_fence_state loop_need =
+            hk_apple9_cf_list_fence_need(&loop->body);
+         bool fp = st.pbe && loop_need.pbe;
+         bool ft = st.tex && loop_need.tex;
+         if (fp || ft) {
+            hk_apple9_emit_lazy_fence(nir_before_cf_node(node), fp, ft);
+            if (fp) st.pbe = false;
+            if (ft) st.tex = false;
+         }
+         struct hk_lazy_fence_state nested_need = {
+            .pbe = loop_need.pbe || in_loop_need.pbe,
+            .tex = loop_need.tex || in_loop_need.tex,
+         };
+         struct hk_lazy_fence_state loop_break = {0};
+         struct hk_lazy_fence_state d_body =
+            hk_apple9_fence_cf_list(&loop->body,
+                                    (struct hk_lazy_fence_state){0},
+                                    nested_need, &loop_break);
+         bool bfp = d_body.pbe && loop_need.pbe;
+         bool bft = d_body.tex && loop_need.tex;
+         if (bfp || bft) {
+            nir_block *last = nir_loop_last_block(loop);
+            if (!nir_block_ends_in_jump(last))
+               hk_apple9_emit_lazy_fence(nir_after_block(last), bfp, bft);
+            if (bfp) d_body.pbe = false;
+            if (bft) d_body.tex = false;
+         }
+         st.pbe = st.pbe || d_body.pbe || loop_break.pbe ||
+                  (loop_stores && !loop_need.pbe);
+         st.tex = st.tex || d_body.tex || loop_break.tex ||
+                  (loop_stores && !loop_need.tex);
+         break;
+      }
+      default:
+         break;
+      }
+   }
+   return st;
+}
+
+static void
+hk_apple9_insert_lazy_image_fences(nir_shader *nir)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!hk_apple9_cf_list_has_native_image_store(&impl->body))
+      return;
+   hk_apple9_fence_cf_list(&impl->body, (struct hk_lazy_fence_state){0},
+                           (struct hk_lazy_fence_state){0}, NULL);
+   nir_progress(true, impl, nir_metadata_control_flow);
+}
+
+/* When every storage image access has become global memory, synchronize that
+ * memory domain. Retain workgroup nir_var_image barriers when native PBE
+ * stores are present so the compiler emits 0x0e51/0x0ed1 (or 0x0e50/0x0ed0).
+ * Sampled images and uniform texel buffers need not observe writes from the
+ * same dispatch, and descriptor queries only read metadata, so neither
+ * requires texture fences.
+ */
+static void
+hk_apple9_lower_image_barriers(nir_shader *nir, bool fenced,
+                               bool has_global_image_fallback)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   bool has_native_store = false;
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
             continue;
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_image_store_apple9_agx)
+            has_native_store = true;
          if (nir_intrinsic_has_image_dim(intr) &&
              intr->intrinsic != nir_intrinsic_image_size &&
              intr->intrinsic != nir_intrinsic_bindless_image_size &&
@@ -3473,14 +3765,26 @@ hk_apple9_lower_image_barriers(nir_shader *nir, bool fenced)
          if (intr->intrinsic == nir_intrinsic_barrier) {
             unsigned modes = nir_intrinsic_memory_modes(intr);
             if (modes & nir_var_image) {
-               nir_intrinsic_set_memory_modes(intr,
-                  (modes & ~nir_var_image) | nir_var_mem_global);
-               /* In fenced shaders, readers use the texture unit: invalidate
-                * the texture cache after image barriers so invocations that
-                * did not store observe other invocations' drained PBE writes. */
-               if (fenced) {
-                  nir_builder b = nir_builder_at(nir_after_instr(instr));
-                  nir_fence_tex_invalidate_apple9_agx(&b);
+               unsigned mem_scope = nir_intrinsic_memory_scope(intr);
+               if (has_native_store && mem_scope == SCOPE_WORKGROUP) {
+                  /* Native PBE workgroup texture barrier lowers directly to
+                   * 0x0e51/0x0ed1 (or 0x0e50/0x0ed0). Only add global sync
+                   * when global-memory image fallbacks actually coexist in
+                   * the shader. */
+                  unsigned next_modes = modes;
+                  if (has_global_image_fallback)
+                     next_modes |= nir_var_mem_global;
+                  nir_intrinsic_set_memory_modes(intr, next_modes);
+               } else {
+                  nir_intrinsic_set_memory_modes(intr,
+                     (modes & ~nir_var_image) | nir_var_mem_global);
+                  /* In fenced shaders, readers use the texture unit: invalidate
+                   * the texture cache after image barriers so invocations that
+                   * did not store observe other invocations' drained PBE writes. */
+                  if (fenced) {
+                     nir_builder b = nir_builder_at(nir_after_instr(instr));
+                     nir_fence_tex_invalidate_apple9_agx(&b);
+                  }
                }
             }
          } else if (intr->intrinsic == nir_intrinsic_fence_pbe_to_tex_agx ||
@@ -3916,8 +4220,9 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    /* Buffer residency lookups add control flow. */
    NIR_PASS(_, nir, hk_apple9_lower_sparse_residency);
    /* Texel-buffer bounds and RGB32 checks add control flow. */
-   NIR_PASS(_, nir, nir_shader_tex_pass, hk_apple9_lower_texel_buffer,
-            nir_metadata_none, NULL);
+   bool texel_buf_global = false;
+   NIR_PASS(texel_buf_global, nir, nir_shader_tex_pass,
+            hk_apple9_lower_texel_buffer, nir_metadata_none, NULL);
    struct set *texture_loads = _mesa_pointer_set_create(NULL);
    const bool ordered = hk_apple9_native_store_shader(nir);
    bool fenced_stores = !ordered &&
@@ -3938,11 +4243,13 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             nir_metadata_none, &lower);
    _mesa_set_destroy(texture_loads, NULL);
 
-   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_apple9_lower_buffer_address,
-            nir_metadata_control_flow, NULL);
+   bool buf_addr_global = false;
+   NIR_PASS(buf_addr_global, nir, nir_shader_intrinsics_pass,
+            hk_apple9_lower_buffer_address, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_apple9_lower_storage_queries,
             nir_metadata_control_flow, NULL);
-   NIR_PASS(_, nir, agx_nir_lower_images);
+   bool lower_images_global = false;
+   NIR_PASS(lower_images_global, nir, agx_nir_lower_images);
    /* Sampled views' queries (AGX_TEXTURE_FLAG_METADATA_QUERY) are answered
     * from texture metadata by the Apple9 backend; uniform texel buffers use
     * agx_nir_lower_texture_queries on their prefix. */
@@ -3953,7 +4260,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * otherwise replaces sine/cosine with the older fsin_agx operation. */
    NIR_PASS(_, nir, agx_nir_lower_apple9_math);
    agx_preprocess_nir(nir);
-   hk_apple9_lower_image_barriers(nir, fenced_stores);
+   const bool has_global_image_fallback =
+      texel_buf_global || lower.has_global_fallback || buf_addr_global ||
+      lower_images_global;
+   hk_apple9_lower_image_barriers(nir, fenced_stores, has_global_image_fallback);
+   if (fenced_stores || ordered)
+      hk_apple9_insert_lazy_image_fences(nir);
 
    nir_opt_peephole_select_options peephole_select_options = {
       .limit = 0,

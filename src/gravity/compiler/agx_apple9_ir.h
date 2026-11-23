@@ -232,6 +232,16 @@ enum agx_apple9_vir_opcode {
 #define AGX_APPLE9_ABI_REG_BASE 8
 #define AGX_APPLE9_MAX_ABI_REGS 64
 
+/* Workgroup execution barrier forms (VIR_WORKGROUP_BARRIER immediate). */
+enum agx_apple9_workgroup_barrier_mode {
+   /* Workgroup execution + threadgroup memory barrier (0x0961). */
+   AGX_APPLE9_WORKGROUP_BARRIER_SHARED = 0,
+   /* Workgroup execution-only barrier, omitting TG-mem bit 0x20 (0x0941). */
+   AGX_APPLE9_WORKGROUP_BARRIER_NONE = 1,
+   /* Core-local workgroup execution + device memory barrier (0x0885). */
+   AGX_APPLE9_WORKGROUP_BARRIER_DEVICE = 2,
+};
+
 /* The object-grid form is not an API workgroup barrier. */
 enum agx_apple9_fence_mode {
    AGX_APPLE9_FENCE_DEVICE = 0,
@@ -240,15 +250,20 @@ enum agx_apple9_fence_mode {
    /* The device fence with acquire semantics: same encoding, but device
     * reads issued before it must have completed when it executes. */
    AGX_APPLE9_FENCE_DEVICE_ACQUIRE = 3,
-   /* Wait on image-write scoreboard slot 1 and drain PBE writes to memory. */
+   /* Wait on image-write scoreboard slots and drain PBE writes to memory. */
    AGX_APPLE9_FENCE_IMAGE_WRITE = 4,
    /* Invalidate the texture cache so subsequent texture loads observe memory. */
    AGX_APPLE9_FENCE_TEX_INVALIDATE = 5,
-   /* Fragment-stage PBE drain (07 14 64 50 06 00). */
+   /* Fragment-stage PBE drain (07 <mask>4 64 50 06 00). */
    AGX_APPLE9_FENCE_IMAGE_WRITE_FS = 6,
    /* Workgroup-scope texture barrier drain (0x0e51) and invalidate (0x0ed1). */
    AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP = 7,
    AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP = 8,
+   /* Workgroup-scope texture fence without rendezvous (0x0e50 / 0x0ed0). */
+   AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP_MEM = 9,
+   AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP_MEM = 10,
+   /* Zero-byte compiler scheduling/ordering barrier (subgroup/WG mem-only). */
+   AGX_APPLE9_FENCE_COMPILER_BARRIER = 11,
 };
 
 enum agx_apple9_unpack_norm_mode {

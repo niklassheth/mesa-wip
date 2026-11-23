@@ -1093,6 +1093,440 @@ test_soft_fault_ssbo_and_4b_vectorize(void)
    return 0;
 }
 
+static int
+test_coalesced_lazy_image_fences(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_physical_device pdev = {0};
+   CHECK(dev);
+   dev->vk.base.type = VK_OBJECT_TYPE_DEVICE;
+   dev->vk.physical = &pdev.vk;
+   dev->dev.chip = pdev.dev.chip = AGX_CHIP_G16G;
+   struct hk_descriptor_set_layout *img_layout =
+      make_set_layout(dev, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+   struct vk_descriptor_set_layout *img_sets[] = {&img_layout->vk};
+   const struct vk_pipeline_robustness_state rs = vk_robustness_disabled;
+
+   /* 4 back-to-back imageStores followed by 1 imageLoad must coalesce into
+    * ONE fence_image_write + ONE fence_tex_invalidate pair (instead of 4x). */
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                  &agx_nir_options,
+                                                  "coalesced_4_stores");
+   b.shader->info.internal = false;
+   b.shader->info.workgroup_size[0] = 64;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   nir_def *gid = nir_load_global_invocation_id(&b, 32);
+   nir_def *handle = nir_bindless_image_agx(&b, nir_imm_int(&b, 0), .desc_set = 0);
+   nir_def *val = nir_imm_vec4(&b, 1.0f, 2.0f, 3.0f, 4.0f);
+   for (unsigned k = 0; k < 4; ++k) {
+      nir_def *coord = nir_vec4(&b, nir_iadd_imm(&b, nir_channel(&b, gid, 0), k),
+                                nir_channel(&b, gid, 1), nir_imm_int(&b, 0),
+                                nir_imm_int(&b, 0));
+      nir_bindless_image_store(&b, handle, coord, nir_imm_int(&b, 0), val,
+                               nir_imm_int(&b, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                               .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                               .src_type = nir_type_float32);
+   }
+   nir_def *rcoord = nir_vec4(&b, nir_channel(&b, gid, 0), nir_channel(&b, gid, 1),
+                              nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+   nir_def *loaded = nir_bindless_image_load(&b, 4, 32, handle, rcoord,
+                                             nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                                             .image_dim = GLSL_SAMPLER_DIM_2D,
+                                             .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                                             .dest_type = nir_type_float32);
+   nir_store_global(&b, loaded, nir_imm_int64(&b, 0x80000),
+                    .write_mask = 0xf, .align_mul = 16);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+
+   hk_lower_nir(dev, b.shader, &rs, false, 1, img_sets, 0);
+   struct nir_stats st = gather_stats(b.shader);
+   CHECK(st.native_stores == 4);
+   CHECK(st.fence_tex_invalidate == 1);
+   CHECK(st.fence_image_write >= 1);
+   /* Top-level hot path has 1 coalesced fence_image_write before imageLoad,
+    * and 1 fence_tex_invalidate right before the texture-routed load. */
+   unsigned top_pbe = 0;
+   foreach_list_typed(nir_cf_node, n, node, &nir_shader_get_entrypoint(b.shader)->body) {
+      if (n->type != nir_cf_node_block)
+         continue;
+      nir_foreach_instr(ins, nir_cf_node_as_block(n)) {
+         if (ins->type != nir_instr_type_intrinsic)
+            continue;
+         if (nir_instr_as_intrinsic(ins)->intrinsic ==
+             nir_intrinsic_fence_image_write_apple9_agx)
+            top_pbe++;
+      }
+   }
+   CHECK(top_pbe == 1 && st.fence_tex_invalidate == 1);
+   CHECK(compile_lowered_compute(b.shader) == 0);
+   ralloc_free(b.shader);
+
+   /* Workgroup image barrier between imageStore and imageLoad:
+    * hk_apple9_lower_image_barriers preserves nir_var_image on SCOPE_WORKGROUP
+    * so the backend emits workgroup-scoped 0x0e51 + 0x0ed1 without an extra
+    * eager per-store fence pair. */
+   nir_builder wb = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                   &agx_nir_options,
+                                                   "workgroup_image_barrier");
+   wb.shader->info.internal = false;
+   wb.shader->info.workgroup_size[0] = 64;
+   wb.shader->info.workgroup_size[1] = wb.shader->info.workgroup_size[2] = 1;
+   nir_def *wgid = nir_load_global_invocation_id(&wb, 32);
+   nir_def *whandle = nir_bindless_image_agx(&wb, nir_imm_int(&wb, 0), .desc_set = 0);
+   nir_def *wcoord = nir_vec4(&wb, nir_channel(&wb, wgid, 0), nir_channel(&wb, wgid, 1),
+                              nir_imm_int(&wb, 0), nir_imm_int(&wb, 0));
+   nir_bindless_image_store(&wb, whandle, wcoord, nir_imm_int(&wb, 0),
+                            nir_imm_vec4(&wb, 1.0f, 2.0f, 3.0f, 4.0f),
+                            nir_imm_int(&wb, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                            .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                            .src_type = nir_type_float32);
+   nir_barrier(&wb,
+               .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_image);
+   nir_def *wloaded = nir_bindless_image_load(&wb, 4, 32, whandle, wcoord,
+                                              nir_imm_int(&wb, 0), nir_imm_int(&wb, 0),
+                                              .image_dim = GLSL_SAMPLER_DIM_2D,
+                                              .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                                              .dest_type = nir_type_float32);
+   nir_store_global(&wb, wloaded, nir_imm_int64(&wb, 0x80000),
+                    .write_mask = 0xf, .align_mul = 16);
+   nir_shader_gather_info(wb.shader, nir_shader_get_entrypoint(wb.shader));
+
+   hk_lower_nir(dev, wb.shader, &rs, false, 1, img_sets, 0);
+   struct nir_stats wst = gather_stats(wb.shader);
+   CHECK(wst.native_stores == 1);
+   CHECK(wst.fence_image_write == 0 && wst.fence_tex_invalidate == 0);
+   unsigned wg_img_barriers = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(wb.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+         if (intr->intrinsic == nir_intrinsic_barrier &&
+             nir_intrinsic_execution_scope(intr) == SCOPE_WORKGROUP &&
+             (nir_intrinsic_memory_modes(intr) & nir_var_image))
+            wg_img_barriers++;
+      }
+   }
+   CHECK(wg_img_barriers == 1);
+   CHECK(compile_lowered_compute(wb.shader) == 0);
+   ralloc_free(wb.shader);
+
+   /* Pure unchecked native image store + workgroup image barrier (MEDIUM #8):
+    * no global image fallback exists, so nir_var_mem_global must NOT be added
+    * (no extra 0x0885 barrier). */
+   nir_builder pb = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                   &agx_nir_options,
+                                                   "pure_native_wg_img_barrier");
+   pb.shader->info.internal = false;
+   pb.shader->info.workgroup_size[0] = 64;
+   pb.shader->info.workgroup_size[1] = pb.shader->info.workgroup_size[2] = 1;
+   nir_def *pgid = nir_load_global_invocation_id(&pb, 32);
+   nir_def *phandle = nir_bindless_image_agx(&pb, nir_imm_int(&pb, 0), .desc_set = 0);
+   nir_def *pcoord = nir_vec4(&pb, nir_channel(&pb, pgid, 0), nir_channel(&pb, pgid, 1),
+                              nir_imm_int(&pb, 0), nir_imm_int(&pb, 0));
+   nir_bindless_image_store(&pb, phandle, pcoord, nir_imm_int(&pb, 0),
+                            nir_imm_vec4(&pb, 1.0f, 2.0f, 3.0f, 4.0f),
+                            nir_imm_int(&pb, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                            .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                            .src_type = nir_type_float32);
+   nir_barrier(&pb,
+               .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_image);
+   nir_shader_gather_info(pb.shader, nir_shader_get_entrypoint(pb.shader));
+   hk_lower_nir(dev, pb.shader, &rs, false, 1, img_sets, 0);
+   unsigned pure_wg_img = 0, pure_wg_global = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(pb.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+         if (intr->intrinsic == nir_intrinsic_barrier &&
+             nir_intrinsic_execution_scope(intr) == SCOPE_WORKGROUP) {
+            if (nir_intrinsic_memory_modes(intr) & nir_var_image)
+               pure_wg_img++;
+            if (nir_intrinsic_memory_modes(intr) & nir_var_mem_global)
+               pure_wg_global++;
+         }
+      }
+   }
+   CHECK(pure_wg_img == 1 && pure_wg_global == 0);
+   CHECK(compile_lowered_compute(pb.shader) == 0);
+   ralloc_free(pb.shader);
+
+   /* HIGH #4: device-scope non-image barrier (memoryBarrierBuffer) between
+    * imageStore and imageLoad drains PBE before the barrier and MUST STILL
+    * emit fence_tex_invalidate before the subsequent imageLoad. */
+   nir_builder db = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                   &agx_nir_options,
+                                                   "device_ssbo_barrier_tex_inv");
+   db.shader->info.internal = false;
+   db.shader->info.workgroup_size[0] = 64;
+   db.shader->info.workgroup_size[1] = db.shader->info.workgroup_size[2] = 1;
+   nir_def *dgid = nir_load_global_invocation_id(&db, 32);
+   nir_def *dhandle = nir_bindless_image_agx(&db, nir_imm_int(&db, 0), .desc_set = 0);
+   nir_def *dcoord = nir_vec4(&db, nir_channel(&db, dgid, 0), nir_channel(&db, dgid, 1),
+                              nir_imm_int(&db, 0), nir_imm_int(&db, 0));
+   nir_bindless_image_store(&db, dhandle, dcoord, nir_imm_int(&db, 0),
+                            nir_imm_vec4(&db, 1.0f, 2.0f, 3.0f, 4.0f),
+                            nir_imm_int(&db, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                            .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                            .src_type = nir_type_float32);
+   nir_barrier(&db,
+               .execution_scope = SCOPE_NONE,
+               .memory_scope = SCOPE_DEVICE,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_ssbo);
+   nir_def *dloaded = nir_bindless_image_load(&db, 4, 32, dhandle, dcoord,
+                                              nir_imm_int(&db, 0), nir_imm_int(&db, 0),
+                                              .image_dim = GLSL_SAMPLER_DIM_2D,
+                                              .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                                              .dest_type = nir_type_float32);
+   nir_store_global(&db, dloaded, nir_imm_int64(&db, 0x80000),
+                    .write_mask = 0xf, .align_mul = 16);
+   nir_shader_gather_info(db.shader, nir_shader_get_entrypoint(db.shader));
+   hk_lower_nir(dev, db.shader, &rs, false, 1, img_sets, 0);
+   struct nir_stats dst = gather_stats(db.shader);
+   CHECK(dst.native_stores == 1);
+   CHECK(dst.fence_image_write == 1 && dst.fence_tex_invalidate == 1);
+   CHECK(compile_lowered_compute(db.shader) == 0);
+   ralloc_free(db.shader);
+
+   /* HIGH #3: dirty state across direct & nested loop break exits MUST emit
+    * both fence_image_write and fence_tex_invalidate before post-loop load. */
+   for (unsigned nested = 0; nested < 2; ++nested) {
+      nir_builder lb = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options,
+         nested ? "nested_loop_break_fence" : "direct_loop_break_fence");
+      lb.shader->info.internal = false;
+      lb.shader->info.workgroup_size[0] = 64;
+      lb.shader->info.workgroup_size[1] = lb.shader->info.workgroup_size[2] = 1;
+      nir_def *lgid = nir_load_global_invocation_id(&lb, 32);
+      nir_def *lhandle = nir_bindless_image_agx(&lb, nir_imm_int(&lb, 0), .desc_set = 0);
+      nir_def *lcoord = nir_vec4(&lb, nir_channel(&lb, lgid, 0), nir_channel(&lb, lgid, 1),
+                                 nir_imm_int(&lb, 0), nir_imm_int(&lb, 0));
+      nir_def *cond = nir_ine_imm(&lb, nir_channel(&lb, lgid, 0), 0);
+      nir_push_loop(&lb);
+      if (nested)
+         nir_push_loop(&lb);
+      nir_push_if(&lb, cond);
+      nir_bindless_image_store(&lb, lhandle, lcoord, nir_imm_int(&lb, 0),
+                               nir_imm_vec4(&lb, 1.0f, 2.0f, 3.0f, 4.0f),
+                               nir_imm_int(&lb, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                               .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                               .src_type = nir_type_float32);
+      nir_jump(&lb, nir_jump_break);
+      nir_pop_if(&lb, NULL);
+      nir_def *in_ld = nir_bindless_image_load(&lb, 4, 32, lhandle, lcoord,
+                                               nir_imm_int(&lb, 0), nir_imm_int(&lb, 0),
+                                               .image_dim = GLSL_SAMPLER_DIM_2D,
+                                               .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                                               .dest_type = nir_type_float32);
+      nir_store_global(&lb, in_ld, nir_imm_int64(&lb, 0x80000),
+                       .write_mask = 0xf, .align_mul = 16);
+      nir_jump(&lb, nir_jump_break);
+      nir_pop_loop(&lb, NULL);
+      if (nested) {
+         nir_jump(&lb, nir_jump_break);
+         nir_pop_loop(&lb, NULL);
+      }
+      nir_def *post_ld = nir_bindless_image_load(&lb, 4, 32, lhandle, lcoord,
+                                                 nir_imm_int(&lb, 0), nir_imm_int(&lb, 0),
+                                                 .image_dim = GLSL_SAMPLER_DIM_2D,
+                                                 .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                                                 .dest_type = nir_type_float32);
+      nir_store_global(&lb, post_ld, nir_imm_int64(&lb, 0x80010),
+                       .write_mask = 0xf, .align_mul = 16);
+      nir_shader_gather_info(lb.shader, nir_shader_get_entrypoint(lb.shader));
+      hk_lower_nir(dev, lb.shader, &rs, false, 1, img_sets, 0);
+      /* Verify post-loop block has BOTH fence_image_write and fence_tex_invalidate. */
+      unsigned post_pbe = 0, post_tex = 0;
+      bool after_loop = false;
+      foreach_list_typed(nir_cf_node, n, node, &nir_shader_get_entrypoint(lb.shader)->body) {
+         if (n->type == nir_cf_node_loop) {
+            after_loop = true;
+         } else if (after_loop) {
+            nir_foreach_block_in_cf_node(blk, n) {
+               nir_foreach_instr(ins, blk) {
+                  if (ins->type != nir_instr_type_intrinsic)
+                     continue;
+                  nir_intrinsic_op op = nir_instr_as_intrinsic(ins)->intrinsic;
+                  if (op == nir_intrinsic_fence_image_write_apple9_agx)
+                     post_pbe++;
+                  else if (op == nir_intrinsic_fence_tex_invalidate_apple9_agx)
+                     post_tex++;
+               }
+            }
+         }
+      }
+      CHECK(post_pbe >= 1 && post_tex >= 1);
+      CHECK(compile_lowered_compute(lb.shader) == 0);
+      ralloc_free(lb.shader);
+   }
+
+   /* HIGH #6: native imageStore followed by volatile/coherent imageStore
+    * (global fallback store_global) MUST drain PBE before the global store. */
+   nir_builder gb = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                   &agx_nir_options,
+                                                   "native_then_volatile_store");
+   gb.shader->info.internal = false;
+   gb.shader->info.workgroup_size[0] = 64;
+   gb.shader->info.workgroup_size[1] = gb.shader->info.workgroup_size[2] = 1;
+   nir_def *ggid = nir_load_global_invocation_id(&gb, 32);
+   nir_def *ghandle = nir_bindless_image_agx(&gb, nir_imm_int(&gb, 0), .desc_set = 0);
+   nir_def *gcoord = nir_vec4(&gb, nir_channel(&gb, ggid, 0), nir_channel(&gb, ggid, 1),
+                              nir_imm_int(&gb, 0), nir_imm_int(&gb, 0));
+   nir_bindless_image_store(&gb, ghandle, gcoord, nir_imm_int(&gb, 0),
+                            nir_imm_vec4(&gb, 1.0f, 2.0f, 3.0f, 4.0f),
+                            nir_imm_int(&gb, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                            .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                            .src_type = nir_type_float32);
+   nir_bindless_image_store(&gb, ghandle, gcoord, nir_imm_int(&gb, 0),
+                            nir_imm_vec4(&gb, 5.0f, 6.0f, 7.0f, 8.0f),
+                            nir_imm_int(&gb, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                            .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                            .src_type = nir_type_float32,
+                            .access = ACCESS_COHERENT);
+   nir_def *gloaded = nir_bindless_image_load(&gb, 4, 32, ghandle, gcoord,
+                                              nir_imm_int(&gb, 0), nir_imm_int(&gb, 0),
+                                              .image_dim = GLSL_SAMPLER_DIM_2D,
+                                              .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                                              .dest_type = nir_type_float32);
+   nir_store_global(&gb, gloaded, nir_imm_int64(&gb, 0x80000),
+                    .write_mask = 0xf, .align_mul = 16);
+   nir_shader_gather_info(gb.shader, nir_shader_get_entrypoint(gb.shader));
+   hk_lower_nir(dev, gb.shader, &rs, false, 1, img_sets, 0);
+   /* Verify fence_image_write appears before the coherent fallback store_global. */
+   bool seen_native = false, seen_pbe_before_coherent_store = false;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(gb.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+         if (intr->intrinsic == nir_intrinsic_image_store_apple9_agx)
+            seen_native = true;
+         else if (seen_native &&
+                  intr->intrinsic == nir_intrinsic_fence_image_write_apple9_agx)
+            seen_pbe_before_coherent_store = true;
+         else if (intr->intrinsic == nir_intrinsic_store_global &&
+                  (nir_intrinsic_access(intr) & ACCESS_COHERENT))
+            CHECK(seen_pbe_before_coherent_store);
+      }
+   }
+   CHECK(seen_native && seen_pbe_before_coherent_store);
+   CHECK(compile_lowered_compute(gb.shader) == 0);
+   ralloc_free(gb.shader);
+
+   /* HIGH #3: store-only shader (ordered == true, fenced_stores == false) with
+    * a native PBE imageStore followed by an ACCESS_COHERENT imageStore (global
+    * fallback store_global) MUST still drain PBE before the global store. */
+   nir_builder sb = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                   &agx_nir_options,
+                                                   "store_only_native_then_coherent");
+   sb.shader->info.internal = false;
+   sb.shader->info.workgroup_size[0] = 64;
+   sb.shader->info.workgroup_size[1] = sb.shader->info.workgroup_size[2] = 1;
+   nir_def *sgid = nir_load_global_invocation_id(&sb, 32);
+   nir_def *shandle = nir_bindless_image_agx(&sb, nir_imm_int(&sb, 0), .desc_set = 0);
+   nir_def *scoord = nir_vec4(&sb, nir_channel(&sb, sgid, 0), nir_channel(&sb, sgid, 1),
+                              nir_imm_int(&sb, 0), nir_imm_int(&sb, 0));
+   nir_bindless_image_store(&sb, shandle, scoord, nir_imm_int(&sb, 0),
+                            nir_imm_vec4(&sb, 1.0f, 2.0f, 3.0f, 4.0f),
+                            nir_imm_int(&sb, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                            .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                            .src_type = nir_type_float32);
+   nir_bindless_image_store(&sb, shandle, scoord, nir_imm_int(&sb, 0),
+                            nir_imm_vec4(&sb, 5.0f, 6.0f, 7.0f, 8.0f),
+                            nir_imm_int(&sb, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                            .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                            .src_type = nir_type_float32,
+                            .access = ACCESS_COHERENT);
+   nir_shader_gather_info(sb.shader, nir_shader_get_entrypoint(sb.shader));
+   CHECK(hk_apple9_native_store_shader(sb.shader));
+   hk_lower_nir(dev, sb.shader, &rs, false, 1, img_sets, 0);
+   bool so_native = false, so_pbe_before_coherent = false, so_coherent = false;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(sb.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+         if (intr->intrinsic == nir_intrinsic_image_store_apple9_agx)
+            so_native = true;
+         else if (so_native &&
+                  intr->intrinsic == nir_intrinsic_fence_image_write_apple9_agx)
+            so_pbe_before_coherent = true;
+         else if (intr->intrinsic == nir_intrinsic_store_global &&
+                  (nir_intrinsic_access(intr) & ACCESS_COHERENT)) {
+            so_coherent = true;
+            CHECK(so_pbe_before_coherent);
+         }
+      }
+   }
+   CHECK(so_native && so_coherent && so_pbe_before_coherent);
+   CHECK(compile_lowered_compute(sb.shader) == 0);
+   ralloc_free(sb.shader);
+
+   /* HIGH #5: 2D ACCESS_NON_READABLE bindless_image_atomic (lowered to global
+    * by agx_nir_lower_images) + native 2D bindless_image_store + workgroup
+    * nir_var_image barrier MUST keep nir_var_mem_global on the barrier. */
+   nir_builder ab = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                   &agx_nir_options,
+                                                   "atomic_plus_native_wg_barrier");
+   ab.shader->info.internal = false;
+   ab.shader->info.workgroup_size[0] = 64;
+   ab.shader->info.workgroup_size[1] = ab.shader->info.workgroup_size[2] = 1;
+   nir_def *agid = nir_load_global_invocation_id(&ab, 32);
+   nir_def *ahandle = nir_bindless_image_agx(&ab, nir_imm_int(&ab, 0), .desc_set = 0);
+   nir_def *acoord = nir_vec4(&ab, nir_channel(&ab, agid, 0), nir_channel(&ab, agid, 1),
+                              nir_imm_int(&ab, 0), nir_imm_int(&ab, 0));
+   nir_def *ares = nir_bindless_image_atomic(&ab, 32, ahandle, acoord,
+                                             nir_imm_int(&ab, 0),
+                                             nir_imm_int(&ab, 1),
+                                             .image_dim = GLSL_SAMPLER_DIM_2D,
+                                             .format = PIPE_FORMAT_R32_UINT,
+                                             .atomic_op = nir_atomic_op_iadd,
+                                             .access = ACCESS_NON_READABLE);
+   nir_bindless_image_store(&ab, ahandle, acoord, nir_imm_int(&ab, 0),
+                            nir_vec4(&ab, ares, ares, ares, ares),
+                            nir_imm_int(&ab, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                            .format = PIPE_FORMAT_R32_UINT,
+                            .src_type = nir_type_uint32);
+   nir_barrier(&ab,
+               .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_image);
+   nir_shader_gather_info(ab.shader, nir_shader_get_entrypoint(ab.shader));
+   hk_lower_nir(dev, ab.shader, &rs, false, 1, img_sets, 0);
+   unsigned ab_wg_img = 0, ab_wg_global = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(ab.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+         if (intr->intrinsic == nir_intrinsic_barrier &&
+             nir_intrinsic_execution_scope(intr) == SCOPE_WORKGROUP) {
+            if (nir_intrinsic_memory_modes(intr) & nir_var_image)
+               ab_wg_img++;
+            if (nir_intrinsic_memory_modes(intr) & nir_var_mem_global)
+               ab_wg_global++;
+         }
+      }
+   }
+   CHECK(ab_wg_img == 1 && ab_wg_global == 1);
+   CHECK(compile_lowered_compute(ab.shader) == 0);
+   ralloc_free(ab.shader);
+
+   destroy_set_layout(img_layout);
+   free(dev);
+   puts("coalesced lazy image fences + loop break + barrier + global store + pure native wg: pass");
+   return 0;
+}
+
 int
 main(void)
 {
@@ -1166,6 +1600,7 @@ main(void)
    CHECK(test_branchless_storage_and_tbuf() == 0);
    CHECK(test_gpl_sw_needed() == 0);
    CHECK(test_soft_fault_ssbo_and_4b_vectorize() == 0);
+   CHECK(test_coalesced_lazy_image_fences() == 0);
 
    glsl_type_singleton_decref();
    return 0;

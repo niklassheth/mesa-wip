@@ -8198,7 +8198,7 @@ TEST(Apple9Allocator, TileReadNormalizesAndRetainsTheFirstLogicConsumer)
    agx_apple9_vir_finish(&program);
 }
 
-TEST(Apple9Allocator, TileReadMaterializesBeforeAStoreWithoutAWaitField)
+TEST(Apple9Allocator, TileReadFoldsWaitDirectlyIntoTileStore)
 {
    agx_apple9_vir_program program;
    agx_apple9_vir_init(&program);
@@ -8209,8 +8209,7 @@ TEST(Apple9Allocator, TileReadMaterializesBeforeAStoreWithoutAWaitField)
       AGX_APPLE9_ENC_TILE_STORE, &tile, 1, 0));
    const char *reason = nullptr;
    ASSERT_TRUE(agx_apple9_assign_vir_scoreboard_slots(&program, &reason)) << reason;
-   ASSERT_EQ(program.instruction_count, 3u);
-   EXPECT_TRUE(program.instructions[1]->scoreboard_materialize);
+   ASSERT_EQ(program.instruction_count, 2u);
    EXPECT_EQ(program.instructions[1]->scoreboard_slot,
              program.instructions[0]->producer_scoreboard_slot);
    agx_apple9_vir_finish(&program);
@@ -15928,10 +15927,10 @@ TEST(Apple9Compiler, LazyFragmentTileLockPlacement)
          b.shader, nullptr, &blend, use_epilog ? 1 : 0, &main_out, &reason))
          << (reason ?: "");
       unsigned n600 = 0, nlock = 0, n20c = 0;
-      const uint8_t *lock_pat = use_epilog ? tile_80c : tile_808;
+      const uint8_t *want_lock = use_epilog ? tile_80c : tile_808;
       size_t off_tex = apple9_find_tex_sample(main_out);
       size_t off_600 = apple9_find_bytes(main_out, tile_600, sizeof(tile_600), &n600);
-      size_t off_lock = apple9_find_bytes(main_out, lock_pat, 6, &nlock);
+      size_t off_lock = apple9_find_bytes(main_out, want_lock, 6, &nlock);
       size_t off_20c = apple9_find_bytes(main_out, fence_20c, sizeof(fence_20c), &n20c);
       EXPECT_EQ(n600, 1u);
       EXPECT_EQ(nlock, 1u);

@@ -1224,8 +1224,9 @@ struct apple9_dag_lower {
    bool tile_preamble_needed;
    uint32_t tile_preamble_imm;
    bool tile_lock_needed;
-   bool tile_lock_acquired;
-   uint32_t tile_lock_imm;
+   bool tile_lock_exclusive;
+   bool tile_read_lock_acquired;
+   bool tile_write_lock_acquired;
    /* Fragment shader interlock holds the pixel acquired for writing. */
    bool interlock;
    uint32_t coverage_control;
@@ -1281,29 +1282,71 @@ apple9_acquire_tile_preamble(struct apple9_dag_lower *lower)
 }
 
 static bool
-apple9_acquire_tile_lock(struct apple9_dag_lower *lower)
+apple9_acquire_tile_read_lock(struct apple9_dag_lower *lower)
 {
    if (!apple9_acquire_tile_preamble(lower))
       return false;
-   if (!lower->tile_lock_needed || lower->tile_lock_acquired)
+   if (!lower->tile_lock_needed || lower->tile_read_lock_acquired ||
+       lower->tile_write_lock_acquired)
       return true;
-   lower->tile_lock_acquired = true;
+   /* Any shader that writes tile data (RMW / programmable blend), hands off to
+    * a color-writing epilog, or uses fragment shader interlock must acquire an
+    * exclusive R/W lock (0x80c) up front so overlapping fragments on the same
+    * pixel cannot both read stale tile color before writing. Strictly read-only
+    * tile access uses the shared read lock (0x808). */
+   if (lower->tile_lock_exclusive) {
+      lower->tile_read_lock_acquired = true;
+      lower->tile_write_lock_acquired = true;
+      return agx_apple9_vir_emit_side_effect(
+         &lower->program, AGX_APPLE9_VIR_TILE_ACCESS, AGX_APPLE9_ENC_TILE_ACCESS,
+         NULL, 0, 0x80c);
+   }
+   lower->tile_read_lock_acquired = true;
    return agx_apple9_vir_emit_side_effect(
       &lower->program, AGX_APPLE9_VIR_TILE_ACCESS, AGX_APPLE9_ENC_TILE_ACCESS,
-      NULL, 0, lower->tile_lock_imm);
+      NULL, 0, 0x808);
 }
 
 static bool
-apple9_cf_node_needs_tile_lock(nir_cf_node *node)
+apple9_acquire_tile_write_lock(struct apple9_dag_lower *lower)
+{
+   if (!apple9_acquire_tile_preamble(lower))
+      return false;
+   if (!lower->tile_lock_needed || lower->tile_write_lock_acquired)
+      return true;
+   uint32_t imm = lower->tile_read_lock_acquired ? 0x804 : 0x80c;
+   lower->tile_read_lock_acquired = true;
+   lower->tile_write_lock_acquired = true;
+   return agx_apple9_vir_emit_side_effect(
+      &lower->program, AGX_APPLE9_VIR_TILE_ACCESS, AGX_APPLE9_ENC_TILE_ACCESS,
+      NULL, 0, imm);
+}
+
+static bool
+apple9_cf_node_needs_tile_write_lock(nir_cf_node *node)
 {
    nir_foreach_block_in_cf_node(block, node) {
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
             continue;
          nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
-         if (op == nir_intrinsic_load_local_pixel_agx ||
-             op == nir_intrinsic_store_local_pixel_agx ||
+         if (op == nir_intrinsic_store_local_pixel_agx ||
              op == nir_intrinsic_begin_invocation_interlock)
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
+apple9_cf_node_needs_tile_read_lock(nir_cf_node *node)
+{
+   nir_foreach_block_in_cf_node(block, node) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         if (nir_instr_as_intrinsic(instr)->intrinsic ==
+             nir_intrinsic_load_local_pixel_agx)
             return true;
       }
    }
@@ -3323,7 +3366,7 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
             lower, nir_get_scalar(intr->src[coords ? 1 : 0].ssa, 0));
          if (source == AGX_APPLE9_VREG_INVALID)
             return AGX_APPLE9_VREG_INVALID;
-         if (!coords && !apple9_acquire_tile_lock(lower))
+         if (!coords && !apple9_acquire_tile_read_lock(lower))
             return AGX_APPLE9_VREG_INVALID;
          assert(lower->tile_access && lower->tile_read);
          value = apple9_dag_emit(lower, AGX_APPLE9_VIR_TILE_LOAD,
@@ -5093,7 +5136,7 @@ apple9_emit_graphics_output(struct apple9_dag_lower *lower,
          if (colors[word] == AGX_APPLE9_VREG_INVALID)
             return false;
       }
-      if (!apple9_acquire_tile_lock(lower))
+      if (!apple9_acquire_tile_write_lock(lower))
          return false;
       assert(lower->tile_access && lower->tile_write);
       for (unsigned word = 0; word < intr->num_components; ++word) {
@@ -5241,7 +5284,7 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
           * if a prior tile access already opened it). Its end orders the
           * section's memory accesses before the release at exit. */
          if (intr->intrinsic == nir_intrinsic_begin_invocation_interlock) {
-            if (!apple9_acquire_tile_lock(lower))
+            if (!apple9_acquire_tile_write_lock(lower))
                return false;
             continue;
          }
@@ -5253,38 +5296,106 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
             continue;
          }
          if (intr->intrinsic == nir_intrinsic_barrier) {
-            unsigned scope = nir_intrinsic_execution_scope(intr);
+            unsigned exec_scope = nir_intrinsic_execution_scope(intr);
+            unsigned mem_scope = nir_intrinsic_memory_scope(intr);
             unsigned modes = nir_intrinsic_memory_modes(intr);
-            if (scope > SCOPE_WORKGROUP ||
+            if (exec_scope > SCOPE_WORKGROUP ||
                 (modes & ~(nir_var_mem_shared | nir_var_mem_global |
                            nir_var_mem_ssbo | nir_var_image))) {
                lower->reason = "Apple9 barrier scope or memory class is unsupported";
                return false;
             }
-            /* As on Apple8, a subgroup executes in lockstep and shared memory
-             * needs no fence. Storage images are lowered to global memory.
-             */
-            /* An acquiring fence keeps its device reads ordered before it:
-             * leaving one pending across the fence, with the later read
-             * waiting instead, intermittently failed fragment
-             * memory_model.message_passing on T8132. Release-only fences
-             * may leave reads pending (native Metal). */
             const bool acquire =
-               nir_intrinsic_memory_semantics(intr) & NIR_MEMORY_ACQUIRE;
-            if (nir_intrinsic_memory_scope(intr) != SCOPE_NONE &&
-                (modes & (nir_var_mem_global | nir_var_mem_ssbo |
-                          nir_var_image)) &&
-                !agx_apple9_vir_emit_side_effect(&lower->program,
-                   AGX_APPLE9_VIR_DEVICE_FENCE,
-                   AGX_APPLE9_ENC_DEVICE_FENCE, NULL, 0,
-                   acquire ? AGX_APPLE9_FENCE_DEVICE_ACQUIRE
-                           : AGX_APPLE9_FENCE_DEVICE))
-               return false;
-            if (scope == SCOPE_WORKGROUP &&
-                !agx_apple9_vir_emit_side_effect(&lower->program,
-                   AGX_APPLE9_VIR_WORKGROUP_BARRIER,
-                   AGX_APPLE9_ENC_WORKGROUP_BARRIER, NULL, 0, 0))
-               return false;
+               (nir_intrinsic_memory_semantics(intr) & NIR_MEMORY_ACQUIRE) != 0;
+            const bool dev_mem =
+               mem_scope != SCOPE_NONE &&
+               (modes & (nir_var_mem_global | nir_var_mem_ssbo)) != 0;
+            const bool img_mem =
+               mem_scope != SCOPE_NONE && (modes & nir_var_image) != 0;
+            const bool shared_mem =
+               mem_scope != SCOPE_NONE && (modes & nir_var_mem_shared) != 0;
+            const bool need_dev_wide =
+               mem_scope > SCOPE_WORKGROUP && (dev_mem || img_mem);
+
+            if (exec_scope == SCOPE_WORKGROUP) {
+               bool emitted_exec = false;
+               if (need_dev_wide) {
+                  if (!agx_apple9_vir_emit_side_effect(&lower->program,
+                         AGX_APPLE9_VIR_DEVICE_FENCE,
+                         AGX_APPLE9_ENC_DEVICE_FENCE, NULL, 0,
+                         acquire ? AGX_APPLE9_FENCE_DEVICE_ACQUIRE
+                                 : AGX_APPLE9_FENCE_DEVICE))
+                     return false;
+               } else if (mem_scope == SCOPE_WORKGROUP && dev_mem) {
+                  /* Core-local workgroup device-memory + execution barrier (0x0885). */
+                  if (!agx_apple9_vir_emit_side_effect(&lower->program,
+                         AGX_APPLE9_VIR_WORKGROUP_BARRIER,
+                         AGX_APPLE9_ENC_WORKGROUP_BARRIER, NULL, 0,
+                         AGX_APPLE9_WORKGROUP_BARRIER_DEVICE))
+                     return false;
+                  emitted_exec = true;
+               }
+               if (mem_scope == SCOPE_WORKGROUP && img_mem) {
+                  /* Workgroup-scope texture barrier (0x0e51 + 0x0ed1) includes
+                   * execution rendezvous. */
+                  if (!agx_apple9_vir_emit_side_effect(&lower->program,
+                         AGX_APPLE9_VIR_DEVICE_FENCE,
+                         AGX_APPLE9_ENC_DEVICE_FENCE, NULL, 0,
+                         AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP) ||
+                      !agx_apple9_vir_emit_side_effect(&lower->program,
+                         AGX_APPLE9_VIR_DEVICE_FENCE,
+                         AGX_APPLE9_ENC_DEVICE_FENCE, NULL, 0,
+                         AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP))
+                     return false;
+                  emitted_exec = true;
+               }
+               if (shared_mem && mem_scope >= SCOPE_WORKGROUP) {
+                  if (!agx_apple9_vir_emit_side_effect(&lower->program,
+                         AGX_APPLE9_VIR_WORKGROUP_BARRIER,
+                         AGX_APPLE9_ENC_WORKGROUP_BARRIER, NULL, 0,
+                         AGX_APPLE9_WORKGROUP_BARRIER_SHARED))
+                     return false;
+                  emitted_exec = true;
+               }
+               if (!emitted_exec) {
+                  /* Execution-only workgroup barrier (0x0941, omits TG-mem 0x20). */
+                  if (!agx_apple9_vir_emit_side_effect(&lower->program,
+                         AGX_APPLE9_VIR_WORKGROUP_BARRIER,
+                         AGX_APPLE9_ENC_WORKGROUP_BARRIER, NULL, 0,
+                         AGX_APPLE9_WORKGROUP_BARRIER_NONE))
+                     return false;
+               }
+            } else {
+               if (need_dev_wide) {
+                  if (!agx_apple9_vir_emit_side_effect(&lower->program,
+                         AGX_APPLE9_VIR_DEVICE_FENCE,
+                         AGX_APPLE9_ENC_DEVICE_FENCE, NULL, 0,
+                         acquire ? AGX_APPLE9_FENCE_DEVICE_ACQUIRE
+                                 : AGX_APPLE9_FENCE_DEVICE))
+                     return false;
+               } else if (mem_scope == SCOPE_WORKGROUP && img_mem) {
+                  /* Workgroup texture fence without rendezvous (0x0e50 + 0x0ed0). */
+                  if (!agx_apple9_vir_emit_side_effect(&lower->program,
+                         AGX_APPLE9_VIR_DEVICE_FENCE,
+                         AGX_APPLE9_ENC_DEVICE_FENCE, NULL, 0,
+                         AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP_MEM) ||
+                      !agx_apple9_vir_emit_side_effect(&lower->program,
+                         AGX_APPLE9_VIR_DEVICE_FENCE,
+                         AGX_APPLE9_ENC_DEVICE_FENCE, NULL, 0,
+                         AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP_MEM))
+                     return false;
+               } else if (mem_scope != SCOPE_NONE &&
+                          (dev_mem || img_mem || shared_mem)) {
+                  /* Subgroup/invocation/workgroup-memory-only barriers need 0
+                   * HW fence instructions on Apple9 (same core coherent L1 +
+                   * lockstep SIMD); keep a zero-byte compiler ordering barrier. */
+                  if (!agx_apple9_vir_emit_side_effect(&lower->program,
+                         AGX_APPLE9_VIR_DEVICE_FENCE,
+                         AGX_APPLE9_ENC_PSEUDO, NULL, 0,
+                         AGX_APPLE9_FENCE_COMPILER_BARRIER))
+                     return false;
+               }
+            }
             continue;
          }
          if (intr->intrinsic == nir_intrinsic_store_scratch) {
@@ -6404,10 +6515,16 @@ apple9_emit_cf_list(struct apple9_dag_lower *lower,
       }
       case nir_cf_node_if:
          if (!lower->mask_depth && !lower->loop_depth && !lower->object_region) {
-            if (lower->tile_lock_needed && !lower->tile_lock_acquired &&
-                apple9_cf_node_needs_tile_lock(node) &&
-                !apple9_acquire_tile_lock(lower))
-               return false;
+            if (lower->tile_lock_needed) {
+               if (!lower->tile_write_lock_acquired &&
+                   apple9_cf_node_needs_tile_write_lock(node) &&
+                   !apple9_acquire_tile_write_lock(lower))
+                  return false;
+               else if (!lower->tile_read_lock_acquired &&
+                        apple9_cf_node_needs_tile_read_lock(node) &&
+                        !apple9_acquire_tile_read_lock(lower))
+                  return false;
+            }
             if (lower->tile_preamble_needed && !lower->tile_access &&
                 apple9_cf_node_needs_tile_preamble(node) &&
                 !apple9_acquire_tile_preamble(lower))
@@ -6418,10 +6535,16 @@ apple9_emit_cf_list(struct apple9_dag_lower *lower,
          break;
       case nir_cf_node_loop:
          if (!lower->mask_depth && !lower->loop_depth && !lower->object_region) {
-            if (lower->tile_lock_needed && !lower->tile_lock_acquired &&
-                apple9_cf_node_needs_tile_lock(node) &&
-                !apple9_acquire_tile_lock(lower))
-               return false;
+            if (lower->tile_lock_needed) {
+               if (!lower->tile_write_lock_acquired &&
+                   apple9_cf_node_needs_tile_write_lock(node) &&
+                   !apple9_acquire_tile_write_lock(lower))
+                  return false;
+               else if (!lower->tile_read_lock_acquired &&
+                        apple9_cf_node_needs_tile_read_lock(node) &&
+                        !apple9_acquire_tile_read_lock(lower))
+                  return false;
+            }
             if (lower->tile_preamble_needed && !lower->tile_access &&
                 apple9_cf_node_needs_tile_preamble(node) &&
                 !apple9_acquire_tile_preamble(lower))
@@ -7742,14 +7865,16 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
          /* Per-sample trampoline acquires 0x600/0x80c once before the sample
           * loop and releases 0x020c + ZS once after the final sample. */
          lower.tile_access = true;
-         lower.tile_lock_acquired = true;
+         lower.tile_read_lock_acquired = true;
+         lower.tile_write_lock_acquired = true;
          lower.tile_read = reads;
          lower.tile_write = true;
       } else if (tile_mode == APPLE9_TILE_EPILOG_TAIL_LOCKED) {
-         /* fs_main already acquired 0x600 + 0x80c (pixel_interlock or tile
-          * read) and handed off the lock for this epilog to release. */
+         /* fs_main already acquired 0x600 + 0x80c (or 0x808 -> 0x804) and
+          * handed off the lock for this epilog to release. */
          lower.tile_access = true;
-         lower.tile_lock_acquired = true;
+         lower.tile_read_lock_acquired = true;
+         lower.tile_write_lock_acquired = true;
          lower.tile_read = reads;
          lower.tile_write = true;
       } else {
@@ -7768,10 +7893,9 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
             }
          }
          if ((reads || writes || lower.interlock) && !lower.tile_coords) {
-            bool lock_write = writes || lower.interlock ||
-                              tile_mode == APPLE9_TILE_EPILOG_MAIN;
             lower.tile_lock_needed = true;
-            lower.tile_lock_imm = lock_write ? 0x80c : 0x808;
+            lower.tile_lock_exclusive =
+               writes || lower.interlock || tile_mode == APPLE9_TILE_EPILOG_MAIN;
             lower.tile_read = reads;
             lower.tile_write = writes;
          }
@@ -7790,7 +7914,11 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
        tile_mode == APPLE9_TILE_EPILOG_MAIN) {
-      lower.handed_off_tile_lock = lower.tile_lock_acquired;
+      if (lower.tile_read_lock_acquired && !lower.tile_write_lock_acquired &&
+          !apple9_acquire_tile_write_lock(&lower))
+         goto fail;
+      lower.handed_off_tile_lock =
+         lower.tile_read_lock_acquired || lower.tile_write_lock_acquired;
       lower.handed_off_tile_preamble = lower.tile_access;
    }
 
@@ -7802,12 +7930,14 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
 
    /* Finalize tile writes once after all color outputs. The release marks
     * completion of the fragment's tile transaction, including MRT stores. */
+   const bool any_tile_lock =
+      lower.tile_read_lock_acquired || lower.tile_write_lock_acquired;
    bool need_tile_fence =
       tile_mode == APPLE9_TILE_EPILOG_TAIL_LOCKED ||
       (tile_mode != APPLE9_TILE_PROLOG &&
        tile_mode != APPLE9_TILE_EPILOG_PER_SAMPLE &&
        !(tile_mode == APPLE9_TILE_EPILOG_MAIN && lower.handed_off_tile_lock) &&
-       (lower.tile_coords ? lower.tile_read : lower.tile_lock_acquired));
+       (lower.tile_coords ? lower.tile_read : any_tile_lock));
    if (nir->info.stage == MESA_SHADER_FRAGMENT && need_tile_fence &&
        !agx_apple9_vir_emit_side_effect(
           &lower.program, AGX_APPLE9_VIR_TILE_FENCE, AGX_APPLE9_ENC_TILE_FENCE,
@@ -7899,7 +8029,10 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
       }
       if (!agx_apple9_pack_vir_instruction(instruction, lower.program.phys,
                                            &packed, reason) ||
-          !apple9_emit_packed(&emitter, &packed)) {
+          (packed.length > 0 && !apple9_emit_packed(&emitter, &packed)) ||
+          (packed.length == 0 &&
+           !(instruction->op == AGX_APPLE9_VIR_DEVICE_FENCE &&
+             instruction->immediate == AGX_APPLE9_FENCE_COMPILER_BARRIER))) {
          if (agx_apple9_trace_enabled()) {
             fprintf(apple9_log(), "APPLE9_PACK_FAIL i=%u op=%u enc=%u dst=", i,
                     instruction->op, instruction->encoding);

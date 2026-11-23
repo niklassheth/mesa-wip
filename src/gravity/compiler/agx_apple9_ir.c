@@ -3907,6 +3907,24 @@ agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
       }
 
       if (apple9_vir_is_control_side_effect(instruction->op)) {
+         if (instruction->op == AGX_APPLE9_VIR_DEVICE_FENCE &&
+             instruction->immediate == AGX_APPLE9_FENCE_COMPILER_BARRIER) {
+            if (instruction->encoding != AGX_APPLE9_ENC_PSEUDO ||
+                instruction->nr_srcs != 0 ||
+                instruction->dest != AGX_APPLE9_VREG_INVALID ||
+                instruction->memory_bits != 0 ||
+                instruction->memory_components != 0 ||
+                instruction->fence_slot_mask != 0 ||
+                instruction->producer_scoreboard_slot !=
+                   AGX_APPLE9_SCOREBOARD_SLOT_NONE ||
+                instruction->scoreboard_slot !=
+                   AGX_APPLE9_SCOREBOARD_SLOT_NONE) {
+               if (reason != NULL)
+                  *reason = "Apple9 compiler barrier has an invalid VIR contract";
+               return false;
+            }
+            continue;
+         }
          bool mesh = instruction->op == AGX_APPLE9_VIR_MESH_CONTROL ||
                      instruction->op == AGX_APPLE9_VIR_MESH_SUBMIT_SCALAR ||
                      instruction->op == AGX_APPLE9_VIR_MESH_SUBMIT_CHANNEL;
@@ -3917,10 +3935,12 @@ agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
             (instruction->producer_scoreboard_slot ==
                 AGX_APPLE9_SCOREBOARD_SLOT_NONE ||
              instruction->op == AGX_APPLE9_VIR_MESH_CONTROL) &&
-            /* Compares and U instructions may consume a pending source;
-             * the layout check above validated their dependency field. */
+            /* Compares, EXEC_MASK_PUSH, and U instructions may consume a
+             * pending source or folded wait; the layout check above validated
+             * their dependency field. */
             (instruction->scoreboard_slot == AGX_APPLE9_SCOREBOARD_SLOT_NONE ||
-             instruction->op == AGX_APPLE9_VIR_PREDICATE_COMPARE || mesh);
+             instruction->op == AGX_APPLE9_VIR_PREDICATE_COMPARE ||
+             instruction->op == AGX_APPLE9_VIR_EXEC_MASK_PUSH || mesh);
 
          switch (instruction->op) {
          case AGX_APPLE9_VIR_MESH_CONTROL:
@@ -4012,14 +4032,24 @@ agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
          }
          case AGX_APPLE9_VIR_WORKGROUP_BARRIER:
             valid &= instruction->encoding == AGX_APPLE9_ENC_WORKGROUP_BARRIER &&
-                     instruction->nr_srcs == 0 && instruction->immediate == 0;
+                     instruction->nr_srcs == 0 &&
+                     instruction->immediate <= AGX_APPLE9_WORKGROUP_BARRIER_DEVICE;
             break;
-         case AGX_APPLE9_VIR_DEVICE_FENCE:
+         case AGX_APPLE9_VIR_DEVICE_FENCE: {
+            const bool uses_slot_mask =
+               instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE ||
+               instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS ||
+               instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP ||
+               instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP_MEM;
             valid &= instruction->encoding == AGX_APPLE9_ENC_DEVICE_FENCE &&
                      instruction->nr_srcs == 0 &&
                      instruction->immediate <=
-                        AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP;
+                        AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP_MEM &&
+                     (uses_slot_mask
+                         ? (instruction->fence_slot_mask & ~BITFIELD_MASK(6)) == 0
+                         : instruction->fence_slot_mask == 0);
             break;
+         }
          case AGX_APPLE9_VIR_WAIT:
             valid &= instruction->encoding == AGX_APPLE9_ENC_WAIT &&
                      instruction->nr_srcs == 0 && instruction->immediate != 0 &&
@@ -4072,14 +4102,16 @@ agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
             break;
          }
 
-         unsigned tuple[AGX_APPLE9_MAX_ENCODING_OPERANDS] = {0};
-         unsigned tuple_count = 0;
-         const unsigned bits =
-            instruction->op == AGX_APPLE9_VIR_MESH_CONTROL ? 16 : 32;
-         valid &=
-            encoding_tuple(instruction, program->phys, tuple, &tuple_count) &&
-            agx_apple9_encoding_accepts_gpr_tuple(instruction->encoding, tuple,
-                                                  tuple_count, bits);
+         if (valid) {
+            unsigned tuple[AGX_APPLE9_MAX_ENCODING_OPERANDS] = {0};
+            unsigned tuple_count = 0;
+            const unsigned bits =
+               instruction->op == AGX_APPLE9_VIR_MESH_CONTROL ? 16 : 32;
+            valid &=
+               encoding_tuple(instruction, program->phys, tuple, &tuple_count) &&
+               agx_apple9_encoding_accepts_gpr_tuple(instruction->encoding, tuple,
+                                                     tuple_count, bits);
+         }
          if (!valid) {
             if (reason != NULL)
                *reason =
@@ -8142,10 +8174,18 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
    }
    case AGX_APPLE9_VIR_WORKGROUP_BARRIER: {
       if (instruction->encoding != AGX_APPLE9_ENC_WORKGROUP_BARRIER ||
-          instruction->nr_srcs || instruction->immediate ||
+          instruction->nr_srcs ||
+          instruction->immediate > AGX_APPLE9_WORKGROUP_BARRIER_DEVICE ||
           instruction->dest != AGX_APPLE9_VREG_INVALID)
          return false;
-      const uint8_t bytes[] = {0x07, 0x04, 0x54, 0x61, 0x09, 0};
+      const uint8_t b3 =
+         instruction->immediate == AGX_APPLE9_WORKGROUP_BARRIER_NONE     ? 0x41
+         : instruction->immediate == AGX_APPLE9_WORKGROUP_BARRIER_DEVICE ? 0x85
+                                                                         : 0x61;
+      const uint8_t b4 =
+         instruction->immediate == AGX_APPLE9_WORKGROUP_BARRIER_DEVICE ? 0x08
+                                                                       : 0x09;
+      const uint8_t bytes[] = {0x07, 0x04, 0x54, b3, b4, 0};
       packed_init(packed, bytes, sizeof(bytes));
       return true;
    }
@@ -8160,9 +8200,26 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       return true;
    }
    case AGX_APPLE9_VIR_DEVICE_FENCE: {
+      if (instruction->immediate == AGX_APPLE9_FENCE_COMPILER_BARRIER) {
+         if (instruction->encoding != AGX_APPLE9_ENC_PSEUDO ||
+             instruction->nr_srcs ||
+             instruction->fence_slot_mask != 0 ||
+             instruction->dest != AGX_APPLE9_VREG_INVALID)
+            return false;
+         packed->length = 0;
+         return true;
+      }
+      const bool uses_slot_mask =
+         instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE ||
+         instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS ||
+         instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP ||
+         instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP_MEM;
       if (instruction->encoding != AGX_APPLE9_ENC_DEVICE_FENCE ||
           instruction->nr_srcs ||
-          instruction->immediate > AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP ||
+          instruction->immediate > AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP_MEM ||
+          (uses_slot_mask
+              ? (instruction->fence_slot_mask & ~BITFIELD_MASK(6)) != 0
+              : instruction->fence_slot_mask != 0) ||
           instruction->dest != AGX_APPLE9_VREG_INVALID)
          return false;
       /* A device memory fence has no execution rendezvous. It is safe in
@@ -8176,7 +8233,7 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
        * FENCE_TEX_INVALIDATE (0x06d0) invalidates the texture cache so
        * subsequent texture loads observe the written memory. Fragment PBE
        * drain uses byte 2 base 0x64; workgroup texture barriers use
-       * 0x0e51 / 0x0ed1. */
+       * 0x0e51 / 0x0ed1 (with rendezvous) and 0x0e50 / 0x0ed0 (mem-only). */
       if (instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE ||
           instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS) {
          const uint8_t mask = (instruction->fence_slot_mask & 0x3fu)
@@ -8197,20 +8254,28 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
          packed_init(packed, bytes, sizeof(bytes));
          return true;
       }
-      if (instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP) {
+      if (instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP ||
+          instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP_MEM) {
          const uint8_t mask = (instruction->fence_slot_mask & 0x3fu)
                                  ? (instruction->fence_slot_mask & 0x3fu)
                                  : 0x01u;
+         const uint8_t b3 =
+            instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP
+               ? 0x51u : 0x50u;
          const uint8_t bytes[] = {
             0x07,
             (uint8_t)(0x04u | ((mask & 0x0fu) << 4)),
             (uint8_t)(0x54u | ((mask >> 4) & 0x03u)),
-            0x51, 0x0e, 0};
+            b3, 0x0e, 0};
          packed_init(packed, bytes, sizeof(bytes));
          return true;
       }
-      if (instruction->immediate == AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP) {
-         const uint8_t bytes[] = {0x07, 0x04, 0x54, 0xd1, 0x0e, 0};
+      if (instruction->immediate == AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP ||
+          instruction->immediate == AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP_MEM) {
+         const uint8_t b3 =
+            instruction->immediate == AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP
+               ? 0xd1u : 0xd0u;
+         const uint8_t bytes[] = {0x07, 0x04, 0x54, b3, 0x0e, 0};
          packed_init(packed, bytes, sizeof(bytes));
          return true;
       }
