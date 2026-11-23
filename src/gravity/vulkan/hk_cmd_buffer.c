@@ -884,6 +884,19 @@ hk_cmd_sync_barrier_group(struct hk_cmd_buffer *cmd,
           * in its own stream. */
          if (unrelated && cmd->merge_pre_cs)
             hk_cmd_buffer_end_compute_internal(cmd, &cmd->merge_pre_cs);
+         if (cmd->current_cs.cs) {
+            unsigned b_src = hk_sync_stage_mask(src, true);
+            unsigned b_dst = hk_sync_stage_mask(dst, false);
+            unsigned b_ordered = hk_sync_ordered_stages(
+               b_src, b_dst,
+               vk_filter_src_access_flags2(src, src_access),
+               vk_filter_dst_access_flags2(dst, dst_access));
+            if ((cmd->current_cs.cs->sync_stages & b_ordered) ||
+                (hk_cs_is_behind_other(cmd, cmd->current_cs.cs) && b_ordered)) {
+               hk_cs_end_hint(cmd, HK_CS_END_BARRIER);
+               hk_cmd_buffer_end_compute(cmd);
+            }
+         }
          /* The next render pass may continue the open render, where the tile
           * order satisfies this barrier. Earlier work it orders must still
           * precede the whole render: place it before the render's first
@@ -926,6 +939,9 @@ hk_cmd_sync_barrier_group(struct hk_cmd_buffer *cmd,
       dst_stages = dst_stages ? HK_SYNC_ALL : 0;
    }
 
+   const VkAccessFlags2 raw_src_access = src_access;
+   const VkAccessFlags2 raw_dst_access = dst_access;
+
    /* Access scopes govern availability/visibility, not execution ordering:
     * even zero-access WAR barriers must split ordered streams. Stream endings
     * currently provide full cache maintenance, covering the filtered access
@@ -938,27 +954,51 @@ hk_cmd_sync_barrier_group(struct hk_cmd_buffer *cmd,
                                              src_access, dst_access);
    const unsigned compute = HK_SYNC_COMPUTE | HK_SYNC_DISPATCH_INDIRECT;
    struct hk_cs *cs = cmd->current_cs.cs;
-   if (!cmd->sync_fallback && cs && ordered && !(ordered & ~compute) &&
-       !(cs->sync_stages & ~compute)) {
+   bool cs_behind_other = hk_cs_is_behind_other(cmd, cs);
+   if (!cmd->sync_fallback && cs && !cs_behind_other && ordered &&
+       !(ordered & ~compute) && !(cs->sync_stages & ~compute)) {
       /* The cache barrier is also an execution barrier. Keep compute-only
        * dependencies in one CDM stream; no firmware command boundary is needed.
        * Shader-to-shader dependencies take the compute-only barrier on G16;
-       * indirect grids are fetched by the CDM itself and need the full flush.
+       * indirect grids and host-read visibility need the full flush.
        */
       struct hk_device *dev = hk_cmd_buffer_device(cmd);
       hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
-      if (!(dst_stages & HK_SYNC_DISPATCH_INDIRECT))
+      if (!(dst_stages & HK_SYNC_DISPATCH_INDIRECT) &&
+          !(dst & VK_PIPELINE_STAGE_2_HOST_BIT))
          hk_cdm_compute_barrier(dev, cs);
       else
          hk_cdm_cache_flush(dev, cs);
    } else if (cmd->sync_fallback ||
-       (cmd->current_cs.cs && (cmd->current_cs.cs->sync_stages & ordered))) {
+              (cs && ((cs->sync_stages & ordered) ||
+                      (cs_behind_other && ordered)))) {
       hk_cs_end_hint(cmd, HK_CS_END_BARRIER);
       hk_cmd_buffer_end_compute(cmd);
    }
 
+   /* Inside an active render pass, two barrier classes are already satisfied
+    * within one Apple9 TBDR hardware render without splitting the VDM stream:
+    *  - Attachment-only barriers (no input-attachment/shader reads; per-tile
+    *    execution order orders colour/depth/stencil attachment accesses).
+    *  - Execution-only / WAR pre-rasterization -> fragment barriers (all
+    *    tiling completes strictly before any fragment shading begins).
+    */
+   bool keep_in_pass_gfx = false;
+   if (!cmd->sync_fallback && !cmd->in_meta && cmd->current_cs.gfx) {
+      bool in_pass_attachment =
+         !hk_reads_input_attachments(dst, raw_dst_access) &&
+         hk_render_merge_barrier(src, dst, raw_src_access, raw_dst_access) &&
+         (!(dst & VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT) ||
+          (!cmd->state.gfx.render.feedback && raw_dst_access != 0));
+      bool in_pass_prerast_to_frag =
+         src_access == 0 && src_stages != 0 &&
+         !(src_stages & ~HK_SYNC_TILING) && dst_stages == HK_SYNC_FRAGMENT;
+      keep_in_pass_gfx = in_pass_attachment || in_pass_prerast_to_frag;
+   }
+
    if (cmd->sync_fallback ||
-       (cmd->current_cs.gfx && (cmd->current_cs.gfx->sync_stages & ordered))) {
+       (!keep_in_pass_gfx && cmd->current_cs.gfx &&
+        (cmd->current_cs.gfx->sync_stages & ordered))) {
       hk_cs_end_hint(cmd, HK_CS_END_BARRIER);
       hk_cmd_buffer_end_graphics(cmd);
    }
@@ -1723,6 +1763,12 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
    struct hk_cs *cs = cmd->current_cs.gfx;
    struct hk_rendering_state *render = &cmd->state.gfx.render;
 
+   /* Empty-render loadOp clears execute in the attachment/fragment scope (or
+    * the enclosing meta scope), not HK_SYNC_ALL.
+    */
+   unsigned saved_scope = cmd->sync_scope;
+   cmd->sync_scope = saved_scope ?: HK_SYNC_FRAGMENT;
+
    for (unsigned i = 0; i < render->color_att_count; ++i) {
       clear_attachment_as_image(cmd, render, &render->color_att[i], ~0);
    }
@@ -1732,6 +1778,8 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
 
    clear_attachment_as_image(cmd, render, &render->stencil_att,
                              VK_IMAGE_ASPECT_STENCIL_BIT);
+
+   cmd->sync_scope = saved_scope;
 
    /* If the drawless render pass had an end timestamp, transfer it to a
     * compute control stream so the firmware still writes it (even if there
@@ -1749,9 +1797,9 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
          ts_cs->timestamp.end = cs->timestamp.end;
 
          /* If a post-graphics stream exists (e.g., a second timestamp write
-          * inside this render pass copying from cs->timestamp.end), ensure
-          * ts_cs executes before post_gfx. post_gfx already sets
-          * cmd->sync_fallback, so stream list order governs synchronization.
+          * inside this render pass copying from cs->timestamp.end), place
+          * ts_cs ahead of post_gfx. Both carry HK_SYNC_ALL events (post_gfx's
+          * event is emitted when the render closes), so post_gfx waits on ts_cs.
           */
          if (cmd->current_cs.post_gfx) {
             list_del(&ts_cs->node);

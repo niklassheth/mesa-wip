@@ -170,7 +170,7 @@ test_timestamp_with_post_gfx_copy_order(void)
     * emitting libagx_copy_timestamp into post_gfx. */
    struct hk_cs *post = hk_cmd_buffer_get_cs_general(
       t.cmd, &t.cmd->current_cs.post_gfx, true, HK_SYNC_ALL);
-   CHECK(post && t.cmd->sync_fallback);
+   CHECK(post && post->sync_after_gfx && !t.cmd->sync_fallback);
    post->stats.cmds = 1;
 
    /* Simulate an active compute stream created after post_gfx (e.g. by
@@ -198,7 +198,7 @@ test_timestamp_with_post_gfx_copy_order(void)
    CHECK(first->timestamp.end.offset_B == 8);
    CHECK(first->stats.flushes > 0);
 
-   /* Fallback sync must order post_gfx after ts_cs. */
+   /* Precise sync (no fallback poisoning) must order post_gfx after ts_cs. */
    unsigned count = util_dynarray_num_elements(&t.cmd->sync_remap, uint32_t);
    struct hk_sync_stream *streams = calloc(count, sizeof(*streams));
    CHECK(streams);
@@ -212,11 +212,12 @@ test_timestamp_with_post_gfx_copy_order(void)
    }
    struct hk_sync_state state;
    hk_sync_init(&state);
-   CHECK(!hk_sync_resolve(&state, t.cmd->sync_events.data,
-                          util_dynarray_num_elements(&t.cmd->sync_events,
-                                                     struct hk_sync_event),
-                          t.cmd->sync_remap.data, streams, count,
-                          t.cmd->sync_fallback));
+   CHECK(!t.cmd->sync_fallback);
+   CHECK(hk_sync_resolve(&state, t.cmd->sync_events.data,
+                         util_dynarray_num_elements(&t.cmd->sync_events,
+                                                    struct hk_sync_event),
+                         t.cmd->sync_remap.data, streams, count,
+                         t.cmd->sync_fallback));
    CHECK(streams[post->sync_id].wait.engine[HK_SYNC_CDM] ==
          streams[first->sync_id].index);
    free(streams);

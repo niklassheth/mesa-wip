@@ -118,7 +118,8 @@ hk_sync_stage_mask(VkPipelineStageFlags2 stages, bool source)
       return HK_SYNC_ALL;
 
    stages &= ~(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT |
-               VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+               VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT |
+               VK_PIPELINE_STAGE_2_HOST_BIT);
 
    const VkPipelineStageFlags2 pre_raster =
       VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
@@ -144,10 +145,13 @@ hk_sync_stage_mask(VkPipelineStageFlags2 stages, bool source)
       VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT |
       VK_PIPELINE_STAGE_2_RESOLVE_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT;
    const VkPipelineStageFlags2 compute = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-   const VkPipelineStageFlags2 indirect = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+   const VkPipelineStageFlags2 indirect =
+      VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+      VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT;
 
-   /* Host, extensions without a classified implementation, and future stages
-    * retain full ordering. NONE remains an empty execution scope.
+   /* Extensions without a classified implementation and future stages retain
+    * full ordering. HOST_BIT has no GPU execution scope (write visibility to
+    * the host is still flushed on the producer stream), and NONE remains empty.
     */
    if (stages & ~(graphics | transfer | compute | indirect))
       return HK_SYNC_ALL;

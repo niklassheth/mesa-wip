@@ -2082,8 +2082,12 @@ hk_mesh_heap(struct hk_cmd_buffer *cmd)
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
    if (!cmd->uses_mesh_heap) {
-      hk_queue_write(cmd, dev->rodata.mesh_heap + offsetof(struct poly_heap, bottom),
-                     0, true /* after gfx */);
+      /* Reset the mesh heap in pre_gfx, matching hk_heap(), instead of
+       * spawning a post_gfx stream after the render.
+       */
+      perf_debug(cmd, "Resetting mesh heap");
+      libagx_heap_reset(cmd, agx_1d(1), AGX_BARRIER_ALL | AGX_PREGFX,
+                        dev->rodata.mesh_heap);
       cmd->uses_mesh_heap = true;
    }
 
@@ -2825,9 +2829,13 @@ hk_predicate_indirect(struct hk_cmd_buffer *cmd, uint64_t in, unsigned words,
    uint64_t out = in ? hk_pool_alloc(cmd, words * sizeof(uint32_t), 16).gpu : 0;
    if (!out)
       return 0;
+   unsigned saved_scope = cmd->sync_scope;
+   if (!graphics)
+      cmd->sync_scope = HK_SYNC_COMPUTE | HK_SYNC_DISPATCH_INDIRECT;
    libagx_predicate_indirect_apple9(
       cmd, agx_1d(1), AGX_BARRIER_ALL | (graphics ? AGX_PREGFX : 0), out, in,
       cmd->state.cond_render.predicate, cmd->state.cond_render.inverted, words);
+   cmd->sync_scope = saved_scope;
    return out;
 }
 

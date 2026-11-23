@@ -100,10 +100,18 @@ main(void)
    CHECK(streams[0].wait_tiling.engine[HK_SYNC_CDM] == 2);
    CHECK(streams[1].wait.engine[HK_SYNC_RENDER] == 6);
 
-   /* An unclassified post-graphics helper still requests fallback. */
+   /* A post-graphics helper paired with an active render is tracked at its
+    * render-close boundary instead of permanently setting sync_fallback. */
    struct hk_cs *post = hk_cmd_buffer_get_cs_general(
       cmd, &cmd->current_cs.post_gfx, true, HK_SYNC_ALL);
-   CHECK(post && !post->sync_before_gfx && cmd->sync_fallback);
+   CHECK(post && !post->sync_before_gfx && post->sync_after_gfx &&
+         !cmd->sync_fallback);
+   /* Closing the post-graphics stream emits its sync event at the tail. */
+   hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
+   CHECK(!post->sync_after_gfx && !cmd->sync_fallback);
+   CHECK(util_dynarray_num_elements(&cmd->sync_events, struct hk_sync_event) == 4);
+   ev = cmd->sync_events.data;
+   CHECK(ev[3].stream == post->sync_id && ev[3].dst == HK_SYNC_ALL);
 
    free(post);
    free(pre);

@@ -575,6 +575,9 @@ struct hk_cs {
    unsigned sync_stages;
    /* The whole pre-graphics stream is ordered at its render's first event. */
    bool sync_before_gfx;
+   /* The post-graphics stream is ordered when its render closes, avoiding
+    * interleaved sync events with subsequent draws in the same render. */
+   bool sync_after_gfx;
    bool cdm_dirty;
 
    /* The last dispatch ended with the compute-only barrier: later compute
@@ -1152,10 +1155,38 @@ void hk_heap_prepare_submit(struct hk_device *dev, uint64_t min_B);
 
 size_t hk_apple9_graphics_root_size(const struct hk_device *dev);
 
+static inline bool
+hk_cs_is_behind_other(const struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
+{
+   return cs && cs->node.next && cs->node.next != &cmd->control_streams;
+}
+
+static inline void hk_cs_end_hint(struct hk_cmd_buffer *cmd,
+                                  enum hk_cs_end reason);
+static void hk_cmd_buffer_end_compute(struct hk_cmd_buffer *cmd);
+
 static inline struct hk_cs *
 hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
                              bool compute, unsigned stages)
 {
+   /* Never leave current_cs.cs open when creating another CDM stream
+    * (merge_pre_cs, pre_gfx, post_gfx), otherwise later dispatches into
+    * current_cs.cs would execute ahead of that newer CDM stream in list order.
+    * Also close an open compute stream sitting behind a render before
+    * accepting HK_SYNC_ALL or graphics-scoped CDM work (e.g. empty-render
+    * clears).
+    */
+   if (cmd->current_cs.cs &&
+       ((compute && ptr != &cmd->current_cs.cs) ||
+        (hk_cs_is_behind_other(cmd, cmd->current_cs.cs) &&
+         (stages == HK_SYNC_ALL ||
+          (compute && (stages & ~(HK_SYNC_COMPUTE |
+                                  HK_SYNC_DISPATCH_INDIRECT |
+                                  HK_SYNC_TRANSFER))))))) {
+      hk_cs_end_hint(cmd, HK_CS_END_BARRIER);
+      hk_cmd_buffer_end_compute(cmd);
+   }
+
    /* Work recorded outside a render pass ends a render kept open for
     * merging. A merged render pass takes the stream before drawing. */
    if (unlikely(cmd->merge_cs) && ptr != &cmd->merge_pre_cs) {
@@ -1203,9 +1234,16 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
       list_inithead(&cs->node);
 
       bool before_gfx = (ptr == &cmd->current_cs.pre_gfx);
-      /* Post-graphics operations may still have events interleaved with their
-       * render. Keep the fallback until those operations are classified. */
-      cmd->sync_fallback |= ptr == &cmd->current_cs.post_gfx;
+      bool after_gfx = (ptr == &cmd->current_cs.post_gfx);
+      if (after_gfx) {
+         /* Track post-graphics streams at their render-close boundary instead
+          * of permanently setting sync_fallback when paired with a render.
+          */
+         if (cmd->current_cs.gfx)
+            cs->sync_after_gfx = true;
+         else
+            cmd->sync_fallback = true;
+      }
 
       /* Insert into the command buffer. We usually append to the end of the
        * command buffer, except for pre-graphics streams which go right before
@@ -1241,7 +1279,9 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
    }
 
    assert(*ptr != NULL);
-   if (!(*ptr)->sync_before_gfx)
+   if ((*ptr)->sync_after_gfx)
+      (*ptr)->sync_stages |= stages;
+   else if (!(*ptr)->sync_before_gfx)
       hk_cmd_sync_work(cmd, *ptr, stages);
    return *ptr;
 }
@@ -1315,6 +1355,26 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
       struct hk_cs *cs = *ptr;
       if (!cs->end_reason)
          cs->end_reason = cmd->end_hint;
+
+      if (cs->sync_after_gfx) {
+         /* Place post_gfx at the tail (after its render and any empty-render
+          * replacement streams), order it after its parent render even when
+          * stages is narrowed, and emit its sync event at that boundary.
+          */
+         list_del(&cs->node);
+         list_addtail(&cs->node, &cmd->control_streams);
+         cs->sync_after_gfx = false;
+         unsigned stages = cs->sync_stages ?: HK_SYNC_ALL;
+         if (stages != HK_SYNC_ALL) {
+            struct hk_sync_event dep = {
+               .stream = HK_SYNC_NONE,
+               .src = HK_SYNC_GRAPHICS,
+               .dst = stages,
+            };
+            util_dynarray_append(&cmd->sync_events, dep);
+         }
+         hk_cmd_sync_work(cmd, cs, stages);
+      }
 
       /* This control stream may write immediates as it ends. Queue the writes
        * now that we're done emitting everything else.
@@ -1420,9 +1480,7 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
    assert(cmd->current_cs.post_gfx == NULL);
    cmd->end_hint = HK_CS_END_UNKNOWN;
 
-   /* The next render must acquire and reset the geometry heap again. Mesh
-    * heap releases remain in the post-graphics stream.
-    */
+   /* The next render must acquire and reset the geometry and mesh heaps again. */
    cmd->uses_heap = false;
    cmd->uses_mesh_heap = false;
    assert(!cmd->empty_barriers.size);

@@ -1,7 +1,11 @@
 /* SPDX-License-Identifier: MIT */
+#include "../hk_buffer.h"
 #include "../hk_cmd_buffer.h"
 #include "../hk_device.h"
+#include "../hk_event.h"
 #include "../hk_gpu_busy.h"
+#include "../hk_image.h"
+#include "../hk_image_view.h"
 #include "../hk_query_pool.h"
 #include "../hk_queue.h"
 #include "hk_entrypoints.h"
@@ -617,6 +621,797 @@ test_batched_submit_and_intra_barriers(void)
    return 0;
 }
 
+/* Commit 3A: 2nd timestamp inside a render pass (post_gfx) must not poison
+ * cmd->sync_fallback, and graphics-stage in-pass timestamps must not widen
+ * the render to HK_SYNC_ALL.
+ */
+static int
+test_sync_fallback_non_poisoning(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_cmd_buffer *cmd = calloc(1, sizeof(*cmd));
+   uint8_t *pool = calloc(1, HK_CMD_BO_SIZE);
+   CHECK(dev && cmd && pool);
+
+   dev->dev.chip = AGX_CHIP_G16G;
+   vk_object_base_init(&dev->vk, &cmd->vk.base, VK_OBJECT_TYPE_COMMAND_BUFFER);
+   cmd->sync_events = UTIL_DYNARRAY_INIT;
+   cmd->sync_remap = UTIL_DYNARRAY_INIT;
+   cmd->sync_first_event = UTIL_DYNARRAY_INIT;
+   cmd->uploader[HK_CMD_POOL_MAIN].chunks[0].map = pool;
+   cmd->uploader[HK_CMD_POOL_MAIN].chunks[0].base = 0x2000000000ull;
+   list_inithead(&cmd->control_streams);
+
+   struct agx_va va = {.addr = 0x1000000};
+   struct agx_bo bo = {.va = &va};
+   struct hk_query_pool qp = {
+      .bo = &bo,
+      .query_start = 0,
+      .query_stride = sizeof(uint64_t),
+      .handle = 5,
+   };
+   vk_object_base_init(&dev->vk, &qp.vk.base, VK_OBJECT_TYPE_QUERY_POOL);
+   qp.vk.query_type = VK_QUERY_TYPE_TIMESTAMP;
+   qp.vk.query_count = 4;
+
+   uint8_t gfx_buf[256] = {0};
+   struct hk_cs *gfx = add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, gfx_buf, sizeof(gfx_buf));
+   cmd->current_cs.gfx = gfx;
+
+   /* 1st in-pass timestamp with graphics-only stage: must NOT tag HK_SYNC_ALL. */
+   hk_CmdWriteTimestamp2(hk_cmd_buffer_to_handle(cmd),
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         hk_query_pool_to_handle(&qp), 0);
+   CHECK(gfx->timestamp.end.handle == 5);
+   CHECK(gfx->sync_stages == HK_SYNC_GRAPHICS);
+   CHECK(!cmd->sync_fallback);
+
+   /* 2nd in-pass timestamp spawns post_gfx via libagx_copy_timestamp: must NOT
+    * poison cmd->sync_fallback, and later draws in gfx must not trigger fallback.
+    */
+   precomp_calls = 0;
+   hk_CmdWriteTimestamp2(hk_cmd_buffer_to_handle(cmd),
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         hk_query_pool_to_handle(&qp), 1);
+   CHECK(precomp_calls == 1 && precomp_last_idx == LIBAGX_COPY_TIMESTAMP);
+   CHECK(cmd->current_cs.post_gfx != NULL);
+   CHECK(cmd->current_cs.post_gfx->sync_after_gfx);
+   CHECK(!cmd->sync_fallback);
+
+   /* Simulate a subsequent draw in the same render pass. */
+   hk_cmd_sync_work(cmd, gfx, HK_SYNC_GRAPHICS);
+   struct hk_cs *post = cmd->current_cs.post_gfx;
+
+   hk_cmd_buffer_end_graphics(cmd);
+   CHECK(!cmd->sync_fallback);
+   CHECK(cmd->current_cs.gfx == NULL && cmd->current_cs.post_gfx == NULL);
+   CHECK(list_length(&cmd->control_streams) == 2);
+   CHECK(list_first_entry(&cmd->control_streams, struct hk_cs, node) == gfx);
+   CHECK(list_last_entry(&cmd->control_streams, struct hk_cs, node) == post);
+
+   /* Resolve sync precisely (no fallback): post_gfx waits on gfx. */
+   struct hk_sync_state state;
+   hk_sync_init(&state);
+   struct hk_sync_stream streams[2] = {
+      {.engine = HK_SYNC_RENDER, .index = 1, .before = {0, 0}},
+      {.engine = HK_SYNC_CDM, .index = 1, .before = {1, 0}},
+   };
+   streams[0].wait = streams[0].wait_tiling = hk_sync_empty();
+   streams[1].wait = streams[1].wait_tiling = hk_sync_empty();
+   CHECK(hk_sync_resolve(&state, cmd->sync_events.data,
+                         util_dynarray_num_elements(&cmd->sync_events,
+                                                    struct hk_sync_event),
+                         cmd->sync_remap.data, streams, 2, cmd->sync_fallback));
+   CHECK(streams[post->sync_id].wait.engine[HK_SYNC_RENDER] == 1);
+
+   /* Subsequent pure compute-only barrier still stays intra-CS (not poisoned). */
+   uint8_t cdm_buf[4096] = {0};
+   struct hk_cs *cs = add_test_cs(cmd, HK_CS_CDM, HK_SYNC_COMPUTE, cdm_buf, sizeof(cdm_buf));
+   cs->cdm_dirty = true;
+   cmd->current_cs.cs = cs;
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_WRITE_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT);
+   CHECK(cmd->current_cs.cs == cs);
+   CHECK(*(uint32_t *)cdm_buf == 0x60000160);
+
+   list_for_each_entry_safe(struct hk_cs, iter, &cmd->control_streams, node) {
+      list_del(&iter->node);
+      hk_cs_destroy(iter);
+   }
+   util_dynarray_fini(&cmd->sync_events);
+   util_dynarray_fini(&cmd->sync_remap);
+   util_dynarray_fini(&cmd->sync_first_event);
+   vk_object_base_finish(&qp.vk.base);
+   vk_object_base_finish(&cmd->vk.base);
+   free(pool);
+   free(cmd);
+   free(dev);
+   return 0;
+}
+
+static VKAPI_ATTR VkDeviceAddress VKAPI_CALL
+mock_get_buffer_device_address(VkDevice device,
+                               const VkBufferDeviceAddressInfo *pInfo)
+{
+   VK_FROM_HANDLE(hk_buffer, buf, pInfo->buffer);
+   return buf->vk.device_address;
+}
+
+/* Commit 3B: Narrowed HK_SYNC_ALL leaks (clears, copies, query copy, empty VDM,
+ * HOST_BIT) and merge_move_stage preserving kept-open merge renders.
+ */
+static int
+test_narrowed_scopes_and_merge_move(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_cmd_buffer *cmd = calloc(1, sizeof(*cmd));
+   uint8_t *pool = calloc(1, HK_CMD_BO_SIZE);
+   CHECK(dev && cmd && pool);
+
+   dev->dev.chip = AGX_CHIP_G16G;
+   vk_object_base_init(&dev->vk, &cmd->vk.base, VK_OBJECT_TYPE_COMMAND_BUFFER);
+   cmd->sync_events = UTIL_DYNARRAY_INIT;
+   cmd->sync_remap = UTIL_DYNARRAY_INIT;
+   cmd->sync_first_event = UTIL_DYNARRAY_INIT;
+   cmd->empty_barriers = UTIL_DYNARRAY_INIT;
+   cmd->occlusion_accum = UTIL_DYNARRAY_INIT;
+   cmd->query_adds = UTIL_DYNARRAY_INIT;
+   cmd->query_writes = UTIL_DYNARRAY_INIT;
+   cmd->uploader[HK_CMD_POOL_MAIN].chunks[0].map = pool;
+   cmd->uploader[HK_CMD_POOL_MAIN].chunks[0].base = 0x2000000000ull;
+   list_inithead(&cmd->control_streams);
+
+   /* Set up a kept-open merge render to test merge_move_stage on buffer ops
+    * and image clears. */
+   uint8_t gfx_buf[256] = {0};
+   struct hk_cs *gfx = add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, gfx_buf, sizeof(gfx_buf));
+   cmd->current_cs.gfx = cmd->merge_cs = gfx;
+   cmd->merge_event = 0;
+   cmd->merge_reach = hk_merge_graphics_stages();
+
+   struct agx_va buf_va = {.addr = 0x3000000, .size_B = 256};
+   struct hk_buffer buf_obj = {.va = &buf_va};
+   vk_object_base_init(&dev->vk, &buf_obj.vk.base, VK_OBJECT_TYPE_BUFFER);
+   buf_obj.vk.size = 256;
+   buf_obj.vk.device_address = 0x3000000;
+   dev->vk.dispatch_table.GetBufferDeviceAddress =
+      mock_get_buffer_device_address;
+
+   /* vkCmdCopyBuffer2: HK_SYNC_TRANSFER + merge_move_stage keeps merge_cs open! */
+   VkBufferCopy2 region = {.sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2, .size = 64};
+   VkCopyBufferInfo2 copy_info = {
+      .sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2,
+      .srcBuffer = hk_buffer_to_handle(&buf_obj),
+      .dstBuffer = hk_buffer_to_handle(&buf_obj),
+      .regionCount = 1,
+      .pRegions = &region,
+   };
+   precomp_calls = 0;
+   hk_CmdCopyBuffer2(hk_cmd_buffer_to_handle(cmd), &copy_info);
+   CHECK(precomp_calls == 1 && precomp_last_scope == HK_SYNC_TRANSFER);
+   CHECK(precomp_last_move_stage & VK_PIPELINE_STAGE_2_COPY_BIT);
+   CHECK(cmd->merge_cs == gfx && cmd->merge_pre_cs != NULL);
+
+   /* vkCmdFillBuffer: HK_SYNC_TRANSFER + merge_move_stage keeps merge_cs open! */
+   precomp_calls = 0;
+   hk_CmdFillBuffer(hk_cmd_buffer_to_handle(cmd), hk_buffer_to_handle(&buf_obj),
+                    0, 64, 0x12345678);
+   CHECK(precomp_calls == 1 && precomp_last_scope == HK_SYNC_TRANSFER);
+   CHECK(precomp_last_move_stage & VK_PIPELINE_STAGE_2_CLEAR_BIT);
+   CHECK(cmd->merge_cs == gfx);
+
+   /* vkCmdUpdateBuffer: HK_SYNC_TRANSFER + merge_move_stage keeps merge_cs open! */
+   uint32_t data[4] = {1, 2, 3, 4};
+   precomp_calls = 0;
+   hk_CmdUpdateBuffer(hk_cmd_buffer_to_handle(cmd), hk_buffer_to_handle(&buf_obj),
+                      0, sizeof(data), data);
+   CHECK(precomp_calls == 1 && precomp_last_scope == HK_SYNC_TRANSFER);
+   CHECK(precomp_last_move_stage & VK_PIPELINE_STAGE_2_COPY_BIT);
+   CHECK(cmd->merge_cs == gfx);
+
+   /* vkCmdClearColorImage: HK_SYNC_TRANSFER + merge_move_stage keeps merge_cs open! */
+   struct hk_image img = {0};
+   vk_object_base_init(&dev->vk, &img.vk.base, VK_OBJECT_TYPE_IMAGE);
+   img.vk.image_type = VK_IMAGE_TYPE_2D;
+   img.vk.format = VK_FORMAT_R8G8B8A8_UNORM;
+   img.vk.extent = (VkExtent3D){16, 16, 1};
+   img.vk.mip_levels = 1;
+   img.vk.array_layers = 1;
+   img.vk.samples = VK_SAMPLE_COUNT_1_BIT;
+   img.plane_count = 1;
+   img.planes[0].addr = 0x4000000;
+   img.planes[0].layout.format = PIPE_FORMAT_R8G8B8A8_UNORM;
+   img.planes[0].layout.levels = 1;
+   img.planes[0].layout.depth_px = 1;
+   img.planes[0].layout.layer_stride_B = 1024;
+   img.planes[0].layout.size_B = 1024;
+   img.planes[0].layout.level_offsets_B[0] = 0;
+   img.planes[0].layout.level_offsets_B[1] = 1024;
+
+   VkClearColorValue clear_color = {.float32 = {1, 0, 0, 1}};
+   VkImageSubresourceRange range = {
+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .levelCount = 1,
+      .layerCount = 1,
+   };
+   precomp_calls = 0;
+   hk_CmdClearColorImage(hk_cmd_buffer_to_handle(cmd), hk_image_to_handle(&img),
+                         VK_IMAGE_LAYOUT_GENERAL, &clear_color, 1, &range);
+   CHECK(precomp_calls == 1 && precomp_last_scope == HK_SYNC_TRANSFER);
+   CHECK(precomp_last_move_stage & VK_PIPELINE_STAGE_2_CLEAR_BIT);
+   CHECK(cmd->merge_cs == gfx);
+
+   /* Flush merge render before testing vkCmdCopyQueryPoolResults. */
+   hk_cmd_render_merge_flush(cmd);
+   CHECK(cmd->merge_cs == NULL);
+
+   /* vkCmdCopyQueryPoolResults: waits on timestamp/query producers (incoming
+    * ALL -> TRANSFER barrier), while the copy itself is HK_SYNC_TRANSFER (not
+    * HK_SYNC_ALL) so later independent graphics is not stalled.
+    */
+   struct agx_va qp_va = {.addr = 0x5000000};
+   struct agx_bo qp_bo = {.va = &qp_va};
+   struct hk_query_pool qp = {
+      .bo = &qp_bo,
+      .query_start = 0,
+      .query_stride = sizeof(uint64_t),
+      .handle = 11,
+   };
+   vk_object_base_init(&dev->vk, &qp.vk.base, VK_OBJECT_TYPE_QUERY_POOL);
+   qp.vk.query_type = VK_QUERY_TYPE_TIMESTAMP;
+   qp.vk.query_count = 2;
+
+   precomp_calls = 0;
+   hk_CmdCopyQueryPoolResults(hk_cmd_buffer_to_handle(cmd),
+                              hk_query_pool_to_handle(&qp), 0, 1,
+                              hk_buffer_to_handle(&buf_obj), 0, 8,
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+   CHECK(precomp_calls == 1 && precomp_last_idx == LIBAGX_COPY_QUERY);
+   CHECK(precomp_last_scope == HK_SYNC_TRANSFER);
+   /* Event before the copy dispatch is the incoming ALL -> TRANSFER barrier. */
+   unsigned ev_count =
+      util_dynarray_num_elements(&cmd->sync_events, struct hk_sync_event);
+   CHECK(ev_count >= 2);
+   const struct hk_sync_event *events = cmd->sync_events.data;
+   CHECK(events[ev_count - 2].stream == HK_SYNC_NONE);
+   CHECK(events[ev_count - 2].src == HK_SYNC_ALL);
+   CHECK(events[ev_count - 2].dst == HK_SYNC_TRANSFER);
+   CHECK(events[ev_count - 1].stream != HK_SYNC_NONE);
+   CHECK(events[ev_count - 1].dst == HK_SYNC_TRANSFER);
+   hk_cmd_buffer_end_compute(cmd);
+
+   /* COMPUTE -> HOST_BIT write barrier emits full 0x600fffff flush (for host
+    * visibility) without splitting CDM or stalling subsequent renders.
+    */
+   uint8_t cdm_buf[4096] = {0};
+   struct hk_cs *cs = add_test_cs(cmd, HK_CS_CDM, HK_SYNC_COMPUTE, cdm_buf, sizeof(cdm_buf));
+   cs->cdm_dirty = true;
+   cmd->current_cs.cs = cs;
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_2_HOST_BIT,
+                       VK_ACCESS_2_SHADER_WRITE_BIT,
+                       VK_ACCESS_2_HOST_READ_BIT);
+   CHECK(cmd->current_cs.cs == cs);
+   CHECK(!cs->cdm_dirty && !cs->cdm_compute_barrier);
+   CHECK(*(uint32_t *)cdm_buf != 0x60000160 && *(uint32_t *)cdm_buf != 0);
+   const struct hk_sync_event *host_ev =
+      util_dynarray_top_ptr(&cmd->sync_events, struct hk_sync_event);
+   CHECK(host_ev->stream == HK_SYNC_NONE && host_ev->dst == 0);
+
+   list_for_each_entry_safe(struct hk_cs, iter, &cmd->control_streams, node) {
+      list_del(&iter->node);
+      hk_cs_destroy(iter);
+   }
+   util_dynarray_fini(&cmd->sync_events);
+   util_dynarray_fini(&cmd->sync_remap);
+   util_dynarray_fini(&cmd->sync_first_event);
+   util_dynarray_fini(&cmd->empty_barriers);
+   util_dynarray_fini(&cmd->occlusion_accum);
+   util_dynarray_fini(&cmd->query_adds);
+   util_dynarray_fini(&cmd->query_writes);
+   vk_object_base_finish(&qp.vk.base);
+   vk_object_base_finish(&img.vk.base);
+   vk_object_base_finish(&buf_obj.vk.base);
+   vk_object_base_finish(&cmd->vk.base);
+   free(pool);
+   free(cmd);
+   free(dev);
+   return 0;
+}
+
+/* Commit 3C: In-pass barriers (attachment-only and execution-only/WAR
+ * PRE_RASTER -> FRAGMENT keep gfx open; VS write, input attachment, or
+ * feedback loop still split) + compute CS preserved across independent
+ * renders while guarded against cross-engine dependencies.
+ */
+static int
+test_in_pass_barriers_and_compute_preservation(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_cmd_buffer *cmd = calloc(1, sizeof(*cmd));
+   uint8_t *pool = calloc(1, HK_CMD_BO_SIZE);
+   CHECK(dev && cmd && pool);
+
+   dev->dev.chip = AGX_CHIP_G16G;
+   vk_object_base_init(&dev->vk, &cmd->vk.base, VK_OBJECT_TYPE_COMMAND_BUFFER);
+   cmd->sync_events = UTIL_DYNARRAY_INIT;
+   cmd->sync_remap = UTIL_DYNARRAY_INIT;
+   cmd->sync_first_event = UTIL_DYNARRAY_INIT;
+   cmd->uploader[HK_CMD_POOL_MAIN].chunks[0].map = pool;
+   cmd->uploader[HK_CMD_POOL_MAIN].chunks[0].base = 0x2000000000ull;
+   list_inithead(&cmd->control_streams);
+
+   uint8_t gfx_buf[256] = {0}, cdm_buf[4096] = {0};
+   struct hk_cs *gfx = add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, gfx_buf, sizeof(gfx_buf));
+   cmd->current_cs.gfx = gfx;
+
+   /* 1. In-pass attachment-only barrier keeps gfx open. */
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+   CHECK(cmd->current_cs.gfx == gfx);
+
+   /* 2. In-pass execution-only/WAR PRE_RASTER -> FRAGMENT keeps gfx open. */
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+   CHECK(cmd->current_cs.gfx == gfx);
+
+   /* 3. In-pass PRE_RASTER -> FRAGMENT with VS write access MUST split gfx. */
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT);
+   CHECK(cmd->current_cs.gfx == NULL);
+
+   /* 4. In-pass COLOR_ATTACHMENT -> FRAGMENT with feedback loop MUST split. */
+   gfx = add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, gfx_buf, sizeof(gfx_buf));
+   cmd->current_cs.gfx = gfx;
+   cmd->state.gfx.render.feedback = true;
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 0);
+   CHECK(cmd->current_cs.gfx == NULL);
+   cmd->state.gfx.render.feedback = false;
+
+   /* 5. Compute stream at tail vs preceding a render in control_streams:
+    *    - Tail cs on pure COMPUTE -> COMPUTE barrier stays open with 0x60000160.
+    *    - Behind-other cs closes on COMPUTE -> COMPUTE and GRAPHICS -> COMPUTE
+    *      barriers so later compute work cannot be reordered ahead of newer
+    *      streams.
+    */
+   struct hk_cs *cs = add_test_cs(cmd, HK_CS_CDM, HK_SYNC_COMPUTE, cdm_buf, sizeof(cdm_buf));
+   cs->cdm_dirty = true;
+   cmd->current_cs.cs = cs;
+   CHECK(!hk_cs_is_behind_other(cmd, cs));
+
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0, 0);
+   CHECK(cmd->current_cs.cs == cs);
+   CHECK(*(uint32_t *)cdm_buf == 0x60000160);
+
+   /* Once a render follows cs in control_streams, any ordered barrier closes cs. */
+   gfx = add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, gfx_buf, sizeof(gfx_buf));
+   CHECK(hk_cs_is_behind_other(cmd, cs));
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0, 0);
+   CHECK(cmd->current_cs.cs == NULL);
+
+   /* Also verify GRAPHICS -> COMPUTE closes a behind-other TRANSFER stream. */
+   cs = add_test_cs(cmd, HK_CS_CDM, HK_SYNC_TRANSFER, cdm_buf, sizeof(cdm_buf));
+   cmd->current_cs.cs = cs;
+   gfx = add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, gfx_buf, sizeof(gfx_buf));
+   CHECK(hk_cs_is_behind_other(cmd, cs));
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT);
+   CHECK(cmd->current_cs.cs == NULL);
+
+   list_for_each_entry_safe(struct hk_cs, iter, &cmd->control_streams, node) {
+      list_del(&iter->node);
+      hk_cs_destroy(iter);
+   }
+   util_dynarray_fini(&cmd->sync_events);
+   util_dynarray_fini(&cmd->sync_remap);
+   util_dynarray_fini(&cmd->sync_first_event);
+   vk_object_base_finish(&cmd->vk.base);
+   free(pool);
+   free(cmd);
+   free(dev);
+   return 0;
+}
+
+/* Commit 3D: Narrowed VkEvent handling (DEVICE_ONLY skips CDM write + merge
+ * flush; host-visible SetEvent2 respects stage mask; WaitEvents2 replays
+ * VkDependencyInfo without forcing ALL_COMMANDS).
+ */
+static int
+test_narrowed_events(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_cmd_buffer *cmd = calloc(1, sizeof(*cmd));
+   uint8_t *pool = calloc(1, HK_CMD_BO_SIZE);
+   CHECK(dev && cmd && pool);
+
+   dev->dev.chip = AGX_CHIP_G16G;
+   vk_object_base_init(&dev->vk, &cmd->vk.base, VK_OBJECT_TYPE_COMMAND_BUFFER);
+   cmd->sync_events = UTIL_DYNARRAY_INIT;
+   cmd->sync_remap = UTIL_DYNARRAY_INIT;
+   cmd->sync_first_event = UTIL_DYNARRAY_INIT;
+   cmd->empty_barriers = UTIL_DYNARRAY_INIT;
+   cmd->uploader[HK_CMD_POOL_MAIN].chunks[0].map = pool;
+   cmd->uploader[HK_CMD_POOL_MAIN].chunks[0].base = 0x2000000000ull;
+   list_inithead(&cmd->control_streams);
+
+   uint8_t gfx_buf[256] = {0}, cdm_buf[4096] = {0};
+   struct hk_cs *gfx = add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, gfx_buf, sizeof(gfx_buf));
+   cmd->current_cs.gfx = cmd->merge_cs = gfx;
+   cmd->merge_event = 0;
+   cmd->merge_reach = hk_merge_graphics_stages();
+
+   struct hk_event dev_ev = {.device_only = true};
+   vk_object_base_init(&dev->vk, &dev_ev.base, VK_OBJECT_TYPE_EVENT);
+
+   VkMemoryBarrier2 comp_barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
+   };
+   VkDependencyInfo dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &comp_barrier,
+   };
+
+   /* DEVICE_ONLY SetEvent2 / ResetEvent2: 0 dispatches, merge_cs stays open! */
+   precomp_calls = 0;
+   hk_CmdSetEvent2(hk_cmd_buffer_to_handle(cmd), hk_event_to_handle(&dev_ev), &dep);
+   hk_CmdResetEvent2(hk_cmd_buffer_to_handle(cmd), hk_event_to_handle(&dev_ev),
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+   CHECK(precomp_calls == 0);
+   CHECK(cmd->merge_cs == gfx);
+
+   /* WaitEvents2 with COMPUTE -> COMPUTE: keeps CDM unsplit with 0x60000160
+    * and does not flush unrelated open gfx!
+    */
+   cmd->merge_cs = NULL;
+   struct hk_cs *cs = add_test_cs(cmd, HK_CS_CDM, HK_SYNC_COMPUTE, cdm_buf, sizeof(cdm_buf));
+   cs->cdm_dirty = true;
+   cmd->current_cs.cs = cs;
+   VkEvent ev_handle = hk_event_to_handle(&dev_ev);
+   hk_CmdWaitEvents2(hk_cmd_buffer_to_handle(cmd), 1, &ev_handle, &dep);
+   CHECK(cmd->current_cs.cs == cs);
+   CHECK(cmd->current_cs.gfx == gfx);
+   CHECK(*(uint32_t *)cdm_buf == 0x60000160);
+
+   /* Host-visible SetEvent2(COMPUTE): uses HK_SYNC_COMPUTE, not HK_SYNC_ALL. */
+   VkResult host_status = VK_EVENT_RESET;
+   struct hk_event host_ev = {
+      .device_only = false,
+      .addr = 0x6000000,
+      .status = &host_status,
+   };
+   vk_object_base_init(&dev->vk, &host_ev.base, VK_OBJECT_TYPE_EVENT);
+   precomp_calls = 0;
+   hk_CmdSetEvent2(hk_cmd_buffer_to_handle(cmd), hk_event_to_handle(&host_ev), &dep);
+   CHECK(precomp_calls == 1 && precomp_last_idx == LIBAGX_WRITE_U32);
+   CHECK(precomp_last_scope == HK_SYNC_COMPUTE);
+   CHECK(cmd->current_cs.gfx == gfx);
+
+   list_for_each_entry_safe(struct hk_cs, iter, &cmd->control_streams, node) {
+      list_del(&iter->node);
+      hk_cs_destroy(iter);
+   }
+   util_dynarray_fini(&cmd->sync_events);
+   util_dynarray_fini(&cmd->sync_remap);
+   util_dynarray_fini(&cmd->sync_first_event);
+   util_dynarray_fini(&cmd->empty_barriers);
+   vk_object_base_finish(&host_ev.base);
+   vk_object_base_finish(&dev_ev.base);
+   vk_object_base_finish(&cmd->vk.base);
+   free(pool);
+   free(cmd);
+   free(dev);
+   return 0;
+}
+
+/* Sync-ordering edge-case regression tests:
+ *  - Open CS1 + merge_pre_cs (D1 -> R open -> D2(MPC) -> D3(indirect) ->
+ *    COMPUTE->COMPUTE barrier -> D4) must close CS1 when MPC is created so
+ *    D3/D4 run strictly after MPC in list and sync order; behind-other
+ *    COMPUTE->COMPUTE barriers and graphics-scoped CDM clears also close CS1.
+ *  - Consecutive compute timestamps D1 -> TS1(COMPUTE) -> D2 -> TS2(COMPUTE)
+ *    must preserve the implicit execution dependency CS2 -> CS1.
+ *  - Compute-only PIPELINE_STATISTICS EndQuery must order its availability
+ *    write after an already-closed compute producer stream.
+ *  - In-pass TOP_OF_PIPE / NONE timestamps (stage_mask == 0) must retain
+ *    HK_SYNC_ALL instead of narrowing to HK_SYNC_GRAPHICS.
+ */
+static int
+test_sync_ordering_edge_cases(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_cmd_buffer *cmd = calloc(1, sizeof(*cmd));
+   uint8_t *pool = calloc(1, HK_CMD_BO_SIZE);
+   CHECK(dev && cmd && pool);
+
+   dev->dev.chip = AGX_CHIP_G16G;
+   vk_object_base_init(&dev->vk, &cmd->vk.base, VK_OBJECT_TYPE_COMMAND_BUFFER);
+   cmd->sync_events = UTIL_DYNARRAY_INIT;
+   cmd->sync_remap = UTIL_DYNARRAY_INIT;
+   cmd->sync_first_event = UTIL_DYNARRAY_INIT;
+   cmd->empty_barriers = UTIL_DYNARRAY_INIT;
+   cmd->occlusion_accum = UTIL_DYNARRAY_INIT;
+   cmd->query_adds = UTIL_DYNARRAY_INIT;
+   cmd->query_writes = UTIL_DYNARRAY_INIT;
+   cmd->uploader[HK_CMD_POOL_MAIN].chunks[0].map = pool;
+   cmd->uploader[HK_CMD_POOL_MAIN].chunks[0].base = 0x2000000000ull;
+   list_inithead(&cmd->control_streams);
+
+   /* --- B1: D1 -> CS1; R open for merge; D2 -> MPC; D3 flushes merge;
+    *         COMPUTE->COMPUTE barrier; D4 must be listed AFTER MPC!
+    */
+   struct hk_cs *cs1 = hk_cmd_buffer_get_cs_general(
+      cmd, &cmd->current_cs.cs, true, HK_SYNC_COMPUTE);
+   CHECK(cs1 != NULL);
+
+   uint8_t gfx_buf[256] = {0};
+   struct hk_cs *r = add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, gfx_buf, sizeof(gfx_buf));
+   cmd->current_cs.gfx = r;
+   cmd->merge_cs = r;
+   cmd->merge_event = 1;
+   cmd->merge_reach = 0;
+
+   /* D2 (movable compute) routes to merge_pre_cs and MUST close CS1. */
+   cmd->merge_move_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+   struct hk_cs *mpc = hk_cmd_buffer_get_cs_general(
+      cmd, &cmd->current_cs.cs, true, HK_SYNC_COMPUTE);
+   cmd->merge_move_stage = 0;
+   CHECK(mpc != NULL && mpc == cmd->merge_pre_cs && mpc != cs1);
+   CHECK(cmd->current_cs.cs == NULL);
+
+   /* D3 (non-movable, e.g. DispatchIndirect) flushes the merge (R + MPC close)
+    * and opens a fresh CS2 at the tail after R.
+    */
+   struct hk_cs *cs2 = hk_cmd_buffer_get_cs_general(
+      cmd, &cmd->current_cs.cs, true, HK_SYNC_COMPUTE | HK_SYNC_DISPATCH_INDIRECT);
+   CHECK(cs2 != NULL && cs2 != cs1 && cs2 != mpc);
+   CHECK(cmd->merge_cs == NULL && cmd->merge_pre_cs == NULL);
+
+   /* COMPUTE_WRITE -> COMPUTE_READ barrier + D4 stay in CS2, strictly AFTER MPC. */
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_WRITE_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT);
+   struct hk_cs *d4_cs = hk_cmd_buffer_get_cs_general(
+      cmd, &cmd->current_cs.cs, true, HK_SYNC_COMPUTE);
+   CHECK(d4_cs == cs2);
+
+   /* Verify physical list order is [CS1, MPC, R, CS2] (D4 strictly after D2!). */
+   struct hk_cs *order[4] = {0};
+   unsigned n = 0;
+   list_for_each_entry(struct hk_cs, iter, &cmd->control_streams, node) {
+      CHECK(n < 4);
+      order[n++] = iter;
+   }
+   CHECK(n == 4 && order[0] == cs1 && order[1] == mpc && order[2] == r &&
+         order[3] == cs2);
+
+   /* Verify hk_sync_resolve succeeds with no fallback and orders CS2 after MPC. */
+   struct hk_sync_state st;
+   hk_sync_init(&st);
+   struct hk_sync_stream b1_streams[4] = {0};
+   b1_streams[cs1->sync_id] = (struct hk_sync_stream){
+      .engine = HK_SYNC_CDM, .index = 1, .before = {0, 0},
+      .wait = hk_sync_empty(), .wait_tiling = hk_sync_empty(),
+   };
+   b1_streams[mpc->sync_id] = (struct hk_sync_stream){
+      .engine = HK_SYNC_CDM, .index = 2, .before = {0, 1},
+      .wait = hk_sync_empty(), .wait_tiling = hk_sync_empty(),
+   };
+   b1_streams[r->sync_id] = (struct hk_sync_stream){
+      .engine = HK_SYNC_RENDER, .index = 1, .before = {0, 2},
+      .wait = hk_sync_empty(), .wait_tiling = hk_sync_empty(),
+   };
+   b1_streams[cs2->sync_id] = (struct hk_sync_stream){
+      .engine = HK_SYNC_CDM, .index = 3, .before = {1, 2},
+      .wait = hk_sync_empty(), .wait_tiling = hk_sync_empty(),
+   };
+   /* Verify hk_sync_resolve succeeds with no fallback (no backward wait).
+    * MPC (CDM #2) was closed and flushed before CS2 (CDM #3) in FIFO CDM
+    * subqueue order, and the COMPUTE->COMPUTE barrier after D3 is satisfied
+    * intra-stream inside CS2 (so CS2 does not wait on itself).
+    */
+   CHECK(hk_sync_resolve(&st, cmd->sync_events.data,
+                         util_dynarray_num_elements(&cmd->sync_events,
+                                                    struct hk_sync_event),
+                         cmd->sync_remap.data, b1_streams, 4, false));
+   CHECK(b1_streams[cs2->sync_id].wait.engine[HK_SYNC_CDM] == HK_SYNC_NONE);
+
+   /* --- B1b + L3: CS1 behind R closes on COMPUTE->COMPUTE barrier AND on
+    *               graphics-scoped CDM work (HK_SYNC_FRAGMENT).
+    */
+   list_for_each_entry_safe(struct hk_cs, iter, &cmd->control_streams, node) {
+      list_del(&iter->node);
+      hk_cs_destroy(iter);
+   }
+   cmd->current_cs.cs = cmd->current_cs.gfx = NULL;
+   util_dynarray_clear(&cmd->sync_events);
+   util_dynarray_clear(&cmd->sync_remap);
+   util_dynarray_clear(&cmd->sync_first_event);
+
+   struct hk_cs *behind = hk_cmd_buffer_get_cs_general(
+      cmd, &cmd->current_cs.cs, true, HK_SYNC_COMPUTE);
+   add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, gfx_buf, sizeof(gfx_buf));
+   CHECK(hk_cs_is_behind_other(cmd, behind));
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_WRITE_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT);
+   CHECK(cmd->current_cs.cs == NULL);
+
+   /* L3: graphics-scoped CDM clear closes CS1 sitting behind a render. */
+   struct hk_cs *behind2 = hk_cmd_buffer_get_cs_general(
+      cmd, &cmd->current_cs.cs, true, HK_SYNC_COMPUTE);
+   add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, gfx_buf, sizeof(gfx_buf));
+   CHECK(hk_cs_is_behind_other(cmd, behind2));
+   struct hk_cs *frag_cdm = hk_cmd_buffer_get_cs_general(
+      cmd, &cmd->current_cs.cs, true, HK_SYNC_FRAGMENT);
+   CHECK(frag_cdm != NULL && frag_cdm != behind2);
+   CHECK(list_last_entry(&cmd->control_streams, struct hk_cs, node) == frag_cdm);
+
+   /* --- H1: D1 -> TS1(COMPUTE) -> D2 -> TS2(COMPUTE) orders CS2 after CS1. */
+   list_for_each_entry_safe(struct hk_cs, iter, &cmd->control_streams, node) {
+      list_del(&iter->node);
+      hk_cs_destroy(iter);
+   }
+   cmd->current_cs.cs = cmd->current_cs.gfx = NULL;
+   util_dynarray_clear(&cmd->sync_events);
+   util_dynarray_clear(&cmd->sync_remap);
+   util_dynarray_clear(&cmd->sync_first_event);
+
+   struct agx_va qp_va = {.addr = 0x5000000};
+   struct agx_bo qp_bo = {.va = &qp_va};
+   struct hk_query_pool ts_qp = {
+      .bo = &qp_bo,
+      .query_start = 0,
+      .query_stride = sizeof(uint64_t),
+      .handle = 11,
+   };
+   vk_object_base_init(&dev->vk, &ts_qp.vk.base, VK_OBJECT_TYPE_QUERY_POOL);
+   ts_qp.vk.query_type = VK_QUERY_TYPE_TIMESTAMP;
+   ts_qp.vk.query_count = 4;
+
+   struct hk_cs *ts_cs1 = hk_cmd_buffer_get_cs_general(
+      cmd, &cmd->current_cs.cs, true, HK_SYNC_COMPUTE);
+   hk_CmdWriteTimestamp2(hk_cmd_buffer_to_handle(cmd),
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         hk_query_pool_to_handle(&ts_qp), 0);
+   CHECK(cmd->current_cs.cs == ts_cs1 && ts_cs1->timestamp.end.handle == 11);
+   /* D2 into ts_cs1, then TS2 splits into ts_cs2. */
+   hk_cmd_sync_work(cmd, ts_cs1, HK_SYNC_COMPUTE);
+   hk_CmdWriteTimestamp2(hk_cmd_buffer_to_handle(cmd),
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         hk_query_pool_to_handle(&ts_qp), 1);
+   struct hk_cs *ts_cs2 = cmd->current_cs.cs;
+   CHECK(ts_cs2 != NULL && ts_cs2 != ts_cs1 && ts_cs2->timestamp.end.handle == 11);
+   CHECK(ts_cs2->sync_stages == HK_SYNC_COMPUTE);
+
+   hk_sync_init(&st);
+   struct hk_sync_stream h1_streams[2] = {
+      {.engine = HK_SYNC_CDM, .index = 1, .before = {0, 0},
+       .wait = hk_sync_empty(), .wait_tiling = hk_sync_empty()},
+      {.engine = HK_SYNC_CDM, .index = 2, .before = {0, 1},
+       .wait = hk_sync_empty(), .wait_tiling = hk_sync_empty()},
+   };
+   CHECK(hk_sync_resolve(&st, cmd->sync_events.data,
+                         util_dynarray_num_elements(&cmd->sync_events,
+                                                    struct hk_sync_event),
+                         cmd->sync_remap.data, h1_streams, 2, false));
+   CHECK(h1_streams[ts_cs2->sync_id].wait.engine[HK_SYNC_CDM] == 1);
+
+   /* --- M1: Compute-only PIPELINE_STATISTICS EndQuery orders availability
+    *         write after an already-closed compute producer stream.
+    */
+   list_for_each_entry_safe(struct hk_cs, iter, &cmd->control_streams, node) {
+      list_del(&iter->node);
+      hk_cs_destroy(iter);
+   }
+   cmd->current_cs.cs = cmd->current_cs.gfx = NULL;
+   util_dynarray_clear(&cmd->sync_events);
+   util_dynarray_clear(&cmd->sync_remap);
+   util_dynarray_clear(&cmd->sync_first_event);
+
+   struct hk_query_pool stat_qp = {
+      .bo = &qp_bo,
+      .query_start = 64,
+      .query_stride = 64,
+      .handle = 12,
+   };
+   vk_object_base_init(&dev->vk, &stat_qp.vk.base, VK_OBJECT_TYPE_QUERY_POOL);
+   stat_qp.vk.query_type = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+   stat_qp.vk.pipeline_statistics =
+      VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT;
+   stat_qp.vk.query_count = 2;
+
+   struct hk_cs *stat_prod = hk_cmd_buffer_get_cs_general(
+      cmd, &cmd->current_cs.cs, true,
+      HK_SYNC_COMPUTE | HK_SYNC_DISPATCH_INDIRECT);
+   /* Close producer stream before EndQuery. */
+   hk_cmd_buffer_end_compute(cmd);
+   CHECK(cmd->current_cs.cs == NULL);
+
+   hk_CmdEndQueryIndexedEXT(hk_cmd_buffer_to_handle(cmd),
+                            hk_query_pool_to_handle(&stat_qp), 0, 0);
+   struct hk_cs *stat_avail = cmd->current_cs.cs;
+   CHECK(stat_avail != NULL && stat_avail != stat_prod);
+   CHECK(stat_avail->sync_stages == HK_SYNC_COMPUTE);
+
+   hk_sync_init(&st);
+   struct hk_sync_stream m1_streams[2] = {
+      {.engine = HK_SYNC_CDM, .index = 1, .before = {0, 0},
+       .wait = hk_sync_empty(), .wait_tiling = hk_sync_empty()},
+      {.engine = HK_SYNC_CDM, .index = 2, .before = {0, 1},
+       .wait = hk_sync_empty(), .wait_tiling = hk_sync_empty()},
+   };
+   CHECK(hk_sync_resolve(&st, cmd->sync_events.data,
+                         util_dynarray_num_elements(&cmd->sync_events,
+                                                    struct hk_sync_event),
+                         cmd->sync_remap.data, m1_streams, 2, false));
+   CHECK(m1_streams[stat_avail->sync_id].wait.engine[HK_SYNC_CDM] == 1);
+
+   /* --- L2: In-pass TOP_OF_PIPE / NONE timestamp keeps HK_SYNC_ALL. */
+   list_for_each_entry_safe(struct hk_cs, iter, &cmd->control_streams, node) {
+      list_del(&iter->node);
+      hk_cs_destroy(iter);
+   }
+   cmd->current_cs.cs = cmd->current_cs.gfx = NULL;
+   util_dynarray_clear(&cmd->sync_events);
+   util_dynarray_clear(&cmd->sync_remap);
+   util_dynarray_clear(&cmd->sync_first_event);
+
+   struct hk_cs *top_gfx = add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, gfx_buf, sizeof(gfx_buf));
+   cmd->current_cs.gfx = top_gfx;
+   hk_CmdWriteTimestamp2(hk_cmd_buffer_to_handle(cmd),
+                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                         hk_query_pool_to_handle(&ts_qp), 0);
+   CHECK(top_gfx->sync_stages == HK_SYNC_ALL);
+
+   struct hk_cs *none_gfx = add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, gfx_buf, sizeof(gfx_buf));
+   cmd->current_cs.gfx = none_gfx;
+   hk_CmdWriteTimestamp2(hk_cmd_buffer_to_handle(cmd),
+                         VK_PIPELINE_STAGE_2_NONE,
+                         hk_query_pool_to_handle(&ts_qp), 1);
+   CHECK(none_gfx->sync_stages == HK_SYNC_ALL);
+
+   list_for_each_entry_safe(struct hk_cs, iter, &cmd->control_streams, node) {
+      list_del(&iter->node);
+      hk_cs_destroy(iter);
+   }
+   util_dynarray_fini(&cmd->sync_events);
+   util_dynarray_fini(&cmd->sync_remap);
+   util_dynarray_fini(&cmd->sync_first_event);
+   util_dynarray_fini(&cmd->empty_barriers);
+   util_dynarray_fini(&cmd->occlusion_accum);
+   util_dynarray_fini(&cmd->query_adds);
+   util_dynarray_fini(&cmd->query_writes);
+   vk_object_base_finish(&stat_qp.vk.base);
+   vk_object_base_finish(&ts_qp.vk.base);
+   vk_object_base_finish(&cmd->vk.base);
+   free(pool);
+   free(cmd);
+   free(dev);
+   return 0;
+}
+
 int
 main(void)
 {
@@ -628,6 +1423,16 @@ main(void)
       return 1;
    if (test_batched_submit_and_intra_barriers())
       return 1;
-   puts("PASS barrier-vk Commits 1-2: hoisted barrier_group, query flush space, mixed-engine in_syncs, default submit batching");
+   if (test_sync_fallback_non_poisoning())
+      return 1;
+   if (test_narrowed_scopes_and_merge_move())
+      return 1;
+   if (test_in_pass_barriers_and_compute_preservation())
+      return 1;
+   if (test_narrowed_events())
+      return 1;
+   if (test_sync_ordering_edge_cases())
+      return 1;
+   puts("PASS barrier-vk Commits 1-3: all barrier, batching, sync_fallback, scope, in-pass, event, and sync-review checks");
    return 0;
 }

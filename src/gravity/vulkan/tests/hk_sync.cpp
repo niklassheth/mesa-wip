@@ -381,9 +381,15 @@ TEST(SyncScopes, PipelineOrderingAndUnknownStages)
              HK_SYNC_GRAPHICS | HK_SYNC_DRAW_INDIRECT);
    EXPECT_EQ(hk_sync_stage_mask(VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, false),
              HK_SYNC_INDIRECT | HK_SYNC_COMPUTE | HK_SYNC_GRAPHICS);
-   EXPECT_EQ(hk_sync_stage_mask(VK_PIPELINE_STAGE_2_HOST_BIT, true), HK_SYNC_ALL);
+   EXPECT_EQ(hk_sync_stage_mask(VK_PIPELINE_STAGE_2_HOST_BIT, true), 0u);
+   EXPECT_EQ(hk_sync_stage_mask(VK_PIPELINE_STAGE_2_HOST_BIT, false), 0u);
+   EXPECT_EQ(hk_sync_stage_mask(VK_PIPELINE_STAGE_2_HOST_BIT |
+                                   VK_PIPELINE_STAGE_2_TRANSFER_BIT, true),
+             HK_SYNC_TRANSFER);
    EXPECT_EQ(hk_sync_stage_mask(VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT, true),
-             HK_SYNC_ALL);
+             HK_SYNC_INDIRECT);
+   EXPECT_EQ(hk_sync_stage_mask(VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT, false),
+             HK_SYNC_INDIRECT | HK_SYNC_COMPUTE | HK_SYNC_GRAPHICS);
    EXPECT_EQ(hk_sync_stage_mask(UINT64_C(1) << 63, false), HK_SYNC_ALL);
 }
 

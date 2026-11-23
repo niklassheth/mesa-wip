@@ -142,8 +142,10 @@ void
 hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
                bool after_gfx)
 {
+   unsigned scope = cmd->sync_scope ?: HK_SYNC_ALL;
    struct hk_cs *cs = hk_cmd_buffer_get_cs_general(
-      cmd, after_gfx ? &cmd->current_cs.post_gfx : &cmd->current_cs.cs, true, HK_SYNC_ALL);
+      cmd, after_gfx ? &cmd->current_cs.post_gfx : &cmd->current_cs.cs, true,
+      scope);
    if (!cs)
       return;
 
@@ -183,9 +185,30 @@ hk_flush_query_writes(struct hk_cmd_buffer *cmd)
 {
    unsigned accums = util_dynarray_num_elements(&cmd->occlusion_accum,
                                                 struct libagx_occlusion_accum);
+   unsigned adds =
+      util_dynarray_num_elements(&cmd->query_adds, struct libagx_imm_write);
+   unsigned writes =
+      util_dynarray_num_elements(&cmd->query_writes, struct libagx_imm_write);
+
+   if (!accums && !adds && !writes)
+      return;
+
+   /* Deferred query results and availability come from graphics work. Order
+    * these transfer-scoped dispatches after prior graphics without stalling
+    * unrelated compute with HK_SYNC_ALL.
+    */
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+                       VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                       VK_ACCESS_2_MEMORY_WRITE_BIT,
+                       VK_ACCESS_2_TRANSFER_READ_BIT |
+                          VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+   unsigned saved_scope = cmd->sync_scope;
+   cmd->sync_scope = HK_SYNC_TRANSFER;
+
    if (accums) {
-      struct hk_cs *cs =
-         hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.cs, true, HK_SYNC_ALL);
+      struct hk_cs *cs = hk_cmd_buffer_get_cs_general(
+         cmd, &cmd->current_cs.cs, true, HK_SYNC_TRANSFER);
       if (cs) {
          /* The segments were written by rendering that has to complete. */
          hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
@@ -197,11 +220,6 @@ hk_flush_query_writes(struct hk_cmd_buffer *cmd)
       }
    }
 
-   unsigned adds =
-      util_dynarray_num_elements(&cmd->query_adds, struct libagx_imm_write);
-   unsigned writes =
-      util_dynarray_num_elements(&cmd->query_writes, struct libagx_imm_write);
-
    if (adds) {
       uint64_t params = hk_pool_upload(cmd, cmd->query_adds.data,
                                        cmd->query_adds.size, 16);
@@ -209,8 +227,8 @@ hk_flush_query_writes(struct hk_cmd_buffer *cmd)
    }
 
    if (writes) {
-      struct hk_cs *cs =
-         hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.cs, true, HK_SYNC_ALL);
+      struct hk_cs *cs = hk_cmd_buffer_get_cs_general(
+         cmd, &cmd->current_cs.cs, true, HK_SYNC_TRANSFER);
       if (cs) {
          /* Results must be visible system-wide once marked available, as in
           * hk_dispatch_imm_writes. */
@@ -221,6 +239,8 @@ hk_flush_query_writes(struct hk_cmd_buffer *cmd)
          libagx_write_u32s(cmd, agx_1d(writes), AGX_BARRIER_ALL, params);
       }
    }
+
+   cmd->sync_scope = saved_scope;
 
    util_dynarray_clear(&cmd->occlusion_accum);
    util_dynarray_clear(&cmd->query_adds);
@@ -448,6 +468,10 @@ hk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    hk_flush_if_timestamp(cmd, pool);
    hk_flush_query_writes(cmd);
 
+   /* Vulkan guarantees an implicit execution dependency from
+    * vkCmdResetQueryPool to subsequent queries/timestamps on either engine
+    * without an API barrier, so keep emit_zero_queries() in HK_SYNC_ALL.
+    */
    perf_debug(cmd, "Reset query pool");
    emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
 }
@@ -482,8 +506,33 @@ hk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
       hk_cmd_buffer_end_compute(cmd);
    }
 
+   unsigned stage_mask = hk_sync_stage_mask(stage, true);
+   unsigned ts_scope = HK_SYNC_ALL;
+   if (after_gfx) {
+      if (stage_mask && !(stage_mask & ~(HK_SYNC_GRAPHICS | HK_SYNC_DRAW_INDIRECT)))
+         ts_scope = HK_SYNC_GRAPHICS;
+   } else {
+      const unsigned compute = HK_SYNC_COMPUTE | HK_SYNC_DISPATCH_INDIRECT;
+      if (stage_mask && !(stage_mask & ~compute)) {
+         /* Preserve vkCmdWriteTimestamp2's implicit execution dependency on
+          * earlier compute work even when the producer stream was already
+          * closed (e.g., split for a prior timestamp).
+          */
+         hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0, 0);
+         ts_scope = HK_SYNC_COMPUTE;
+      } else if (stage_mask == HK_SYNC_TRANSFER) {
+         hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                             VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                             VK_ACCESS_2_TRANSFER_READ_BIT);
+         ts_scope = HK_SYNC_TRANSFER;
+      }
+   }
+
    struct hk_cs *cs = hk_cmd_buffer_get_cs_general(
-      cmd, after_gfx ? &cmd->current_cs.gfx : &cmd->current_cs.cs, true, HK_SYNC_ALL);
+      cmd, after_gfx ? &cmd->current_cs.gfx : &cmd->current_cs.cs, !after_gfx,
+      ts_scope);
    if (!cs)
       return;
 
@@ -614,6 +663,19 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
       if (graphics) {
          struct libagx_imm_write write = {.address = available, .value = 1};
          util_dynarray_append(&cmd->query_writes, write);
+      } else if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
+         /* Order the availability write after any preceding compute counter
+          * updates (libagx_increment_cs_invocations), even if the compute
+          * stream was closed between dispatch and vkCmdEndQuery.
+          */
+         hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                             VK_ACCESS_2_SHADER_WRITE_BIT,
+                             VK_ACCESS_2_SHADER_WRITE_BIT);
+         unsigned saved_scope = cmd->sync_scope;
+         cmd->sync_scope = HK_SYNC_COMPUTE;
+         hk_queue_write(cmd, available, 1, false);
+         cmd->sync_scope = saved_scope;
       } else {
          hk_queue_write(cmd, available, 1, false);
       }
@@ -775,6 +837,16 @@ hk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    hk_flush_if_timestamp(cmd, pool);
    hk_flush_query_writes(cmd);
 
+   /* Query copies may read timestamps or query results without an API barrier
+    * (e.g. VK_QUERY_RESULT_WAIT_BIT). Wait on all prior producers before the
+    * copy, while tagging the copy itself with HK_SYNC_TRANSFER so unrelated
+    * work after the copy is not serialized by HK_SYNC_ALL.
+    */
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                       VK_PIPELINE_STAGE_2_COPY_BIT,
+                       VK_ACCESS_2_MEMORY_WRITE_BIT,
+                       VK_ACCESS_2_TRANSFER_READ_BIT);
+
    perf_debug(cmd, "Query pool copy");
 
    struct libagx_copy_query_args info = {
@@ -788,5 +860,8 @@ hk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
       .flags = flags,
    };
 
+   unsigned saved_scope = cmd->sync_scope;
+   cmd->sync_scope = HK_SYNC_TRANSFER;
    libagx_copy_query_struct(cmd, agx_1d(queryCount), AGX_BARRIER_ALL, info);
+   cmd->sync_scope = saved_scope;
 }

@@ -142,10 +142,19 @@ hk_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage _image,
    VK_FROM_HANDLE(hk_image, image, _image);
    hk_cmd_use_implicit_sync(cmd, image->implicit_sync_res);
 
+   unsigned saved_scope = cmd->sync_scope;
+   VkPipelineStageFlags2 saved_move = cmd->merge_move_stage;
+   cmd->sync_scope = HK_SYNC_TRANSFER;
+   cmd->merge_move_stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT |
+                           VK_PIPELINE_STAGE_2_CLEAR_BIT;
+
    for (uint32_t r = 0; r < rangeCount; r++) {
       hk_clear_image(cmd, image, PIPE_FORMAT_NONE, pColor->uint32, &pRanges[r],
                      true /* whole 3D */);
    }
+
+   cmd->merge_move_stage = saved_move;
+   cmd->sync_scope = saved_scope;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -160,9 +169,18 @@ hk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage _image,
    VK_FROM_HANDLE(hk_image, image, _image);
    hk_cmd_use_implicit_sync(cmd, image->implicit_sync_res);
 
+   unsigned saved_scope = cmd->sync_scope;
+   VkPipelineStageFlags2 saved_move = cmd->merge_move_stage;
+   cmd->sync_scope = HK_SYNC_TRANSFER;
+   cmd->merge_move_stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT |
+                           VK_PIPELINE_STAGE_2_CLEAR_BIT;
+
    for (uint32_t r = 0; r < rangeCount; r++) {
       uint32_t colour[4] = {fui(pDepthStencil->depth), pDepthStencil->stencil};
       hk_clear_image(cmd, image, PIPE_FORMAT_NONE, colour, &pRanges[r],
                      true /* whole 3D */);
    }
+
+   cmd->merge_move_stage = saved_move;
+   cmd->sync_scope = saved_scope;
 }

@@ -1459,12 +1459,27 @@ hk_meta_resolve_rendering(struct hk_cmd_buffer *cmd,
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
+   /* Attachment resolves consume the MSAA stores emitted by the render pass
+    * that just ended (including any converted empty-render clears), and write
+    * resolved attachments in COLOR_ATTACHMENT_OUTPUT / LATE_FRAGMENT_TESTS.
+    * Order explicitly against the fragment/attachment scope instead of using
+    * HK_SYNC_ALL so unrelated compute work is not stalled.
+    */
+   hk_cmd_sync_barrier(cmd,
+                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                       VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+                          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+
    struct hk_meta_save save;
    hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
-   /* Attachment resolves include an implicit dependency on the rendering
-    * whose stores they consume; keep the internal helper fully ordered.
-    */
-   cmd->sync_scope = HK_SYNC_ALL;
+   cmd->sync_scope = HK_SYNC_FRAGMENT;
    vk_meta_resolve_rendering(&cmd->vk, &dev->meta, pRenderingInfo);
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
 }
@@ -1473,7 +1488,10 @@ static void
 hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
 {
    unsigned saved_scope = cmd->sync_scope;
+   VkPipelineStageFlags2 saved_move = cmd->merge_move_stage;
    cmd->sync_scope = HK_SYNC_TRANSFER;
+   cmd->merge_move_stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT |
+                           VK_PIPELINE_STAGE_2_COPY_BIT;
    /* Use vectorized copies for as much of the buffer as possible. This requires
     * that dst, src, and size are all properly aligned. Failing to check for
     * alignment on the buffers causes subtle and hard-to-debug issues!
@@ -1492,6 +1510,7 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
    if (size) {
       libagx_copy_uchar(cmd, agx_1d(size), AGX_BARRIER_ALL, dst, src);
    }
+   cmd->merge_move_stage = saved_move;
    cmd->sync_scope = saved_scope;
 }
 
@@ -1636,7 +1655,12 @@ hk_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
    uint64_t addr =
       vk_meta_buffer_address(&dev->vk, dstBuffer, dstOffset, dstRange);
 
+   unsigned saved_scope = cmd->sync_scope;
+   VkPipelineStageFlags2 saved_move = cmd->merge_move_stage;
    cmd->sync_scope = HK_SYNC_TRANSFER;
+   cmd->merge_move_stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT |
+                           VK_PIPELINE_STAGE_2_CLEAR_BIT |
+                           VK_PIPELINE_STAGE_2_COPY_BIT;
 
    if (util_is_aligned(addr, 16) && util_is_aligned(range, 16)) {
       libagx_fill_uint4(cmd, agx_2d(range / 16, 1), AGX_BARRIER_ALL,
@@ -1644,7 +1668,8 @@ hk_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
    } else {
       libagx_fill(cmd, agx_1d(range / 4), AGX_BARRIER_ALL, addr, data);
    }
-   cmd->sync_scope = 0;
+   cmd->merge_move_stage = saved_move;
+   cmd->sync_scope = saved_scope;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1680,7 +1705,7 @@ hk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
    struct hk_meta_save save;
    hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
    /* Attachment clears are subject to conditional rendering. */
-   cmd->sync_scope = HK_SYNC_GRAPHICS;
+   cmd->sync_scope = HK_SYNC_GRAPHICS | HK_SYNC_DRAW_INDIRECT;
    cmd->state.cond_render.meta = true;
    vk_meta_clear_attachments(&cmd->vk, &dev->meta, &render_info,
                              attachmentCount, pAttachments, rectCount, pRects);

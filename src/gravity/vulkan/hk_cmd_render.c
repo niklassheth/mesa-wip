@@ -1163,13 +1163,18 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    /* Reordering barrier for post-gfx, in case we had any. */
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
 
-   hk_cs_end_hint(cmd, HK_CS_END_BEGIN_RENDER);
-   /* Don't reorder compute across render passes.
-    *
-    * TODO: Check if this is necessary if the proper PipelineBarriers are
-    * handled... there may be CTS bugs...
+   /* hk_sync orders compute <-> graphics dependencies across streams via
+    * explicit barriers. Only end an open compute stream here when fallback
+    * sync is active or the stream carries a timestamp / HK_SYNC_ALL work
+    * that this render must not delay or overtake.
     */
-   hk_cmd_buffer_end_compute(cmd);
+   if (cmd->sync_fallback ||
+       (cmd->current_cs.cs &&
+        (cmd->current_cs.cs->timestamp.end.handle ||
+         cmd->current_cs.cs->sync_stages == HK_SYNC_ALL))) {
+      hk_cs_end_hint(cmd, HK_CS_END_BEGIN_RENDER);
+      hk_cmd_buffer_end_compute(cmd);
+   }
 
    /* If we spill colour attachments, we need to decompress them. This happens
     * at the start of the render; it is not re-emitted when resuming

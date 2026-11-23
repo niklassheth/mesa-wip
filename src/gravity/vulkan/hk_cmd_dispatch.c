@@ -621,11 +621,14 @@ dispatch(struct hk_cmd_buffer *cmd, struct agx_grid grid)
    uint64_t stat = hk_pipeline_stat_addr(
       cmd, VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT);
    if (hk_stat_enabled(stat)) {
+      unsigned saved_scope = cmd->sync_scope;
+      cmd->sync_scope = HK_SYNC_COMPUTE | HK_SYNC_DISPATCH_INDIRECT;
       libagx_increment_cs_invocations(
          cmd, agx_1d(1), AGX_BARRIER_ALL,
          cmd->state.cs.descriptors.root.cs.group_count_addr, stat,
          s->info.apple9.local_size[0] * s->info.apple9.local_size[1] *
             s->info.apple9.local_size[2]);
+      cmd->sync_scope = saved_scope;
    }
    if (hk_cond_render_applies(cmd)) {
       /* Predicated dispatches read zero group counts when skipped. */

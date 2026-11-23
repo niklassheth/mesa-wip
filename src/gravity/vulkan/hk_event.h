@@ -18,6 +18,7 @@ struct hk_event {
 
    uint64_t addr;
    VkResult *status;
+   bool device_only;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_event, base, VkEvent, VK_OBJECT_TYPE_EVENT)
