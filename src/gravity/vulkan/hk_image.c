@@ -918,6 +918,11 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
               const VkImageCreateInfo *pCreateInfo)
 {
    vk_image_init(&dev->vk, &image->vk, pCreateInfo);
+   list_inithead(&image->feedback_raw_link);
+   image->feedback_prefer_raw = 0;
+   image->feedback_track_cross_submit = false;
+   image->feedback_gpu_decompressions = 0;
+   image->feedback_submitted_raw_mask = 0;
 
    if ((image->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
@@ -1038,6 +1043,20 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
       }
    }
 
+   bool any_compressed = false;
+   for (uint8_t plane = 0; plane < image->plane_count; plane++)
+      any_compressed |= image->planes[plane].layout.compressed;
+   const bool is_swapchain =
+      vk_find_struct_const(pCreateInfo->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR) != NULL;
+   image->feedback_track_cross_submit =
+      any_compressed &&
+      pCreateInfo->tiling == VK_IMAGE_TILING_OPTIMAL &&
+      image->vk.external_handle_types == 0 &&
+      !is_swapchain &&
+      !(pCreateInfo->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                              VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                              VK_IMAGE_CREATE_SPARSE_ALIASED_BIT));
+
    return VK_SUCCESS;
 }
 
@@ -1132,6 +1151,8 @@ static void
 hk_image_finish(struct hk_device *dev, struct hk_image *image,
                 const VkAllocationCallbacks *pAllocator)
 {
+   hk_feedback_image_destroy(image);
+
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
       hk_image_plane_finish(dev, &image->planes[plane], image->vk.create_flags,
                             pAllocator);
@@ -1559,6 +1580,12 @@ hk_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
 #endif
 
       assert(mem);
+      if (mem->vk.import_handle_type || mem->vk.export_handle_types ||
+          vk_find_struct_const(pBindInfos[i].pNext,
+                               BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR)) {
+         image->feedback_track_cross_submit = false;
+         hk_feedback_image_destroy(image);
+      }
       uint64_t offset_B = pBindInfos[i].memoryOffset;
       if (image->disjoint) {
          const VkBindImagePlaneMemoryInfo *plane_info = vk_find_struct_const(

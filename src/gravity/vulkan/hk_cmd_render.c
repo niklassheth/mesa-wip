@@ -377,7 +377,8 @@ hk_render_merge_key_init(struct hk_render_merge_key *key, VkRenderingFlags flags
 }
 
 static bool
-hk_render_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
+hk_render_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
+                      uint8_t raw_mask, bool raw_zs)
 {
    struct hk_image_view *views[HK_MAX_RTS] = {NULL};
    struct hk_render_merge_key key;
@@ -443,6 +444,8 @@ hk_render_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    }
 
    return !cmd->merge_feedback && hk_render_merge_enabled(cmd) &&
+          raw_mask == cmd->merge_raw_color_mask &&
+          raw_zs == cmd->merge_raw_zs &&
           hk_render_merge_key_init(&key,
                               info->flags & ~(empty ? VK_RENDERING_SUSPENDING_BIT : 0),
                               info->layerCount,
@@ -459,8 +462,7 @@ static bool
 hk_render_suspend_keeps_open(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
-   return cs && !render->feedback && !render->raw_color_mask &&
-          !render->raw_zs &&
+   return cs && !render->feedback &&
           (render->flags & VK_RENDERING_SUSPENDING_BIT) &&
           cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY && !cmd->in_meta &&
           !cmd->sync_fallback && !cmd->current_cs.pre_gfx &&
@@ -475,7 +477,6 @@ hk_render_merge_end(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    struct hk_image_view *views[HK_MAX_RTS] = {NULL};
 
    if (!cs || cs->timestamp.end.handle || render->feedback ||
-       render->raw_color_mask || render->raw_zs ||
        !hk_render_merge_enabled(cmd) ||
        cmd->sync_fallback || cmd->current_cs.pre_gfx ||
        cmd->current_cs.post_gfx || cmd->tess_batch.draws ||
@@ -523,15 +524,17 @@ hk_render_inherit_empty_clears(struct hk_cmd_buffer *cmd)
    }
 }
 
-/* A compressed attachment must use raw stores as soon as feedback is possible.
+/* A compressed attachment must use raw stores as soon as feedback is possible,
+ * or once the image latched prefer_raw to avoid compressed <-> raw thrashing.
  * GENERAL alone does not imply sampling, but the layout/enable bit or explicit
  * dynamic feedback state does. Keep raw stores sticky within the render.
  */
 static uint8_t
-hk_feedback_color_mask(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
+hk_feedback_color_mask(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
+                       uint8_t *feedback_mask_out)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   uint8_t mask = 0;
+   uint8_t mask = 0, fb_mask = 0;
    for (unsigned i = 0; i < info->colorAttachmentCount; i++) {
       const VkRenderingAttachmentInfo *a = &info->pColorAttachments[i];
       if (!a->imageView)
@@ -545,10 +548,17 @@ hk_feedback_color_mask(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
                                     image->vk.format, image->vk.samples) ||
           !ail_is_level_logically_compressed(layout, view->vk.base_mip_level))
          continue;
-      if (cmd->feedback_decompress || hk_attachment_may_be_sampled(a) ||
-          (cmd->vk.dynamic_graphics_state.feedback_loops & VK_IMAGE_ASPECT_COLOR_BIT))
+      bool is_feedback =
+         hk_attachment_may_be_sampled(a) ||
+         (cmd->vk.dynamic_graphics_state.feedback_loops & VK_IMAGE_ASPECT_COLOR_BIT);
+      bool prefer_raw = !cmd->in_meta && hk_feedback_image_prefers_raw(image);
+      if (cmd->feedback_decompress || is_feedback || prefer_raw)
          mask |= BITFIELD_BIT(i);
+      if (is_feedback)
+         fb_mask |= BITFIELD_BIT(i);
    }
+   if (feedback_mask_out)
+      *feedback_mask_out = fb_mask;
    return mask;
 }
 
@@ -557,9 +567,12 @@ hk_feedback_color_mask(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
  * its raw state is tracked per image, not per plane.
  */
 static const struct hk_image_view *
-hk_feedback_zs_view(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
+hk_feedback_zs_view(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
+                    bool *is_feedback_out)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (is_feedback_out)
+      *is_feedback_out = false;
    /* Meta renders inherit the application's dynamic feedback state. */
    if (cmd->in_meta)
       return NULL;
@@ -574,33 +587,102 @@ hk_feedback_zs_view(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
          sampled |= hk_attachment_may_be_sampled(ds[i]);
       }
    }
-   if (!view || !sampled)
+   if (!view)
       return NULL;
    const struct hk_image *image = container_of(view->vk.image, struct hk_image, vk);
+   if (!sampled && !hk_feedback_image_prefers_raw(image))
+      return NULL;
    if (!hk_feedback_can_compress(&dev->dev, image->vk.image_type,
                                  image->vk.format, image->vk.samples))
       return NULL;
    for (unsigned p = 0; p < image->plane_count; ++p) {
       if (ail_is_level_logically_compressed(&image->planes[p].layout,
-                                            view->vk.base_mip_level))
+                                            view->vk.base_mip_level)) {
+         if (is_feedback_out)
+            *is_feedback_out = sampled;
          return view;
+      }
    }
    return NULL;
 }
 
 static bool
-hk_feedback_decompress_layers(struct hk_cmd_buffer *cmd,
-                              const VkRenderingInfo *info,
-                              const struct hk_image_view *view)
+hk_feedback_view_all_raw(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
+                         const struct hk_image_view *view)
 {
+   const struct hk_image *image = container_of(view->vk.image, struct hk_image, vk);
+   unsigned level = view->vk.base_mip_level;
    if (info->viewMask) {
       u_foreach_bit(v, info->viewMask) {
-         if (!hk_meta_decompress_view(cmd, view, view->vk.base_array_layer + v))
+         if (!hk_feedback_is_raw(cmd, image, level, view->vk.base_array_layer + v))
             return false;
       }
    } else {
       for (unsigned v = 0; v < info->layerCount; v++) {
-         if (!hk_meta_decompress_view(cmd, view, view->vk.base_array_layer + v))
+         if (!hk_feedback_is_raw(cmd, image, level, view->vk.base_array_layer + v))
+            return false;
+      }
+   }
+   return true;
+}
+
+static bool
+hk_feedback_all_raw(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
+                    uint8_t mask, const struct hk_image_view *zs)
+{
+   if (cmd->feedback_decompress)
+      return true;
+   u_foreach_bit(i, mask) {
+      const struct hk_image_view *view =
+         hk_image_view_from_handle(info->pColorAttachments[i].imageView);
+      if (!hk_feedback_view_all_raw(cmd, info, view))
+         return false;
+   }
+   return !zs || hk_feedback_view_all_raw(cmd, info, zs);
+}
+
+static bool
+hk_feedback_decompress_one(struct hk_cmd_buffer *cmd,
+                           const struct hk_image_view *view, unsigned layer,
+                           bool is_feedback)
+{
+   struct hk_image *image = container_of(view->vk.image, struct hk_image, vk);
+   unsigned level = view->vk.base_mip_level;
+   if (hk_feedback_is_raw(cmd, image, level, layer))
+      return hk_meta_decompress_view(cmd, view, layer);
+
+   uint32_t event_start =
+      util_dynarray_num_elements(&cmd->sync_events, struct hk_sync_event);
+   struct hk_cs *prev_tail =
+      list_is_empty(&cmd->control_streams)
+         ? NULL
+         : list_last_entry(&cmd->control_streams, struct hk_cs, node);
+   if (!hk_meta_decompress_view(cmd, view, layer))
+      return false;
+   uint32_t event_end =
+      util_dynarray_num_elements(&cmd->sync_events, struct hk_sync_event);
+   return hk_feedback_record_decompress(cmd, image, level, layer, event_start,
+                                        event_end, prev_tail, is_feedback);
+}
+
+static bool
+hk_feedback_decompress_layers(struct hk_cmd_buffer *cmd,
+                              const VkRenderingInfo *info,
+                              const struct hk_image_view *view,
+                              bool is_feedback)
+{
+   if (info->viewMask) {
+      u_foreach_bit(v, info->viewMask) {
+         if (!hk_feedback_decompress_one(cmd, view,
+                                         view->vk.base_array_layer + v,
+                                         is_feedback))
+            return false;
+      }
+   } else {
+      for (unsigned v = 0; v < info->layerCount; v++) {
+         if (!hk_feedback_decompress_one(cmd, view,
+                                         view->vk.base_array_layer + v,
+                                         is_feedback))
             return false;
       }
    }
@@ -609,17 +691,19 @@ hk_feedback_decompress_layers(struct hk_cmd_buffer *cmd,
 
 static bool
 hk_feedback_decompress(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
-                         uint8_t mask, const struct hk_image_view *zs)
+                       uint8_t mask, uint8_t feedback_mask,
+                       const struct hk_image_view *zs, bool feedback_zs)
 {
    if (cmd->feedback_decompress)
       return true;
    u_foreach_bit(i, mask) {
       const struct hk_image_view *view =
          hk_image_view_from_handle(info->pColorAttachments[i].imageView);
-      if (!hk_feedback_decompress_layers(cmd, info, view))
+      if (!hk_feedback_decompress_layers(cmd, info, view,
+                                         (feedback_mask & BITFIELD_BIT(i)) != 0))
          return false;
    }
-   return !zs || hk_feedback_decompress_layers(cmd, info, zs);
+   return !zs || hk_feedback_decompress_layers(cmd, info, zs, feedback_zs);
 }
 
 static void
@@ -677,16 +761,25 @@ hk_feedback_prepare_draw(struct hk_cmd_buffer *cmd)
       .pDepthAttachment = &zs[0],
       .pStencilAttachment = &zs[1],
    };
-   uint8_t mask = hk_feedback_color_mask(cmd, &info) & ~render->raw_color_mask;
+   uint8_t feedback_mask = 0;
+   bool feedback_zs = false;
+   uint8_t mask = hk_feedback_color_mask(cmd, &info, &feedback_mask) &
+                  ~render->raw_color_mask;
    const struct hk_image_view *zs_view =
-      render->raw_zs ? NULL : hk_feedback_zs_view(cmd, &info);
+      render->raw_zs ? NULL : hk_feedback_zs_view(cmd, &info, &feedback_zs);
+   /* Feedback was enabled mid-render (dynamic or static pipeline). Even if
+    * attachments were already raw via prefer_raw, mark render->feedback so
+    * barrier hoisting and merge end treat this render as a feedback pass. */
+   render->feedback = true;
    if (!mask && !zs_view)
       return true;
 
    hk_cs_end_hint(cmd, HK_CS_END_RENDER_SPLIT);
    hk_cmd_buffer_end_graphics(cmd);
+   hk_cmd_buffer_end_compute(cmd);
    struct hk_rendering_state saved = *render;
-   if (!hk_feedback_decompress(cmd, &info, mask, zs_view))
+   if (!hk_feedback_decompress(cmd, &info, mask, feedback_mask & mask, zs_view,
+                               feedback_zs))
       return false;
    *render = saved;
    cmd->rendering = true;
@@ -730,26 +823,38 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
 
-   uint8_t raw_mask = hk_feedback_color_mask(cmd, pRenderingInfo);
-   const struct hk_image_view *raw_zs = hk_feedback_zs_view(cmd, pRenderingInfo);
-   if (raw_mask || raw_zs) {
+   uint8_t feedback_color_mask = 0;
+   bool feedback_zs = false;
+   uint8_t raw_mask =
+      hk_feedback_color_mask(cmd, pRenderingInfo, &feedback_color_mask);
+   const struct hk_image_view *raw_zs =
+      hk_feedback_zs_view(cmd, pRenderingInfo, &feedback_zs);
+   bool need_decompress =
+      (raw_mask || raw_zs) &&
+      !hk_feedback_all_raw(cmd, pRenderingInfo, raw_mask, raw_zs);
+   if (need_decompress) {
       hk_cmd_render_merge_flush(cmd);
-      if (!hk_feedback_decompress(cmd, pRenderingInfo, raw_mask, raw_zs))
-         return;
+      hk_cmd_buffer_end_compute(cmd);
    }
-   if (!cmd->feedback_decompress && (raw_mask || raw_zs))
+   if ((raw_mask || raw_zs) &&
+       !hk_feedback_decompress(cmd, pRenderingInfo, raw_mask,
+                               feedback_color_mask, raw_zs, feedback_zs))
+      return;
+   if (!cmd->feedback_decompress && need_decompress)
       cmd->sync_render_continuation = false;
    bool merge = false;
    /* The resuming render pass of a suspended one continues its render. */
    bool resume = false;
    if (cmd->merge_cs && cmd->merge_suspended) {
       resume = (pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT) &&
-               !cmd->in_meta;
+               !cmd->in_meta && raw_mask == cmd->merge_raw_color_mask &&
+               (raw_zs != NULL) == cmd->merge_raw_zs;
       if (!resume)
          hk_cmd_render_merge_flush(cmd);
    }
    if (cmd->merge_cs && !resume) {
-      merge = hk_render_merge_begin(cmd, pRenderingInfo);
+      merge = hk_render_merge_begin(cmd, pRenderingInfo, raw_mask,
+                                    raw_zs != NULL);
       if (merge)
          hk_cmd_empty_barriers_flush(cmd, true);
       if (!merge) {
@@ -763,8 +868,8 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
    /* A continued render needs no dependency on itself. */
    cmd->sync_render_continuation =
-      (pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT) != 0 && !resume && !raw_mask &&
-      !raw_zs;
+      (pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT) != 0 && !resume &&
+      !need_decompress;
    cmd->sync_render_stages = cmd->sync_scope ?: HK_SYNC_GRAPHICS;
    cmd->state.gfx.render_gen++;
    struct hk_rendering_state *render = &cmd->state.gfx.render;
@@ -1233,6 +1338,8 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
        * its mask covers the whole open render. */
       cmd->merge_store_mask = render->store_mask;
       cmd->merge_ds_store_mask = render->ds_store_mask;
+      cmd->merge_raw_color_mask = render->raw_color_mask;
+      cmd->merge_raw_zs = render->raw_zs;
       cmd->merge_feedback = render->feedback;
       cmd->merge_reach = hk_merge_graphics_stages() | render->merge_reach;
       cmd->merge_cs = cs;

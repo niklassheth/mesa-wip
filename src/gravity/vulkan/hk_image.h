@@ -8,6 +8,7 @@
 #pragma once
 
 #include "gravity/layout/layout.h"
+#include "util/list.h"
 #include "vulkan/vulkan_core.h"
 
 #include "hk_private.h"
@@ -91,6 +92,25 @@ struct hk_image {
 
    uint8_t plane_count;
    struct hk_image_plane planes[3];
+
+   /* Sticky recording-time hint set atomically once repeated feedback
+    * decompressions execute on this image, so later normal render passes also
+    * store raw (with a submit-time-elidable decompression) rather than
+    * re-compressing and thrashing. Correctness never relies on this alone.
+    */
+   uint32_t feedback_prefer_raw;
+
+   /* True when cross-submit raw-state tracking is safe (internal, optimal,
+    * non-external, non-swapchain, non-sparse compressed image).
+    */
+   bool feedback_track_cross_submit;
+
+   /* Submit-time execution-order raw subresource tracking, protected by the
+    * feedback tracker mutex in hk_feedback.c.
+    */
+   uint32_t feedback_gpu_decompressions;
+   uint64_t feedback_submitted_raw_mask;
+   struct list_head feedback_raw_link;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_image, vk.base, VkImage, VK_OBJECT_TYPE_IMAGE)

@@ -21,6 +21,7 @@
 #include "hk_device.h"
 #include "hk_device_memory.h"
 #include "hk_entrypoints.h"
+#include "hk_feedback.h"
 #include "hk_image.h"
 #include "hk_image_view.h"
 #include "hk_physical_device.h"
@@ -58,7 +59,7 @@ hk_fini_cmd_buffer_storage(struct hk_cmd_buffer *cmd)
       &cmd->large_bos, &cmd->query_adds,
       &cmd->query_writes, &cmd->occlusion_accum, &cmd->sync_events,
       &cmd->sync_remap, &cmd->sync_first_event, &cmd->empty_barriers,
-      &cmd->feedback_raw, &cmd->cdm_narrow_barriers,
+      &cmd->feedback_raw, &cmd->feedback_ops, &cmd->cdm_narrow_barriers,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(arrays); ++i)
       util_dynarray_fini(arrays[i]);
@@ -118,6 +119,7 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd, bool release)
    util_dynarray_clear(&cmd->sync_remap);
    util_dynarray_clear(&cmd->sync_first_event);
    util_dynarray_clear(&cmd->feedback_raw);
+   util_dynarray_clear(&cmd->feedback_ops);
    util_dynarray_clear(&cmd->cdm_narrow_barriers);
    if (release)
       hk_trim_cmd_buffer(cmd);
@@ -217,6 +219,7 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    cmd->sync_remap = UTIL_DYNARRAY_INIT;
    cmd->sync_first_event = UTIL_DYNARRAY_INIT;
    cmd->feedback_raw = UTIL_DYNARRAY_INIT;
+   cmd->feedback_ops = UTIL_DYNARRAY_INIT;
    cmd->cdm_narrow_barriers = UTIL_DYNARRAY_INIT;
    for (unsigned i = 0; i < HK_TESS_BATCH_LANES; ++i)
       cmd->tess_batch.lane[i] = UTIL_DYNARRAY_INIT;
@@ -487,7 +490,8 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
    list_for_each_entry_safe(struct hk_cs, cs, &cmd->control_streams, node) {
       if (cs->type == HK_CS_CDM && last && last->type == HK_CS_CDM &&
           !last->timestamp.end.handle &&
-          last->end_reason != HK_CS_END_PASS_SPLIT) {
+          last->end_reason != HK_CS_END_PASS_SPLIT &&
+          last->feedback_decomp_op == cs->feedback_decomp_op) {
 
          hk_cs_merge_cdm(last, cs, hk_cmd_buffer_device(cmd));
          last->sync_stages |= cs->sync_stages;
@@ -624,6 +628,7 @@ hk_cmd_sync_before_gfx(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    };
    if (cmd->merge_event >= pos)
       cmd->merge_event++;
+   hk_feedback_shift_events(cmd, pos, 1);
    /* Every stream whose first event moved shifts by one; the helper's
     * stream starts at the inserted event. */
    first_event = cmd->sync_first_event.data;
@@ -732,6 +737,7 @@ hk_render_merge_place_events(struct hk_cmd_buffer *cmd, unsigned first)
    memcpy(&events[cmd->merge_event], moved, n * sizeof(*events));
    hk_sync_reindex_events(cmd->sync_first_event.data, events, cmd->merge_event,
                           count);
+   hk_feedback_shift_events(cmd, cmd->merge_event, n);
 done:
    cmd->merge_event += n;
 }
@@ -1125,7 +1131,8 @@ hk_defer_empty_barriers(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info)
    }
    for (unsigned i = 0; i < info->imageMemoryBarrierCount; ++i) {
       const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
-      if (b->srcQueueFamilyIndex != b->dstQueueFamilyIndex)
+      if (b->srcQueueFamilyIndex != b->dstQueueFamilyIndex ||
+          b->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
          return false;
    }
    uint32_t group = ++cmd->sync_next_group;
@@ -1168,6 +1175,23 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
    hk_apple9_end_native_batch(cmd);
+
+   /* Transitioning from UNDEFINED may repurpose aliased memory whose
+    * compression metadata is no longer uncompressed. Invalidate before any
+    * early return or barrier deferral.
+    */
+   for (unsigned i = 0; i < pDependencyInfo->imageMemoryBarrierCount; ++i) {
+      const VkImageMemoryBarrier2 *b = &pDependencyInfo->pImageMemoryBarriers[i];
+      if (b->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+         VK_FROM_HANDLE(hk_image, image, b->image);
+         const VkImageSubresourceRange *r = &b->subresourceRange;
+         hk_feedback_invalidate_range(
+            cmd, image, r->baseMipLevel,
+            vk_image_subresource_level_count(&image->vk, r),
+            r->baseArrayLayer,
+            vk_image_subresource_layer_count(&image->vk, r));
+      }
+   }
 
    if (HK_PERF(dev, NOBARRIER))
       return;

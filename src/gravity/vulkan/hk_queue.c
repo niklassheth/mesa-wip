@@ -26,6 +26,7 @@
 #include "agx_pack.h"
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
+#include "hk_feedback.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
 
@@ -967,15 +968,63 @@ hk_queue_submit_bind_sparse_memory(struct hk_device *device,
  */
 static struct hk_sync_stream *
 hk_resolve_sync(struct hk_cmd_buffer *cmd, struct hk_sync_state *state,
-                uint32_t nr_vdm, uint32_t nr_cdm)
+                uint32_t nr_vdm, uint32_t nr_cdm, const bool *skip_ops,
+                unsigned num_ops)
 {
    unsigned count = util_dynarray_num_elements(&cmd->sync_remap, uint32_t);
    struct hk_sync_stream *streams = calloc(MAX2(count, 1), sizeof(*streams));
    if (!streams)
       return NULL;
 
+   uint32_t *remap_copy = NULL;
+   struct hk_sync_event *events_copy = NULL;
+   const uint32_t *remap = cmd->sync_remap.data;
+   const struct hk_sync_event *events = cmd->sync_events.data;
+   unsigned event_count =
+      util_dynarray_num_elements(&cmd->sync_events, struct hk_sync_event);
+
+   if (skip_ops) {
+      remap_copy = malloc(MAX2(count, 1) * sizeof(*remap_copy));
+      if (!remap_copy) {
+         free(streams);
+         return NULL;
+      }
+      if (count)
+         memcpy(remap_copy, remap, count * sizeof(*remap_copy));
+      remap = remap_copy;
+
+      if (event_count) {
+         events_copy = malloc(event_count * sizeof(*events_copy));
+         if (!events_copy) {
+            free(remap_copy);
+            free(streams);
+            return NULL;
+         }
+         const struct hk_feedback_op *ops = cmd->feedback_ops.data;
+         unsigned out_n = 0;
+         unsigned op_cursor = 0;
+         for (unsigned e = 0; e < event_count; ++e) {
+            while (op_cursor < num_ops &&
+                   (!skip_ops[op_cursor] || ops[op_cursor].event_end <= e))
+               op_cursor++;
+            if (op_cursor < num_ops && skip_ops[op_cursor] &&
+                e >= ops[op_cursor].event_start && e < ops[op_cursor].event_end)
+               continue;
+            events_copy[out_n++] = events[e];
+         }
+         events = events_copy;
+         event_count = out_n;
+      }
+   }
+
    uint32_t next[HK_SYNC_ENGINE_COUNT] = {nr_vdm, nr_cdm};
    list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
+      if (skip_ops && cs->feedback_decomp_op &&
+          skip_ops[cs->feedback_decomp_op - 1]) {
+         if (remap_copy && cs->sync_id < count)
+            remap_copy[cs->sync_id] = HK_SYNC_NONE;
+         continue;
+      }
       struct hk_sync_stream *s = &streams[cs->sync_id];
       s->wait = hk_sync_empty();
       s->wait_tiling = hk_sync_empty();
@@ -984,10 +1033,10 @@ hk_resolve_sync(struct hk_cmd_buffer *cmd, struct hk_sync_state *state,
       s->index = ++next[s->engine];
    }
 
-   bool precise = hk_sync_resolve(
-      state, cmd->sync_events.data,
-      util_dynarray_num_elements(&cmd->sync_events, struct hk_sync_event),
-      cmd->sync_remap.data, streams, count, cmd->sync_fallback);
+   bool precise = hk_sync_resolve(state, events, event_count, remap, streams,
+                                  count, cmd->sync_fallback);
+   free(events_copy);
+   free(remap_copy);
    if (!precise)
       perf_debug(cmd, "Conservative synchronization for reordered helpers");
 
@@ -1139,6 +1188,39 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    if (debug_get_option_hk_null_submit())
       return queue_submit_empty(dev, queue, submit);
 
+   bool has_future_wait = false;
+   for (unsigned w = 0; w < submit->wait_count; ++w) {
+      if (submit->waits[w].wait_value == 0)
+         continue;
+      if (vk_sync_wait(&dev->vk, submit->waits[w].sync,
+                       submit->waits[w].wait_value,
+                       VK_SYNC_WAIT_PENDING, 0) != VK_SUCCESS) {
+         has_future_wait = true;
+         break;
+      }
+   }
+
+   struct hk_feedback_submit_plan fb_plan;
+   VkResult fb_res = hk_feedback_plan_submit(
+      dev, submit->command_buffers, submit->command_buffer_count,
+      has_future_wait, queue->drm.syncobj, queue->drm.timeline_value + 1,
+      &fb_plan);
+   if (fb_res != VK_SUCCESS) {
+      hk_feedback_queue_finish(dev, queue->drm.syncobj);
+      hk_feedback_device_invalidate_all(dev);
+      return vk_error(dev, fb_res);
+   }
+
+   if (hk_cpu_level) {
+      for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
+         struct hk_cmd_buffer *cmdbuf =
+            (struct hk_cmd_buffer *)submit->command_buffers[i];
+         struct hk_feedback_stats stats = cmdbuf->feedback_stats;
+         hk_feedback_plan_adjust_stats(&fb_plan, i, &stats);
+         hk_cpu_timing_note_feedback(&stats);
+      }
+   }
+
    unsigned command_count = 0;
 
    /* Gather the number of individual commands to submit up front */
@@ -1150,7 +1232,14 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       if (unlikely(upgrade_narrow_cdm))
          hk_cmd_upgrade_narrow_cdm_barriers(cmdbuf, dev);
 
-      command_count += list_length(&cmdbuf->control_streams);
+      if (fb_plan.elided_total) {
+         list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+            if (!hk_feedback_plan_cs_skipped(&fb_plan, i, cs))
+               command_count++;
+         }
+      } else {
+         command_count += list_length(&cmdbuf->control_streams);
+      }
    }
 
    perf_debug_dev(&dev->dev,
@@ -1161,23 +1250,36 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    if (command_count == 0) {
       for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
          struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[i];
-         struct hk_sync_stream *streams = hk_resolve_sync(cmd, &sync, 0, 0);
-         if (!streams)
+         unsigned num_ops = 0;
+         const bool *skip_ops =
+            hk_feedback_plan_cb_skip_ops(&fb_plan, i, &num_ops);
+         struct hk_sync_stream *streams =
+            hk_resolve_sync(cmd, &sync, 0, 0, skip_ops, num_ops);
+         if (!streams) {
+            hk_feedback_plan_fini(&fb_plan);
+            hk_feedback_device_invalidate_all(dev);
             return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
          free(streams);
       }
+      hk_feedback_plan_fini(&fb_plan);
       VkResult result = queue_submit_empty(dev, queue, submit);
       if (result == VK_SUCCESS) {
          hk_sync_next_submit(&sync);
          queue->sync = sync;
+      } else {
+         hk_feedback_device_invalidate_all(dev);
       }
       return result;
    }
 
    STACK_ARRAY(struct drm_asahi_sync, syncs,
                submit->wait_count + submit->signal_count + 1);
-   if (!syncs)
+   if (!syncs) {
+      hk_feedback_plan_fini(&fb_plan);
+      hk_feedback_device_invalidate_all(dev);
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
    unsigned wait_count =
       hk_fill_submit_wait_syncs(syncs, submit->waits, submit->wait_count);
 
@@ -1208,15 +1310,22 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       struct hk_cmd_buffer *cmdbuf =
          (struct hk_cmd_buffer *)submit->command_buffers[i];
 
+      unsigned num_ops = 0;
+      const bool *skip_ops =
+         hk_feedback_plan_cb_skip_ops(&fb_plan, i, &num_ops);
       struct hk_sync_stream *streams =
-         hk_resolve_sync(cmdbuf, &sync, nr_vdm, nr_cdm);
+         hk_resolve_sync(cmdbuf, &sync, nr_vdm, nr_cdm, skip_ops, num_ops);
       if (!streams) {
+         hk_feedback_plan_fini(&fb_plan);
+         hk_feedback_device_invalidate_all(dev);
          util_dynarray_fini(&payload);
          STACK_ARRAY_FINISH(syncs);
          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       }
 
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         if (hk_feedback_plan_cs_skipped(&fb_plan, i, cs))
+            continue;
          bool is_vdm = cs->type == HK_CS_VDM;
          if (slice_cmds == 0 || slice_cmds >= slice_limit ||
              (is_vdm && slice_vdms >= vdm_limit)) {
@@ -1243,6 +1352,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
              util_dynarray_grow(&payload, struct drm_asahi_cmd_header, 1);
           if (!hdr_slot) {
              free(streams);
+             hk_feedback_plan_fini(&fb_plan);
+             hk_feedback_device_invalidate_all(dev);
              util_dynarray_fini(&payload);
              STACK_ARRAY_FINISH(syncs);
              return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -1267,6 +1378,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                util_dynarray_grow(&payload, struct drm_asahi_cmd_compute, 1);
             if (!cmd_slot) {
                free(streams);
+               hk_feedback_plan_fini(&fb_plan);
+               hk_feedback_device_invalidate_all(dev);
                util_dynarray_fini(&payload);
                STACK_ARRAY_FINISH(syncs);
                return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -1300,7 +1413,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                unsigned waits =
                   (ws->wait.engine[HK_SYNC_RENDER] != HK_SYNC_NONE) |
                   ((ws->wait.engine[HK_SYNC_CDM] != HK_SYNC_NONE) << 1) |
-                  ((ws->wait_tiling.engine[HK_SYNC_RENDER] != HK_SYNC_NONE) << 2) |
+                  ((!deferred && ws->wait_tiling.engine[HK_SYNC_RENDER] != HK_SYNC_NONE) << 2) |
                   ((ws->wait_tiling.engine[HK_SYNC_CDM] != HK_SYNC_NONE) << 3);
                agx_timeline_emit(TL_RENDER_INFO, waits, tl_timestamp_key(cmd.ts_vtx.start),
                   cs->diag.color0, cs->diag.depth,
@@ -1315,6 +1428,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                util_dynarray_grow(&payload, struct drm_asahi_cmd_render, 1);
             if (!cmd_slot) {
                free(streams);
+               hk_feedback_plan_fini(&fb_plan);
+               hk_feedback_device_invalidate_all(dev);
                util_dynarray_fini(&payload);
                STACK_ARRAY_FINISH(syncs);
                return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -1359,8 +1474,11 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       for (unsigned i = 0; reasons && i < submit->command_buffer_count; ++i) {
          struct hk_cmd_buffer *cmdbuf =
             (struct hk_cmd_buffer *)submit->command_buffers[i];
-         list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node)
+         list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+            if (hk_feedback_plan_cs_skipped(&fb_plan, i, cs))
+               continue;
             reasons[r++] = cs->end_reason | (cs->meta << 8);
+         }
       }
    }
 
@@ -1373,11 +1491,15 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    }
 
    free(reasons);
+   hk_feedback_plan_fini(&fb_plan);
    util_dynarray_fini(&payload);
    STACK_ARRAY_FINISH(syncs);
    if (result == VK_SUCCESS) {
       hk_sync_next_submit(&sync);
       queue->sync = sync;
+   } else {
+      hk_feedback_queue_finish(dev, queue->drm.syncobj);
+      hk_feedback_device_invalidate_all(dev);
    }
    return result;
 }
@@ -1397,7 +1519,6 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          struct hk_cmd_buffer *cmd =
             container_of(submit->command_buffers[i], struct hk_cmd_buffer, vk);
          hk_cpu_timing_note_heap(cmd->heap_renders, false);
-         hk_cpu_timing_note_feedback(&cmd->feedback_stats);
          total += cmd->heap_renders;
       }
       hk_cpu_timing_note_heap(total, true);
@@ -1426,8 +1547,11 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    VkResult result = queue_submit(dev, queue, submit);
    if (uses_heap)
       simple_mtx_unlock(&dev->heap_lock);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      hk_feedback_queue_finish(dev, queue->drm.syncobj);
+      hk_feedback_device_invalidate_all(dev);
       result = vk_queue_set_lost(&queue->vk, "Submit failed");
+   }
 
    if (dev->dev.debug & AGX_DBG_SYNC) {
       /* Wait for completion */
@@ -1558,6 +1682,7 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
    hk_gpu_busy_finish(queue);
    if (queue->completion_initialized)
       hk_queue_completion_finish(&queue->completion);
+   hk_feedback_queue_finish(dev, queue->drm.syncobj);
    u_watchdog_forget_queue(dev->dev.fd, queue->drm.id);
    drmSyncobjDestroy(dev->dev.fd, queue->drm.syncobj);
    agx_destroy_command_queue(&dev->dev, queue->drm.id);

@@ -562,6 +562,9 @@ struct hk_cs {
    uint8_t end_reason;
    bool meta;
    bool feedback_decompression, feedback_color;
+   /* 1-based index into cmd->feedback_ops for conditional decompression CSs,
+    * or 0 for ordinary control streams. */
+   uint32_t feedback_decomp_op;
 
    /* Parent command buffer. Convenience. */
    struct hk_cmd_buffer *cmd;
@@ -869,6 +872,7 @@ struct hk_cmd_buffer {
    bool feedback_decompress;
    bool rendering;
    struct util_dynarray feedback_raw;
+   struct util_dynarray feedback_ops;
    struct hk_feedback_stats feedback_stats;
 
    /* Render-pass merging: the control stream of a render pass that has
@@ -886,6 +890,8 @@ struct hk_cmd_buffer {
     * must store them too, or the merged render would drop those stores. */
    uint32_t merge_store_mask;
    uint8_t merge_ds_store_mask;
+   uint8_t merge_raw_color_mask;
+   bool merge_raw_zs;
    bool merge_feedback;
    /* The open render is a suspended render pass, which only its resuming
     * render pass may continue. */
@@ -1372,10 +1378,14 @@ void hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 void hk_tess_batch_flush(struct hk_cmd_buffer *cmd);
 bool hk_tess_fold_enabled(void);
 
+void hk_feedback_record_invalidate_all(struct hk_cmd_buffer *cmd);
+
 /* Record why the next stream end happens, unless a caller already did. */
 static inline void
 hk_cs_end_hint(struct hk_cmd_buffer *cmd, enum hk_cs_end reason)
 {
+   if (reason == HK_CS_END_EVENT)
+      hk_feedback_record_invalidate_all(cmd);
    if (!cmd->end_hint)
       cmd->end_hint = reason;
 }
@@ -1466,7 +1476,12 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
       cmd->sync_render_continuation = true;
    }
 
-   if (cs && cs->stats.cmds == 0) {
+   const struct hk_rendering_state *empty_render =
+      restore ? cmd->merge_empty_render : &cmd->state.gfx.render;
+   const bool keep_raw_clear =
+      cs && cs->cr.process_empty_tiles &&
+      (empty_render->raw_color_mask || empty_render->raw_zs);
+   if (cs && cs->stats.cmds == 0 && !keep_raw_clear) {
       if (restore) {
          struct hk_rendering_state *render = &cmd->state.gfx.render;
          memcpy(render, cmd->merge_empty_render, sizeof(*render));
