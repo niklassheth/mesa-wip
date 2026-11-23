@@ -234,10 +234,8 @@ hk_va_has_ro_shadow(const struct hk_device *dev, uint64_t addr)
 }
 
 enum hk_perftest {
-   HK_PERF_NOTESS = BITFIELD_BIT(0),
-   HK_PERF_NOBORDER = BITFIELD_BIT(1),
-   HK_PERF_NOBARRIER = BITFIELD_BIT(2),
-   HK_PERF_NOROBUST = BITFIELD_BIT(3),
+   HK_PERF_NOBARRIER = BITFIELD_BIT(0),
+   HK_PERF_NOROBUST = BITFIELD_BIT(1),
 };
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)

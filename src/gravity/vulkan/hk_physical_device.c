@@ -957,7 +957,7 @@ hk_get_device_properties(const struct agx_device *dev,
       /* VK_KHR_push_descriptor */
       .maxPushDescriptors = HK_MAX_PUSH_DESCRIPTORS,
 
-      /* VK_EXT_descriptor_buffer (G16; HK_APPLE9_DESCRIPTOR_BUFFER=0 hides it) */
+      /* VK_EXT_descriptor_buffer */
       .combinedImageSamplerDescriptorSingleArray = true,
       .bufferlessPushDescriptors = true,
       .allowSamplerImageViewPostSubmitCreation = false,
@@ -1746,15 +1746,12 @@ hk_apple9_restrict_caps(struct vk_device_extension_table *ext,
     * rasterization shader writes the view's layer. Query counters are updated
     * by task/mesh kernels before the deferred availability write, using the
     * same query-pool machinery as other graphics stages.
-    * HK_APPLE9_MESH_SHADER=0 hides it.
     */
-   if (debug_get_bool_option("HK_APPLE9_MESH_SHADER", true)) {
-      ext->EXT_mesh_shader = true;
-      feat->meshShader = true;
-      feat->taskShader = true;
-      feat->multiviewMeshShader = true;
-      feat->meshShaderQueries = true;
-   }
+   ext->EXT_mesh_shader = true;
+   feat->meshShader = true;
+   feat->taskShader = true;
+   feat->multiviewMeshShader = true;
+   feat->meshShaderQueries = true;
 
    /* Fragment shader interlock: the compiler acquires the pixel in raster
     * order at shader entry, holds it through the end of the shader and fences
@@ -2015,13 +2012,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       goto fail_agx_device;
    }
 
-   /* HK_EXPERIMENTAL_APPLE9=0 hides the device, e.g. to fall back to
-    * another Vulkan implementation. */
-   if (!debug_get_bool_option("HK_EXPERIMENTAL_APPLE9", true)) {
-      result = VK_ERROR_INCOMPATIBLE_DRIVER;
-      goto fail_agx_device;
-   }
-
    /* A private install prefix or a DRIRC_CONFIGDIR override loses the
     * application options silently otherwise. */
    if (!instance->drirc.misc.defaults_loaded)
@@ -2060,17 +2050,12 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    properties.sparseResidencyNonResidentStrict =
       hk_sparse_unbound_unmapped(&pdev->dev);
 
-   /* VK_EXT_descriptor_buffer, with its memory type; HK_APPLE9_DESCRIPTOR_BUFFER=0
-    * hides both. With 128 B image and sampler parts vkd3d-proton finds its
-    * host copy templates; in-world ELDEN RING runs 13% faster with it (x86
-    * driver) and 5% (FEX thunk), with descriptor CPU near zero (2026-10-11). */
-   if (debug_get_bool_option("HK_APPLE9_DESCRIPTOR_BUFFER", true)) {
-      supported_extensions.EXT_descriptor_buffer = true;
-      supported_features.descriptorBuffer = true;
-      supported_features.descriptorBufferPushDescriptors = true;
-      supported_features.descriptorBufferCaptureReplay = true;
-      supported_features.descriptorBufferImageLayoutIgnored = false;
-   }
+   /* VK_EXT_descriptor_buffer, with its USC-aperture memory type. */
+   supported_extensions.EXT_descriptor_buffer = true;
+   supported_features.descriptorBuffer = true;
+   supported_features.descriptorBufferPushDescriptors = true;
+   supported_features.descriptorBufferCaptureReplay = true;
+   supported_features.descriptorBufferImageLayoutIgnored = false;
 
 
    properties.drmHasRender = true;
@@ -2128,17 +2113,14 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       .heapIndex = sysmem_heap_idx,
    };
 
-   pdev->apple9_descriptor_mem_type = UINT8_MAX;
-   if (debug_get_bool_option("HK_APPLE9_DESCRIPTOR_BUFFER", true)) {
-      pdev->apple9_descriptor_mem_type = pdev->mem_type_count;
-      pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
-         .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
-                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-         .heapIndex = sysmem_heap_idx,
-      };
-   }
+   pdev->apple9_descriptor_mem_type = pdev->mem_type_count;
+   pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
+      .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
+                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      .heapIndex = sysmem_heap_idx,
+   };
 
    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));

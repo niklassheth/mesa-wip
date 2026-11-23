@@ -329,13 +329,13 @@ hk_zls_control_make_raw(struct agx_zls_control_packed *packed)
       packed->opaque[i] &= ~compress.opaque[i];
 }
 
-/* HK_APPLE9_MERGE_RENDERS (default on; =0 disables): continue the hardware render of a
- * render pass in the next render pass when nothing but attachment barriers
- * separates them and both use the same colour attachments. The render covers
- * the whole attachment whatever the render area, and tiles keep their
- * contents between the passes, which satisfies the second pass's load.
- * Depth/stencil views and render areas must also match. As with suspend/resume,
- * keep the first pass's ZLS loads and the final pass's stores.
+/* Render-pass merging: continue the hardware render of a render pass in the
+ * next render pass when nothing but attachment barriers separates them and
+ * both use the same colour attachments. The render covers the whole
+ * attachment whatever the render area, and tiles keep their contents between
+ * the passes, which satisfies the second pass's load. Depth/stencil views and
+ * render areas must also match. As with suspend/resume, keep the first pass's
+ * ZLS loads and the final pass's stores.
  */
 /* Whether the render pass's draws may read this attachment other than as an
  * attachment (render->feedback). A written attachment may be read so only
@@ -363,12 +363,7 @@ hk_attachment_may_be_sampled(const VkRenderingAttachmentInfo *att)
 static bool
 hk_render_merge_enabled(struct hk_cmd_buffer *cmd)
 {
-   static int enabled = -1;
-   if (enabled < 0)
-      enabled = debug_get_bool_option("HK_APPLE9_MERGE_RENDERS", true);
-
-   return enabled &&
-          cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY && !cmd->in_meta;
+   return cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY && !cmd->in_meta;
 }
 
 /* Key a render pass that may merge, from its attachment views, or return false.
@@ -492,18 +487,15 @@ hk_render_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
           !memcmp(&key, &cmd->merge_key, sizeof(key));
 }
 
-/* HK_APPLE9_MERGE_RESUME (default on): a suspended render pass keeps its
- * render open for the resuming one. Only state commands may come between
- * them, so the resuming pass continues the same render pass instance in one
- * hardware render: loads from the first pass, stores from the last. */
+/* A suspended render pass keeps its render open for the resuming one. Only
+ * state commands may come between them, so the resuming pass continues the
+ * same render pass instance in one hardware render: loads from the first
+ * pass, stores from the last. */
 static bool
 hk_render_suspend_keeps_open(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
-   static int enabled = -1;
-   if (enabled < 0)
-      enabled = debug_get_bool_option("HK_APPLE9_MERGE_RESUME", true);
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
-   return enabled && cs && !render->feedback && !render->raw_color_mask &&
+   return cs && !render->feedback && !render->raw_color_mask &&
           !render->raw_zs &&
           (render->flags & VK_RENDERING_SUSPENDING_BIT) &&
           cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY && !cmd->in_meta &&

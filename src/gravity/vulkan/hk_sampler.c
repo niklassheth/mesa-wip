@@ -215,25 +215,6 @@ hk_CreateSampler(VkDevice device,
    bool native_custom =
       custom_border && sampler->vk.format != VK_FORMAT_UNDEFINED;
 
-   /* Sanity check the noborder setting. There's no way to recover from it being
-    * wrong but at least we can make noise to lint for errors in the driconf.
-    */
-   static bool warned_custom_border = false;
-   if (HK_PERF(dev, NOBORDER) && custom_border && !warned_custom_border) {
-      fprintf(stderr, "custom border colour used, but emulation is disabled\n");
-      fprintf(stderr, "border %u\n", info->borderColor);
-      fprintf(stderr, "unnorm %X\n", info->unnormalizedCoordinates);
-      fprintf(stderr, "compare %X\n", info->compareEnable);
-      fprintf(stderr, "value: %X, %X, %X, %X\n",
-              sampler->vk.border_color_value.uint32[0],
-              sampler->vk.border_color_value.uint32[1],
-              sampler->vk.border_color_value.uint32[2],
-              sampler->vk.border_color_value.uint32[3]);
-      fprintf(stderr, "wraps: %X, %X, %X\n", info->addressModeU,
-              info->addressModeV, info->addressModeW);
-      warned_custom_border = true;
-   }
-
    if (native_custom) {
       /* The hardware applies the image view's swizzle to the native border
        * colour itself, so the border colour component mapping hint must not

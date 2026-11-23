@@ -41,7 +41,7 @@ def main():
                 directory.mkdir(exist_ok=True)
                 env = dict(base, LD_PRELOAD=str(args.shim),
                            VK_DRIVER_FILES=str(getattr(args, label + "_icd")),
-                           HK_EXPERIMENTAL_APPLE9="1", HK_APPLE9_NATIVE_MESH="1",
+                           HK_APPLE9_NATIVE_MESH="1",
                            HK_APPLE9_NATIVE_MESH_ATTRIBUTES="1",
                            HK_APPLE9_NATIVE_MESH_PRIMITIVE_LOWERING="1",
                            hk_enable_vertex_pipeline_stores_atomics="true",

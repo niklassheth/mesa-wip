@@ -771,23 +771,20 @@ hk_image_overlaps(const struct hk_image *a, const struct hk_image *b)
    return false;
 }
 
-/* Whether the image barrier being recorded may leave the open render R open
- * (HK_APPLE9_MERGE_HOIST_BARRIERS, default on). Its image is none of R's
- * attachments nor shares memory with them, and R's stream has not written
- * memory from a shader, so every write to the image precedes R in recording
- * order: placing the barrier ahead of R orders those writes before R, and
- * reads after the barrier in R see them. Later draws in R that write memory
- * end it first (hk_apple9_prepare_draw). A barrier from R's shader stages
- * also orders R's reads before later writes, so it ends R instead. */
+/* Whether the image barrier being recorded may leave the open render R open.
+ * Its image is none of R's attachments nor shares memory with them, and R's
+ * stream has not written memory from a shader, so every write to the image
+ * precedes R in recording order: placing the barrier ahead of R orders those
+ * writes before R, and reads after the barrier in R see them. Later draws in R
+ * that write memory end it first (hk_apple9_prepare_draw). A barrier from R's
+ * shader stages also orders R's reads before later writes, so it ends R
+ * instead. */
 static bool
 hk_render_merge_image_barrier(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 src,
                               VkAccessFlags2 dst_access)
 {
-   static int enabled = -1;
-   if (enabled < 0)
-      enabled = debug_get_bool_option("HK_APPLE9_MERGE_HOIST_BARRIERS", true);
    const struct hk_image *image = cmd->barrier_image;
-   if (!enabled || !image || cmd->barrier_qfot || cmd->in_meta ||
+   if (!image || cmd->barrier_qfot || cmd->in_meta ||
        cmd->merge_cs->merge_writes || image->planes[0].sparse_map)
       return false;
    /* Read-only depth/stencil is immutable for this render, whether it is
@@ -855,18 +852,6 @@ hk_render_merge_image_barrier(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 s
    return true;
 }
 
-/* HK_APPLE9_MERGE_MOVE_COMPUTE=0 keeps compute and transfer work in order
- * after a render kept open for merging, and ends the render at every barrier
- * that does not involve it. */
-bool
-hk_render_merge_move_enabled(void)
-{
-   static int enabled = -1;
-   if (enabled < 0)
-      enabled = debug_get_bool_option("HK_APPLE9_MERGE_MOVE_COMPUTE", true);
-   return enabled;
-}
-
 void
 hk_cmd_sync_barrier_group(struct hk_cmd_buffer *cmd,
                           VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst,
@@ -889,8 +874,7 @@ hk_cmd_sync_barrier_group(struct hk_cmd_buffer *cmd,
       if (!input_read && ((!cmd->in_meta &&
            hk_render_merge_barrier(src, dst, src_access, dst_access)) ||
           (image_barrier = hk_render_merge_image_barrier(cmd, src, dst_access)) ||
-          (unrelated = hk_render_merge_move_enabled() && !cmd->in_meta &&
-                       !(xsrc & cmd->merge_reach)))) {
+          (unrelated = !cmd->in_meta && !(xsrc & cmd->merge_reach)))) {
          cmd->merge_cs->merge_hoisted |= image_barrier;
          if (!image_barrier && !unrelated) {
             assert(hk_sync_stage_mask(src, true) ==
@@ -1101,10 +1085,7 @@ hk_defer_empty_barriers(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info)
          return false;
 #undef READS_INPUT
 
-   static int enabled = -1;
-   if (enabled < 0)
-      enabled = debug_get_bool_option("HK_APPLE9_FOLD_EMPTY_CLEARS", true);
-   if (!enabled || !cmd->merge_cs || !cmd->merge_empty ||
+   if (!cmd->merge_cs || !cmd->merge_empty ||
        cmd->merge_suspended || cmd->merge_feedback || cmd->merge_pre_cs ||
        cmd->in_meta || cmd->sync_fallback ||
        (info->dependencyFlags & ~VK_DEPENDENCY_BY_REGION_BIT))

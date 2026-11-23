@@ -765,7 +765,7 @@ enum hk_upload_last {
    HK_UPLOAD_LAST_COUNT,
 };
 
-/* Identity of a render pass's attachments, for HK_APPLE9_MERGE_RENDERS. */
+/* Identity of a render pass's attachments, for render-pass merging. */
 struct hk_render_merge_key {
    const struct vk_image *image[HK_MAX_RTS + 2];
    uint32_t level[HK_MAX_RTS + 2];
@@ -873,7 +873,7 @@ struct hk_cmd_buffer {
    struct util_dynarray feedback_raw;
    struct hk_feedback_stats feedback_stats;
 
-   /* HK_APPLE9_MERGE_RENDERS: the control stream of a render pass that has
+   /* Render-pass merging: the control stream of a render pass that has
     * ended but is kept open, so the next render pass on the same attachments
     * can continue it. Ending graphics, or any command other than a
     * render-pass-internal barrier, closes it (hk_cmd_render_merge_flush).
@@ -890,7 +890,7 @@ struct hk_cmd_buffer {
    uint8_t merge_ds_store_mask;
    bool merge_feedback;
    /* The open render is a suspended render pass, which only its resuming
-    * render pass may continue (HK_APPLE9_MERGE_RESUME). */
+    * render pass may continue. */
    bool merge_suspended;
    bool merge_chain_load[2];
    /* Compute or transfer work recorded while a render is kept open, which
@@ -1180,7 +1180,6 @@ void hk_cmd_empty_barriers_flush(struct hk_cmd_buffer *cmd, bool merge);
 void hk_cmd_render_merge_flush_why(struct hk_cmd_buffer *cmd, const char *why);
 struct hk_cs *hk_render_merge_pre_cs(struct hk_cmd_buffer *cmd, unsigned stages);
 void hk_render_merge_trace(const char *why, uint64_t a, uint64_t b);
-bool hk_render_merge_move_enabled(void);
 #define hk_cmd_render_merge_flush(cmd) hk_cmd_render_merge_flush_why(cmd, __func__)
 
 /* Do this before an outside-render operation uploads data or changes the meta
@@ -1244,8 +1243,7 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
    if (unlikely(cmd->merge_cs) && ptr != &cmd->merge_pre_cs) {
       if (compute && ptr == &cmd->current_cs.cs && cmd->merge_move_stage &&
           !cmd->merge_suspended && !cmd->empty_barriers.size &&
-          !(cmd->merge_move_stage & cmd->merge_reach) &&
-          hk_render_merge_move_enabled())
+          !(cmd->merge_move_stage & cmd->merge_reach))
          return hk_render_merge_pre_cs(cmd, stages);
       hk_cmd_render_merge_flush(cmd);
    }

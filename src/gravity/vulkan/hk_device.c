@@ -48,8 +48,6 @@
 
 /* clang-format off */
 static const struct debug_named_value hk_perf_options[] = {
-   {"notess",    HK_PERF_NOTESS,   "Skip draws with tessellation"},
-   {"noborder",  HK_PERF_NOBORDER, "Disable custom border colour emulation"},
    {"nobarrier", HK_PERF_NOBARRIER,"Ignore pipeline barriers"},
    {"norobust",  HK_PERF_NOROBUST, "Disable robustness"},
    DEBUG_NAMED_VALUE_END
@@ -391,9 +389,6 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    }
 
    dev->perftest = debug_get_flags_option("HK_PERFTEST", hk_perf_options, 0);
-
-   /* Apple9 uses native custom border colours without software emulation. */
-   dev->perftest |= HK_PERF_NOBORDER;
 
    if (HK_PERF(dev, NOROBUST)) {
       dev->vk.enabled_features.robustBufferAccess = false;
