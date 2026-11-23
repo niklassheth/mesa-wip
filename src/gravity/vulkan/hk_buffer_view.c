@@ -66,74 +66,6 @@ hk_get_buffer_format_features(struct hk_physical_device *pdev,
    return features;
 }
 
-/* Byte offset [7:0], bit shift [12:8], width minus one [17:13] and
- * conversion kind [21:18] of each component of a texel of this format.
- */
-void
-hk_apple9_texel_layout(enum pipe_format format,
-                       struct hk_apple9_texel_metadata *m)
-{
-   const struct util_format_description *desc = util_format_description(format);
-   m->size_B = util_format_get_blocksize(format);
-   for (unsigned c = 0; c < 4; ++c) {
-      unsigned swizzle = desc->swizzle[c];
-      unsigned kind, offset = 0, shift = 0, bits = 1;
-      if (swizzle >= 4) {
-         kind = swizzle == PIPE_SWIZZLE_1 ? HK_TEXEL_ONE : HK_TEXEL_ZERO;
-      } else {
-         const struct util_format_channel_description *chan =
-            &desc->channel[swizzle];
-         offset = (chan->shift / 32) * 4;
-         shift = chan->shift % 32;
-         bits = chan->size;
-         if (format == PIPE_FORMAT_R9G9B9E5_FLOAT)
-            kind = HK_TEXEL_RGB9E5;
-         else if (format == PIPE_FORMAT_R11G11B10_FLOAT)
-            kind = HK_TEXEL_FLOAT11;
-         else if (chan->type == UTIL_FORMAT_TYPE_FLOAT)
-            kind = bits == 16 ? HK_TEXEL_FLOAT16 : HK_TEXEL_FLOAT32;
-         else if (chan->type == UTIL_FORMAT_TYPE_SIGNED)
-            kind = chan->normalized ? HK_TEXEL_SNORM : HK_TEXEL_SINT;
-         else
-            kind = chan->normalized ? HK_TEXEL_UNORM : HK_TEXEL_UINT;
-         if (desc->colorspace == UTIL_FORMAT_COLORSPACE_SRGB && c < 3)
-            kind = HK_TEXEL_SRGB;
-      }
-      m->component[c] = offset | (shift << 8) | ((bits - 1) << 13) |
-                        (kind << 18);
-   }
-}
-
-enum hk_apple9_store_encode
-hk_apple9_store_encode(enum pipe_format format)
-{
-   if (format == PIPE_FORMAT_R11G11B10_FLOAT)
-      return HK_STORE_ENCODE_FLOAT11;
-   const struct util_format_description *desc = util_format_description(format);
-   if (desc->layout != UTIL_FORMAT_LAYOUT_PLAIN ||
-       desc->colorspace != UTIL_FORMAT_COLORSPACE_RGB || !desc->nr_channels)
-      return HK_STORE_ENCODE_GENERIC;
-   const struct util_format_channel_description *first = &desc->channel[0];
-   unsigned w = first->size;
-   for (unsigned c = 0; c < desc->nr_channels; ++c) {
-      const struct util_format_channel_description *chan = &desc->channel[c];
-      if (desc->swizzle[c] != c || chan->size != w || chan->shift != c * w ||
-          chan->type != first->type || chan->normalized != first->normalized ||
-          chan->pure_integer != first->pure_integer)
-         return HK_STORE_ENCODE_GENERIC;
-   }
-   if (w == 32 && !first->normalized &&
-       (first->type == UTIL_FORMAT_TYPE_FLOAT ||
-        first->type == UTIL_FORMAT_TYPE_UNSIGNED ||
-        first->type == UTIL_FORMAT_TYPE_SIGNED))
-      return HK_STORE_ENCODE_RAW32;
-   if (w == 8 && first->normalized && first->type == UTIL_FORMAT_TYPE_UNSIGNED)
-      return HK_STORE_ENCODE_UNORM8;
-   if (w == 16 && first->type == UTIL_FORMAT_TYPE_FLOAT)
-      return HK_STORE_ENCODE_FLOAT16;
-   return HK_STORE_ENCODE_GENERIC;
-}
-
 /* Native texel-buffer state for elements of format at the given addresses
  * (read-only and read-write views of the same memory, any texel alignment),
  * shared by buffer views and descriptor-buffer descriptors. */
@@ -166,6 +98,26 @@ hk_pack_texel_buffer(struct hk_device *dev, enum pipe_format format,
       format_swizzle[3] = 0;
    }
 
+   unsigned bs = util_format_get_blocksize(format);
+   if (bs == 12) {
+      /* RGB32 uniform texel buffers have no native hardware format and are
+       * read directly via 3x32-bit global loads using metadata.{base,elements,size_B},
+       * so any 4-byte-aligned offset (including non-multiple-of-12 sub-16B tails)
+       * is valid without packing a native 2D texture or PBE descriptor. */
+      agx_set_null_texture(tex);
+      agx_set_null_pbe(pbe);
+      agx_apple9_set_null_texture(apple9_texture);
+      if (apple9_pbe) {
+         agx_apple9_set_null_pbe(apple9_pbe);
+         *apple9_store = 0;
+      }
+      m->base = rw_addr;
+      m->elements = elements;
+      m->size_B = bs;
+      m->residency = residency;
+      return;
+   }
+
    /* Decompose the offset into a multiple of 16-bytes (which we can include in
     * the address) and an extra texel-aligned tail offset of up to 15 bytes.
     *
@@ -176,9 +128,8 @@ hk_pack_texel_buffer(struct hk_device *dev, enum pipe_format format,
    uint64_t ro_base = ro_addr & ~0xfull;
    uint32_t tail_offset_B = rw_addr & 0xf;
    assert((ro_addr & 0xf) == tail_offset_B);
-   uint32_t tail_offset_el = tail_offset_B / util_format_get_blocksize(format);
-   assert(tail_offset_el * util_format_get_blocksize(format) == tail_offset_B &&
-          "must be texel aligned");
+   uint32_t tail_offset_el = tail_offset_B / bs;
+   assert(tail_offset_el * bs == tail_offset_B && "must be texel aligned");
 
    (void)dev;
    struct AGX_TEXTURE texture = {AGX_TEXTURE_header};
@@ -192,7 +143,7 @@ hk_pack_texel_buffer(struct hk_device *dev, enum pipe_format format,
    texture.swizzle_a = agx_channel_from_pipe(format_swizzle[3]);
 
    texture.width = AGX_TEXTURE_BUFFER_WIDTH;
-   texture.height = DIV_ROUND_UP(elements + tail_offset_el, texture.width);
+   texture.height = MAX2(DIV_ROUND_UP(elements + tail_offset_el, texture.width), 1);
    texture.first_level = texture.last_level = 0;
 
    texture.address = ro_base;
@@ -249,16 +200,15 @@ hk_pack_texel_buffer(struct hk_device *dev, enum pipe_format format,
 
    m->base = rw_addr;
    m->elements = elements;
-   hk_apple9_texel_layout(format, m);
+   m->size_B = util_format_get_blocksize(format);
    m->residency = residency;
 
    /* Native storage writes see the buffer as a linear 2D image 16384 texels
     * wide from the 16-byte aligned base, element e + tail at
     * ((e + tail) % 16384, (e + tail) / 16384), as Metal's buffer textures.
     * Stores bound the element index against the view first, so rows past
-    * the buffer are never written. The native_ok word carries the tail in
-    * the PBE index field; residency buffers are not write-valid, so checked
-    * stores keep them on the converter. */
+    * the buffer are never written. Sparse residency buffers check
+    * buf_residency before issuing PBE stores. */
    if (apple9_pbe) {
       unsigned bs = util_format_get_blocksize(format);
       uint64_t rows = DIV_ROUND_UP((uint64_t)elements + tail_offset_el,
@@ -277,9 +227,8 @@ hk_pack_texel_buffer(struct hk_device *dev, enum pipe_format format,
                                        0, 1, false, AGX_TEXTURE_DIMENSION_2D);
       }
       if (!ok)
-         memset(apple9_pbe, 0, AGX_APPLE9_TEXTURE_TABLE_STRIDE);
-      *apple9_store = (ok && !residency ? HK_APPLE9_STORAGE_WRITE_VALID : 0) |
-                      (tail_offset_el << HK_APPLE9_STORAGE_TAIL_SHIFT);
+         agx_apple9_set_null_pbe(apple9_pbe);
+      *apple9_store = tail_offset_el << HK_APPLE9_STORAGE_TAIL_SHIFT;
    }
 }
 

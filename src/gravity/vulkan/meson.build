@@ -585,18 +585,6 @@ if with_tests
     suite : ['gravity'],
   )
   test(
-    'gravity_texel_encode',
-    executable(
-      'gravity_texel_encode',
-      'tests/hk-texel-encode.c',
-      include_directories : [inc_gallium, inc_gallium_aux, inc_include,
-                             inc_src, inc_gravity],
-      dependencies : [gravity_vk_deps],
-      link_with : [libgravity_vk],
-    ),
-    suite : ['gravity'],
-  )
-  test(
     'gravity_sync_tests',
     executable(
       'gravity_sync_tests',

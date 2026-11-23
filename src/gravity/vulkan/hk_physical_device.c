@@ -718,7 +718,9 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxImageDimension3D = 16384,
       .maxImageDimensionCube = 16384,
       .maxImageArrayLayers = 2048,
-      .maxTexelBufferElements = AGX_TEXTURE_BUFFER_MAX_SIZE,
+      /* Reserve 16 elements for the sub-16-byte alignment tail on R8 views so
+       * DIV_ROUND_UP(elements + tail, 16384) never exceeds 16384 rows. */
+      .maxTexelBufferElements = AGX_TEXTURE_BUFFER_MAX_SIZE - 16,
 
       /* Uniform and storage buffers both lower through hk_buffer_address to
        * global address arithmetic, so there is no 64 KiB hardware UBO limit.
@@ -985,7 +987,8 @@ hk_get_device_properties(const struct agx_device *dev,
       .samplerDescriptorBufferAddressSpaceSize = HK_APPLE9_DB_ADDRESS_SPACE,
       .resourceDescriptorBufferAddressSpaceSize = HK_APPLE9_DB_ADDRESS_SPACE,
       .descriptorBufferAddressSpaceSize = HK_APPLE9_DB_ADDRESS_SPACE,
-      .bufferCaptureReplayDescriptorDataSize = sizeof(uint64_t),
+      .bufferCaptureReplayDescriptorDataSize =
+         sizeof(struct hk_buffer_capture_data),
       .imageCaptureReplayDescriptorDataSize =
          sizeof(struct hk_image_capture_data),
       .imageViewCaptureReplayDescriptorDataSize =

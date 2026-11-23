@@ -144,9 +144,7 @@ check(void)
 
    view.plane_count = 1;
    memset(&view.apple9_storage, 0x61, sizeof(view.apple9_storage));
-   view.apple9_storage.native_ok =
-      HK_APPLE9_STORAGE_READ_VALID | HK_APPLE9_STORAGE_WRITE_VALID |
-      (HK_STORE_ENCODE_UNORM8 << HK_APPLE9_STORAGE_ENCODE_SHIFT);
+   view.apple9_storage.native_ok = HK_APPLE9_STORAGE_LINEAR_2D_INDEX;
    struct hk_apple9_storage_descriptor storage = view.apple9_storage;
    CHECK(check_writers(dev, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, info, &storage, sizeof(storage)));
    CHECK(view.apple9_storage.buf.base == UINT64_C(0x6161616161616161));
@@ -181,11 +179,13 @@ check(void)
    struct hk_apple9_storage_descriptor storage_texel = {0};
    agx_set_null_pbe(&storage_texel.pbe_sw);
    agx_apple9_set_null_pbe(storage_texel.pbe);
+   agx_apple9_set_null_texture(storage_texel.texture);
    CHECK(check_writers(dev, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, info,
                        &storage_texel, sizeof(storage_texel)));
    storage = (struct hk_apple9_storage_descriptor){0};
    agx_set_null_pbe(&storage.pbe_sw);
    agx_apple9_set_null_pbe(storage.pbe);
+   agx_apple9_set_null_texture(storage.texture);
    CHECK(check_writers(dev, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, info, &storage, sizeof(storage)));
    free(dev);
    return true;

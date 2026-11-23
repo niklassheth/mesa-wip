@@ -199,6 +199,24 @@ view_denominator(struct hk_image_view *view)
  * so dEQP texel_view_compatible ...texture.astc_8x* stay expected failures
  * (src/asahi/ci/asahi-agx2-fails.txt).
  */
+static void
+hk_apple9_block_alias_extent(const struct ail_layout *layout, unsigned level,
+                             unsigned *out_w, unsigned *out_h)
+{
+   if (level >= layout->mip_tail_first_lod) {
+      *out_w = u_minify(util_next_power_of_two(
+         util_format_get_nblocksx(layout->format, layout->width_px)), level);
+      *out_h = u_minify(util_next_power_of_two(
+         util_format_get_nblocksy(layout->format, layout->height_px)), level);
+   } else {
+      *out_w = MAX2(util_format_get_nblocksx(layout->format,
+                                             u_minify(layout->width_px, level)),
+                    layout->stride_el[level]);
+      *out_h = util_format_get_nblocksy(layout->format,
+                                        u_minify(layout->height_px, level));
+   }
+}
+
 static unsigned
 alias_width_el(struct hk_image_view *view, unsigned view_plane,
                enum hk_desc_usage usage, const struct ail_layout *layout,
@@ -337,10 +355,19 @@ pack_texture(struct hk_image_view *view, unsigned view_plane,
          assert(view->vk.layer_count == 1);
 
          cfg.address = base_addr + ail_get_layer_level_B(layout, layer, level);
-         cfg.width = alias_width_el(view, view_plane, usage, layout, level, denom.x);
-         cfg.height = DIV_ROUND_UP(u_minify(layout->height_px, level), denom.y);
-         cfg.first_level = 0;
-         cfg.last_level = 1;
+         if (usage == HK_DESC_USAGE_STORAGE && layout->tiling == AIL_TILING_GPU) {
+            unsigned phys_w, phys_h;
+            hk_apple9_block_alias_extent(layout, level, &phys_w, &phys_h);
+            cfg.width = phys_w;
+            cfg.height = phys_h;
+            cfg.first_level = 0;
+            cfg.last_level = 0;
+         } else {
+            cfg.width = alias_width_el(view, view_plane, usage, layout, level, denom.x);
+            cfg.height = DIV_ROUND_UP(u_minify(layout->height_px, level), denom.y);
+            cfg.first_level = 0;
+            cfg.last_level = 1;
+         }
       } else {
          cfg.address = base_addr + ail_get_layer_offset_B(layout, layer);
          cfg.width = layout->width_px;
@@ -386,7 +413,8 @@ pack_texture(struct hk_image_view *view, unsigned view_plane,
       }
 
       cfg.srgb = (desc->colorspace == UTIL_FORMAT_COLORSPACE_SRGB);
-      cfg.unk_mipmapped = layout->levels > 1;
+      cfg.unk_mipmapped =
+         (denom.x > 1 && usage == HK_DESC_USAGE_STORAGE) ? false : layout->levels > 1;
       cfg.srgb_2_channel = cfg.srgb && util_format_colormask(desc) == 0x3;
 
       if (layout->compressed) {
@@ -490,13 +518,15 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
           * with image_write_block instructions.
           */
          unsigned blocksize_B = util_format_get_blocksize(p_format);
-         unsigned size_px =
-            (layout->size_B - layout->layer_stride_B * layer) / blocksize_B;
+         uint64_t size_px =
+            (layout->size_B - (uint64_t)layout->layer_stride_B * layer) /
+            blocksize_B;
+         uint64_t rows = DIV_ROUND_UP(size_px, AGX_TEXTURE_BUFFER_WIDTH);
 
          cfg.dimension = AGX_TEXTURE_DIMENSION_2D;
          cfg.layout = AGX_LAYOUT_LINEAR;
          cfg.width = AGX_TEXTURE_BUFFER_WIDTH;
-         cfg.height = DIV_ROUND_UP(size_px, cfg.width);
+         cfg.height = CLAMP(rows, 1, AGX_TEXTURE_BUFFER_MAX_HEIGHT);
          cfg.stride = (cfg.width * blocksize_B) - 4;
          cfg.layers = 1;
          cfg.levels = 1;
@@ -511,9 +541,16 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
 
             cfg.buffer =
                base_addr + ail_get_layer_level_B(layout, layer, level);
-            cfg.width = alias_width_el(view, view_plane, usage, layout, level, denom.x);
-            cfg.height =
-               DIV_ROUND_UP(u_minify(layout->height_px, level), denom.y);
+            if (layout->tiling == AIL_TILING_GPU) {
+               unsigned phys_w, phys_h;
+               hk_apple9_block_alias_extent(layout, level, &phys_w, &phys_h);
+               cfg.width = phys_w;
+               cfg.height = phys_h;
+            } else {
+               cfg.width = alias_width_el(view, view_plane, usage, layout, level, denom.x);
+               cfg.height =
+                  DIV_ROUND_UP(u_minify(layout->height_px, level), denom.y);
+            }
             cfg.level = 0;
          } else {
             cfg.buffer = base_addr + ail_get_layer_offset_B(layout, layer);
@@ -611,13 +648,7 @@ hk_apple9_init_view_descriptors(struct hk_image_view *view)
    *storage = (struct hk_apple9_storage_descriptor){0};
    storage->pbe_sw = view->planes[0].storage;
    enum pipe_format format = vk_format_to_pipe_format(view->vk.format);
-   struct hk_apple9_texel_metadata layout_meta = {0};
-   hk_apple9_texel_layout(format, &layout_meta);
-   storage->size_B = layout_meta.size_B;
-   memcpy(storage->component, layout_meta.component, sizeof(storage->component));
-   storage->native_ok =
-      (hk_apple9_store_encode(format) & HK_APPLE9_STORAGE_ENCODE_MASK) <<
-      HK_APPLE9_STORAGE_ENCODE_SHIFT;
+   storage->size_B = util_format_get_blocksize(format);
 
    const struct hk_image *image =
       container_of(view->vk.image, struct hk_image, vk);
@@ -636,19 +667,56 @@ hk_apple9_init_view_descriptors(struct hk_image_view *view)
    storage->extent[2] = d;
    storage->extent[3] = image->vk.samples;
 
-   /* A block-texel alias rebases to a single level. Its native 3D
-    * descriptor cannot express the original image's Z stride, and a padded
-    * 2D alias widens ro_storage.width past storage->extent[0] for AIL tile
-    * alignment; keep both on software storage reads so bounds and stride stay
-    * exact under branchless hardware OOB clipping.
-    */
+   const bool block_view = util_format_is_compressed(layout->format);
    const bool alias_3d = view->vk.view_type == VK_IMAGE_VIEW_TYPE_3D &&
-                         vk_format_is_compressed(view->vk.image->format) &&
-                         !vk_format_is_compressed(view->vk.format);
-   const bool padded_alias = view->planes[0].alias_width_el != 0;
-   if (!alias_3d && !padded_alias &&
-       agx_apple9_translate_texture(storage->texture, &view->planes[0].ro_storage)) {
-      storage->native_ok |= HK_APPLE9_STORAGE_READ_VALID;
+                         block_view && !vk_format_is_compressed(view->vk.format);
+   const bool linear_2d_3d = alias_3d && d > 1 && layout->tiling == AIL_TILING_GPU;
+   enum pipe_format pbe_fmt = format_for_plane(view, 0);
+   if (pbe_fmt == PIPE_FORMAT_S8_UINT)
+      pbe_fmt = PIPE_FORMAT_R8_UINT;
+
+   if (linear_2d_3d) {
+      unsigned bs = util_format_get_blocksize(pbe_fmt);
+      uint64_t base = hk_image_base_address(image, image_plane) +
+         ail_get_layer_level_B(layout, view->vk.storage.z_slice_offset,
+                               view->vk.base_mip_level);
+      uint64_t size_el = DIV_ROUND_UP(
+         (uint64_t)(d - 1) * layout->layer_stride_B +
+            ail_get_level_size_B(layout, view->vk.base_mip_level),
+         bs);
+      uint64_t rows = DIV_ROUND_UP(size_el, AGX_TEXTURE_BUFFER_WIDTH);
+
+      agx_unpack(stderr, &view->planes[0].ro_storage, TEXTURE, tex);
+      tex.dimension = AGX_TEXTURE_DIMENSION_2D;
+      tex.layout = AGX_LAYOUT_LINEAR;
+      tex.width = AGX_TEXTURE_BUFFER_WIDTH;
+      tex.height = MAX2(rows, 1);
+      tex.depth = 1;
+      tex.first_level = 0;
+      tex.last_level = 0;
+      tex.unk_mipmapped = false;
+      tex.extended = false;
+      tex.mode = AGX_IMAGE_MODE_NORMAL;
+      tex.address = base;
+      tex.stride = (AGX_TEXTURE_BUFFER_WIDTH * bs) - 16;
+      if (rows <= AGX_TEXTURE_BUFFER_MAX_HEIGHT &&
+          agx_apple9_pack_texture(storage->texture, &tex)) {
+         storage->native_ok |= HK_APPLE9_STORAGE_LINEAR_2D_INDEX;
+         unsigned phys_w, phys_h;
+         hk_apple9_block_alias_extent(layout, view->vk.base_mip_level,
+                                      &phys_w, &phys_h);
+         struct ail_tile ts = layout->tilesize_el[view->vk.base_mip_level];
+         storage->alias_3d.layer_stride_el = layout->layer_stride_B / bs;
+         storage->alias_3d.aligned_width_el = align(phys_w, ts.width_el);
+         storage->alias_3d.tile_w_el = ts.width_el;
+         storage->alias_3d.tile_h_el = ts.height_el;
+      } else {
+         agx_apple9_set_null_texture(storage->texture);
+      }
+   } else {
+      if (!agx_apple9_translate_texture(storage->texture,
+                                        &view->planes[0].ro_storage))
+         agx_apple9_set_null_texture(storage->texture);
       if (image->planes[image_plane].sparse_map != NULL)
          storage->native_ok |= HK_APPLE9_STORAGE_SPARSE;
    }
@@ -656,43 +724,82 @@ hk_apple9_init_view_descriptors(struct hk_image_view *view)
    /* Pack the inline native Apple9 PBE descriptor directly into the 128-byte
     * storage descriptor (slot 2, offset 64). Layered views (1D/2D arrays,
     * cubes, cube arrays, and 3D views whose depth slices share AIL's array
-    * layer stride) use a single 2D-array PBE addressed via IMAGE_WRITE_LAYERED,
-    * requiring zero USC side-table allocations and supporting capture-replay. */
+    * layer stride) use a single 2D-array PBE addressed via IMAGE_WRITE_LAYERED;
+    * MSAA views and multi-slice 3D block-texel aliases use a 16384-wide linear
+    * 2D-buffer PBE addressed via tiled sample/block coordinates. */
+   agx_apple9_set_null_pbe(storage->pbe);
    if ((view->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
-       image->vk.samples == 1) {
-      enum pipe_format pbe_fmt = format_for_plane(view, 0);
-      struct ail_layout pbe_layout;
-      unsigned pbe_level;
-      if (hk_apple9_native_store_format(pbe_fmt) &&
-          hk_apple9_native_store_image(image, image_plane) &&
-          hk_apple9_native_store_view_layout(layout, pbe_fmt,
-                                             view->vk.base_mip_level,
-                                             &pbe_layout, &pbe_level)) {
-         const bool block_view = util_format_is_compressed(layout->format);
-         VkImageViewType type = view->vk.view_type;
-         bool slices = type == VK_IMAGE_VIEW_TYPE_3D;
-         bool layered = type != VK_IMAGE_VIEW_TYPE_2D &&
-                        type != VK_IMAGE_VIEW_TYPE_1D;
-         unsigned first = slices ? view->vk.storage.z_slice_offset
-                                 : view->vk.base_array_layer;
-         unsigned count = slices ? view->vk.storage.z_slice_count
-                          : layered ? view->vk.layer_count : 1;
-         bool stride_ok = !block_view || count == 1 ||
-                          pbe_layout.layer_stride_B == layout->layer_stride_B;
+       hk_apple9_native_store_format(pbe_fmt) &&
+       hk_apple9_native_store_image(image, image_plane)) {
+      bool ok = false;
+      if (image->vk.samples > 1) {
+         unsigned bs = util_format_get_blocksize(pbe_fmt);
+         uint64_t size_sa = ((uint64_t)view->vk.layer_count *
+                             layout->layer_stride_B) / bs;
+         uint64_t rows = DIV_ROUND_UP(size_sa, AGX_TEXTURE_BUFFER_WIDTH);
          uint64_t base = hk_image_base_address(image, image_plane) +
-            ail_get_layer_level_B(layout, first,
-                                  block_view ? view->vk.base_mip_level : 0);
-         if (stride_ok &&
-             agx_apple9_translate_pbe(
-                storage->pbe, &view->planes[0].storage, pbe_fmt, &pbe_layout,
-                base, pbe_level, count, layered,
-                layered ? AGX_TEXTURE_DIMENSION_2D_ARRAY
-                        : AGX_TEXTURE_DIMENSION_2D)) {
-            storage->native_ok |= HK_APPLE9_STORAGE_WRITE_VALID;
-         } else {
-            memset(storage->pbe, 0, sizeof(storage->pbe));
+            ail_get_layer_level_B(layout, view->vk.base_array_layer,
+                                  view->vk.base_mip_level);
+         if (rows <= AGX_TEXTURE_BUFFER_MAX_HEIGHT) {
+            struct ail_layout ms_pbe = {
+               .width_px = AGX_TEXTURE_BUFFER_WIDTH,
+               .height_px = MAX2(rows, 1),
+               .depth_px = 1, .sample_count_sa = 1, .levels = 1,
+               .tiling = AIL_TILING_LINEAR, .format = pbe_fmt,
+               .linear_stride_B = AGX_TEXTURE_BUFFER_WIDTH * bs,
+            };
+            ok = agx_apple9_translate_pbe(storage->pbe, &view->planes[0].storage,
+                                          pbe_fmt, &ms_pbe, base, 0, 1, false,
+                                          AGX_TEXTURE_DIMENSION_2D);
+         }
+      } else if (linear_2d_3d) {
+         unsigned bs = util_format_get_blocksize(pbe_fmt);
+         uint64_t size_el = DIV_ROUND_UP(
+            (uint64_t)(d - 1) * layout->layer_stride_B +
+               ail_get_level_size_B(layout, view->vk.base_mip_level),
+            bs);
+         uint64_t rows = DIV_ROUND_UP(size_el, AGX_TEXTURE_BUFFER_WIDTH);
+         uint64_t base = hk_image_base_address(image, image_plane) +
+            ail_get_layer_level_B(layout, view->vk.storage.z_slice_offset,
+                                  view->vk.base_mip_level);
+         if (rows <= AGX_TEXTURE_BUFFER_MAX_HEIGHT) {
+            struct ail_layout alias_pbe = {
+               .width_px = AGX_TEXTURE_BUFFER_WIDTH,
+               .height_px = MAX2(rows, 1),
+               .depth_px = 1, .sample_count_sa = 1, .levels = 1,
+               .tiling = AIL_TILING_LINEAR, .format = pbe_fmt,
+               .linear_stride_B = AGX_TEXTURE_BUFFER_WIDTH * bs,
+            };
+            ok = agx_apple9_translate_pbe(storage->pbe, &view->planes[0].storage,
+                                          pbe_fmt, &alias_pbe, base, 0, 1, false,
+                                          AGX_TEXTURE_DIMENSION_2D);
+         }
+      } else {
+         struct ail_layout pbe_layout;
+         unsigned pbe_level;
+         if (hk_apple9_native_store_view_layout(layout, pbe_fmt,
+                                                view->vk.base_mip_level,
+                                                &pbe_layout, &pbe_level)) {
+            VkImageViewType type = view->vk.view_type;
+            bool slices = type == VK_IMAGE_VIEW_TYPE_3D;
+            bool layered = type != VK_IMAGE_VIEW_TYPE_2D &&
+                           type != VK_IMAGE_VIEW_TYPE_1D;
+            unsigned first = slices ? view->vk.storage.z_slice_offset
+                                    : view->vk.base_array_layer;
+            unsigned count = slices ? view->vk.storage.z_slice_count
+                             : layered ? view->vk.layer_count : 1;
+            uint64_t base = hk_image_base_address(image, image_plane) +
+               ail_get_layer_level_B(layout, first,
+                                     block_view ? view->vk.base_mip_level : 0);
+            ok = agx_apple9_translate_pbe(
+               storage->pbe, &view->planes[0].storage, pbe_fmt, &pbe_layout,
+               base, pbe_level, count, layered,
+               layered ? AGX_TEXTURE_DIMENSION_2D_ARRAY
+                       : AGX_TEXTURE_DIMENSION_2D);
          }
       }
+      if (!ok)
+         agx_apple9_set_null_pbe(storage->pbe);
    }
 }
 
@@ -826,18 +933,7 @@ hk_apple9_native_store_view_layout(const struct ail_layout *layout,
    if (layout->tiling != AIL_TILING_GPU || level >= layout->levels)
       return false;
    unsigned w, h;
-   if (level >= layout->mip_tail_first_lod) {
-      w = u_minify(util_next_power_of_two(
-             util_format_get_nblocksx(layout->format, layout->width_px)), level);
-      h = u_minify(util_next_power_of_two(
-             util_format_get_nblocksy(layout->format, layout->height_px)), level);
-   } else {
-      w = MAX2(util_format_get_nblocksx(layout->format,
-                                        u_minify(layout->width_px, level)),
-               layout->stride_el[level]);
-      h = util_format_get_nblocksy(layout->format,
-                                   u_minify(layout->height_px, level));
-   }
+   hk_apple9_block_alias_extent(layout, level, &w, &h);
    *out = (struct ail_layout){
       .width_px = w, .height_px = h, .depth_px = 1, .sample_count_sa = 1,
       .levels = 1, .tiling = AIL_TILING_GPU, .format = view_format,

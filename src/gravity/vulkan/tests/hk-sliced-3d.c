@@ -249,23 +249,34 @@ check_view(struct hk_device *dev, VkExtent3D extent, unsigned levels, unsigned l
    get_descriptor(dev, sliced, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &desc);
    CHECK(sizeof(desc) == HK_APPLE9_DB_STORAGE_SIZE);
    /* Native stores pack a single inline 2D-array PBE anchored at the view's
-    * slice offset (including sparse and capture-replay views); only multi-slice
-    * mipmapped block-texel views whose single-level stride differs keep the
-    * software converter. */
-   bool pbe_inline = !alias;
-   uint32_t expected_flags =
-      (alias ? 0 : HK_APPLE9_STORAGE_READ_VALID) |
-      (pbe_inline ? HK_APPLE9_STORAGE_WRITE_VALID : 0);
-   CHECK((desc.native_ok & (HK_APPLE9_STORAGE_READ_VALID |
-                            HK_APPLE9_STORAGE_WRITE_VALID |
+    * slice offset (including sparse and capture-replay views); multi-slice 3D
+    * block-texel aliases pack linear 2D-buffer PBE + texture descriptors with
+    * HK_APPLE9_STORAGE_LINEAR_2D_INDEX and twiddle metadata in alias_3d. */
+   bool linear_2d = alias && slices > 1;
+   uint32_t expected_flags = linear_2d ? HK_APPLE9_STORAGE_LINEAR_2D_INDEX : 0;
+   CHECK((desc.native_ok & (HK_APPLE9_STORAGE_LINEAR_2D_INDEX |
                             HK_APPLE9_STORAGE_SPARSE)) == expected_flags);
-   if (pbe_inline) {
+   if (!linear_2d) {
       CHECK((desc.pbe[0] & 0xf) == AGX_TEXTURE_DIMENSION_2D_ARRAY);
       uint64_t entry_address;
       memcpy(&entry_address, desc.pbe + 8, 8);
       CHECK((entry_address & ((UINT64_C(1) << 40) - 1)) ==
             (image.planes[0].addr + ail_get_layer_level_B(layout, offset, 0)) >> 4);
       CHECK(((entry_address >> 44) & 0xffff) == slices - 1);
+   } else {
+      CHECK((desc.pbe[0] & 0xf) == AGX_TEXTURE_DIMENSION_2D);
+      CHECK(((desc.pbe[0] >> 4) & 0x3) == AGX_LAYOUT_LINEAR);
+      uint64_t entry_address;
+      memcpy(&entry_address, desc.pbe + 8, 8);
+      uint64_t expected_base =
+         image.planes[0].addr + ail_get_layer_level_B(layout, offset, level);
+      CHECK((entry_address & ((UINT64_C(1) << 40) - 1)) == expected_base >> 4);
+      unsigned bs = util_format_get_blocksize(vk_format_to_pipe_format(vi.format));
+      CHECK(((entry_address >> 44) & 0xffff) ==
+            ((AGX_TEXTURE_BUFFER_WIDTH * bs) >> 4) - 1);
+      CHECK(desc.alias_3d.layer_stride_el == layout->layer_stride_B / bs);
+      CHECK(desc.alias_3d.tile_w_el == layout->tilesize_el[level].width_el);
+      CHECK(desc.alias_3d.tile_h_el == layout->tilesize_el[level].height_el);
    }
    agx_unpack(NULL, &desc.pbe_sw, PBE, pbe);
    agx_unpack(NULL, &s->planes[0].ro_storage, TEXTURE, native);
@@ -276,17 +287,19 @@ check_view(struct hk_device *dev, VkExtent3D extent, unsigned levels, unsigned l
    CHECK(pbe.buffer == image.planes[0].addr + offset * (uint64_t)layout->layer_stride_B +
          (alias ? layout->level_offsets_B[level] : 0));
    CHECK(native.address == pbe.buffer);
-   uint8_t native_expected[AGX_APPLE9_TEXTURE_TABLE_STRIDE] = {0};
-   if (!alias)
-      CHECK(agx_apple9_translate_texture(native_expected, &s->planes[0].ro_storage));
-   CHECK(!memcmp(desc.texture, native_expected, sizeof(native_expected)));
-   /* Independently inspect the native depth bits: a Z-major image must retain
-    * its full mip-tree depth even when only one slice is visible to storage.
-    */
    uint64_t native_address;
    memcpy(&native_address, desc.texture + 8, 8);
-   if (!alias) {
+   if (!linear_2d) {
+      uint8_t native_expected[AGX_APPLE9_TEXTURE_TABLE_STRIDE] = {0};
+      CHECK(agx_apple9_translate_texture(native_expected, &s->planes[0].ro_storage));
+      CHECK(!memcmp(desc.texture, native_expected, sizeof(native_expected)));
+      /* Independently inspect the native depth bits: a Z-major image must retain
+       * its full mip-tree depth even when only one slice is visible to storage. */
       CHECK(((native_address >> 46) & 0x7ff) + 1 == extent.depth);
+      CHECK((native_address & ((UINT64_C(1) << 40) - 1)) << 4 == pbe.buffer);
+   } else {
+      CHECK((desc.texture[0] & 0xf) == AGX_TEXTURE_DIMENSION_2D);
+      CHECK(((desc.texture[0] >> 4) & 0x3) == AGX_LAYOUT_LINEAR);
       CHECK((native_address & ((UINT64_C(1) << 40) - 1)) << 4 == pbe.buffer);
    }
    unsigned w = u_minify(extent.width, level), h = u_minify(extent.height, level);

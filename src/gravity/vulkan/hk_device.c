@@ -497,6 +497,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    list_inithead(&dev->apple9_bodies.slabs);
    dev->dev.apple9_pin_entry = hk_apple9_pin_entry;
    simple_mtx_init(&dev->apple9_tile_helpers.lock, mtx_plain);
+   simple_mtx_init(&dev->sparse_buffers.lock, mtx_plain);
+   list_inithead(&dev->sparse_buffers.list);
    simple_mtx_init(&dev->apple9_vs_prologs.lock, mtx_plain);
    simple_mtx_init(&dev->apple9_fs_epilogs.lock, mtx_plain);
    simple_mtx_init(&dev->apple9_linked_entries.lock, mtx_plain);
@@ -565,6 +567,7 @@ fail_mem_cache:
    simple_mtx_destroy(&dev->apple9_vs_prologs.lock);
    simple_mtx_destroy(&dev->apple9_bodies.lock);
    simple_mtx_destroy(&dev->apple9_tile_helpers.lock);
+   simple_mtx_destroy(&dev->sparse_buffers.lock);
    if (dev->va_alias_bos)
       _mesa_hash_table_u64_destroy(dev->va_alias_bos);
    simple_mtx_destroy(&dev->va_alias_lock);
@@ -647,6 +650,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    assert(list_is_empty(&dev->apple9_bodies.slabs));
    simple_mtx_destroy(&dev->apple9_bodies.lock);
    simple_mtx_destroy(&dev->apple9_tile_helpers.lock);
+   simple_mtx_destroy(&dev->sparse_buffers.lock);
 
    if (dev->apple9_fetch_sampler)
       agx_bo_unreference(&dev->dev, dev->apple9_fetch_sampler);

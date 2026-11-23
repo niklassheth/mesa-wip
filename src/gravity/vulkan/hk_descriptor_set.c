@@ -164,14 +164,12 @@ hk_pack_storage_image(struct hk_device *dev, void *out,
    struct hk_apple9_storage_descriptor *ext = out;
    if (view) {
       *ext = view->apple9_storage;
-      hk_gpu_busy_storage_format(
-         view->vk.format,
-         (ext->native_ok >> HK_APPLE9_STORAGE_ENCODE_SHIFT) &
-            HK_APPLE9_STORAGE_ENCODE_MASK);
+      hk_gpu_busy_storage_format(view->vk.format, 0);
    } else {
       *ext = (struct hk_apple9_storage_descriptor){0};
       agx_set_null_pbe(&ext->pbe_sw);
       agx_apple9_set_null_pbe(ext->pbe);
+      agx_apple9_set_null_texture(ext->texture);
    }
    return sizeof(*ext);
 }
@@ -257,12 +255,13 @@ hk_pack_texel_buffer_desc(struct hk_device *dev, void *out,
          desc.size_B = m->size_B;
          desc.buf.elements = m->elements;
          desc.buf.base = m->base;
-         memcpy(desc.component, m->component, sizeof(desc.component));
+         desc.buf_residency = m->residency;
          memcpy(desc.pbe, apple9_pbe, sizeof(desc.pbe));
-         desc.buf_sparse.residency = m->residency;
+         memcpy(desc.texture, apple9_texture, sizeof(desc.texture));
       } else {
          agx_set_null_pbe(&desc.pbe_sw);
          agx_apple9_set_null_pbe(desc.pbe);
+         agx_apple9_set_null_texture(desc.texture);
       }
       memcpy(out, &desc, sizeof(desc));
       return sizeof(desc);
@@ -1000,14 +999,12 @@ hk_get_texel_buffer_descriptor(struct hk_device *dev, VkDescriptorType type,
       uint32_t store = 0;
       enum pipe_format format = hk_format_to_pipe_format(info->format);
       uint32_t elements = info->range / util_format_get_blocksize(format);
+      uint64_t residency = dev->vk.enabled_features.sparseResidencyBuffer
+         ? hk_device_lookup_sparse_buffer_residency(dev, info->address,
+                                                    info->range)
+         : 0;
       hk_pack_texel_buffer(dev, format, info->address, info->address, elements,
-                           0, &tex, &pbe, &m, texture, native, &store);
-      /* vkGetDescriptorEXT sees only a VA, not a VkBuffer, so it cannot attach
-       * a sparse buffer's residency table. On devices with sparse residency
-       * buffers, keep descriptor-buffer storage texel buffers on the global
-       * fallback (whose writes to read-only zero_bo soft-fault cleanly). */
-      if (dev->vk.enabled_features.sparseResidencyBuffer)
-         store &= ~HK_APPLE9_STORAGE_WRITE_VALID;
+                           residency, &tex, &pbe, &m, texture, native, &store);
       size = hk_pack_texel_buffer_desc(dev, out, type, &tex, &pbe, &m, texture,
                                        native, store);
    } else {

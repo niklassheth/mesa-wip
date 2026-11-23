@@ -126,6 +126,14 @@ struct hk_device {
       struct hash_table *ht;
    } apple9_tile_helpers;
 
+   /* Sparse residency buffers indexed by VA for vkGetDescriptorEXT texel
+    * buffer descriptors (count == 0 skips locking on the common path). */
+   struct {
+      simple_mtx_t lock;
+      struct list_head list;
+      uint32_t count;
+   } sparse_buffers;
+
    /* Apple9 vertex prologs, keyed by agx_apple9_vertex_prolog_key. */
    struct {
       simple_mtx_t lock;

@@ -45,38 +45,33 @@ hk_get_buffer_alignment(const struct hk_physical_device *pdev,
    return alignment;
 }
 
-static uint64_t
-hk_get_bda_replay_addr(const VkBufferCreateInfo *pCreateInfo)
+static struct hk_buffer_capture_data
+hk_get_bda_replay_data(const VkBufferCreateInfo *pCreateInfo)
 {
-   uint64_t addr = 0;
+   struct hk_buffer_capture_data out = {0};
    vk_foreach_struct_const(sType, ext, pCreateInfo->pNext) {
       switch (sType) {
       case VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO: {
          const VkBufferOpaqueCaptureAddressCreateInfo *bda = ext;
          if (bda->opaqueCaptureAddress != 0) {
-#ifdef NDEBUG
-            return bda->opaqueCaptureAddress;
-#else
-            assert(addr == 0 || bda->opaqueCaptureAddress == addr);
-            addr = bda->opaqueCaptureAddress;
-#endif
+            assert(out.addr == 0 || bda->opaqueCaptureAddress == out.addr);
+            out.addr = bda->opaqueCaptureAddress;
          }
          break;
       }
 
       case VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT: {
-         /* Descriptor-buffer capture data of a buffer is its address. */
          const VkOpaqueCaptureDescriptorDataCreateInfoEXT *dd = ext;
-         uint64_t dd_addr = 0;
+         struct hk_buffer_capture_data data = {0};
          if (dd->opaqueCaptureDescriptorData)
-            memcpy(&dd_addr, dd->opaqueCaptureDescriptorData, sizeof(dd_addr));
-         if (dd_addr != 0) {
-#ifdef NDEBUG
-            return dd_addr;
-#else
-            assert(addr == 0 || dd_addr == addr);
-            addr = dd_addr;
-#endif
+            memcpy(&data, dd->opaqueCaptureDescriptorData, sizeof(data));
+         if (data.addr != 0) {
+            assert(out.addr == 0 || data.addr == out.addr);
+            out.addr = data.addr;
+         }
+         if (data.residency != 0) {
+            assert(out.residency == 0 || data.residency == out.residency);
+            out.residency = data.residency;
          }
          break;
       }
@@ -84,12 +79,8 @@ hk_get_bda_replay_addr(const VkBufferCreateInfo *pCreateInfo)
       case VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_CREATE_INFO_EXT: {
          const VkBufferDeviceAddressCreateInfoEXT *bda = ext;
          if (bda->deviceAddress != 0) {
-#ifdef NDEBUG
-            return bda->deviceAddress;
-#else
-            assert(addr == 0 || bda->deviceAddress == addr);
-            addr = bda->deviceAddress;
-#endif
+            assert(out.addr == 0 || bda->deviceAddress == out.addr);
+            out.addr = bda->deviceAddress;
          }
          break;
       }
@@ -99,7 +90,7 @@ hk_get_bda_replay_addr(const VkBufferCreateInfo *pCreateInfo)
       }
    }
 
-   return addr;
+   return out;
 }
 
 VkResult
@@ -185,8 +176,11 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
 
       const bool bda_capture_replay =
          buffer->vk.create_flags & HK_BUFFER_CREATE_CAPTURE_REPLAY_BITS;
-      const uint64_t bda_fixed_addr =
-         bda_capture_replay ? hk_get_bda_replay_addr(pCreateInfo) : 0;
+      const struct hk_buffer_capture_data replay_data =
+         bda_capture_replay ? hk_get_bda_replay_data(pCreateInfo)
+                            : (struct hk_buffer_capture_data){0};
+      const uint64_t bda_fixed_addr = replay_data.addr;
+      const uint64_t replay_residency = replay_data.residency;
 
       uint32_t alignment = hk_get_buffer_alignment(
          hk_device_physical(dev), buffer->vk.usage, buffer->vk.create_flags);
@@ -257,14 +251,35 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
        */
       if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT) {
          size_t pages = DIV_ROUND_UP(vma_size_B, AIL_PAGESIZE);
-         buffer->apple9_residency =
-            agx_bo_create(&dev->dev, pages, 0, 0, "Apple9 buffer residency");
+         enum agx_va_flags res_va_flags =
+            bda_capture_replay
+               ? AGX_VA_REPLAY | (replay_residency ? AGX_VA_FIXED : 0)
+               : 0;
+         buffer->apple9_residency = agx_bo_create_va(
+            &dev->dev, pages, AIL_PAGESIZE, 0, res_va_flags, replay_residency,
+            "Apple9 buffer residency");
          if (!buffer->apple9_residency) {
             hk_buffer_free_va(dev, buffer);
             vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
-            return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            return vk_errorf(dev,
+                             replay_residency
+                                ? VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS
+                                : VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "Apple9 buffer residency allocation failed");
          }
-         memset(agx_bo_map(buffer->apple9_residency), 0, pages);
+         void *res_map = agx_bo_map(buffer->apple9_residency);
+         if (!res_map) {
+            agx_bo_unreference(&dev->dev, buffer->apple9_residency);
+            buffer->apple9_residency = NULL;
+            hk_buffer_free_va(dev, buffer);
+            vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+            return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+         memset(res_map, 0, pages);
+         simple_mtx_lock(&dev->sparse_buffers.lock);
+         list_addtail(&buffer->sparse_link, &dev->sparse_buffers.list);
+         p_atomic_inc(&dev->sparse_buffers.count);
+         simple_mtx_unlock(&dev->sparse_buffers.lock);
       }
 
       if (hk_buffer_needs_cdm_full_flush(dev, buffer)) {
@@ -295,6 +310,16 @@ hk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
    }
    hk_memory_remove_va_bind(dev, buffer->va_bind_bo_key, buffer->va_bind_id);
 
+   /* Unlink from the sparse-residency lookup list BEFORE freeing buffer->va or
+    * buffer->apple9_residency so concurrent vkGetDescriptorEXT readers never
+    * dereference a freed VA or residency BO. */
+   if (buffer->apple9_residency) {
+      simple_mtx_lock(&dev->sparse_buffers.lock);
+      list_del(&buffer->sparse_link);
+      p_atomic_dec(&dev->sparse_buffers.count);
+      simple_mtx_unlock(&dev->sparse_buffers.lock);
+   }
+
    if (buffer->va)
       hk_buffer_free_va(dev, buffer);
 
@@ -302,6 +327,30 @@ hk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
       agx_bo_unreference(&dev->dev, buffer->apple9_residency);
 
    vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+}
+
+uint64_t
+hk_device_lookup_sparse_buffer_residency(struct hk_device *dev, uint64_t va,
+                                         uint64_t range)
+{
+   if (!p_atomic_read(&dev->sparse_buffers.count))
+      return 0;
+
+   uint64_t residency = 0;
+   simple_mtx_lock(&dev->sparse_buffers.lock);
+   list_for_each_entry(struct hk_buffer, buf, &dev->sparse_buffers.list,
+                       sparse_link) {
+      if (buf->va && va >= buf->va->addr) {
+         uint64_t offset = va - buf->va->addr;
+         if (offset < buf->vk.size &&
+             (range == 0 || range <= buf->vk.size - offset)) {
+            residency = hk_buffer_apple9_residency(buf);
+            break;
+         }
+      }
+   }
+   simple_mtx_unlock(&dev->sparse_buffers.lock);
+   return residency;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -542,9 +591,15 @@ hk_GetBufferOpaqueCaptureDescriptorDataEXT(
 {
    VK_FROM_HANDLE(hk_buffer, buffer, pInfo->buffer);
 
-   uint64_t addr = buffer->va && (buffer->va->flags & AGX_VA_REPLAY)
-                      ? buffer->va->addr
-                      : 0;
-   memcpy(pData, &addr, sizeof(addr));
+   struct hk_buffer_capture_data data = {
+      .addr = buffer->va && (buffer->va->flags & AGX_VA_REPLAY)
+                 ? buffer->va->addr
+                 : 0,
+      .residency = buffer->apple9_residency &&
+                   (buffer->apple9_residency->va->flags & AGX_VA_REPLAY)
+                      ? buffer->apple9_residency->va->addr
+                      : 0,
+   };
+   memcpy(pData, &data, sizeof(data));
    return VK_SUCCESS;
 }

@@ -21,25 +21,14 @@
 
 struct hk_descriptor_set_layout;
 
-/* GPU-readable format metadata for Apple9 uniform texel-buffer loads. The
- * ordinary texture prefix remains available for descriptor queries.
- * A component word contains byte offset [7:0], bit shift [12:8], width minus
- * one [17:13], and conversion kind [21:18]. Swizzles are resolved per component.
- */
-enum hk_apple9_texel_kind {
-   HK_TEXEL_ZERO, HK_TEXEL_ONE, HK_TEXEL_UINT, HK_TEXEL_SINT,
-   HK_TEXEL_UNORM, HK_TEXEL_SNORM, HK_TEXEL_FLOAT16, HK_TEXEL_FLOAT32,
-   HK_TEXEL_FLOAT11, HK_TEXEL_RGB9E5, HK_TEXEL_SRGB,
-};
-
-/* Texel-buffer metadata: base address, element count, and format layout.
- * Storage images leave base, elements, and residency zero.
+/* Texel-buffer metadata: base address, element count, and block size for
+ * RGB32 uniform texel buffers and sparse buffer residency lookups.
  */
 struct hk_apple9_texel_metadata {
    uint64_t base;
    uint32_t elements;
    uint32_t size_B;
-   uint32_t component[4];
+   uint32_t pad[4];
    /* Sparse residency buffers: the residency byte of the page holding
     * address A is at residency + A / AIL_PAGESIZE, see
     * hk_buffer::apple9_residency. Zero for other resources. */
@@ -62,15 +51,12 @@ static_assert(offsetof(struct hk_apple9_texel_descriptor, texture) ==
               "native texture entry is where register indices expect it");
 
 enum hk_apple9_storage_native_flags {
-   HK_APPLE9_STORAGE_READ_VALID = 1u << 0,
-   HK_APPLE9_STORAGE_WRITE_VALID = 1u << 1,
-   /* Bit 30 marks sparse-resident storage images (for unrouted loads). */
+   /* Multi-slice 3D block-texel alias packed as a 16384-wide linear 2D
+    * buffer in both pbe and texture, addressed via alias_3d metadata. */
+   HK_APPLE9_STORAGE_LINEAR_2D_INDEX = 1u << 2,
+   /* Bit 30 marks sparse-resident storage images. */
    HK_APPLE9_STORAGE_SPARSE = 1u << 30,
 };
-
-/* Storage images pack enum hk_apple9_store_encode in native_ok bits 4..6. */
-#define HK_APPLE9_STORAGE_ENCODE_SHIFT 4
-#define HK_APPLE9_STORAGE_ENCODE_MASK  0x7u
 
 /* Storage texel buffers pack their sub-16-byte element offset in native_ok
  * bits 3..29. */
@@ -80,14 +66,15 @@ enum hk_apple9_storage_native_flags {
 bool hk_apple9_native_store_format(enum pipe_format format);
 
 /* Apple9 storage images and storage texel buffers, 128 bytes (matching the
- * descriptor-buffer ABI). Both native PBE (offset 64) and native ro_storage
- * texture (offset 96) live inline in the USC-aperture descriptor, eliminating
- * per-view USC side-table allocations and enabling capture-replay directly. */
+ * descriptor-buffer ABI). Both native PBE (offset 64) and native texture
+ * (offset 96) live inline in the USC-aperture descriptor for images and
+ * storage texel buffers alike, eliminating per-view USC side-table
+ * allocations and enabling capture-replay directly. */
 struct hk_apple9_storage_descriptor {
-   /* [0..23] 24B: software PBE for atomics, MSAA, and rare software fallbacks.
+   /* [0..23] 24B: software PBE for image atomics and MSAA sample addressing.
     * Placed at offset 0 so storage handles address the descriptor base. */
    struct agx_pbe_packed pbe_sw;
-   /* [24..27] 4B: enum hk_apple9_storage_native_flags + store_encode / tail. */
+   /* [24..27] 4B: enum hk_apple9_storage_native_flags + texel-buffer tail. */
    uint32_t native_ok;
    /* [28..31] 4B: texel block size in bytes (1..16). */
    uint32_t size_B;
@@ -102,21 +89,27 @@ struct hk_apple9_storage_descriptor {
          uint64_t base;
       } buf;
    };
-   /* [48..63] 16B: per-component formatless texel layout. */
-   uint32_t component[4];
-   /* [64..95] 32B (32-byte aligned): inline native Apple9 PBE descriptor
-    * (2D or 2D-array for images; 16384-wide linear 2D for texel buffers). */
-   uint8_t pbe[AGX_APPLE9_TEXTURE_TABLE_STRIDE];
-   /* [96..127] 32B (32-byte aligned):
-    *   - Storage images: inline native Apple9 ro_storage texture descriptor.
-    *   - Storage texel buffers: sparse buffer residency table VA at [96..103]. */
+   /* [48..63] 16B:
+    *   - Storage texel buffers: sparse buffer residency table VA at [48..55].
+    *   - 3D multi-slice block-texel aliases (HK_APPLE9_STORAGE_LINEAR_2D_INDEX):
+    *     tiled XY + slice stride metadata for 2D-buffer linear indexing. */
    union {
-      uint8_t texture[AGX_APPLE9_TEXTURE_TABLE_STRIDE];
+      uint64_t buf_residency;
       struct {
-         uint64_t residency;
-         uint8_t pad[24];
-      } buf_sparse;
+         uint32_t layer_stride_el;
+         uint32_t aligned_width_el;
+         uint16_t tile_w_el;
+         uint16_t tile_h_el;
+         uint32_t pad;
+      } alias_3d;
    };
+   /* [64..95] 32B (32-byte aligned): inline native Apple9 PBE descriptor
+    * (2D or 2D-array for images; 16384-wide linear 2D for MSAA, 3D block-texel
+    * aliases, and storage texel buffers). */
+   uint8_t pbe[AGX_APPLE9_TEXTURE_TABLE_STRIDE];
+   /* [96..127] 32B (32-byte aligned): inline native Apple9 texture descriptor
+    * for storage image and storage texel buffer loads. */
+   uint8_t texture[AGX_APPLE9_TEXTURE_TABLE_STRIDE];
 };
 static_assert(sizeof(struct hk_apple9_storage_descriptor) == 128,
               "Apple9 storage descriptor retains the 128-byte ABI");
@@ -131,28 +124,6 @@ static_assert(offsetof(struct hk_apple9_storage_descriptor, texture) ==
 static_assert(offsetof(struct hk_apple9_storage_descriptor, extent[0]) ==
                  offsetof(struct hk_apple9_storage_descriptor, buf.elements),
               "buffer elements alias extent[0] for unified imageSize queries");
-
-void hk_apple9_texel_layout(enum pipe_format format,
-                            struct hk_apple9_texel_metadata *metadata);
-
-/* Encodings for stores to storage images without a shader format. A
- * canonical format packs its N channels in order, each W bits wide from bit
- * 0, so stores can encode it with constant shifts instead of decoding the
- * per-component layout. Everything else uses the layout (GENERIC).
- */
-enum hk_apple9_store_encode {
-   HK_STORE_ENCODE_GENERIC = 0,
-   /* 32-bit channels: the texel's bits as they are (float, uint, sint). */
-   HK_STORE_ENCODE_RAW32,
-   /* 8-bit unsigned normalized channels. */
-   HK_STORE_ENCODE_UNORM8,
-   /* 16-bit float channels. */
-   HK_STORE_ENCODE_FLOAT16,
-   /* R11G11B10 unsigned float (B10G11R11_UFLOAT_PACK32). */
-   HK_STORE_ENCODE_FLOAT11,
-};
-
-enum hk_apple9_store_encode hk_apple9_store_encode(enum pipe_format format);
 
 /* G16 descriptor records, 128 bytes each so translation layers can copy
  * them with their 128-byte paths: an image part and a sampler part. A

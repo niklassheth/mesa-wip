@@ -22,6 +22,11 @@ struct hk_physical_device;
    (VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT |                       \
     VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT)
 
+struct hk_buffer_capture_data {
+   uint64_t addr;
+   uint64_t residency;
+};
+
 struct hk_buffer {
    struct vk_buffer vk;
 
@@ -33,6 +38,7 @@ struct hk_buffer {
 
    /* Apple9 sparse residency: one byte per page, nonzero if bound. */
    struct agx_bo *apple9_residency;
+   struct list_head sparse_link;
 
    /* Virtio resource id of bound implicit-sync (WSI) memory, or 0. */
    uint32_t implicit_sync_res;
@@ -63,6 +69,8 @@ uint64_t hk_buffer_address(const struct hk_buffer *buffer, uint64_t offset,
                            bool read_only);
 bool hk_buffer_needs_cdm_full_flush(const struct hk_device *dev,
                                     const struct hk_buffer *buffer);
+uint64_t hk_device_lookup_sparse_buffer_residency(struct hk_device *dev,
+                                                  uint64_t va, uint64_t range);
 
 static inline uint64_t
 hk_buffer_address_rw(const struct hk_buffer *buffer, uint64_t offset)

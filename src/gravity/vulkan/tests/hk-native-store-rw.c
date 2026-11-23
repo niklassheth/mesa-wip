@@ -25,46 +25,22 @@
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%u: failed: %s\n", __FILE__, __LINE__, #c); return 1; } } while (0)
 
-static void
-image_op(nir_builder *b, nir_intrinsic_op op)
-{
-   nir_intrinsic_instr *intr = nir_intrinsic_instr_create(b->shader, op);
-   const nir_intrinsic_info *info = &nir_intrinsic_infos[op];
-   intr->num_components = 4;
-   nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_2D);
-   nir_intrinsic_set_format(intr, PIPE_FORMAT_R32_FLOAT);
-   for (unsigned j = 0; j < info->num_srcs; ++j) {
-      unsigned components = info->src_components[j] ? info->src_components[j] : 4;
-      intr->src[j] = nir_src_for_ssa(nir_imm_zero(b, components, j == 0 ? 64 : 32));
-   }
-   if (info->has_dest)
-      nir_def_init(&intr->instr, &intr->def, 4, 32);
-   nir_builder_instr_insert(b, &intr->instr);
-}
-
-#define LOAD nir_intrinsic_bindless_image_load
-#define STORE nir_intrinsic_bindless_image_store
-
-static nir_builder
-shader(void)
-{
-   static const nir_shader_compiler_options options = {0};
-   return nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &options, "rw");
-}
-
 struct nir_stats {
    unsigned ifs;
    unsigned native_stores;
    unsigned native_store_array;
    unsigned native_store_16bit;
+   unsigned native_store_coherent;
+   unsigned native_loads;
+   unsigned native_load_coherent;
    unsigned fence_image_write;
    unsigned fence_tex_invalidate;
    unsigned txf_2d;
+   unsigned txf_3d;
    unsigned txf_ms;
    unsigned txf_inside_nested_if;
-   unsigned umin_ffff;
    unsigned global_stores;
-   unsigned rw_valid_checks;
+   unsigned global_loads;
 };
 
 static void
@@ -85,7 +61,24 @@ collect_cf_stats(struct exec_list *cf_list, unsigned if_depth,
                      st->native_store_array++;
                   if (intr->src[2].ssa->bit_size == 16)
                      st->native_store_16bit++;
+                  if (nir_intrinsic_access(intr) & (ACCESS_COHERENT | ACCESS_VOLATILE))
+                     st->native_store_coherent++;
                   break;
+               case nir_intrinsic_image_load_apple9_agx: {
+                  st->native_loads++;
+                  if (nir_intrinsic_access(intr) & (ACCESS_COHERENT | ACCESS_VOLATILE))
+                     st->native_load_coherent++;
+                  enum glsl_sampler_dim d = nir_intrinsic_image_dim(intr);
+                  if (d == GLSL_SAMPLER_DIM_MS)
+                     st->txf_ms++;
+                  else if (d == GLSL_SAMPLER_DIM_3D)
+                     st->txf_3d++;
+                  else
+                     st->txf_2d++;
+                  if (if_depth > 1)
+                     st->txf_inside_nested_if++;
+                  break;
+               }
                case nir_intrinsic_fence_image_write_apple9_agx:
                   st->fence_image_write++;
                   break;
@@ -94,6 +87,9 @@ collect_cf_stats(struct exec_list *cf_list, unsigned if_depth,
                   break;
                case nir_intrinsic_store_global:
                   st->global_stores++;
+                  break;
+               case nir_intrinsic_load_global:
+                  st->global_loads++;
                   break;
                default:
                   break;
@@ -112,23 +108,6 @@ collect_cf_stats(struct exec_list *cf_list, unsigned if_depth,
                   st->txf_ms++;
                   if (if_depth > 1)
                      st->txf_inside_nested_if++;
-               }
-            } else if (instr->type == nir_instr_type_alu) {
-               nir_alu_instr *alu = nir_instr_as_alu(instr);
-               if (alu->op == nir_op_umin) {
-                  for (unsigned s = 0; s < 2; ++s) {
-                     if (nir_src_is_const(alu->src[s].src) &&
-                         nir_src_as_uint(alu->src[s].src) == 0xffffu)
-                        st->umin_ffff++;
-                  }
-               } else if (alu->op == nir_op_iand) {
-                  const uint32_t rw_mask = HK_APPLE9_STORAGE_WRITE_VALID |
-                                           HK_APPLE9_STORAGE_READ_VALID;
-                  for (unsigned s = 0; s < 2; ++s) {
-                     if (nir_src_is_const(alu->src[s].src) &&
-                         nir_src_as_uint(alu->src[s].src) == rw_mask)
-                        st->rw_valid_checks++;
-                  }
                }
             }
          }
@@ -388,7 +367,7 @@ test_branchless_storage_and_tbuf(void)
    struct vk_descriptor_set_layout *tbuf_sets[] = {&tbuf_layout->vk};
    const struct vk_pipeline_robustness_state rs = vk_robustness_disabled;
 
-   /* 1. Compute 2D typed & formatless IMAGE_WRITE: 0 branches, umin(..., 0xffff). */
+   /* 1. Compute 2D typed & formatless IMAGE_WRITE: 0 branches, 0 global stores. */
    const enum pipe_format fmts[] = {PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_NONE};
    for (unsigned i = 0; i < ARRAY_SIZE(fmts); ++i) {
       nir_shader *nir = build_storage_shader(MESA_SHADER_COMPUTE,
@@ -397,13 +376,12 @@ test_branchless_storage_and_tbuf(void)
       hk_lower_nir(dev, nir, &rs, false, 1, img_sets, 0);
       struct nir_stats st = gather_stats(nir);
       CHECK(st.native_stores == 1 && st.native_store_array == 0);
-      CHECK(st.ifs == 0);
-      CHECK(st.umin_ffff >= 2);
+      CHECK(st.ifs == 0 && st.global_stores == 0);
       CHECK(compile_lowered_compute(nir) == 0);
       ralloc_free(nir);
    }
 
-   /* 2. Compute 2D-array formatless IMAGE_WRITE: 0 branches, layer cmpsel. */
+   /* 2. Compute 2D-array formatless IMAGE_WRITE: 0 branches, 0 global stores. */
    {
       nir_shader *nir = build_storage_shader(MESA_SHADER_COMPUTE,
                                              GLSL_SAMPLER_DIM_2D, true,
@@ -411,26 +389,28 @@ test_branchless_storage_and_tbuf(void)
       hk_lower_nir(dev, nir, &rs, false, 1, img_sets, 0);
       struct nir_stats st = gather_stats(nir);
       CHECK(st.native_stores == 1 && st.native_store_array == 1);
-      CHECK(st.ifs == 0);
-      CHECK(st.umin_ffff >= 2);
+      CHECK(st.ifs == 0 && st.global_stores == 0);
       CHECK(compile_lowered_compute(nir) == 0);
       ralloc_free(nir);
    }
 
-   /* 3. Compute formatless storage texel buffer IMAGE_WRITE: 0 branches. */
-   {
+   /* 3. Compute typed & formatless storage texel buffer load & store:
+    *    100% native TEXTURE_LOAD + IMAGE_WRITE, 0 branches, 0 SW codec. */
+   for (unsigned i = 0; i < ARRAY_SIZE(fmts); ++i) {
       nir_shader *nir = build_storage_shader(MESA_SHADER_COMPUTE,
                                              GLSL_SAMPLER_DIM_BUF, false,
-                                             PIPE_FORMAT_NONE, true, false);
+                                             fmts[i], true, true);
       hk_lower_nir(dev, nir, &rs, false, 1, img_sets, 0);
       struct nir_stats st = gather_stats(nir);
-      CHECK(st.native_stores == 1 && st.ifs == 0);
+      CHECK(st.native_stores == 1 && st.native_loads == 1 && st.txf_2d == 1);
+      CHECK(st.ifs == 0 && st.global_loads == 0 && st.global_stores == 1);
+      CHECK(st.fence_image_write == 1 && st.fence_tex_invalidate == 1);
       CHECK(compile_lowered_compute(nir) == 0);
       ralloc_free(nir);
    }
 
-   /* 4. Compute 2D & 2D-MS storage loads: branchless TEXTURE_LOAD / TEXTURE_LOAD_MS
-    *    inside the single uniform if (READ_VALID), with 0 nested bounds branches. */
+   /* 4. Compute 2D & 2D-MS storage loads: branchless image_load_apple9_agx
+    *    with 0 branches and 0 global loads. */
    for (unsigned ms = 0; ms < 2; ++ms) {
       enum glsl_sampler_dim dim = ms ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D;
       nir_shader *nir = build_storage_shader(MESA_SHADER_COMPUTE, dim, false,
@@ -439,28 +419,28 @@ test_branchless_storage_and_tbuf(void)
       hk_lower_nir(dev, nir, &rs, false, 1, img_sets, 0);
       struct nir_stats st = gather_stats(nir);
       CHECK(ms ? st.txf_ms == 1 : st.txf_2d == 1);
-      CHECK(st.txf_inside_nested_if == 0);
+      CHECK(st.ifs == 0 && st.global_loads == 0 && st.txf_inside_nested_if == 0);
       CHECK(compile_lowered_compute(nir) == 0);
       ralloc_free(nir);
    }
 
    /* 5. All image dimensions (1D, 1D-array, 2D, 2D-array, 3D, Cube, Cube-array,
-    *    2D-MS, 2D-MS-array): branchless TEXTURE_LOAD / TEXTURE_LOAD_MS and
-    *    branchless native IMAGE_WRITE compile cleanly end-to-end. */
+    *    2D-MS, 2D-MS-array): branchless native TEXTURE_LOAD / TEXTURE_LOAD_MS
+    *    and branchless native IMAGE_WRITE (including 2D-buffer MSAA PBE and
+    *    3D linear-2D alias arm) compile cleanly end-to-end with 0 SW codec. */
    static const struct {
       enum glsl_sampler_dim dim;
       bool array;
-      bool can_store;
    } dims[] = {
-      {GLSL_SAMPLER_DIM_1D, false, true},
-      {GLSL_SAMPLER_DIM_1D, true, true},
-      {GLSL_SAMPLER_DIM_2D, false, true},
-      {GLSL_SAMPLER_DIM_2D, true, true},
-      {GLSL_SAMPLER_DIM_3D, false, true},
-      {GLSL_SAMPLER_DIM_CUBE, false, true},
-      {GLSL_SAMPLER_DIM_CUBE, true, true},
-      {GLSL_SAMPLER_DIM_MS, false, false},
-      {GLSL_SAMPLER_DIM_MS, true, false},
+      {GLSL_SAMPLER_DIM_1D, false},
+      {GLSL_SAMPLER_DIM_1D, true},
+      {GLSL_SAMPLER_DIM_2D, false},
+      {GLSL_SAMPLER_DIM_2D, true},
+      {GLSL_SAMPLER_DIM_3D, false},
+      {GLSL_SAMPLER_DIM_CUBE, false},
+      {GLSL_SAMPLER_DIM_CUBE, true},
+      {GLSL_SAMPLER_DIM_MS, false},
+      {GLSL_SAMPLER_DIM_MS, true},
    };
    for (unsigned i = 0; i < ARRAY_SIZE(dims); ++i) {
       nir_shader *load_nir = build_storage_shader(MESA_SHADER_COMPUTE,
@@ -468,23 +448,29 @@ test_branchless_storage_and_tbuf(void)
                                                   PIPE_FORMAT_NONE, false, true);
       hk_lower_nir(dev, load_nir, &rs, false, 1, img_sets, 0);
       struct nir_stats lst = gather_stats(load_nir);
-      CHECK(dims[i].dim == GLSL_SAMPLER_DIM_MS ? lst.txf_ms == 1 : lst.txf_2d == 1 || dims[i].dim == GLSL_SAMPLER_DIM_3D);
-      CHECK(lst.txf_inside_nested_if == 0);
+      if (dims[i].dim == GLSL_SAMPLER_DIM_3D) {
+         CHECK(lst.txf_3d == 1 && lst.txf_2d == 1 && lst.ifs == 1);
+      } else {
+         CHECK(dims[i].dim == GLSL_SAMPLER_DIM_MS ? lst.txf_ms == 1 : lst.txf_2d == 1);
+         CHECK(lst.ifs == 0);
+      }
+      CHECK(lst.global_loads == 0 && lst.txf_inside_nested_if == 0);
       CHECK(compile_lowered_compute(load_nir) == 0);
       ralloc_free(load_nir);
 
-      if (dims[i].can_store) {
-         nir_shader *store_nir = build_storage_shader(MESA_SHADER_COMPUTE,
-                                                      dims[i].dim, dims[i].array,
-                                                      PIPE_FORMAT_NONE, true, false);
-         hk_lower_nir(dev, store_nir, &rs, false, 1, img_sets, 0);
-         struct nir_stats sst = gather_stats(store_nir);
-         CHECK(sst.native_stores == 1);
-         if (dims[i].dim != GLSL_SAMPLER_DIM_3D)
-            CHECK(sst.ifs == 0);
-         CHECK(compile_lowered_compute(store_nir) == 0);
-         ralloc_free(store_nir);
+      nir_shader *store_nir = build_storage_shader(MESA_SHADER_COMPUTE,
+                                                   dims[i].dim, dims[i].array,
+                                                   PIPE_FORMAT_NONE, true, false);
+      hk_lower_nir(dev, store_nir, &rs, false, 1, img_sets, 0);
+      struct nir_stats sst = gather_stats(store_nir);
+      if (dims[i].dim == GLSL_SAMPLER_DIM_3D) {
+         CHECK(sst.native_stores == 2 && sst.ifs == 1);
+      } else {
+         CHECK(sst.native_stores == 1 && sst.ifs == 0);
       }
+      CHECK(sst.global_stores == 0);
+      CHECK(compile_lowered_compute(store_nir) == 0);
+      ralloc_free(store_nir);
    }
 
    /* 6. Uniform texel buffer fetch: branchless sentinel 2D txf in the else of
@@ -585,22 +571,51 @@ test_branchless_storage_and_tbuf(void)
       ralloc_free(nir);
    }
 
-   /* 11. Fenced RW compute 2D stores (typed & formatless) must require BOTH
-    *     WRITE_VALID and READ_VALID so views whose reads stay global (e.g.
-    *     padded 2D block-texel aliases with READ_VALID == 0) fall back to
-    *     coherent global stores rather than mixing PBE writes with L1 loads. */
+   /* 11. Fenced RW compute 2D stores (typed & formatless): 100% branchless
+    *     native PBE store + lazy fence pair + native TEXTURE_LOAD with 0
+    *     software fallback branches or global fallback stores. */
    for (unsigned i = 0; i < ARRAY_SIZE(fmts); ++i) {
       nir_shader *nir = build_storage_shader(MESA_SHADER_COMPUTE,
                                              GLSL_SAMPLER_DIM_2D, false,
                                              fmts[i], true, true);
       hk_lower_nir(dev, nir, &rs, false, 1, img_sets, 0);
       struct nir_stats st = gather_stats(nir);
-      CHECK(st.native_stores == 1);
+      CHECK(st.native_stores == 1 && st.native_loads == 1);
       CHECK(st.fence_image_write == 1 && st.fence_tex_invalidate == 1);
-      CHECK(st.rw_valid_checks >= 1);
-      CHECK(st.global_stores >= 2); /* fallback image store + final result store */
+      CHECK(st.ifs == 0 && st.global_loads == 0 && st.global_stores == 1);
       CHECK(compile_lowered_compute(nir) == 0);
       ralloc_free(nir);
+   }
+
+   /* 12. Typed 4-byte 3D store (e.g. R32_FLOAT) skips the linear-2D alias
+    *     branch completely (0 ifs, 1 native IMAGE_WRITE_LAYERED). */
+   {
+      nir_shader *nir = build_storage_shader(MESA_SHADER_COMPUTE,
+                                             GLSL_SAMPLER_DIM_3D, false,
+                                             PIPE_FORMAT_R32_FLOAT, true, false);
+      hk_lower_nir(dev, nir, &rs, false, 1, img_sets, 0);
+      struct nir_stats st = gather_stats(nir);
+      CHECK(st.native_stores == 1 && st.native_store_array == 1);
+      CHECK(st.ifs == 0 && st.global_stores == 0);
+      CHECK(compile_lowered_compute(nir) == 0);
+      ralloc_free(nir);
+   }
+
+   /* 13. MSAA 2D & 2D-array RW (typed & formatless): 100% native 2D-buffer
+    *     PBE IMAGE_WRITE + lazy fence pair + native TEXTURE_LOAD_MS, 0 ifs. */
+   for (unsigned arr = 0; arr < 2; ++arr) {
+      for (unsigned i = 0; i < ARRAY_SIZE(fmts); ++i) {
+         nir_shader *nir = build_storage_shader(MESA_SHADER_COMPUTE,
+                                                GLSL_SAMPLER_DIM_MS, arr != 0,
+                                                fmts[i], true, true);
+         hk_lower_nir(dev, nir, &rs, false, 1, img_sets, 0);
+         struct nir_stats st = gather_stats(nir);
+         CHECK(st.native_stores == 1 && st.native_loads == 1 && st.txf_ms == 1);
+         CHECK(st.fence_image_write == 1 && st.fence_tex_invalidate == 1);
+         CHECK(st.ifs == 0 && st.global_loads == 0 && st.global_stores == 1);
+         CHECK(compile_lowered_compute(nir) == 0);
+         ralloc_free(nir);
+      }
    }
 
    destroy_set_layout(img_layout);
@@ -1310,6 +1325,7 @@ test_coalesced_lazy_image_fences(void)
       nir_def *lcoord = nir_vec4(&lb, nir_channel(&lb, lgid, 0), nir_channel(&lb, lgid, 1),
                                  nir_imm_int(&lb, 0), nir_imm_int(&lb, 0));
       nir_def *cond = nir_ine_imm(&lb, nir_channel(&lb, lgid, 0), 0);
+      nir_def *cond2 = nir_ine_imm(&lb, nir_channel(&lb, lgid, 1), 0);
       nir_push_loop(&lb);
       if (nested)
          nir_push_loop(&lb);
@@ -1328,10 +1344,14 @@ test_coalesced_lazy_image_fences(void)
                                                .dest_type = nir_type_float32);
       nir_store_global(&lb, in_ld, nir_imm_int64(&lb, 0x80000),
                        .write_mask = 0xf, .align_mul = 16);
+      nir_push_if(&lb, cond2);
       nir_jump(&lb, nir_jump_break);
+      nir_pop_if(&lb, NULL);
       nir_pop_loop(&lb, NULL);
       if (nested) {
+         nir_push_if(&lb, cond2);
          nir_jump(&lb, nir_jump_break);
+         nir_pop_if(&lb, NULL);
          nir_pop_loop(&lb, NULL);
       }
       nir_def *post_ld = nir_bindless_image_load(&lb, 4, 32, lhandle, lcoord,
@@ -1368,11 +1388,12 @@ test_coalesced_lazy_image_fences(void)
       ralloc_free(lb.shader);
    }
 
-   /* HIGH #6: native imageStore followed by volatile/coherent imageStore
-    * (global fallback store_global) MUST drain PBE before the global store. */
+   /* Coherent/volatile storage images lower 100% natively via hardware
+    * memory_coherence_device bits + immediate PBE drain (0x0650), with ZERO
+    * global fallback stores and non-CSEable image_load_apple9_agx ordering. */
    nir_builder gb = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
                                                    &agx_nir_options,
-                                                   "native_then_volatile_store");
+                                                   "native_coherent_rw_and_nocse");
    gb.shader->info.internal = false;
    gb.shader->info.workgroup_size[0] = 64;
    gb.shader->info.workgroup_size[1] = gb.shader->info.workgroup_size[2] = 1;
@@ -1380,6 +1401,12 @@ test_coalesced_lazy_image_fences(void)
    nir_def *ghandle = nir_bindless_image_agx(&gb, nir_imm_int(&gb, 0), .desc_set = 0);
    nir_def *gcoord = nir_vec4(&gb, nir_channel(&gb, ggid, 0), nir_channel(&gb, ggid, 1),
                               nir_imm_int(&gb, 0), nir_imm_int(&gb, 0));
+   nir_def *gload0 = nir_bindless_image_load(&gb, 4, 32, ghandle, gcoord,
+                                             nir_imm_int(&gb, 0), nir_imm_int(&gb, 0),
+                                             .image_dim = GLSL_SAMPLER_DIM_2D,
+                                             .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                                             .dest_type = nir_type_float32,
+                                             .access = ACCESS_COHERENT);
    nir_bindless_image_store(&gb, ghandle, gcoord, nir_imm_int(&gb, 0),
                             nir_imm_vec4(&gb, 1.0f, 2.0f, 3.0f, 4.0f),
                             nir_imm_int(&gb, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
@@ -1391,39 +1418,28 @@ test_coalesced_lazy_image_fences(void)
                             .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
                             .src_type = nir_type_float32,
                             .access = ACCESS_COHERENT);
-   nir_def *gloaded = nir_bindless_image_load(&gb, 4, 32, ghandle, gcoord,
-                                              nir_imm_int(&gb, 0), nir_imm_int(&gb, 0),
-                                              .image_dim = GLSL_SAMPLER_DIM_2D,
-                                              .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
-                                              .dest_type = nir_type_float32);
-   nir_store_global(&gb, gloaded, nir_imm_int64(&gb, 0x80000),
+   nir_def *gload1 = nir_bindless_image_load(&gb, 4, 32, ghandle, gcoord,
+                                             nir_imm_int(&gb, 0), nir_imm_int(&gb, 0),
+                                             .image_dim = GLSL_SAMPLER_DIM_2D,
+                                             .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                                             .dest_type = nir_type_float32,
+                                             .access = ACCESS_COHERENT);
+   nir_store_global(&gb, nir_fadd(&gb, gload0, gload1), nir_imm_int64(&gb, 0x80000),
                     .write_mask = 0xf, .align_mul = 16);
    nir_shader_gather_info(gb.shader, nir_shader_get_entrypoint(gb.shader));
    hk_lower_nir(dev, gb.shader, &rs, false, 1, img_sets, 0);
-   /* Verify fence_image_write appears before the coherent fallback store_global. */
-   bool seen_native = false, seen_pbe_before_coherent_store = false;
-   nir_foreach_block(blk, nir_shader_get_entrypoint(gb.shader)) {
-      nir_foreach_instr(ins, blk) {
-         if (ins->type != nir_instr_type_intrinsic)
-            continue;
-         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
-         if (intr->intrinsic == nir_intrinsic_image_store_apple9_agx)
-            seen_native = true;
-         else if (seen_native &&
-                  intr->intrinsic == nir_intrinsic_fence_image_write_apple9_agx)
-            seen_pbe_before_coherent_store = true;
-         else if (intr->intrinsic == nir_intrinsic_store_global &&
-                  (nir_intrinsic_access(intr) & ACCESS_COHERENT))
-            CHECK(seen_pbe_before_coherent_store);
-      }
-   }
-   CHECK(seen_native && seen_pbe_before_coherent_store);
+   /* Running CSE after lowering MUST keep both image_load_apple9_agx intact. */
+   nir_opt_cse(gb.shader);
+   struct nir_stats gst = gather_stats(gb.shader);
+   CHECK(gst.native_stores == 2 && gst.native_store_coherent == 1);
+   CHECK(gst.native_loads == 2 && gst.native_load_coherent == 2);
+   CHECK(gst.fence_image_write == 1 && gst.fence_tex_invalidate == 1);
+   CHECK(gst.global_loads == 0 && gst.global_stores == 1);
    CHECK(compile_lowered_compute(gb.shader) == 0);
    ralloc_free(gb.shader);
 
-   /* HIGH #3: store-only shader (ordered == true, fenced_stores == false) with
-    * a native PBE imageStore followed by an ACCESS_COHERENT imageStore (global
-    * fallback store_global) MUST still drain PBE before the global store. */
+   /* Store-only shader with normal + coherent store: both native PBE, coherent
+    * store emits immediate fence_image_write (0x0650), 0 global stores. */
    nir_builder sb = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
                                                    &agx_nir_options,
                                                    "store_only_native_then_coherent");
@@ -1446,33 +1462,18 @@ test_coalesced_lazy_image_fences(void)
                             .src_type = nir_type_float32,
                             .access = ACCESS_COHERENT);
    nir_shader_gather_info(sb.shader, nir_shader_get_entrypoint(sb.shader));
-   CHECK(hk_apple9_native_store_shader(sb.shader));
    hk_lower_nir(dev, sb.shader, &rs, false, 1, img_sets, 0);
-   bool so_native = false, so_pbe_before_coherent = false, so_coherent = false;
-   nir_foreach_block(blk, nir_shader_get_entrypoint(sb.shader)) {
-      nir_foreach_instr(ins, blk) {
-         if (ins->type != nir_instr_type_intrinsic)
-            continue;
-         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
-         if (intr->intrinsic == nir_intrinsic_image_store_apple9_agx)
-            so_native = true;
-         else if (so_native &&
-                  intr->intrinsic == nir_intrinsic_fence_image_write_apple9_agx)
-            so_pbe_before_coherent = true;
-         else if (intr->intrinsic == nir_intrinsic_store_global &&
-                  (nir_intrinsic_access(intr) & ACCESS_COHERENT)) {
-            so_coherent = true;
-            CHECK(so_pbe_before_coherent);
-         }
-      }
-   }
-   CHECK(so_native && so_coherent && so_pbe_before_coherent);
+   struct nir_stats sst = gather_stats(sb.shader);
+   CHECK(sst.native_stores == 2 && sst.native_store_coherent == 1);
+   CHECK(sst.fence_image_write == 1 && sst.fence_tex_invalidate == 0);
+   CHECK(sst.global_stores == 0);
    CHECK(compile_lowered_compute(sb.shader) == 0);
    ralloc_free(sb.shader);
 
    /* HIGH #5: 2D ACCESS_NON_READABLE bindless_image_atomic (lowered to global
     * by agx_nir_lower_images) + native 2D bindless_image_store + workgroup
-    * nir_var_image barrier MUST keep nir_var_mem_global on the barrier. */
+    * nir_var_image barrier MUST keep nir_var_mem_global on the barrier, and
+    * promote the coexisting image store to ACCESS_COHERENT. */
    nir_builder ab = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
                                                    &agx_nir_options,
                                                    "atomic_plus_native_wg_barrier");
@@ -1502,6 +1503,8 @@ test_coalesced_lazy_image_fences(void)
                .memory_modes = nir_var_image);
    nir_shader_gather_info(ab.shader, nir_shader_get_entrypoint(ab.shader));
    hk_lower_nir(dev, ab.shader, &rs, false, 1, img_sets, 0);
+   struct nir_stats abst = gather_stats(ab.shader);
+   CHECK(abst.native_stores == 1 && abst.native_store_coherent == 1);
    unsigned ab_wg_img = 0, ab_wg_global = 0;
    nir_foreach_block(blk, nir_shader_get_entrypoint(ab.shader)) {
       nir_foreach_instr(ins, blk) {
@@ -1521,9 +1524,61 @@ test_coalesced_lazy_image_fences(void)
    CHECK(compile_lowered_compute(ab.shader) == 0);
    ralloc_free(ab.shader);
 
+   /* Unused ACCESS_VOLATILE imageLoad must survive generic nir_opt_dce before
+    * Apple9 lowering and compile to a hardware fetch; ACCESS_CAN_REORDER must
+    * be cleared on image_load_apple9_agx. */
+   {
+      nir_builder vb = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                      &agx_nir_options,
+                                                      "volatile_dead_and_noreorder");
+      vb.shader->info.internal = false;
+      vb.shader->info.workgroup_size[0] = 64;
+      vb.shader->info.workgroup_size[1] = vb.shader->info.workgroup_size[2] = 1;
+      nir_def *vgid = nir_load_global_invocation_id(&vb, 32);
+      nir_def *vhandle = nir_bindless_image_agx(&vb, nir_imm_int(&vb, 0), .desc_set = 0);
+      nir_def *vcoord = nir_vec4(&vb, nir_channel(&vb, vgid, 0), nir_channel(&vb, vgid, 1),
+                                 nir_imm_int(&vb, 0), nir_imm_int(&vb, 0));
+      /* Unused volatile load */
+      (void)nir_bindless_image_load(&vb, 4, 32, vhandle, vcoord,
+                                    nir_imm_int(&vb, 0), nir_imm_int(&vb, 0),
+                                    .image_dim = GLSL_SAMPLER_DIM_2D,
+                                    .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                                    .dest_type = nir_type_float32,
+                                    .access = ACCESS_VOLATILE);
+      /* Live load annotated with ACCESS_CAN_REORDER */
+      nir_def *vkept = nir_bindless_image_load(&vb, 4, 32, vhandle, vcoord,
+                                               nir_imm_int(&vb, 0), nir_imm_int(&vb, 0),
+                                               .image_dim = GLSL_SAMPLER_DIM_2D,
+                                               .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+                                               .dest_type = nir_type_float32,
+                                               .access = ACCESS_CAN_REORDER);
+      nir_store_global(&vb, vkept, nir_imm_int64(&vb, 0x80000),
+                       .write_mask = 0xf, .align_mul = 16);
+      nir_shader_gather_info(vb.shader, nir_shader_get_entrypoint(vb.shader));
+      nir_opt_dce(vb.shader);
+      hk_lower_nir(dev, vb.shader, &rs, false, 1, img_sets, 0);
+      nir_opt_dce(vb.shader);
+      unsigned loads = 0, can_reorder = 0;
+      nir_foreach_block(blk, nir_shader_get_entrypoint(vb.shader)) {
+         nir_foreach_instr(ins, blk) {
+            if (ins->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_image_load_apple9_agx) {
+               loads++;
+               if (nir_intrinsic_access(intr) & ACCESS_CAN_REORDER)
+                  can_reorder++;
+            }
+         }
+      }
+      CHECK(loads == 2 && can_reorder == 0);
+      CHECK(compile_lowered_compute(vb.shader) == 0);
+      ralloc_free(vb.shader);
+   }
+
    destroy_set_layout(img_layout);
    free(dev);
-   puts("coalesced lazy image fences + loop break + barrier + global store + pure native wg: pass");
+   puts("coalesced lazy image fences + loop break + barrier + coherent + atomics: pass");
    return 0;
 }
 
@@ -1531,72 +1586,6 @@ int
 main(void)
 {
    glsl_type_singleton_init_or_ref();
-
-   /* Read, then store: native. */
-   nir_builder b = shader();
-   image_op(&b, LOAD);
-   image_op(&b, STORE);
-   CHECK(hk_apple9_native_store_shader(b.shader));
-   ralloc_free(b.shader);
-
-   /* Store, then read: the read could observe the native write. */
-   b = shader();
-   image_op(&b, STORE);
-   image_op(&b, LOAD);
-   CHECK(!hk_apple9_native_store_shader(b.shader));
-   ralloc_free(b.shader);
-
-   /* An atomic after a store reads it too. */
-   b = shader();
-   image_op(&b, STORE);
-   image_op(&b, nir_intrinsic_bindless_image_atomic);
-   CHECK(!hk_apple9_native_store_shader(b.shader));
-   ralloc_free(b.shader);
-
-   /* Read before store inside one loop: the next iteration reads the write. */
-   b = shader();
-   nir_push_loop(&b);
-   image_op(&b, LOAD);
-   image_op(&b, STORE);
-   nir_jump(&b, nir_jump_break);
-   nir_pop_loop(&b, NULL);
-   CHECK(!hk_apple9_native_store_shader(b.shader));
-   ralloc_free(b.shader);
-
-   /* Reads in a loop that ends before the stores: native. */
-   b = shader();
-   nir_push_loop(&b);
-   image_op(&b, LOAD);
-   nir_jump(&b, nir_jump_break);
-   nir_pop_loop(&b, NULL);
-   nir_push_loop(&b);
-   image_op(&b, STORE);
-   nir_jump(&b, nir_jump_break);
-   nir_pop_loop(&b, NULL);
-   CHECK(hk_apple9_native_store_shader(b.shader));
-   ralloc_free(b.shader);
-
-   /* Store in the then-branch, read in the else-branch: rejected (block order). */
-   b = shader();
-   nir_push_if(&b, nir_imm_true(&b));
-   image_op(&b, STORE);
-   nir_push_else(&b, NULL);
-   image_op(&b, LOAD);
-   nir_pop_if(&b, NULL);
-   CHECK(!hk_apple9_native_store_shader(b.shader));
-   ralloc_free(b.shader);
-
-   /* A second function: block order is no longer program order. */
-   b = shader();
-   image_op(&b, LOAD);
-   image_op(&b, STORE);
-   nir_function *callee = nir_function_create(b.shader, "callee");
-   nir_function_impl_create(callee);
-   CHECK(!hk_apple9_native_store_shader(b.shader));
-   ralloc_free(b.shader);
-
-   puts("native storage rw rule: order, loops, branches and calls pass");
-
    CHECK(test_branchless_storage_and_tbuf() == 0);
    CHECK(test_gpl_sw_needed() == 0);
    CHECK(test_soft_fault_ssbo_and_4b_vectorize() == 0);

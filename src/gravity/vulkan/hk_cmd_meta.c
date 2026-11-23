@@ -442,7 +442,7 @@ canonical_format_pipe(enum pipe_format fmt)
       CASE(R16G16,       R16G16_UINT),
       CASE(R11G11B10,    R11G11B10_FLOAT),
       CASE(R10G10B10A2,  R10G10B10A2_UNORM),
-      CASE(R9G9B9E5,     R9G9B9E5_FLOAT),
+      CASE(R9G9B9E5,     R32_UINT),
       CASE(R8G8B8A8,     R8G8B8A8_UINT),
       CASE(R32G32,       R32G32_UINT),
       CASE(R16G16B16A16, R16G16B16A16_UINT),
@@ -492,6 +492,7 @@ struct vk_meta_image_copy_key {
    enum pipe_format src_format, dst_format;
    unsigned block_size;
    unsigned nr_samples;
+   bool src_linear, dst_linear;
 };
 
 static nir_def *
@@ -565,12 +566,14 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key)
       msaa ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D;
    enum glsl_sampler_dim dim_src = src_is_buf ? GLSL_SAMPLER_DIM_BUF : dim_2d;
    enum glsl_sampler_dim dim_dst = dst_is_buf ? GLSL_SAMPLER_DIM_BUF : dim_2d;
+   bool src_array = !src_is_buf && !key->src_linear;
+   bool dst_array = !dst_is_buf && !key->dst_linear;
 
    const struct glsl_type *texture_type =
-      glsl_image_type(dim_src, !src_is_buf, GLSL_TYPE_UINT);
+      glsl_image_type(dim_src, src_array, GLSL_TYPE_UINT);
 
    const struct glsl_type *image_type =
-      glsl_image_type(dim_dst, !dst_is_buf, GLSL_TYPE_UINT);
+      glsl_image_type(dim_dst, dst_array, GLSL_TYPE_UINT);
 
    nir_variable *texture =
       nir_variable_create(b->shader, nir_var_image, texture_type, "source");
@@ -629,11 +632,13 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key)
             value1 = load_store_formatted(b, get_push(b, buffer), src_coord,
                                           NULL, key->dst_format);
          } else {
+            nir_alu_type src_type = util_format_is_pure_uint(key->src_format)
+               ? nir_type_uint32 : nir_type_float32;
             value1 = nir_image_deref_load(
                b, 4, 32, &deref->def, nir_pad_vec4(b, src_coord), ms_index,
                nir_imm_int(b, 0), .image_dim = dim_src,
-               .image_array = !src_is_buf, .format = key->src_format,
-               .access = ACCESS_NON_WRITEABLE, .dest_type = nir_type_uint32);
+               .image_array = src_array, .format = key->src_format,
+               .access = ACCESS_NON_WRITEABLE, .dest_type = src_type);
 
             /* Munge according to the implicit conversions so we get a bit copy */
             if (key->src_format != key->dst_format) {
@@ -648,11 +653,14 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key)
             load_store_formatted(b, get_push(b, buffer), dst_coord, value1,
                                  key->dst_format);
          } else {
+            nir_alu_type dst_type = util_format_is_pure_uint(key->dst_format)
+               ? nir_type_uint32 : nir_type_float32;
             nir_image_deref_store(b, image_deref, nir_pad_vec4(b, dst_coord),
                                   ms_index, value1, nir_imm_int(b, 0),
                                   .image_dim = dim_dst,
-                                  .image_array = !dst_is_buf,
-                                  .format = key->dst_format);
+                                  .image_array = dst_array,
+                                  .format = key->dst_format,
+                                  .src_type = dst_type);
          }
       }
       nir_pop_if(b, NULL);
@@ -854,6 +862,11 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
 
          bool is_3d = region->imageExtent.depth > 1;
 
+         struct hk_image *hk_img = container_of(image, struct hk_image, vk);
+         uint8_t src_plane = hk_image_aspects_to_plane(hk_img, aspect);
+         bool src_linear =
+            hk_img->planes[src_plane].layout.tiling == AIL_TILING_LINEAR &&
+            image->image_type != VK_IMAGE_TYPE_3D;
          struct vk_meta_image_copy_key key = {
             .key_type = VK_META_OBJECT_KEY_COPY_IMAGE_TO_BUFFER,
             .type = IMG2BUF,
@@ -861,6 +874,7 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
             .nr_samples = image->samples,
             .src_format = hk_format_to_pipe_format(canonical),
             .dst_format = hk_format_to_pipe_format(canonical),
+            .src_linear = src_linear,
          };
 
          VkPipelineLayout pipeline_layout;
@@ -881,8 +895,9 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
             .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
             .pNext = &src_view_usage,
             .image = pCopyBufferInfo->srcImage,
-            .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-            .format = canonical,
+            .viewType = src_linear ? VK_IMAGE_VIEW_TYPE_2D
+                                   : VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+            .format = vk_format_from_pipe_format(key.src_format),
             .subresourceRange =
                {
                   .aspectMask = region->imageSubresource.aspectMask,
@@ -1039,6 +1054,11 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
          uint32_t blocksize_B = util_format_get_blocksize(p_format);
          bool is_3d = region->imageExtent.depth > 1;
 
+         struct hk_image *hk_img = container_of(image, struct hk_image, vk);
+         uint8_t dst_plane = hk_image_aspects_to_plane(hk_img, aspect);
+         bool dst_linear =
+            hk_img->planes[dst_plane].layout.tiling == AIL_TILING_LINEAR &&
+            image->image_type != VK_IMAGE_TYPE_3D;
          struct vk_meta_image_copy_key key = {
             .key_type = VK_META_OBJECT_KEY_COPY_IMAGE_TO_BUFFER,
             .type = BUF2IMG,
@@ -1047,6 +1067,7 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
             .src_format = hk_format_to_pipe_format(canonical),
             .dst_format = canonical_format_pipe(
                hk_format_to_pipe_format(aspect_format(image->format, aspect))),
+            .dst_linear = dst_linear,
          };
 
          VkPipelineLayout pipeline_layout;
@@ -1080,8 +1101,9 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
             .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
             .pNext = &dst_view_usage,
             .image = info->dstImage,
-            .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-            .format = canonical,
+            .viewType = dst_linear ? VK_IMAGE_VIEW_TYPE_2D
+                                   : VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+            .format = vk_format_from_pipe_format(key.dst_format),
             .subresourceRange =
                {
                   .aspectMask = region->imageSubresource.aspectMask,
@@ -1197,6 +1219,17 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
                use_dst_aspect_mask ? region->dstSubresource.aspectMask
                                    : (1 << aspect);
 
+            struct hk_image *hk_src = container_of(src_image, struct hk_image, vk);
+            struct hk_image *hk_dst = container_of(dst_image, struct hk_image, vk);
+            uint8_t src_plane = hk_image_aspects_to_plane(
+               hk_src, region->srcSubresource.aspectMask & (1 << aspect));
+            uint8_t dst_plane = hk_image_aspects_to_plane(hk_dst, dst_aspect_mask);
+            bool src_linear =
+               hk_src->planes[src_plane].layout.tiling == AIL_TILING_LINEAR &&
+               src_image->image_type != VK_IMAGE_TYPE_3D;
+            bool dst_linear =
+               hk_dst->planes[dst_plane].layout.tiling == AIL_TILING_LINEAR &&
+               dst_image->image_type != VK_IMAGE_TYPE_3D;
             struct vk_meta_image_copy_key key = {
                .key_type = VK_META_OBJECT_KEY_COPY_IMAGE_TO_BUFFER,
                .type = IMG2IMG,
@@ -1205,6 +1238,8 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
                .src_format = hk_format_to_pipe_format(canonical),
                .dst_format = canonical_format_pipe(hk_format_to_pipe_format(
                   aspect_format(dst_image->format, dst_aspect_mask))),
+               .src_linear = src_linear,
+               .dst_linear = dst_linear,
             };
 
             assert(key.nr_samples == src_image->samples);
@@ -1229,8 +1264,9 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
                .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
                .pNext = &src_view_usage,
                .image = info->srcImage,
-               .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-               .format = canonical,
+               .viewType = src_linear ? VK_IMAGE_VIEW_TYPE_2D
+                                      : VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+               .format = vk_format_from_pipe_format(key.src_format),
                .subresourceRange =
                   {
                      .aspectMask =
@@ -1267,7 +1303,8 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
                .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
                .pNext = &dst_view_usage,
                .image = info->dstImage,
-               .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+               .viewType = dst_linear ? VK_IMAGE_VIEW_TYPE_2D
+                                      : VK_IMAGE_VIEW_TYPE_2D_ARRAY,
                .format = vk_format_from_pipe_format(key.dst_format),
                .subresourceRange =
                   {

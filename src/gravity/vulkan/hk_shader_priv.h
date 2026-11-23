@@ -34,14 +34,10 @@ enum hk_feature_key {
    HK_FEAT_SPARSE_IMAGE = BITFIELD_BIT(2),
    /* Sparse residency buffers may back storage texel buffers. */
    HK_FEAT_STORE_BUFFER_RESIDENCY = BITFIELD_BIT(3),
-   /* Storage texel buffer descriptors may lack a native entry on devices with
-    * both descriptorBuffer and sparseResidencyBuffer (vkGetDescriptorEXT
-    * cannot attach a buffer residency table). */
-   HK_FEAT_CHECKED_BUF_STORES = BITFIELD_BIT(4),
    /* Pipeline statistics queries instrument fragment shaders. */
-   HK_FEAT_PIPELINE_STATS = BITFIELD_BIT(5),
+   HK_FEAT_PIPELINE_STATS = BITFIELD_BIT(4),
    /* Primitives-generated queries require SW VS/TES variants for passthrough GS. */
-   HK_FEAT_PRIMS_GENERATED = BITFIELD_BIT(6),
+   HK_FEAT_PRIMS_GENERATED = BITFIELD_BIT(5),
 };
 
 

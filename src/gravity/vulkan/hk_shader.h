@@ -550,15 +550,6 @@ void hk_apple9_bodies_finish(struct hk_device *dev);
 bool hk_apple9_lower_sparse_residency(nir_shader *nir);
 bool hk_lower_bounded_global_loads(nir_shader *nir, bool soft_fault, bool apple9);
 
-bool hk_apple9_native_store_shader(const nir_shader *nir);
-
-/* Encode a storage-image texel into zero-padded words: from the descriptor's
- * store encoding when it names a canonical format, otherwise from its
- * per-component layout. Exposed for the encoder unit test. */
-nir_def *hk_apple9_encode_texel_fast(struct nir_builder *b, nir_def *value,
-                                     nir_def *layout, bool floating,
-                                     nir_def *encode);
-
 #define hk_foreach_variant(api_shader, var)                                    \
    for (struct hk_shader *var = api_shader->variants;                          \
         var < api_shader->variants + hk_num_variants(api_shader->vk.stage);    \

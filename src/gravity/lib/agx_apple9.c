@@ -41,7 +41,7 @@ agx_apple9_translate_pbe(void *out, const struct agx_pbe_packed *state,
       return false;
 
    bool linear = layout->tiling == AIL_TILING_LINEAR;
-   if (linear && (level || layered || layer_count > 1 || layout->compressed))
+   if (linear && (level || layer_count > 1 || layout->compressed))
       return false;
    unsigned descriptor_level = linear ? level : 0;
    uint64_t base = layer_base + layout->level_offsets_B[descriptor_level] -
@@ -69,7 +69,9 @@ agx_apple9_translate_pbe(void *out, const struct agx_pbe_packed *state,
    memcpy(header, state, sizeof(header));
    unsigned width = u_minify(layout->width_px, descriptor_level);
    unsigned height = u_minify(layout->height_px, descriptor_level);
-   header[0] = (header[0] & 0x00fffff0) | dimension | ((width - 1) << 24);
+   enum agx_layout pbe_layout = agx_translate_layout(layout->tiling);
+   header[0] = (header[0] & 0x00ffffc0) | dimension | (pbe_layout << 4) |
+               ((width - 1) << 24);
    header[1] = ((width - 1) >> 8) | ((height - 1) << 6) |
                (header[1] & 0x01000000) |
                ((uint32_t)layout->compressed << 27);

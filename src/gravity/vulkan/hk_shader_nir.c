@@ -1848,212 +1848,6 @@ hk_apple9_lower_texel_buffer(nir_builder *b, nir_tex_instr *tex, UNUSED void *da
    return true;
 }
 
-/* Loads or stores a texel of 1 to 16 bytes as zero-padded 32-bit words. */
-static nir_def *
-hk_apple9_load_texel_words(nir_builder *b, nir_def *addr, nir_def *size_B,
-                           enum gl_access_qualifier access)
-{
-   nir_def *zero = nir_imm_int(b, 0);
-   nir_push_if(b, nir_ult_imm(b, size_B, 4));
-   nir_push_if(b, nir_ieq_imm(b, size_B, 1));
-   nir_def *r8 = nir_u2u32(b, nir_load_global(b, 1, 8, addr, .align_mul = 1,
-                                              .access = access));
-   nir_push_else(b, NULL);
-   nir_def *r16 = nir_u2u32(b, nir_load_global(b, 1, 16, addr, .align_mul = 2,
-                                               .access = access));
-   nir_pop_if(b, NULL);
-   nir_def *small = nir_vec4(b, nir_if_phi(b, r8, r16), zero, zero, zero);
-   nir_push_else(b, NULL);
-   nir_push_if(b, nir_ieq_imm(b, size_B, 4));
-   nir_def *r32 = nir_vec4(b, nir_load_global(b, 1, 32, addr, .align_mul = 4,
-                                              .access = access),
-                           zero, zero, zero);
-   nir_push_else(b, NULL);
-   nir_push_if(b, nir_ieq_imm(b, size_B, 8));
-   nir_def *r64 = nir_pad_vector_imm_int(
-      b, nir_load_global(b, 2, 32, addr, .align_mul = 8, .access = access), 0, 4);
-   nir_push_else(b, NULL);
-   nir_def *r128 = nir_load_global(b, 4, 32, addr, .align_mul = 16,
-                                   .access = access);
-   nir_pop_if(b, NULL);
-   nir_def *wide = nir_if_phi(b, r64, r128);
-   nir_pop_if(b, NULL);
-   nir_def *large = nir_if_phi(b, r32, wide);
-   nir_pop_if(b, NULL);
-   return nir_if_phi(b, small, large);
-}
-
-static void
-hk_apple9_store_texel_words(nir_builder *b, nir_def *addr, nir_def *size_B,
-                            nir_def *words, enum gl_access_qualifier access)
-{
-   nir_def *w0 = nir_channel(b, words, 0);
-   nir_push_if(b, nir_ieq_imm(b, size_B, 1));
-   nir_store_global(b, nir_u2u8(b, w0), addr, .align_mul = 1, .access = access);
-   nir_push_else(b, NULL);
-   nir_push_if(b, nir_ieq_imm(b, size_B, 2));
-   nir_store_global(b, nir_u2u16(b, w0), addr, .align_mul = 2, .access = access);
-   nir_push_else(b, NULL);
-   nir_push_if(b, nir_ieq_imm(b, size_B, 4));
-   nir_store_global(b, w0, addr, .align_mul = 4, .access = access);
-   nir_push_else(b, NULL);
-   nir_push_if(b, nir_ieq_imm(b, size_B, 8));
-   nir_store_global(b, nir_trim_vector(b, words, 2), addr, .align_mul = 8,
-                    .write_mask = 0x3, .access = access);
-   nir_push_else(b, NULL);
-   nir_store_global(b, words, addr, .align_mul = 16, .write_mask = 0xf,
-                    .access = access);
-   nir_pop_if(b, NULL);
-   nir_pop_if(b, NULL);
-   nir_pop_if(b, NULL);
-   nir_pop_if(b, NULL);
-}
-
-static nir_def *
-hk_apple9_texel_word(nir_builder *b, nir_def *words, nir_def *index)
-{
-   nir_def *w = nir_channel(b, words, 0);
-   for (unsigned i = 1; i < 4; ++i)
-      w = nir_bcsel(b, nir_ieq_imm(b, index, i), nir_channel(b, words, i), w);
-   return w;
-}
-
-/* Decode a texel from the per-component layout of its descriptor, as
- * written by hk_apple9_texel_layout. Now that all non-coherent/non-MS
- * stages use native HW TEXTURE_LOAD / TEXTURE_LOAD_MS, this runs only on
- * rare software fallback paths (padded block-texel aliases, coherent/volatile
- * loads, or unrouted loads), so a single compact branchless select suffices. */
-static nir_def *
-hk_apple9_decode_texel(nir_builder *b, nir_def *words, nir_def *layout,
-                       bool floating)
-{
-   nir_def *rgba[4];
-   for (unsigned c = 0; c < 4; ++c) {
-      nir_def *fmt = nir_channel(b, layout, c);
-      nir_def *kind = nir_ushr_imm(b, fmt, 18);
-      nir_def *raw = hk_apple9_texel_word(
-         b, words, nir_ushr_imm(b, nir_iand_imm(b, fmt, 0xff), 2));
-      nir_def *shift = nir_iand_imm(b, nir_ushr_imm(b, fmt, 8), 31);
-      nir_def *width = nir_iadd_imm(b, nir_iand_imm(b, nir_ushr_imm(b, fmt, 13), 31), 1);
-      nir_def *extend = nir_isub(b, nir_imm_int(b, 32), width);
-      nir_def *mask = nir_ushr(b, nir_imm_int(b, -1), extend);
-      nir_def *u = nir_iand(b, nir_ushr(b, raw, shift), mask);
-      nir_def *i = nir_ishr(b, nir_ishl(b, u, extend), extend);
-      nir_def *value;
-      if (floating) {
-         nir_def *unorm = nir_fdiv(b, nir_u2f32(b, u), nir_u2f32(b, mask));
-         nir_def *snorm = nir_fmax(b, nir_imm_float(b, -1.0),
-            nir_fdiv(b, nir_i2f32(b, i), nir_u2f32(b, nir_ushr_imm(b, mask, 1))));
-         value = nir_bcsel(b, nir_ieq_imm(b, kind, HK_TEXEL_SNORM), snorm, unorm);
-         value = nir_bcsel(b, nir_ieq_imm(b, kind, HK_TEXEL_FLOAT16),
-                           nir_channel(b, nir_unpack_half_2x16(b, u), 0), value);
-         value = nir_bcsel(b, nir_ieq_imm(b, kind, HK_TEXEL_FLOAT32), raw, value);
-         if (c < 3) {
-            nir_def *w0 = nir_channel(b, words, 0);
-            value = nir_bcsel(b, nir_ieq_imm(b, kind, HK_TEXEL_FLOAT11),
-               nir_channel(b, nir_format_unpack_11f11f10f(b, w0), c), value);
-            value = nir_bcsel(b, nir_ieq_imm(b, kind, HK_TEXEL_RGB9E5),
-               nir_channel(b, nir_format_unpack_r9g9b9e5(b, w0), c), value);
-         }
-      } else {
-         value = nir_bcsel(b, nir_ieq_imm(b, kind, HK_TEXEL_SINT), i, u);
-      }
-      value = nir_bcsel(b, nir_ieq_imm(b, kind, HK_TEXEL_ZERO), nir_imm_int(b, 0), value);
-      rgba[c] = nir_bcsel(b, nir_ieq_imm(b, kind, HK_TEXEL_ONE),
-                          floating ? nir_imm_float(b, 1.0) : nir_imm_int(b, 1),
-                          value);
-   }
-   return nir_vec(b, rgba, 4);
-}
-
-/* The common unsigned-float packer clamps with maximumNumber, which turns
- * NaNs into zero. Classify the original bits and preserve NaNs, including
- * payloads lost by mantissa truncation. Finite and infinity encodings retain
- * the common packer's behavior. */
-static nir_def *
-hk_apple9_pack_float11(nir_builder *b, nir_def *rgb)
-{
-   nir_def *packed = nir_format_pack_11f11f10f(b, rgb);
-   const unsigned shifts[] = {0, 11, 22};
-   const uint32_t masks[] = {0x7ff, 0x7ff, 0x3ff};
-   const uint32_t nans[] = {0x7e0, 0x7e0, 0x3f0};
-   for (unsigned c = 0; c < 3; ++c) {
-      nir_def *is_nan = nir_ult(b, nir_imm_int(b, 0x7f800000),
-         nir_iand_imm(b, nir_channel(b, rgb, c), 0x7fffffff));
-      nir_def *repaired = nir_ior_imm(b,
-         nir_iand_imm(b, packed, ~(masks[c] << shifts[c])),
-         nans[c] << shifts[c]);
-      packed = nir_bcsel(b, is_nan, repaired, packed);
-   }
-   return packed;
-}
-
-/* Encode a texel into zero-padded 32-bit words for its descriptor layout.
- * All normal storage writes across compute, vertex, and fragment stages now
- * use native hardware IMAGE_WRITE (including 16-bit and fenced FS RW), so
- * this compact branchless encoder handles only rare software fallback cases
- * (MS writes, coherent/volatile, R9G9B9E5/sRGB, compressed block-texel
- * stride mismatches). */
-static nir_def *
-hk_apple9_encode_texel(nir_builder *b, nir_def *value, nir_def *layout,
-                       bool floating)
-{
-   nir_def *words[4] = {
-      nir_imm_int(b, 0), nir_imm_int(b, 0), nir_imm_int(b, 0), nir_imm_int(b, 0),
-   };
-   nir_def *rgb = nir_trim_vector(b, value, 3);
-   for (unsigned c = 0; c < 4; ++c) {
-      nir_def *fmt = nir_channel(b, layout, c);
-      nir_def *kind = nir_ushr_imm(b, fmt, 18);
-      nir_def *index = nir_ushr_imm(b, nir_iand_imm(b, fmt, 0xff), 2);
-      nir_def *shift = nir_iand_imm(b, nir_ushr_imm(b, fmt, 8), 31);
-      nir_def *width = nir_iadd_imm(b, nir_iand_imm(b, nir_ushr_imm(b, fmt, 13), 31), 1);
-      nir_def *mask = nir_ushr(b, nir_imm_int(b, -1),
-                               nir_isub(b, nir_imm_int(b, 32), width));
-      nir_def *v = nir_channel(b, value, c);
-      nir_def *bits = v;
-      if (floating) {
-         nir_def *unorm = nir_f2u32(b, nir_fround_even(b,
-            nir_fmul(b, nir_fsat(b, v), nir_u2f32(b, mask))));
-         nir_def *snorm = nir_f2i32(b, nir_fround_even(b,
-            nir_fmul(b, nir_fmin(b, nir_fmax(b, v, nir_imm_float(b, -1.0)),
-                                 nir_imm_float(b, 1.0)),
-                     nir_u2f32(b, nir_ushr_imm(b, mask, 1)))));
-         bits = nir_bcsel(b, nir_ieq_imm(b, kind, HK_TEXEL_SNORM), snorm, unorm);
-         bits = nir_bcsel(b, nir_ieq_imm(b, kind, HK_TEXEL_FLOAT16),
-                          nir_pack_half_2x16_split(b, v, nir_imm_float(b, 0)), bits);
-         bits = nir_bcsel(b, nir_ieq_imm(b, kind, HK_TEXEL_FLOAT32), v, bits);
-      }
-      bits = nir_ishl(b, nir_iand(b, bits, mask), shift);
-      /* Packed float formats encode all three components at once. */
-      if (floating && c == 0) {
-         bits = nir_bcsel(b, nir_ieq_imm(b, kind, HK_TEXEL_FLOAT11),
-                          hk_apple9_pack_float11(b, rgb), bits);
-         bits = nir_bcsel(b, nir_ieq_imm(b, kind, HK_TEXEL_RGB9E5),
-                          nir_format_pack_r9g9b9e5(b, rgb), bits);
-      } else if (floating && c < 3) {
-         bits = nir_bcsel(b, nir_ior(b, nir_ieq_imm(b, kind, HK_TEXEL_FLOAT11),
-                                     nir_ieq_imm(b, kind, HK_TEXEL_RGB9E5)),
-                          nir_imm_int(b, 0), bits);
-      }
-      bits = nir_bcsel(b, nir_ior(b, nir_ieq_imm(b, kind, HK_TEXEL_ZERO),
-                                  nir_ieq_imm(b, kind, HK_TEXEL_ONE)),
-                       nir_imm_int(b, 0), bits);
-      for (unsigned w = 0; w < 4; ++w) {
-         words[w] = nir_bcsel(b, nir_ieq_imm(b, index, w),
-                              nir_ior(b, words[w], bits), words[w]);
-      }
-   }
-   return nir_vec(b, words, 4);
-}
-
-nir_def *
-hk_apple9_encode_texel_fast(nir_builder *b, nir_def *value, nir_def *layout,
-                            bool floating, UNUSED nir_def *encode)
-{
-   return hk_apple9_encode_texel(b, value, layout, floating);
-}
-
 /* Storage texel buffers carry their full RW base address inside
  * hk_apple9_storage_descriptor::buf.base. */
 static nir_def *
@@ -2101,199 +1895,38 @@ hk_apple9_lower_buffer_address(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
-/* Storage access without a shader format reads the texel layout from the
- * Apple9 storage descriptor, then converts each component at run time.
- */
-/* Storage-image loads can read through the texture unit, whose cache does
- * not observe shader writes. That is only correct for a load that no image
- * write or atomic of the same invocation can precede: none earlier in
- * program order, none in a loop around it, and no image barrier that could
- * make another invocation's write visible. Volatile loads stay on memory,
- * as do coherent ones when the shader writes images at all.
- */
-static bool
-hk_apple9_image_write(const nir_intrinsic_instr *intr)
-{
-   switch (intr->intrinsic) {
-   case nir_intrinsic_bindless_image_store:
-   case nir_intrinsic_bindless_image_atomic:
-   case nir_intrinsic_bindless_image_atomic_swap:
-      return true;
-   default:
-      return false;
-   }
-}
+static nir_def *hk_apple9_storage_buffer_residency_code(nir_builder *b,
+                                                        nir_def *desc,
+                                                        nir_def *x);
 
-static nir_loop *
-hk_outermost_loop(nir_block *block)
-{
-   nir_loop *loop = NULL;
-   for (nir_cf_node *n = block->cf_node.parent; n; n = n->parent) {
-      if (n->type == nir_cf_node_loop)
-         loop = nir_cf_node_as_loop(n);
-   }
-   return loop;
-}
-
-static void
-hk_apple9_texture_route_loads(nir_shader *nir, struct set *safe, bool fenced)
-{
-   if (nir->info.internal)
-      return;
-   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
-   struct set *write_loops = _mesa_pointer_set_create(NULL);
-   bool writes = false, ms_writes = false;
-   nir_foreach_block(block, impl) {
-      nir_foreach_instr(instr, block) {
-         if (instr->type == nir_instr_type_intrinsic &&
-             hk_apple9_image_write(nir_instr_as_intrinsic(instr))) {
-            nir_intrinsic_instr *w = nir_instr_as_intrinsic(instr);
-            writes = true;
-            ms_writes |= nir_intrinsic_image_dim(w) == GLSL_SAMPLER_DIM_MS;
-            nir_loop *loop = hk_outermost_loop(block);
-            if (loop)
-               _mesa_set_add(write_loops, loop);
-         }
-      }
-   }
-   bool written = false;
-   nir_foreach_block(block, impl) {
-      nir_loop *loop = hk_outermost_loop(block);
-      bool loop_writes = loop && _mesa_set_search(write_loops, loop);
-      nir_foreach_instr(instr, block) {
-         if (instr->type != nir_instr_type_intrinsic)
-            continue;
-         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-         if (hk_apple9_image_write(intr)) {
-            written = true;
-         } else if (intr->intrinsic == nir_intrinsic_barrier) {
-            if (writes && (nir_intrinsic_memory_modes(intr) & nir_var_image))
-               written = true;
-         } else if (intr->intrinsic == nir_intrinsic_bindless_image_load ||
-                    intr->intrinsic == nir_intrinsic_bindless_image_sparse_load) {
-            enum gl_access_qualifier access = nir_intrinsic_access(intr);
-            enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
-            /* After fenced native stores (fence_stores), every non-coherent,
-             * non-volatile load goes through the texture unit: only the
-             * texture unit observes the fenced write in all cases. MS storage
-             * writes stay on global memory (no HW MS PBE), so MS loads only
-             * route through TEXTURE_LOAD_MS when no MS write precedes them. */
-            bool ok_order = dim == GLSL_SAMPLER_DIM_MS
-               ? ((!written && !loop_writes) || (fenced && !ms_writes))
-               : (fenced || (!written && !loop_writes));
-            if (ok_order &&
-                !(access & ACCESS_VOLATILE) &&
-                !(writes && (access & ACCESS_COHERENT)) &&
-                dim != GLSL_SAMPLER_DIM_BUF &&
-                dim != GLSL_SAMPLER_DIM_SUBPASS && dim != GLSL_SAMPLER_DIM_SUBPASS_MS)
-               _mesa_set_add(safe, intr);
-         }
-      }
-   }
-   _mesa_set_destroy(write_loops, NULL);
-}
-
-/* Fetch a storage texel through the native entry of the descriptor that
- * load handle `handle` points at, see hk_apple9_storage_descriptor.
- * Hardware TEXTURE_LOAD clips spatial coordinates (x, y) natively and returns
- * format-aware (0, 0, 0, alpha_default) on OOB; hardware clamps layer/sample
- * (and 3D ro_storage keeps full mip-tree depth rather than sliced depth), so
- * array, cube, 3D, and MS views force x OOB branchlessly via cmpsel. */
+/* Linear 2D-buffer coordinate for a multi-slice 3D block-texel alias whose
+ * descriptor sets HK_APPLE9_STORAGE_LINEAR_2D_INDEX: twiddle (x, y) within
+ * the compressed mip level's tile geometry, add z * layer_stride_el, and map
+ * OOB lanes branchlessly to HK_APPLE9_TBUF_OOB_SENTINEL. */
 static nir_def *
-hk_apple9_texture_load(nir_builder *b, nir_intrinsic_instr *intr,
-                       nir_intrinsic_instr *handle, nir_def *desc_addr,
-                       nir_def *coord, bool sparse)
+hk_apple9_alias_3d_xyz(nir_builder *b, nir_def *desc, nir_def *x, nir_def *y,
+                       nir_def *z, nir_def *in_bounds)
 {
-   enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
-   bool cube = dim == GLSL_SAMPLER_DIM_CUBE;
-   bool ms = dim == GLSL_SAMPLER_DIM_MS;
-   bool array = nir_intrinsic_image_array(intr) || cube;
-   coord = nir_u2u32(b, coord);
-   nir_def *x = nir_channel(b, coord, 0);
-   nir_def *y = dim == GLSL_SAMPLER_DIM_1D ? nir_imm_int(b, 0) : nir_channel(b, coord, 1);
-   nir_def *sample = NULL;
-   nir_def *tex_coord;
-   unsigned coords;
-
-   if (ms) {
-      nir_def *samples = nir_load_global_constant(b, 1, 32,
-         nir_iadd_imm(b, desc_addr,
-            offsetof(struct hk_apple9_storage_descriptor, extent[3])),
-         .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
-      nir_def *raw_sample = nir_u2u32(b, intr->src[2].ssa);
-      nir_def *valid = nir_ult(b, raw_sample, samples);
-      nir_def *layer = NULL;
-      if (array) {
-         nir_def *layers = nir_load_global_constant(b, 1, 32,
-            nir_iadd_imm(b, desc_addr,
-               offsetof(struct hk_apple9_storage_descriptor, extent[2])),
-            .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
-         nir_def *raw_layer = nir_channel(b, coord, 2);
-         valid = nir_iand(b, valid, nir_ult(b, raw_layer, layers));
-         layer = nir_bcsel(b, valid, raw_layer, nir_imm_int(b, 0));
-      }
-      x = nir_bcsel(b, valid, x, nir_imm_int(b, HK_APPLE9_PBE_COORD_MAX));
-      sample = nir_bcsel(b, valid, raw_sample, nir_imm_int(b, 0));
-      coords = 2 + array;
-      tex_coord = array ? nir_vec3(b, x, y, layer) : nir_vec2(b, x, y);
-   } else if (array || dim == GLSL_SAMPLER_DIM_3D) {
-      /* Storage descriptor extent[2] holds layer count (1D/2D array, cube) or
-       * sliced Z depth (3D). Force x OOB branchlessly when layer/z is OOB. */
-      nir_def *layers = nir_load_global_constant(b, 1, 32,
-         nir_iadd_imm(b, desc_addr,
-            offsetof(struct hk_apple9_storage_descriptor, extent[2])),
-         .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
-      nir_def *raw_z = nir_channel(b, coord, dim == GLSL_SAMPLER_DIM_1D ? 1 : 2);
-      nir_def *in_z = nir_ult(b, raw_z, layers);
-      x = nir_bcsel(b, in_z, x, nir_imm_int(b, -1));
-      nir_def *z = nir_bcsel(b, in_z, raw_z, nir_imm_int(b, 0));
-      coords = 3;
-      tex_coord = nir_vec3(b, x, y, z);
-   } else {
-      coords = 2;
-      tex_coord = nir_vec2(b, x, y);
-   }
-
-   nir_def *native = nir_bindless_image_agx(
-      b, nir_iadd_imm(b, handle->src[0].ssa,
-                      offsetof(struct hk_apple9_storage_descriptor, texture) -
-                         AGX_APPLE9_DESCRIPTOR_TEXTURE_ENTRY *
-                            AGX_APPLE9_TEXTURE_TABLE_STRIDE),
-      .desc_set = nir_intrinsic_desc_set(handle));
-   nir_tex_instr *tex = nir_tex_instr_create(b->shader, 3);
-   tex->op = ms ? nir_texop_txf_ms : nir_texop_txf;
-   tex->sampler_dim = (cube || dim == GLSL_SAMPLER_DIM_1D) ? GLSL_SAMPLER_DIM_2D : dim;
-   tex->is_array = array;
-   tex->is_sparse = sparse;
-   tex->coord_components = coords;
-   nir_alu_type base_type = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr));
-   tex->dest_type = base_type | 32;
-   /* Spatial OOB is handled natively by HW TEXTURE_LOAD, and layer/z/sample
-    * bounds were applied branchlessly above (and level is always 0). The
-    * backend's apple9_bound_texel_fetch reads texture_info adjacent to a
-    * sampled handle, which does not exist beside storage->texture. */
-   tex->backend_flags |= AGX_TEXTURE_FLAG_NO_CLAMP |
-                         AGX_APPLE9_TEXTURE_FETCH_BOUNDED;
-   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, tex_coord);
-   tex->src[1] = ms ? nir_tex_src_for_ssa(nir_tex_src_ms_index, sample)
-                    : nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(b, 0));
-   tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, native);
-   nir_def_init(&tex->instr, &tex->def, 4 + sparse, 32);
-   nir_builder_instr_insert(b, &tex->instr);
-   if (intr->def.bit_size == 32)
-      return &tex->def;
-   nir_def *color = nir_trim_vector(b, &tex->def, 4);
-   color = base_type == nir_type_float
-              ? nir_f2fN(b, color, intr->def.bit_size)
-              : nir_u2uN(b, color, intr->def.bit_size);
-   if (!sparse)
-      return color;
-   nir_scalar comps[5];
-   for (unsigned c = 0; c < 4; ++c)
-      comps[c] = nir_get_scalar(color, c);
-   comps[4] = nir_get_scalar(nir_u2uN(b, nir_channel(b, &tex->def, 4),
-                                      intr->def.bit_size), 0);
-   return nir_vec_scalars(b, comps, 5);
+   /* Omit ACCESS_UNIFORM_SAFE_AGX so this cold-arm metadata load stays inside
+    * the uniform LINEAR_2D_INDEX branch instead of bloating normal 3D preambles. */
+   nir_def *meta = nir_load_global_constant(b, 3, 32,
+      nir_iadd_imm(b, desc,
+                   offsetof(struct hk_apple9_storage_descriptor, alias_3d)),
+      .align_mul = 16);
+   nir_def *layer_stride_el = nir_channel(b, meta, 0);
+   nir_def *aligned_width_el = nir_channel(b, meta, 1);
+   nir_def *tile_wh = nir_channel(b, meta, 2);
+   nir_def *tile_w = nir_u2u16(b, tile_wh);
+   nir_def *tile_h = nir_u2u16(b, nir_ushr_imm(b, tile_wh, 16));
+   nir_def *xy16 = nir_vec2(b, nir_u2u16(b, x), nir_u2u16(b, y));
+   nir_def *twiddled =
+      libagx_twiddle_coordinates(b, xy16, tile_w, tile_h, aligned_width_el);
+   nir_def *idx = nir_iadd(b, twiddled, nir_imul(b, z, layer_stride_el));
+   nir_def *e = nir_bcsel(b, in_bounds, idx,
+                          nir_imm_int(b, HK_APPLE9_TBUF_OOB_SENTINEL));
+   return nir_vec3(b, nir_iand_imm(b, e, AGX_TEXTURE_BUFFER_WIDTH - 1),
+                   nir_ushr_imm(b, e, util_logbase2(AGX_TEXTURE_BUFFER_WIDTH)),
+                   nir_imm_int(b, 0));
 }
 
 static nir_def *
@@ -2310,389 +1943,263 @@ hk_apple9_pack_load_result(nir_builder *b, nir_def *color, nir_def *code,
    return nir_vec_scalars(b, comps, num_components);
 }
 
-/* Whether the descriptor behind load handle `tex` has a native entry. */
+/* Fetch a storage texel through the inline native texture descriptor at
+ * offset 96 of hk_apple9_storage_descriptor using the non-reorderable
+ * image_load_apple9_agx intrinsic (propagating coherent/volatile directly
+ * into hardware TEXTURE_LOAD / TEXTURE_LOAD_MS). Logical bounds are clipped
+ * branchlessly against storage->extent so padded/POT-tail block-texel aliases,
+ * sliced 3D views, MSAA views, storage texel buffers, and null descriptors
+ * return format-aware (0, 0, 0, alpha_default) without software format decode. */
 static nir_def *
-hk_apple9_native_ok(nir_builder *b, nir_def *tex)
-{
-   return nir_ine_imm(b, nir_iand_imm(b,
-      nir_load_global_constant(b, 1, 32,
-         nir_iadd_imm(b, nir_load_from_texture_handle_agx(b, tex),
-                      offsetof(struct hk_apple9_storage_descriptor, native_ok)),
-         .align_mul = 4), HK_APPLE9_STORAGE_READ_VALID), 0);
-}
-
-/* Whether the descriptor behind load handle `tex` is a sparse-resident image
- * with a native entry whose hardware sparse page table can answer residency. */
-static nir_def *
-hk_apple9_sparse_read_ok(nir_builder *b, nir_def *tex)
-{
-   const uint32_t mask = HK_APPLE9_STORAGE_READ_VALID | HK_APPLE9_STORAGE_SPARSE;
-   return nir_ieq_imm(b, nir_iand_imm(b,
-      nir_load_global_constant(b, 1, 32,
-         nir_iadd_imm(b, nir_load_from_texture_handle_agx(b, tex),
-                      offsetof(struct hk_apple9_storage_descriptor, native_ok)),
-         .align_mul = 4), mask), mask);
-}
-
-static nir_cf_node *
-hk_apple9_outer_loop(nir_block *block)
-{
-   nir_cf_node *loop = NULL;
-   for (nir_cf_node *node = block->cf_node.parent; node; node = node->parent) {
-      if (node->type == nir_cf_node_loop)
-         loop = node;
-   }
-   return loop;
-}
-
-/* Whether a compute shader whose image reads may follow its image stores can
- * still store natively: each native store is then followed by the PBE drain
- * (0x0650) and texture-cache invalidate (0x06d0), every image barrier invalidates
- * the texture cache for cross-invocation readers, and every image load goes
- * through the texture unit (on the device, a native write is visible to the
- * same invocation's later read only through the texture unit after the fence
- * pair; a global load or atomic can still see the old texel).
- *
- * No read that may access a natively stored resource may stay global: refuse
- * conflicting image atomics, buffer loads, 3D loads (block-texel views of
- * compressed 3D images have no native texture entry), and volatile or coherent
- * loads (which require global-memory visibility without barriers). Buffers and
- * images are distinct resources whose memory aliasing gives no visibility
- * guarantee, so a texel-buffer atomic does not refuse 2D image stores. */
-static bool
-hk_apple9_fenceable_reads(const nir_shader *nir)
-{
-   bool buf_store = false, image_store = false, store_3d = false;
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            if (intr->intrinsic != nir_intrinsic_bindless_image_store)
-               continue;
-            enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
-            /* Typed texel-buffer stores stay global (coherent with loads). */
-            if (dim == GLSL_SAMPLER_DIM_BUF)
-               buf_store |= nir_intrinsic_format(intr) == PIPE_FORMAT_NONE;
-            else if (dim != GLSL_SAMPLER_DIM_MS)
-               image_store = true;
-            store_3d |= dim == GLSL_SAMPLER_DIM_3D;
-         }
-      }
-   }
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            enum glsl_sampler_dim dim;
-            switch (intr->intrinsic) {
-            case nir_intrinsic_bindless_image_atomic:
-            case nir_intrinsic_bindless_image_atomic_swap:
-               dim = nir_intrinsic_image_dim(intr);
-               if (dim == GLSL_SAMPLER_DIM_BUF ? buf_store : image_store)
-                  return false;
-               break;
-            case nir_intrinsic_bindless_image_load:
-            case nir_intrinsic_bindless_image_sparse_load:
-               dim = nir_intrinsic_image_dim(intr);
-               if ((nir_intrinsic_access(intr) & (ACCESS_VOLATILE | ACCESS_COHERENT)) ||
-                   (dim == GLSL_SAMPLER_DIM_BUF && buf_store) ||
-                   (dim == GLSL_SAMPLER_DIM_3D && store_3d) ||
-                   dim == GLSL_SAMPLER_DIM_SUBPASS || dim == GLSL_SAMPLER_DIM_SUBPASS_MS)
-                  return false;
-               break;
-            default:
-               break;
-            }
-         }
-      }
-   }
-   return true;
-}
-
-/* One inlined entry point and no calls: block order is program order. */
-static bool
-hk_apple9_single_entry(const nir_shader *nir)
-{
-   unsigned impls = 0;
-   nir_foreach_function_impl(impl, nir) {
-      ++impls;
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_call)
-               return false;
-         }
-      }
-   }
-   return impls == 1;
-}
-
-/* A native PBE write reaches memory asynchronously: without a wait, the same
- * invocation's later read can return the old texel (device fences do not
- * order it). This decides whether every image read precedes every image store
- * in program order and no loop holds both, in a single inlined entry point.
- * Compute shaders that fail it can still store natively with fenced stores
- * (hk_apple9_fenceable_reads); fragment shaders keep the converter. Decide
- * before lowering removes any image loads. */
-bool
-hk_apple9_native_store_shader(const nir_shader *nir)
-{
-   unsigned impls = 0;
-   nir_foreach_function_impl(impl, nir)
-      ++impls;
-   if (impls != 1)
-      return false;
-   bool stored = false, ok = true;
-   struct set *read_loops = _mesa_pointer_set_create(NULL);
-   struct set *store_loops = _mesa_pointer_set_create(NULL);
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_call)
-               ok = false;
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_cf_node *loop = hk_apple9_outer_loop(block);
-            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
-            case nir_intrinsic_bindless_image_load:
-            case nir_intrinsic_bindless_image_sparse_load:
-            case nir_intrinsic_bindless_image_atomic:
-            case nir_intrinsic_bindless_image_atomic_swap:
-               ok &= !stored;
-               if (loop)
-                  _mesa_set_add(read_loops, loop);
-               break;
-            case nir_intrinsic_bindless_image_store:
-               stored = true;
-               if (loop)
-                  _mesa_set_add(store_loops, loop);
-               break;
-            default:
-               break;
-            }
-         }
-      }
-   }
-   set_foreach(store_loops, entry)
-      ok &= !_mesa_set_search(read_loops, entry->key);
-   _mesa_set_destroy(read_loops, NULL);
-   _mesa_set_destroy(store_loops, NULL);
-   return ok;
-}
-
-struct hk_apple9_storage_lowering {
-   struct set *texture_loads;
-   bool native_stores;
-   /* A read may follow a native store: drain PBE writes and invalidate the
-    * texture cache after each native store (and after image barriers). */
-   bool fence_stores;
-   bool sparse_images;
-   /* Keep the descriptor's write-valid check and the converter behind each
-    * native store (internal shaders, capture-replay devices). */
-   bool checked;
-   /* Same for storage texel buffer stores (also descriptor-buffer devices with
-    * sparse residency buffers). */
-   bool checked_buf;
-   /* Test residency before unchecked native stores to sparse residency buffers. */
-   bool buffer_residency;
-   bool has_global_fallback;
-};
-
-/* The image-write data type must be known: untyped stores (meta copies of raw
- * texels through canonical uint views) would be encoded as float data. */
-static bool
-hk_apple9_native_store_type(nir_alu_type type)
-{
-   nir_alu_type base = nir_alu_type_get_base_type(type);
-   return base == nir_type_float || base == nir_type_int || base == nir_type_uint;
-}
-
-/* Native IMAGE_WRITE (d7 .. 54 .. 89 00) and non-fragment fences (0x0650 /
- * 0x06d0) are already supported by agx_compile_apple9.c across compute,
- * vertex, and compute-emulated pre-rasterization stages. */
-static inline bool
-hk_apple9_stage_supports_native_store(mesa_shader_stage stage)
-{
-   switch (stage) {
-   case MESA_SHADER_VERTEX:
-   case MESA_SHADER_TESS_CTRL:
-   case MESA_SHADER_TESS_EVAL:
-   case MESA_SHADER_GEOMETRY:
-   case MESA_SHADER_FRAGMENT:
-   case MESA_SHADER_COMPUTE:
-   case MESA_SHADER_TASK:
-   case MESA_SHADER_MESH:
-      return true;
-   default:
-      return false;
-   }
-}
-
-/* Compiler capability hooks: FS fenced IMAGE_WRITE and native 16-bit packed
- * IMAGE_WRITE are wired end-to-end in agx_compile_apple9.c + agx_apple9_ir.c.
- * 3D and Cube storage descriptors are packed as AGX_TEXTURE_DIMENSION_2D_ARRAY
- * in hk_image_view.c and already execute natively via IMAGE_WRITE_LAYERED;
- * switching to true 3D/Cube PBEs (byte9=0x08/0x0c) requires adding IMAGE_DIM
- * to image_store_apple9_agx and packing 3D/Cube PBEs in hk_image_view.c. */
-static inline bool
-hk_apple9_compiler_supports_fs_fenced_store(void)
-{
-   return true;
-}
-
-static inline bool
-hk_apple9_compiler_supports_native_16bit_store(void)
-{
-   return true;
-}
-
-static inline bool
-hk_apple9_compiler_supports_native_3d_store(void)
-{
-   return false;
-}
-
-static inline bool
-hk_apple9_stage_supports_fenced_stores(mesa_shader_stage stage)
-{
-   if (stage == MESA_SHADER_FRAGMENT)
-      return hk_apple9_compiler_supports_fs_fenced_store();
-   return hk_apple9_stage_supports_native_store(stage);
-}
-
-/* Native PBE stores, qualified on the device against a CPU reference for
- * every storage format: all compute and graphics stages; 1D, 2D, cube and 3D
- * views, arrays, any level (one 2D/2D-array entry per view), and storage texel
- * buffers without a shader format (a linear 2D entry in the descriptor). A
- * typed texel-buffer store is already a packed global store of a few
- * instructions, cheaper than the native entry's addressing and, with sparse
- * residency, its page test, so it keeps that path. Multisample, untyped,
- * coherent, and volatile stores keep the converter. */
-static bool
-hk_apple9_can_native_store(const nir_builder *b, const nir_intrinsic_instr *intr,
-                            bool native_stores)
+hk_apple9_texture_load(nir_builder *b, nir_intrinsic_instr *intr,
+                       nir_def *desc, nir_def *coord, bool sparse,
+                       enum gl_access_qualifier access)
 {
    enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
    enum pipe_format format = nir_intrinsic_format(intr);
-   mesa_shader_stage stage = b->shader->info.stage;
-   unsigned bits = intr->src[3].ssa->bit_size;
-   return native_stores &&
-          (format == PIPE_FORMAT_NONE || hk_apple9_native_store_format(format)) &&
-          hk_apple9_stage_supports_native_store(stage) &&
-          (dim == GLSL_SAMPLER_DIM_1D || dim == GLSL_SAMPLER_DIM_2D ||
-           dim == GLSL_SAMPLER_DIM_CUBE || dim == GLSL_SAMPLER_DIM_3D ||
-           (dim == GLSL_SAMPLER_DIM_BUF && format == PIPE_FORMAT_NONE)) &&
-          (bits == 32 || bits == 16) &&
-          hk_apple9_native_store_type(nir_intrinsic_src_type(intr)) &&
-          !(nir_intrinsic_access(intr) & (ACCESS_COHERENT | ACCESS_VOLATILE));
-}
+   bool cube = dim == GLSL_SAMPLER_DIM_CUBE;
+   bool ms = dim == GLSL_SAMPLER_DIM_MS;
+   bool array = nir_intrinsic_image_array(intr) || cube;
+   coord = nir_u2u32(b, coord);
 
-static nir_def *
-hk_apple9_native_write_ok(nir_builder *b, nir_def *desc_handle, bool require_read)
-{
-   nir_def *flags = nir_load_global_constant(b, 1, 32,
-      nir_iadd_imm(b, nir_load_from_texture_handle_agx(b, desc_handle),
-                   offsetof(struct hk_apple9_storage_descriptor, native_ok)),
-      .align_mul = 4);
-   const uint32_t mask = HK_APPLE9_STORAGE_WRITE_VALID |
-                         (require_read ? HK_APPLE9_STORAGE_READ_VALID : 0);
-   return nir_ieq_imm(b, nir_iand_imm(b, flags, mask), mask);
-}
+   nir_alu_type base_type = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr));
+   if (base_type == nir_type_invalid)
+      base_type = nir_type_uint;
+   nir_alu_type dest_type = base_type | 32;
+   nir_def *index = nir_ushr_imm(b, nir_iadd_imm(b, nir_u2u32(b, desc),
+      offsetof(struct hk_apple9_storage_descriptor, texture)), 5);
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_def *fetched;
 
-/* Compute software storage bounds check (used only on SW fallback paths). */
-static nir_def *
-hk_apple9_storage_in_bounds(nir_builder *b, nir_intrinsic_instr *intr,
-                            nir_def *tex, nir_def *coord,
-                            enum glsl_sampler_dim dim, bool array, bool cube,
-                            unsigned dimensions)
-{
-   /* Honeykrisp's storage cube descriptors are 2D arrays of faces. */
-   nir_def *size = nir_bindless_image_size(b, dimensions, 32, tex, nir_imm_int(b, 0),
-      .image_dim = cube ? GLSL_SAMPLER_DIM_2D : dim, .image_array = cube || array);
-   nir_def *inside = nir_imm_true(b);
-   for (unsigned d = 0; d < dimensions; ++d)
-      inside = nir_iand(b, inside,
-         nir_ult(b, nir_channel(b, coord, d), nir_channel(b, size, d)));
-   if (dim == GLSL_SAMPLER_DIM_MS) {
-      nir_def *samples = nir_bindless_image_samples(b, 32, tex,
-         .image_dim = dim, .image_array = array);
-      inside = nir_iand(b, inside, nir_ult(b, nir_u2u32(b, intr->src[2].ssa), samples));
+   if (dim == GLSL_SAMPLER_DIM_BUF) {
+      nir_def *elements = nir_load_global_constant(b, 1, 32,
+         nir_iadd_imm(b, desc,
+                      offsetof(struct hk_apple9_storage_descriptor, buf.elements)),
+         .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
+      nir_def *packed = nir_load_global_constant(b, 1, 32,
+         nir_iadd_imm(b, desc,
+                      offsetof(struct hk_apple9_storage_descriptor, native_ok)),
+         .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
+      nir_def *tail = nir_iand_imm(b, nir_ushr_imm(b, packed, HK_APPLE9_STORAGE_TAIL_SHIFT),
+                                   HK_APPLE9_STORAGE_TAIL_MASK);
+      nir_def *x = nir_channel(b, coord, 0);
+      nir_def *in_bounds = nir_ult(b, x, elements);
+      nir_def *e = nir_bcsel(b, in_bounds, nir_iadd(b, x, tail),
+                             nir_imm_int(b, HK_APPLE9_TBUF_OOB_SENTINEL));
+      nir_def *xyz = nir_vec3(b, nir_iand_imm(b, e, AGX_TEXTURE_BUFFER_WIDTH - 1),
+                              nir_ushr_imm(b, e, util_logbase2(AGX_TEXTURE_BUFFER_WIDTH)),
+                              zero);
+      fetched = nir_image_load_apple9_agx(
+         b, 4, 32, index, xyz, zero, zero,
+         .base = 0, .access = access, .dest_type = dest_type,
+         .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false, .flags = 0);
+   } else {
+      unsigned ext_comps = ms ? 4 : (array || dim == GLSL_SAMPLER_DIM_3D) ? 3 :
+                           dim == GLSL_SAMPLER_DIM_1D ? 1 : 2;
+      nir_def *ext = nir_load_global_constant(b, ext_comps, 32,
+         nir_iadd_imm(b, desc,
+                      offsetof(struct hk_apple9_storage_descriptor, extent)),
+         .align_mul = 16, .access = ACCESS_UNIFORM_SAFE_AGX);
+      nir_def *raw_x = nir_channel(b, coord, 0);
+      nir_def *raw_y = dim == GLSL_SAMPLER_DIM_1D ? zero : nir_channel(b, coord, 1);
+      nir_def *in_bounds = nir_ult(b, raw_x, nir_channel(b, ext, 0));
+      if (dim != GLSL_SAMPLER_DIM_1D)
+         in_bounds = nir_iand(b, in_bounds, nir_ult(b, raw_y, nir_channel(b, ext, 1)));
+
+      nir_def *raw_z = zero;
+      if (array || dim == GLSL_SAMPLER_DIM_3D) {
+         raw_z = nir_channel(b, coord, dim == GLSL_SAMPLER_DIM_1D ? 1 : 2);
+         in_bounds = nir_iand(b, in_bounds, nir_ult(b, raw_z, nir_channel(b, ext, 2)));
+      }
+      nir_def *sample = zero;
+      if (ms) {
+         nir_def *raw_sample = nir_u2u32(b, intr->src[2].ssa);
+         in_bounds = nir_iand(b, in_bounds, nir_ult(b, raw_sample, nir_channel(b, ext, 3)));
+         sample = nir_bcsel(b, in_bounds, raw_sample, zero);
+      }
+
+      if (dim == GLSL_SAMPLER_DIM_3D &&
+          (format == PIPE_FORMAT_NONE || util_format_get_blocksize(format) >= 8)) {
+         nir_def *flags = nir_load_global_constant(b, 1, 32,
+            nir_iadd_imm(b, desc,
+                         offsetof(struct hk_apple9_storage_descriptor, native_ok)),
+            .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
+         nir_push_if(b, nir_test_mask(b, flags, HK_APPLE9_STORAGE_LINEAR_2D_INDEX));
+         nir_def *lin_xyz = hk_apple9_alias_3d_xyz(b, desc, raw_x, raw_y, raw_z, in_bounds);
+         nir_def *lin_res = nir_image_load_apple9_agx(
+            b, 4 + sparse, 32, index, lin_xyz, zero, zero,
+            .base = 0, .access = access, .dest_type = dest_type,
+            .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false,
+            .flags = sparse ? 1u : 0u);
+         nir_push_else(b, NULL);
+         nir_def *nat_xyz = nir_vec3(b,
+            nir_bcsel(b, in_bounds, raw_x, nir_imm_int(b, -1)),
+            nir_bcsel(b, in_bounds, raw_y, zero),
+            nir_bcsel(b, in_bounds, raw_z, zero));
+         nir_def *nat_res = nir_image_load_apple9_agx(
+            b, 4 + sparse, 32, index, nat_xyz, zero, zero,
+            .base = 0, .access = access, .dest_type = dest_type,
+            .image_dim = GLSL_SAMPLER_DIM_3D, .image_array = false,
+            .flags = sparse ? 1u : 0u);
+         nir_pop_if(b, NULL);
+         fetched = nir_if_phi(b, lin_res, nat_res);
+      } else {
+         nir_def *oob_x = nir_imm_int(b, ms ? HK_APPLE9_PBE_COORD_MAX : -1);
+         nir_def *xyz = nir_vec3(b,
+            nir_bcsel(b, in_bounds, raw_x, oob_x),
+            nir_bcsel(b, in_bounds, raw_y, zero),
+            nir_bcsel(b, in_bounds, raw_z, zero));
+         enum glsl_sampler_dim hw_dim =
+            (cube || dim == GLSL_SAMPLER_DIM_1D) ? GLSL_SAMPLER_DIM_2D : dim;
+         fetched = nir_image_load_apple9_agx(
+            b, 4 + sparse, 32, index, xyz, sample, zero,
+            .base = 0, .access = access, .dest_type = dest_type,
+            .image_dim = hw_dim, .image_array = array,
+            .flags = sparse ? 1u : 0u);
+      }
    }
-   return inside;
+
+   nir_def *color = sparse ? nir_trim_vector(b, fetched, 4) : fetched;
+   nir_def *code = sparse ? nir_channel(b, fetched, 4) : NULL;
+   if (intr->def.bit_size != 32) {
+      color = base_type == nir_type_float
+                 ? nir_f2fN(b, color, intr->def.bit_size)
+                 : nir_u2uN(b, color, intr->def.bit_size);
+      if (sparse)
+         code = nir_u2uN(b, code, intr->def.bit_size);
+   }
+   return hk_apple9_pack_load_result(b, color, code, intr->def.num_components, sparse);
 }
 
 /* Store through the inline native PBE entry at offset 64 of the descriptor
- * with branchless HW OOB clipping: saturate 32-bit spatial coordinates to 16
- * bits (umin(..., 0xffff)) so HW PBE clips >= width/height natively, and for
- * layered/cube/3D views force x = 0xffff branchlessly when layer >= extent[2]
- * (including null descriptors where extent[2] == 0). Descriptors live in the
- * 4-GiB USC aperture at a 4-GiB aligned base, so (desc_u32 + offsetof(pbe)) >> 5
- * is the PBE table index directly. Sparse-resident images map scratch_bo
- * read-write in their primary VA, so unbound writes discard cleanly without
- * per-store residency checks. */
+ * with branchless logical bounds clipping against storage->extent: OOB lanes
+ * map to x = 0xffff (or HK_APPLE9_TBUF_OOB_SENTINEL for MSAA / linear 3D
+ * aliases) so HW PBE discards them without control flow (including padded
+ * block-texel aliases, POT mip tails, and null descriptors where extent == 0).
+ * Sparse-resident images map scratch_bo read-write in their primary VA, so
+ * unbound writes discard cleanly without per-store residency checks. */
 static void
 hk_apple9_native_store(nir_builder *b, nir_intrinsic_instr *intr,
-                        nir_def *desc, nir_def *coord, bool array,
-                        bool fence)
+                       nir_def *desc, nir_def *coord,
+                       enum gl_access_qualifier access)
 {
    enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   enum pipe_format format = nir_intrinsic_format(intr);
+   bool cube = dim == GLSL_SAMPLER_DIM_CUBE;
+   bool ms = dim == GLSL_SAMPLER_DIM_MS;
+   bool array = nir_intrinsic_image_array(intr);
+   bool native_array = array || cube || dim == GLSL_SAMPLER_DIM_3D;
    coord = nir_u2u32(b, coord);
+
+   nir_def *zero = nir_imm_int(b, 0);
    nir_def *max_coord = nir_imm_int(b, HK_APPLE9_PBE_COORD_MAX);
-   nir_def *x = nir_umin(b, nir_channel(b, coord, 0), max_coord);
-   /* 1D entries are 2D, one texel high; a 1D array's layer is its second
-    * coordinate. Cubes and 3D views pass layer/slice in coord.z. */
-   nir_def *y = dim == GLSL_SAMPLER_DIM_1D
-      ? nir_imm_int(b, 0)
-      : nir_umin(b, nir_channel(b, coord, 1), max_coord);
-   nir_def *layer = nir_imm_int(b, 0);
-   if (array) {
-      nir_def *layers = nir_load_global_constant(b, 1, 32,
-         nir_iadd_imm(b, desc,
-            offsetof(struct hk_apple9_storage_descriptor, extent[2])),
-         .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
-      nir_def *raw_layer = nir_channel(b, coord, dim == GLSL_SAMPLER_DIM_1D ? 1 : 2);
-      nir_def *in_layer = nir_ult(b, raw_layer, layers);
-      x = nir_bcsel(b, in_layer, x, max_coord);
-      layer = nir_bcsel(b, in_layer, raw_layer, nir_imm_int(b, 0));
+   unsigned ext_comps = ms ? 4 : native_array ? 3 :
+                        dim == GLSL_SAMPLER_DIM_1D ? 1 : 2;
+   nir_def *ext = nir_load_global_constant(b, ext_comps, 32,
+      nir_iadd_imm(b, desc,
+                   offsetof(struct hk_apple9_storage_descriptor, extent)),
+      .align_mul = 16, .access = ACCESS_UNIFORM_SAFE_AGX);
+   nir_def *raw_x = nir_channel(b, coord, 0);
+   nir_def *raw_y = dim == GLSL_SAMPLER_DIM_1D ? zero : nir_channel(b, coord, 1);
+   nir_def *in_bounds = nir_ult(b, raw_x, nir_channel(b, ext, 0));
+   if (dim != GLSL_SAMPLER_DIM_1D)
+      in_bounds = nir_iand(b, in_bounds, nir_ult(b, raw_y, nir_channel(b, ext, 1)));
+   nir_def *raw_z = zero;
+   if (native_array) {
+      raw_z = nir_channel(b, coord, dim == GLSL_SAMPLER_DIM_1D ? 1 : 2);
+      in_bounds = nir_iand(b, in_bounds, nir_ult(b, raw_z, nir_channel(b, ext, 2)));
    }
-   nir_def *xyz = nir_vec3(b, x, y, layer);
+   nir_def *raw_sample = zero;
+   if (ms) {
+      raw_sample = nir_u2u32(b, intr->src[2].ssa);
+      in_bounds = nir_iand(b, in_bounds, nir_ult(b, raw_sample, nir_channel(b, ext, 3)));
+   }
+
    nir_def *data = intr->src[3].ssa;
    nir_alu_type type = nir_intrinsic_src_type(intr);
-   if (data->bit_size == 16 && !hk_apple9_compiler_supports_native_16bit_store()) {
-      nir_alu_type base = nir_alu_type_get_base_type(type);
+   nir_alu_type base = nir_alu_type_get_base_type(type);
+   if (base == nir_type_invalid)
+      base = nir_type_uint;
+   if (data->bit_size != 16 && data->bit_size != 32) {
       data = base == nir_type_float ? nir_f2f32(b, data) :
-             base == nir_type_int ? nir_i2i32(b, data) : nir_u2u32(b, data);
-      type = base | 32;
+             base == nir_type_int   ? nir_i2i32(b, data) : nir_u2u32(b, data);
    }
+   type = base | data->bit_size;
+   nir_def *padded_data = nir_pad_vector_imm_int(b, data, 0, 4);
+
    /* The hardware drops helper invocations' image writes, but not under
-    * sample shading (as for the converter's stores, agx_nir_lower_frag_sidefx). */
+    * sample shading (as in agx_nir_lower_frag_sidefx). */
    bool helpers = b->shader->info.stage == MESA_SHADER_FRAGMENT &&
                   b->shader->info.fs.uses_sample_shading;
    if (helpers)
       nir_push_if(b, nir_inot(b, nir_is_helper_invocation(b, 1)));
+
    nir_def *index = nir_ushr_imm(b, nir_iadd_imm(b, nir_u2u32(b, desc),
       offsetof(struct hk_apple9_storage_descriptor, pbe)), 5);
-   /* Wave 2: when hk_apple9_compiler_supports_native_3d_store() is true, pass
-    * .image_dim = dim for true 3D (byte9=0x08) / Cube (byte9=0x0c) PBE.
-    * Fences for fenced shaders are inserted lazily & coalesced in
-    * hk_apple9_insert_lazy_image_fences(). */
-   (void)fence;
-   nir_image_store_apple9_agx(b, index, xyz,
-      nir_pad_vector_imm_int(b, data, 0, 4),
-      .access = nir_intrinsic_access(intr), .src_type = type,
-      .image_array = array && !(hk_apple9_compiler_supports_native_3d_store() &&
-                                (dim == GLSL_SAMPLER_DIM_3D ||
-                                 dim == GLSL_SAMPLER_DIM_CUBE)));
+
+   if (ms) {
+      nir_def *size_B;
+      if (array && format == PIPE_FORMAT_NONE) {
+         size_B = nir_load_global_constant(b, 1, 32,
+            nir_iadd_imm(b, desc,
+                         offsetof(struct hk_apple9_storage_descriptor, size_B)),
+            .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
+         size_B = nir_umax_imm(b, size_B, 1);
+      } else {
+         size_B = nir_imm_int(b, format == PIPE_FORMAT_NONE
+                                    ? 4
+                                    : util_format_get_blocksize(format));
+      }
+      nir_def *idx_sa = nir_u2u32(b, libagx_image_texel_address(
+         b, desc, nir_pad_vector_imm_int(b, coord, 0, 4), raw_sample, size_B,
+         nir_imm_false(b), nir_imm_true(b), nir_imm_bool(b, array),
+         nir_imm_true(b)));
+      nir_def *e = nir_bcsel(b, in_bounds, idx_sa,
+                             nir_imm_int(b, HK_APPLE9_TBUF_OOB_SENTINEL));
+      nir_def *xyz = nir_vec3(b, nir_iand_imm(b, e, AGX_TEXTURE_BUFFER_WIDTH - 1),
+                              nir_ushr_imm(b, e, util_logbase2(AGX_TEXTURE_BUFFER_WIDTH)),
+                              zero);
+      nir_image_store_apple9_agx(b, index, xyz, padded_data,
+         .access = access, .src_type = type,
+         .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false);
+   } else if (dim == GLSL_SAMPLER_DIM_3D &&
+              (format == PIPE_FORMAT_NONE || util_format_get_blocksize(format) >= 8)) {
+      nir_def *flags = nir_load_global_constant(b, 1, 32,
+         nir_iadd_imm(b, desc,
+                      offsetof(struct hk_apple9_storage_descriptor, native_ok)),
+         .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
+      nir_push_if(b, nir_test_mask(b, flags, HK_APPLE9_STORAGE_LINEAR_2D_INDEX));
+      nir_def *lin_xyz = hk_apple9_alias_3d_xyz(b, desc, raw_x, raw_y, raw_z, in_bounds);
+      nir_image_store_apple9_agx(b, index, lin_xyz, padded_data,
+         .access = access, .src_type = type,
+         .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false);
+      nir_push_else(b, NULL);
+      nir_def *nat_xyz = nir_vec3(b,
+         nir_bcsel(b, in_bounds, raw_x, max_coord),
+         nir_bcsel(b, in_bounds, raw_y, zero),
+         nir_bcsel(b, in_bounds, raw_z, zero));
+      nir_image_store_apple9_agx(b, index, nat_xyz, padded_data,
+         .access = access, .src_type = type,
+         .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = true);
+      nir_pop_if(b, NULL);
+   } else {
+      nir_def *xyz = nir_vec3(b,
+         nir_bcsel(b, in_bounds, raw_x, max_coord),
+         nir_bcsel(b, in_bounds, raw_y, zero),
+         nir_bcsel(b, in_bounds, raw_z, zero));
+      nir_image_store_apple9_agx(b, index, xyz, padded_data,
+         .access = access, .src_type = type,
+         .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = native_array);
+   }
+
    if (helpers)
       nir_pop_if(b, NULL);
-}
 
-static nir_def *hk_apple9_storage_buffer_residency_code(nir_builder *b,
-                                                        nir_def *desc,
-                                                        nir_def *x);
+   /* Coherent/volatile writes may be observed by other workgroups without a
+    * shader barrier: drain the PBE write immediately. */
+   if (access & (ACCESS_COHERENT | ACCESS_VOLATILE))
+      nir_fence_image_write_apple9_agx(b);
+}
 
 /* Store element x of a storage texel buffer through the inline native PBE
  * entry at offset 64 of the descriptor (hk_pack_texel_buffer): a linear 2D
@@ -2702,8 +2209,8 @@ static nir_def *hk_apple9_storage_buffer_residency_code(nir_builder *b,
  * without control flow (including null descriptors where elements == 0). */
 static void
 hk_apple9_native_buffer_store(nir_builder *b, nir_intrinsic_instr *intr,
-                               nir_def *desc, nir_def *x, bool residency,
-                               bool fence)
+                              nir_def *desc, nir_def *x, bool residency,
+                              enum gl_access_qualifier access)
 {
    x = nir_u2u32(b, x);
    nir_def *elements = nir_load_global_constant(b, 1, 32,
@@ -2724,12 +2231,14 @@ hk_apple9_native_buffer_store(nir_builder *b, nir_intrinsic_instr *intr,
       offsetof(struct hk_apple9_storage_descriptor, pbe)), 5);
    nir_def *data = intr->src[3].ssa;
    nir_alu_type type = nir_intrinsic_src_type(intr);
-   if (data->bit_size == 16 && !hk_apple9_compiler_supports_native_16bit_store()) {
-      nir_alu_type base = nir_alu_type_get_base_type(type);
+   nir_alu_type base = nir_alu_type_get_base_type(type);
+   if (base == nir_type_invalid)
+      base = nir_type_uint;
+   if (data->bit_size != 16 && data->bit_size != 32) {
       data = base == nir_type_float ? nir_f2f32(b, data) :
-             base == nir_type_int ? nir_i2i32(b, data) : nir_u2u32(b, data);
-      type = base | 32;
+             base == nir_type_int   ? nir_i2i32(b, data) : nir_u2u32(b, data);
    }
+   type = base | data->bit_size;
    bool helpers = b->shader->info.stage == MESA_SHADER_FRAGMENT &&
                   b->shader->info.fs.uses_sample_shading;
    if (helpers)
@@ -2742,281 +2251,18 @@ hk_apple9_native_buffer_store(nir_builder *b, nir_intrinsic_instr *intr,
       nir_push_if(b, nir_ieq_imm(b,
          hk_apple9_storage_buffer_residency_code(b, desc, x), 0));
    }
-   (void)fence;
    nir_image_store_apple9_agx(b, index, xyz, nir_pad_vector_imm_int(b, data, 0, 4),
-      .access = nir_intrinsic_access(intr), .src_type = type,
-      .image_array = false);
+      .access = access, .src_type = type,
+      .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false);
    if (residency) {
       nir_pop_if(b, NULL);
       nir_pop_if(b, NULL);
    }
    if (helpers)
       nir_pop_if(b, NULL);
-}
 
-/* Formatless OOB read value: zero, with a one in formats lacking alpha. */
-static nir_def *
-hk_apple9_formatless_oob_zero(nir_builder *b, nir_intrinsic_instr *intr,
-                              nir_def *layout)
-{
-   bool floating = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) ==
-                   nir_type_float;
-   nir_def *alpha_kind = nir_ushr_imm(b, nir_channel(b, layout, 3), 18);
-   nir_def *one = floating ? nir_imm_float(b, 1.0) : nir_imm_int(b, 1);
-   nir_def *zero = nir_vec4(b, nir_imm_int(b, 0), nir_imm_int(b, 0),
-                            nir_imm_int(b, 0),
-                            nir_bcsel(b, nir_ieq_imm(b, alpha_kind, HK_TEXEL_ONE),
-                                      one, nir_imm_int(b, 0)));
-   if (intr->def.bit_size != 32)
-      zero = floating ? nir_f2fN(b, zero, intr->def.bit_size)
-                      : nir_u2uN(b, zero, intr->def.bit_size);
-   return zero;
-}
-
-static bool
-hk_apple9_lower_formatless_storage(nir_builder *b, nir_intrinsic_instr *intr,
-                                   bool load, bool sparse, bool route,
-                                   struct hk_apple9_storage_lowering *lower)
-{
-   if (nir_def_instr(intr->src[0].ssa)->type != nir_instr_type_intrinsic)
-      return false;
-   nir_intrinsic_instr *handle = nir_def_as_intrinsic(intr->src[0].ssa);
-   if (handle->intrinsic != nir_intrinsic_bindless_image_agx)
-      return false;
-   b->cursor = nir_before_instr(&intr->instr);
-   nir_def *tex = intr->src[0].ssa;
-   bool array = nir_intrinsic_image_array(intr);
-   enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
-   bool cube = dim == GLSL_SAMPLER_DIM_CUBE;
-   unsigned dimensions;
-   switch (dim) {
-   case GLSL_SAMPLER_DIM_BUF: dimensions = 1; break;
-   case GLSL_SAMPLER_DIM_1D: dimensions = 1 + array; break;
-   case GLSL_SAMPLER_DIM_2D:
-   case GLSL_SAMPLER_DIM_MS: dimensions = 2 + array; break;
-   case GLSL_SAMPLER_DIM_3D:
-   case GLSL_SAMPLER_DIM_CUBE: dimensions = 3; break;
-   default: return false;
-   }
-   enum gl_access_qualifier access = nir_intrinsic_access(intr);
-   nir_def *coord = intr->src[1].ssa;
-   nir_def *desc_addr = nir_load_from_texture_handle_agx(b, tex);
-   nir_def *pbe_addr = desc_addr;
-
-   bool native = !load && hk_apple9_can_native_store(b, intr, lower->native_stores);
-   /* Inline 2D/2D-array PBE covers all 1D/2D/cube views unconditionally; only
-    * 3D (mipmapped compressed block-texel views), internal shaders,
-    * sparse-buffer descriptor-buffer texel buffers, and fenced RW stores
-    * (which must fall back to global stores whenever the view's reads stay
-    * global, e.g. padded 2D block-texel aliases with READ_VALID == 0) need a
-    * runtime check. */
-   bool require_read = lower->fence_stores && dim != GLSL_SAMPLER_DIM_BUF;
-   bool checked = dim == GLSL_SAMPLER_DIM_BUF ? lower->checked_buf
-                  : dim == GLSL_SAMPLER_DIM_3D || lower->checked || require_read;
-   bool native_array = array || cube || dim == GLSL_SAMPLER_DIM_3D;
-   bool check_sparse = load && !route && (sparse || lower->sparse_images) &&
-                       dim != GLSL_SAMPLER_DIM_BUF && dim != GLSL_SAMPLER_DIM_MS;
-   bool can_tex = load && ((route && dim != GLSL_SAMPLER_DIM_BUF) || check_sparse);
-
-   /* Fast path 1: unchecked native IMAGE_WRITE — completely branchless HW OOB. */
-   if (native && !checked) {
-      if (dim == GLSL_SAMPLER_DIM_BUF)
-         hk_apple9_native_buffer_store(b, intr, pbe_addr, nir_channel(b, coord, 0),
-                                        lower->buffer_residency, lower->fence_stores);
-      else
-         hk_apple9_native_store(b, intr, pbe_addr, coord, native_array,
-                                 lower->fence_stores);
-      nir_instr_remove(&intr->instr);
-      b->shader->info.use_lowered_image_to_global = true;
-      return true;
-   }
-
-   /* Fast path 2: texture-routed storage load — branchless HW OOB via
-    * TEXTURE_LOAD / TEXTURE_LOAD_MS on the uniform HK_APPLE9_STORAGE_READ_VALID
-    * path; bounds check and SW decode live only on the cold fallback arm. */
-   if (load && route && can_tex) {
-      nir_def *ok = hk_apple9_native_ok(b, tex);
-      nir_push_if(b, ok);
-      nir_def *fetched = hk_apple9_texture_load(b, intr, handle, desc_addr, coord, sparse);
-      nir_def *tex_val = sparse ? nir_trim_vector(b, fetched, 4) : fetched;
-      nir_def *tex_code = sparse ? nir_channel(b, fetched, 4) : NULL;
-      nir_push_else(b, NULL);
-      nir_def *size_B = nir_load_global_constant(b, 1, 32,
-         nir_iadd_imm(b, desc_addr, offsetof(struct hk_apple9_storage_descriptor, size_B)),
-         .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
-      nir_def *layout = nir_load_global_constant(b, 4, 32,
-         nir_iadd_imm(b, desc_addr, offsetof(struct hk_apple9_storage_descriptor, component)),
-         .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
-      nir_def *inside = hk_apple9_storage_in_bounds(b, intr, tex, coord, dim,
-                                                    array, cube, dimensions);
-      nir_push_if(b, inside);
-      bool floating = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) ==
-                      nir_type_float;
-      nir_def *addr = libagx_image_texel_address(
-         b, pbe_addr, nir_pad_vector_imm_int(b, coord, 0, 4),
-         nir_u2u32(b, intr->src[2].ssa), size_B,
-         nir_imm_bool(b, dim == GLSL_SAMPLER_DIM_1D),
-         nir_imm_bool(b, dim == GLSL_SAMPLER_DIM_MS),
-         nir_imm_bool(b, native_array), nir_imm_bool(b, false));
-      nir_def *words = hk_apple9_load_texel_words(b, addr, size_B, access);
-      nir_def *sw_in = hk_apple9_decode_texel(b, words, layout, floating);
-      if (intr->def.bit_size != 32)
-         sw_in = floating ? nir_f2fN(b, sw_in, intr->def.bit_size)
-                          : nir_u2uN(b, sw_in, intr->def.bit_size);
-      nir_push_else(b, NULL);
-      nir_def *sw_oob = hk_apple9_formatless_oob_zero(b, intr, layout);
-      nir_pop_if(b, NULL);
-      nir_def *sw_val = nir_if_phi(b, sw_in, sw_oob);
-      nir_pop_if(b, NULL);
-      nir_def *value = nir_if_phi(b, tex_val, sw_val);
-      nir_def *code = sparse
-         ? nir_if_phi(b, tex_code, nir_imm_intN_t(b, 0, intr->def.bit_size))
-         : NULL;
-      nir_def_replace(&intr->def,
-                      hk_apple9_pack_load_result(b, value, code,
-                                                 intr->def.num_components,
-                                                 sparse));
-      lower->has_global_fallback = true;
-      b->shader->info.use_lowered_image_to_global = true;
-      return true;
-   }
-
-   /* Fast path 3: checked native IMAGE_WRITE — branchless HW OOB on the uniform
-    * HK_APPLE9_STORAGE_WRITE_VALID path; bounds check & SW encode only on fallback. */
-   if (native) {
-      nir_def *ok = hk_apple9_native_write_ok(b, tex, require_read);
-      nir_push_if(b, ok);
-      if (dim == GLSL_SAMPLER_DIM_BUF)
-         hk_apple9_native_buffer_store(b, intr, pbe_addr, nir_channel(b, coord, 0),
-                                        false, lower->fence_stores);
-      else
-         hk_apple9_native_store(b, intr, pbe_addr, coord, native_array,
-                                 lower->fence_stores);
-      nir_push_else(b, NULL);
-      nir_def *size_B = nir_load_global_constant(b, 1, 32,
-         nir_iadd_imm(b, desc_addr, offsetof(struct hk_apple9_storage_descriptor, size_B)),
-         .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
-      nir_def *layout = nir_load_global_constant(b, 4, 32,
-         nir_iadd_imm(b, desc_addr, offsetof(struct hk_apple9_storage_descriptor, component)),
-         .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
-      nir_def *inside = hk_apple9_storage_in_bounds(b, intr, tex, coord, dim,
-                                                    array, cube, dimensions);
-      nir_push_if(b, inside);
-      nir_alu_type src_base = nir_alu_type_get_base_type(nir_intrinsic_src_type(intr));
-      bool floating = src_base == nir_type_float;
-      nir_def *texel = nir_pad_vector_imm_int(b, intr->src[3].ssa, 0, 4);
-      if (texel->bit_size != 32) {
-         texel = floating ? nir_f2f32(b, texel)
-                 : src_base == nir_type_int ? nir_i2i32(b, texel)
-                                            : nir_u2u32(b, texel);
-      }
-      nir_def *addr = dim == GLSL_SAMPLER_DIM_BUF
-         ? hk_apple9_buffer_texel_address(b, desc_addr, coord, size_B)
-         : libagx_image_texel_address(
-              b, pbe_addr, nir_pad_vector_imm_int(b, coord, 0, 4),
-              nir_u2u32(b, intr->src[2].ssa), size_B,
-              nir_imm_bool(b, dim == GLSL_SAMPLER_DIM_1D), nir_imm_bool(b, false),
-              nir_imm_bool(b, native_array), nir_imm_bool(b, false));
-      nir_def *words = hk_apple9_encode_texel(b, texel, layout, floating);
-      hk_apple9_store_texel_words(b, addr, size_B, words, access);
-      nir_pop_if(b, NULL);
-      nir_pop_if(b, NULL);
-      nir_instr_remove(&intr->instr);
-      lower->has_global_fallback = true;
-      b->shader->info.use_lowered_image_to_global = true;
-      return true;
-   }
-
-   /* Software fallback path (unrouted loads, coherent/volatile, MS writes):
-    * explicit bounds check before global I/O. */
-   nir_def *size_B = nir_load_global_constant(b, 1, 32,
-      nir_iadd_imm(b, desc_addr, offsetof(struct hk_apple9_storage_descriptor, size_B)),
-      .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
-   nir_def *layout = nir_load_global_constant(b, 4, 32,
-      nir_iadd_imm(b, desc_addr, offsetof(struct hk_apple9_storage_descriptor, component)),
-      .align_mul = 4, .access = ACCESS_UNIFORM_SAFE_AGX);
-   nir_def *inside = hk_apple9_storage_in_bounds(b, intr, tex, coord, dim,
-                                                 array, cube, dimensions);
-   nir_def *ok = (sparse && check_sparse) ? hk_apple9_native_ok(b, tex)
-                 : check_sparse ? hk_apple9_sparse_read_ok(b, tex) : NULL;
-   /* The address is arithmetic on the descriptor, valid for any coordinate,
-    * so compute it ahead of the bounds check: its uniform part can then
-    * move to the preamble. Only the access below depends on the check. */
-   nir_def *addr = dim == GLSL_SAMPLER_DIM_BUF
-      ? hk_apple9_buffer_texel_address(b, desc_addr, coord, size_B)
-      : libagx_image_texel_address(
-           b, pbe_addr, nir_pad_vector_imm_int(b, coord, 0, 4),
-           nir_u2u32(b, intr->src[2].ssa), size_B,
-           nir_imm_bool(b, dim == GLSL_SAMPLER_DIM_1D),
-           nir_imm_bool(b, dim == GLSL_SAMPLER_DIM_MS),
-           nir_imm_bool(b, native_array), nir_imm_bool(b, false));
-   nir_push_if(b, inside);
-   nir_def *value = NULL;
-   nir_def *code = sparse ? nir_imm_intN_t(b, 0, intr->def.bit_size) : NULL;
-   if (load) {
-      bool floating = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) ==
-                      nir_type_float;
-      if (check_sparse) {
-         /* Unrouted load (prior store in shader): query hardware residency via
-          * the texture unit, then read global memory only when resident so
-          * unbound tiles never observe scratch_bo. */
-         nir_push_if(b, ok);
-         nir_def *fetched = hk_apple9_texture_load(b, intr, handle, desc_addr, coord, true);
-         nir_def *hw_code = nir_channel(b, fetched, 4);
-         nir_pop_if(b, NULL);
-         nir_def *res_code = nir_if_phi(b, hw_code,
-            nir_imm_intN_t(b, 0, intr->def.bit_size));
-         if (sparse)
-            code = res_code;
-         nir_push_if(b, nir_ieq_imm(b, nir_iand_imm(b, res_code, 1), 0));
-         nir_def *words = hk_apple9_load_texel_words(b, addr, size_B, access);
-         nir_def *sw_val = hk_apple9_decode_texel(b, words, layout, floating);
-         if (intr->def.bit_size != 32)
-            sw_val = floating ? nir_f2fN(b, sw_val, intr->def.bit_size)
-                              : nir_u2uN(b, sw_val, intr->def.bit_size);
-         nir_push_else(b, NULL);
-         nir_def *nonres = nir_imm_zero(b, 4, intr->def.bit_size);
-         nir_pop_if(b, NULL);
-         value = nir_if_phi(b, sw_val, nonres);
-      } else {
-         nir_def *words = hk_apple9_load_texel_words(b, addr, size_B, access);
-         value = hk_apple9_decode_texel(b, words, layout, floating);
-         if (intr->def.bit_size != 32)
-            value = floating ? nir_f2fN(b, value, intr->def.bit_size)
-                             : nir_u2uN(b, value, intr->def.bit_size);
-      }
-   } else {
-      nir_alu_type src_base = nir_alu_type_get_base_type(nir_intrinsic_src_type(intr));
-      bool floating = src_base == nir_type_float;
-      nir_def *texel = nir_pad_vector_imm_int(b, intr->src[3].ssa, 0, 4);
-      if (texel->bit_size != 32) {
-         texel = floating ? nir_f2f32(b, texel)
-                 : src_base == nir_type_int ? nir_i2i32(b, texel)
-                                            : nir_u2u32(b, texel);
-      }
-      nir_def *words = hk_apple9_encode_texel(b, texel, layout, floating);
-      hk_apple9_store_texel_words(b, addr, size_B, words, access);
-   }
-   nir_def *zero = NULL;
-   if (load) {
-      nir_push_else(b, NULL);
-      zero = hk_apple9_formatless_oob_zero(b, intr, layout);
-   }
-   nir_pop_if(b, NULL);
-   if (load) {
-      value = nir_if_phi(b, value, zero);
-      if (sparse)
-         code = nir_if_phi(b, code, nir_imm_intN_t(b, 0, intr->def.bit_size));
-      nir_def_replace(&intr->def,
-                      hk_apple9_pack_load_result(b, value, code,
-                                                 intr->def.num_components,
-                                                 sparse));
-   } else {
-      nir_instr_remove(&intr->instr);
-   }
-   lower->has_global_fallback = true;
-   b->shader->info.use_lowered_image_to_global = true;
-   return true;
+   if (access & (ACCESS_COHERENT | ACCESS_VOLATILE))
+      nir_fence_image_write_apple9_agx(b);
 }
 
 /* Residency code of texel x of a buffer view, from the table of its buffer's
@@ -3067,7 +2313,7 @@ hk_apple9_storage_buffer_residency_code(nir_builder *b, nir_def *desc,
 {
    nir_def *table = nir_load_global_constant(b, 1, 64,
       nir_iadd_imm(b, desc,
-         offsetof(struct hk_apple9_storage_descriptor, buf_sparse.residency)),
+         offsetof(struct hk_apple9_storage_descriptor, buf_residency)),
       .align_mul = 8, .access = ACCESS_UNIFORM_SAFE_AGX);
    nir_def *base = nir_load_global_constant(b, 1, 64,
       nir_iadd_imm(b, desc,
@@ -3169,28 +2415,43 @@ hk_apple9_lower_sparse_residency(nir_shader *nir)
    return progress;
 }
 
-/* Typed OOB read value: zero, with a one in formats lacking alpha. */
-static nir_def *
-hk_apple9_typed_oob_zero(nir_builder *b, nir_intrinsic_instr *intr,
-                         const struct util_format_description *desc)
+struct hk_apple9_storage_lowering {
+   /* Test residency before native stores to sparse residency buffers. */
+   bool buffer_residency;
+   /* Promote native image/buffer stores & loads to coherent(device) when
+    * global-memory image atomics coexist on the same resource class. */
+   bool has_image_atomics;
+   bool has_buf_atomics;
+};
+
+static void
+hk_apple9_scan_image_atomics(const nir_shader *nir,
+                             struct hk_apple9_storage_lowering *lower)
 {
-   bool alpha = desc->swizzle[3] <= PIPE_SWIZZLE_W;
-   nir_alu_type type = nir_intrinsic_dest_type(intr);
-   bool floating = nir_alu_type_get_base_type(type) == nir_type_float;
-   nir_def *one = floating ? nir_imm_float(b, 1.0) : nir_imm_int(b, 1);
-   nir_def *zero = nir_vec4(b, nir_imm_int(b, 0), nir_imm_int(b, 0),
-                            nir_imm_int(b, 0), alpha ? nir_imm_int(b, 0) : one);
-   if (intr->def.bit_size != 32)
-      zero = floating ? nir_f2fN(b, zero, intr->def.bit_size)
-                      : nir_u2uN(b, zero, intr->def.bit_size);
-   return zero;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_bindless_image_atomic &&
+                intr->intrinsic != nir_intrinsic_bindless_image_atomic_swap)
+               continue;
+            if (nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF)
+               lower->has_buf_atomics = true;
+            else
+               lower->has_image_atomics = true;
+         }
+      }
+   }
 }
 
-/* Apple9 can access uncompressed storage images through the same
- * descriptor-based address calculation as image atomics. Native PBE stores
- * and texture-routed loads use branchless hardware OOB clipping; software
- * fallback paths keep explicit bounds checks before global memory access.
- */
+/* Unified hardware lowering for all typed and formatless storage image and
+ * storage texel buffer loads/stores on Apple9: every load goes through
+ * non-reorderable TEXTURE_LOAD / TEXTURE_LOAD_MS (image_load_apple9_agx) and
+ * every store goes through native PBE IMAGE_WRITE (image_store_apple9_agx),
+ * with hardware memory_coherence_device bits and lazy coalesced PBE/texture
+ * fences. */
 static bool
 hk_apple9_lower_storage_image(nir_builder *b, nir_intrinsic_instr *intr,
                               void *data)
@@ -3200,209 +2461,49 @@ hk_apple9_lower_storage_image(nir_builder *b, nir_intrinsic_instr *intr,
    bool load = sparse || intr->intrinsic == nir_intrinsic_bindless_image_load;
    if (!load && intr->intrinsic != nir_intrinsic_bindless_image_store)
       return false;
-   bool route = load && _mesa_set_search(lower->texture_loads, intr);
-   enum pipe_format format = nir_intrinsic_format(intr);
-   if (format == PIPE_FORMAT_NONE)
-      return hk_apple9_lower_formatless_storage(b, intr, load, sparse, route,
-                                                lower);
-   const struct util_format_description *desc = util_format_description(format);
-   unsigned size_B = util_format_get_blocksize(format);
-   if ((desc->layout != UTIL_FORMAT_LAYOUT_PLAIN &&
-        format != PIPE_FORMAT_R11G11B10_FLOAT && format != PIPE_FORMAT_R9G9B9E5_FLOAT) ||
-       !util_is_power_of_two_nonzero(size_B) || size_B > 16 ||
-       util_format_is_depth_or_stencil(format))
-      return false;
 
    if (nir_def_instr(intr->src[0].ssa)->type != nir_instr_type_intrinsic)
       return false;
    nir_intrinsic_instr *handle = nir_def_as_intrinsic(intr->src[0].ssa);
    if (handle->intrinsic != nir_intrinsic_bindless_image_agx)
       return false;
-   b->cursor = nir_before_instr(&intr->instr);
-   nir_def *tex = intr->src[0].ssa;
-   nir_def *pbe = intr->src[0].ssa;
-   bool array = nir_intrinsic_image_array(intr);
+
    enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
-   bool cube = dim == GLSL_SAMPLER_DIM_CUBE;
-   unsigned dimensions;
    switch (dim) {
-   case GLSL_SAMPLER_DIM_BUF: dimensions = 1; break;
-   case GLSL_SAMPLER_DIM_1D: dimensions = 1 + array; break;
+   case GLSL_SAMPLER_DIM_BUF:
+   case GLSL_SAMPLER_DIM_1D:
    case GLSL_SAMPLER_DIM_2D:
-   case GLSL_SAMPLER_DIM_MS: dimensions = 2 + array; break;
    case GLSL_SAMPLER_DIM_3D:
-   case GLSL_SAMPLER_DIM_CUBE: dimensions = 3; break;
-   default: return false;
+   case GLSL_SAMPLER_DIM_CUBE:
+   case GLSL_SAMPLER_DIM_MS:
+      break;
+   default:
+      return false;
    }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *desc = nir_load_from_texture_handle_agx(b, intr->src[0].ssa);
    nir_def *coord = intr->src[1].ssa;
-   bool check_sparse = load && !route && (sparse || lower->sparse_images) &&
-                       dim != GLSL_SAMPLER_DIM_BUF && dim != GLSL_SAMPLER_DIM_MS;
-   bool can_tex = load && ((route && dim != GLSL_SAMPLER_DIM_BUF) || check_sparse);
-   bool native = !load && hk_apple9_can_native_store(b, intr, lower->native_stores);
-   bool native_array = array || cube || dim == GLSL_SAMPLER_DIM_3D;
-   bool require_read = lower->fence_stores && dim != GLSL_SAMPLER_DIM_BUF;
-   bool checked = native_array || lower->checked || require_read;
+   enum gl_access_qualifier access = nir_intrinsic_access(intr);
+   if (dim == GLSL_SAMPLER_DIM_BUF ? lower->has_buf_atomics
+                                   : lower->has_image_atomics)
+      access |= ACCESS_COHERENT;
 
-   /* Fast path 1: unchecked native IMAGE_WRITE — completely branchless HW OOB. */
-   if (native && !checked) {
-      hk_apple9_native_store(b, intr, nir_load_from_texture_handle_agx(b, pbe),
-                              coord, native_array, lower->fence_stores);
-      nir_instr_remove(&intr->instr);
-      b->shader->info.use_lowered_image_to_global = true;
-      return true;
-   }
-
-   /* Fast path 2: texture-routed storage load — branchless HW OOB via
-    * TEXTURE_LOAD / TEXTURE_LOAD_MS on the uniform READ_VALID path; bounds
-    * check and global unpack live only on the cold fallback arm. */
-   if (load && route && can_tex) {
-      nir_def *desc_addr = nir_load_from_texture_handle_agx(b, tex);
-      nir_def *ok = hk_apple9_native_ok(b, tex);
-      nir_push_if(b, ok);
-      nir_def *fetched = hk_apple9_texture_load(b, intr, handle, desc_addr, coord, sparse);
-      nir_def *tex_val = sparse ? nir_trim_vector(b, fetched, 4) : fetched;
-      nir_def *tex_code = sparse ? nir_channel(b, fetched, 4) : NULL;
-      nir_push_else(b, NULL);
-      nir_def *inside = hk_apple9_storage_in_bounds(b, intr, tex, coord, dim,
-                                                    array, cube, dimensions);
-      nir_push_if(b, inside);
-      nir_def *addr = nir_bindless_image_texel_address(b, 64, pbe, coord,
-         intr->src[2].ssa, .image_dim = dim,
-         .image_array = array, .format = format, .access = nir_intrinsic_access(intr));
-      nir_def *raw = nir_load_global(b, DIV_ROUND_UP(size_B, 4), MIN2(32, size_B * 8),
-         addr, .align_mul = size_B, .access = nir_intrinsic_access(intr));
-      nir_def *sw_in = nir_format_unpack_rgba(b, raw, format);
-      if (intr->def.bit_size != 32) {
-         bool floating = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) ==
-                         nir_type_float;
-         sw_in = floating ? nir_f2fN(b, sw_in, intr->def.bit_size)
-                          : nir_u2uN(b, sw_in, intr->def.bit_size);
-      }
-      nir_push_else(b, NULL);
-      nir_def *sw_oob = hk_apple9_typed_oob_zero(b, intr, desc);
-      nir_pop_if(b, NULL);
-      nir_def *sw_val = nir_if_phi(b, sw_in, sw_oob);
-      nir_pop_if(b, NULL);
-      nir_def *value = nir_if_phi(b, tex_val, sw_val);
-      nir_def *code = sparse
-         ? nir_if_phi(b, tex_code, nir_imm_intN_t(b, 0, intr->def.bit_size))
-         : NULL;
-      nir_def_replace(&intr->def,
-                      hk_apple9_pack_load_result(b, value, code,
-                                                 intr->def.num_components,
-                                                 sparse));
-      lower->has_global_fallback = true;
-      b->shader->info.use_lowered_image_to_global = true;
-      return true;
-   }
-
-   /* Fast path 3: checked native IMAGE_WRITE — branchless HW OOB on the uniform
-    * WRITE_VALID path; bounds check and global pack live only on fallback. */
-   if (native) {
-      nir_def *ok = hk_apple9_native_write_ok(b, tex, require_read);
-      nir_push_if(b, ok);
-      hk_apple9_native_store(b, intr, nir_load_from_texture_handle_agx(b, pbe),
-                              coord, native_array, lower->fence_stores);
-      nir_push_else(b, NULL);
-      nir_def *inside = hk_apple9_storage_in_bounds(b, intr, tex, coord, dim,
-                                                    array, cube, dimensions);
-      nir_push_if(b, inside);
-      nir_def *addr = nir_bindless_image_texel_address(b, 64, pbe, coord,
-         intr->src[2].ssa, .image_dim = dim, .image_array = array,
-         .format = format, .access = nir_intrinsic_access(intr));
-      nir_def *raw = format == PIPE_FORMAT_R11G11B10_FLOAT
-         ? hk_apple9_pack_float11(b, nir_trim_vector(b, intr->src[3].ssa, 3))
-         : nir_format_pack_rgba(b, format, intr->src[3].ssa);
-      raw = size_B <= 4 ? nir_u2uN(b, raw, size_B * 8)
-                        : nir_trim_vector(b, raw, size_B / 4);
-      nir_store_global(b, raw, addr, .align_mul = size_B,
-                       .write_mask = BITFIELD_MASK(raw->num_components),
-                       .access = nir_intrinsic_access(intr));
-      nir_pop_if(b, NULL);
-      nir_pop_if(b, NULL);
-      nir_instr_remove(&intr->instr);
-      lower->has_global_fallback = true;
-      b->shader->info.use_lowered_image_to_global = true;
-      return true;
-   }
-
-   /* Software fallback path (unrouted loads, coherent/volatile, typed buffer
-    * stores, MS writes, FS-fenced writes until Wave 2). */
-   nir_def *inside = hk_apple9_storage_in_bounds(b, intr, tex, coord, dim,
-                                                 array, cube, dimensions);
-   nir_def *ok = (sparse && check_sparse) ? hk_apple9_native_ok(b, tex)
-                 : check_sparse ? hk_apple9_sparse_read_ok(b, tex) : NULL;
-   /* See hk_apple9_lower_formatless_storage: address ahead of the check. */
-   nir_def *addr = nir_bindless_image_texel_address(b, 64, pbe, coord,
-      intr->src[2].ssa, .image_dim = dim,
-      .image_array = array, .format = format, .access = nir_intrinsic_access(intr));
-   nir_push_if(b, inside);
-   nir_def *value = NULL;
-   nir_def *code = sparse ? nir_imm_intN_t(b, 0, intr->def.bit_size) : NULL;
    if (load) {
-      if (check_sparse) {
-         nir_def *desc_addr = nir_load_from_texture_handle_agx(b, tex);
-         nir_push_if(b, ok);
-         nir_def *fetched = hk_apple9_texture_load(b, intr, handle, desc_addr, coord, true);
-         nir_def *hw_code = nir_channel(b, fetched, 4);
-         nir_pop_if(b, NULL);
-         nir_def *res_code = nir_if_phi(b, hw_code,
-            nir_imm_intN_t(b, 0, intr->def.bit_size));
-         if (sparse)
-            code = res_code;
-         nir_push_if(b, nir_ieq_imm(b, nir_iand_imm(b, res_code, 1), 0));
-         nir_def *raw = nir_load_global(b, DIV_ROUND_UP(size_B, 4), MIN2(32, size_B * 8),
-            addr, .align_mul = size_B, .access = nir_intrinsic_access(intr));
-         nir_def *sw_val = nir_format_unpack_rgba(b, raw, format);
-         if (intr->def.bit_size != 32) {
-            bool floating = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) ==
-                            nir_type_float;
-            sw_val = floating ? nir_f2fN(b, sw_val, intr->def.bit_size)
-                              : nir_u2uN(b, sw_val, intr->def.bit_size);
-         }
-         nir_push_else(b, NULL);
-         nir_def *nonres = nir_imm_zero(b, 4, intr->def.bit_size);
-         nir_pop_if(b, NULL);
-         value = nir_if_phi(b, sw_val, nonres);
-      } else {
-         nir_def *raw = nir_load_global(b, DIV_ROUND_UP(size_B, 4), MIN2(32, size_B * 8),
-            addr, .align_mul = size_B, .access = nir_intrinsic_access(intr));
-         value = nir_format_unpack_rgba(b, raw, format);
-         if (intr->def.bit_size != 32) {
-            bool floating = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) ==
-                            nir_type_float;
-            value = floating ? nir_f2fN(b, value, intr->def.bit_size)
-                             : nir_u2uN(b, value, intr->def.bit_size);
-         }
-      }
+      /* Preserve program-order guarantees of image_load_apple9_agx even when
+       * nir_opt_access annotated the original deref with ACCESS_CAN_REORDER. */
+      nir_def *res = hk_apple9_texture_load(b, intr, desc, coord, sparse,
+                                            access & ~ACCESS_CAN_REORDER);
+      nir_def_replace(&intr->def, res);
+   } else if (dim == GLSL_SAMPLER_DIM_BUF) {
+      hk_apple9_native_buffer_store(b, intr, desc, nir_channel(b, coord, 0),
+                                    lower->buffer_residency, access);
+      nir_instr_remove(&intr->instr);
    } else {
-      nir_def *raw = format == PIPE_FORMAT_R11G11B10_FLOAT
-         ? hk_apple9_pack_float11(b, nir_trim_vector(b, intr->src[3].ssa, 3))
-         : nir_format_pack_rgba(b, format, intr->src[3].ssa);
-      raw = size_B <= 4 ? nir_u2uN(b, raw, size_B * 8)
-                        : nir_trim_vector(b, raw, size_B / 4);
-      nir_store_global(b, raw, addr, .align_mul = size_B,
-                       .write_mask = BITFIELD_MASK(raw->num_components),
-                       .access = nir_intrinsic_access(intr));
-   }
-   nir_def *zero = NULL;
-   if (load) {
-      nir_push_else(b, NULL);
-      zero = hk_apple9_typed_oob_zero(b, intr, desc);
-   }
-   nir_pop_if(b, NULL);
-   if (load) {
-      value = nir_if_phi(b, value, zero);
-      if (sparse)
-         code = nir_if_phi(b, code, nir_imm_intN_t(b, 0, intr->def.bit_size));
-      nir_def_replace(&intr->def,
-                      hk_apple9_pack_load_result(b, value, code,
-                                                 intr->def.num_components,
-                                                 sparse));
-   } else {
+      hk_apple9_native_store(b, intr, desc, coord, access);
       nir_instr_remove(&intr->instr);
    }
-   lower->has_global_fallback = true;
+
    b->shader->info.use_lowered_image_to_global = true;
    return true;
 }
@@ -3481,6 +2582,8 @@ hk_apple9_instr_fence_need(const nir_instr *instr)
       return (struct hk_lazy_fence_state){0};
    const nir_intrinsic_instr *intr = nir_instr_as_intrinsic((nir_instr *)instr);
    switch (intr->intrinsic) {
+   case nir_intrinsic_image_load_apple9_agx:
+      return (struct hk_lazy_fence_state){.pbe = true, .tex = true};
    case nir_intrinsic_load_global:
    case nir_intrinsic_load_global_2x32:
       return (struct hk_lazy_fence_state){.pbe = true};
@@ -3644,9 +2747,14 @@ hk_apple9_fence_cf_list(struct exec_list *cf_list,
             }
             if (instr->type == nir_instr_type_intrinsic) {
                const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-               if ((intr->intrinsic == nir_intrinsic_store_global ||
-                    intr->intrinsic == nir_intrinsic_store_global_2x32) &&
-                   !hk_apple9_addr_is_printf_buf(intr->src[1].ssa, 0))
+               if (((intr->intrinsic == nir_intrinsic_store_global ||
+                     intr->intrinsic == nir_intrinsic_store_global_2x32) &&
+                    !hk_apple9_addr_is_printf_buf(intr->src[1].ssa, 0)) ||
+                   ((intr->intrinsic == nir_intrinsic_global_atomic ||
+                     intr->intrinsic == nir_intrinsic_global_atomic_swap ||
+                     intr->intrinsic == nir_intrinsic_global_atomic_2x32 ||
+                     intr->intrinsic == nir_intrinsic_global_atomic_swap_2x32) &&
+                    !hk_apple9_addr_is_printf_buf(intr->src[0].ssa, 0)))
                   st.tex = true;
             }
          }
@@ -3735,18 +2843,25 @@ hk_apple9_insert_lazy_image_fences(nir_shader *nir)
  * requires texture fences.
  */
 static void
-hk_apple9_lower_image_barriers(nir_shader *nir, bool fenced,
-                               bool has_global_image_fallback)
+hk_apple9_lower_image_barriers(nir_shader *nir, bool has_global_image_fallback)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    bool has_native_store = false;
+   bool has_tex_read = false;
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_tex) {
+            if (!nir_tex_instr_is_query(nir_instr_as_tex(instr)))
+               has_tex_read = true;
+            continue;
+         }
          if (instr->type != nir_instr_type_intrinsic)
             continue;
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
          if (intr->intrinsic == nir_intrinsic_image_store_apple9_agx)
             has_native_store = true;
+         else if (intr->intrinsic == nir_intrinsic_image_load_apple9_agx)
+            has_tex_read = true;
          if (nir_intrinsic_has_image_dim(intr) &&
              intr->intrinsic != nir_intrinsic_image_store_apple9_agx &&
              intr->intrinsic != nir_intrinsic_image_load_apple9_agx &&
@@ -3771,8 +2886,8 @@ hk_apple9_lower_image_barriers(nir_shader *nir, bool fenced,
                if (has_native_store && mem_scope == SCOPE_WORKGROUP) {
                   /* Native PBE workgroup texture barrier lowers directly to
                    * 0x0e51/0x0ed1 (or 0x0e50/0x0ed0). Only add global sync
-                   * when global-memory image fallbacks actually coexist in
-                   * the shader. */
+                   * when global-memory image fallbacks (e.g. image atomics)
+                   * coexist in the shader. */
                   unsigned next_modes = modes;
                   if (has_global_image_fallback)
                      next_modes |= nir_var_mem_global;
@@ -3780,10 +2895,10 @@ hk_apple9_lower_image_barriers(nir_shader *nir, bool fenced,
                } else {
                   nir_intrinsic_set_memory_modes(intr,
                      (modes & ~nir_var_image) | nir_var_mem_global);
-                  /* In fenced shaders, readers use the texture unit: invalidate
-                   * the texture cache after image barriers so invocations that
-                   * did not store observe other invocations' drained PBE writes. */
-                  if (fenced) {
+                  /* All storage loads use the texture unit: invalidate the
+                   * texture cache after device/subgroup image barriers so
+                   * readers observe drained PBE writes and image atomics. */
+                  if (has_tex_read && mem_scope != SCOPE_NONE) {
                      nir_builder b = nir_builder_at(nir_after_instr(instr));
                      nir_fence_tex_invalidate_apple9_agx(&b);
                   }
@@ -3796,6 +2911,8 @@ hk_apple9_lower_image_barriers(nir_shader *nir, bool fenced,
                         .memory_scope = SCOPE_DEVICE,
                         .memory_semantics = NIR_MEMORY_ACQUIRE | NIR_MEMORY_RELEASE,
                         .memory_modes = nir_var_mem_global);
+            if (has_tex_read)
+               nir_fence_tex_invalidate_apple9_agx(&b);
             nir_instr_remove(instr);
          }
       }
@@ -4225,25 +3342,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    bool texel_buf_global = false;
    NIR_PASS(texel_buf_global, nir, nir_shader_tex_pass,
             hk_apple9_lower_texel_buffer, nir_metadata_none, NULL);
-   struct set *texture_loads = _mesa_pointer_set_create(NULL);
-   const bool ordered = hk_apple9_native_store_shader(nir);
-   bool fenced_stores = !ordered &&
-                        hk_apple9_stage_supports_fenced_stores(nir->info.stage) &&
-                        !nir->info.internal && hk_apple9_single_entry(nir) &&
-                        hk_apple9_fenceable_reads(nir);
-   hk_apple9_texture_route_loads(nir, texture_loads, fenced_stores);
    struct hk_apple9_storage_lowering lower = {
-      .texture_loads = texture_loads,
-      .native_stores = ordered || fenced_stores,
-      .fence_stores = fenced_stores,
-      .sparse_images = (features & HK_FEAT_SPARSE_IMAGE) != 0,
-      .checked = nir->info.internal,
-      .checked_buf = nir->info.internal || (features & HK_FEAT_CHECKED_BUF_STORES),
       .buffer_residency = (features & HK_FEAT_STORE_BUFFER_RESIDENCY) != 0,
    };
+   hk_apple9_scan_image_atomics(nir, &lower);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_apple9_lower_storage_image,
             nir_metadata_none, &lower);
-   _mesa_set_destroy(texture_loads, NULL);
 
    bool buf_addr_global = false;
    NIR_PASS(buf_addr_global, nir, nir_shader_intrinsics_pass,
@@ -4256,18 +3360,15 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * from texture metadata by the Apple9 backend; uniform texel buffers use
     * agx_nir_lower_texture_queries on their prefix. */
    NIR_PASS(_, nir, agx_nir_lower_texture_queries);
-   NIR_PASS(_, nir, agx_nir_lower_multisampled_image_store);
 
    /* Keep radians until Apple9 range reduction. The common preprocessor
     * otherwise replaces sine/cosine with the older fsin_agx operation. */
    NIR_PASS(_, nir, agx_nir_lower_apple9_math);
    agx_preprocess_nir(nir);
    const bool has_global_image_fallback =
-      texel_buf_global || lower.has_global_fallback || buf_addr_global ||
-      lower_images_global;
-   hk_apple9_lower_image_barriers(nir, fenced_stores, has_global_image_fallback);
-   if (fenced_stores || ordered)
-      hk_apple9_insert_lazy_image_fences(nir);
+      texel_buf_global || buf_addr_global || lower_images_global;
+   hk_apple9_lower_image_barriers(nir, has_global_image_fallback);
+   hk_apple9_insert_lazy_image_fences(nir);
 
    nir_opt_peephole_select_options peephole_select_options = {
       .limit = 0,
@@ -4599,6 +3700,7 @@ hk_nir_pre_raster_reads(const nir_shader *nir)
             case nir_intrinsic_image_deref_sparse_load:
             case nir_intrinsic_bindless_image_load:
             case nir_intrinsic_bindless_image_sparse_load:
+            case nir_intrinsic_image_load_apple9_agx:
             case nir_intrinsic_load_input_attachment_coord:
                reads |= HK_READS_IMAGES;
                break;
