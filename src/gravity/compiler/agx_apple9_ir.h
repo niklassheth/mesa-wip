@@ -536,6 +536,17 @@ agx_apple9_inline_source_file(const struct agx_apple9_vir_instr *I,
           ((I->alu_src_immediate_mask >> s) & 1 ? AGX_APPLE9_FILE_IMMEDIATE : 0);
 }
 
+/* Number of 32-bit GPRs occupied by a memory load/store's data tuple.
+ * Packed 16-bit vectors pack two lanes per 32-bit GPR (i16x2 -> 1, i16x4 -> 2). */
+static inline unsigned
+agx_apple9_mem_data_gprs(const struct agx_apple9_vir_instr *I)
+{
+   unsigned components = I->memory_components ? I->memory_components : 1;
+   if (I->memory_bits == 16 && (components == 2 || components == 4))
+      return components / 2;
+   return components;
+}
+
 /* Instruction storage and block identity survive every insertion/removal.
  * Layout links are independent of ownership, allowing forward branch targets. */
 struct agx_apple9_block {
@@ -800,6 +811,14 @@ uint32_t agx_apple9_vir_emit_mul_wide(struct agx_apple9_vir_program *program,
 uint32_t agx_apple9_vir_emit_device_load_vector(
    struct agx_apple9_vir_program *program, unsigned binding, uint32_t index,
    unsigned components, const struct agx_apple9_device_load_contract *contract);
+/* Native 16-bit vector device load (i16x2 -> 1 packed GPR, i16x4 -> 2 packed
+ * adjacent GPRs). Index scales by 4B (i16x2) or 8B (i16x4). */
+uint32_t agx_apple9_vir_emit_device_load_vector_u16(
+   struct agx_apple9_vir_program *program, unsigned binding, uint32_t index,
+   unsigned components, const struct agx_apple9_device_load_contract *contract);
+bool agx_apple9_vir_emit_device_store_vector_u16(
+   struct agx_apple9_vir_program *program, unsigned binding, uint32_t index,
+   const uint32_t *data, unsigned components);
 /* Publish two words to an even-aligned publication pair. Publications are
  * normally lane-major. A split pair instead publishes one word (src[0] ==
  * src[1]), with lanes 0-15 in the first publication and 16-31 in the second. */
@@ -828,15 +847,45 @@ bool agx_apple9_vir_emit_image_store_ex(struct agx_apple9_vir_program *program,
                                       bool integer, bool fragment);
 
 /* Aligned threadgroup (shared) memory loads and stores. components may be
- * 1 (32-bit, 4B-scaled index), 2 (64-bit, 8B-scaled index), or 4 (128-bit,
- * 16B-scaled index). Loads allocate a components-wide adjacent SSA tuple
- * with AUTO scoreboard slot; stores consume an adjacent data tuple. */
+ * 1, 2, 3, or 4 for 32-bit elements (4B/8B/12B/16B-scaled index). Loads
+ * allocate an adjacent SSA tuple with AUTO scoreboard slot; stores consume
+ * an adjacent data tuple. Both address r0..r95 and accept input waits. */
 uint32_t agx_apple9_vir_emit_shared_load(struct agx_apple9_vir_program *program,
                                          uint32_t index, unsigned root,
                                          unsigned components);
 bool agx_apple9_vir_emit_shared_store(struct agx_apple9_vir_program *program,
                                       const uint32_t *data, unsigned components,
                                       uint32_t index, unsigned root);
+/* Typed threadgroup (shared) memory loads and stores:
+ * - bits=8:  components=1 (1 GPR low byte, 1B-scaled index)
+ * - bits=16: components=1 (1 GPR low half, 2B-scaled), components=2 (1 packed
+ *            GPR, 4B-scaled), components=4 (2 packed GPRs, 8B-scaled)
+ * - bits=32: components=1..4 (1..4 GPRs, 4B/8B/12B/16B-scaled) */
+uint32_t agx_apple9_vir_emit_shared_load_typed(
+   struct agx_apple9_vir_program *program, uint32_t index, unsigned root,
+   unsigned components, unsigned bits);
+bool agx_apple9_vir_emit_shared_store_typed(
+   struct agx_apple9_vir_program *program, const uint32_t *data,
+   unsigned components, unsigned bits, uint32_t index, unsigned root);
+
+/* Typed invocation-private (scratch) memory loads and stores with multi-slot
+ * scoreboard allocation (1..6) and input wait mask:
+ * - bits=8,  components=1: 1B-scaled index
+ * - bits=16, components=1: 2B-scaled index
+ * - bits=32, components=1: 4B-scaled index
+ * - bits=32, components=2: 8B-scaled index (2 adjacent GPRs)
+ * - bits=32, components=4: 1B-scaled (caller pre-shifts index by 4; 4 GPRs) */
+uint32_t agx_apple9_vir_emit_private_load(
+   struct agx_apple9_vir_program *program, uint32_t index, unsigned word_offset,
+   unsigned components, unsigned bits);
+bool agx_apple9_vir_emit_private_store(
+   struct agx_apple9_vir_program *program, const uint32_t *data,
+   unsigned components, unsigned bits, uint32_t index, unsigned word_offset);
+
+/* Asynchronous multi-slot (1..6) GET_SR targeting r0..r95 (8-byte extended form,
+ * automatically compacted to 4-byte GET_SR when allocated to r0..r63). */
+uint32_t agx_apple9_vir_emit_get_sr_async(
+   struct agx_apple9_vir_program *program, uint8_t selector, uint8_t datapath);
 
 bool agx_apple9_vir_emit_block_image_store(
    struct agx_apple9_vir_program *program, const uint32_t src[4],
@@ -1004,6 +1053,12 @@ agx_apple9_pack_get_global_id(unsigned dst, unsigned component,
                               struct agx_apple9_packed_instruction *packed);
 bool agx_apple9_pack_get_sr(unsigned dst, uint8_t selector, uint8_t datapath,
                             struct agx_apple9_packed_instruction *packed);
+/* Multi-slot (1..6, or NONE for slot 1) GET_SR. Set extended=true for the
+ * 8-byte r0..r95 form; extended=false emits the 4-byte r0..r63 form. */
+bool agx_apple9_pack_get_sr_ex(unsigned dst, uint8_t selector, uint8_t datapath,
+                               enum agx_apple9_scoreboard_slot slot,
+                               bool extended,
+                               struct agx_apple9_packed_instruction *packed);
 /* Local-output stores use byte displacements and optional element indices.
  * Narrow data occupies the low half of a word-allocated SSA value. */
 bool agx_apple9_pack_local_store(unsigned data, unsigned root, unsigned index,
@@ -1050,6 +1105,11 @@ bool agx_apple9_pack_device_load_vector_u32_raw(
    enum agx_apple9_device_load_index_kind index_kind, uint8_t flags,
    enum agx_apple9_scoreboard_slot incoming_slot, uint16_t raw_token,
    struct agx_apple9_packed_instruction *packed);
+bool agx_apple9_pack_device_load_vector_u16_raw(
+   unsigned dst, unsigned index, unsigned binding, unsigned components,
+   enum agx_apple9_device_load_index_kind index_kind, uint8_t flags,
+   enum agx_apple9_scoreboard_slot incoming_slot, uint16_t raw_token,
+   struct agx_apple9_packed_instruction *packed);
 bool agx_apple9_pack_device_load_scalar_raw(
    unsigned dst, unsigned index, unsigned binding, unsigned bits,
    enum agx_apple9_device_load_index_kind index_kind, uint8_t flags,
@@ -1060,6 +1120,10 @@ bool agx_apple9_pack_device_store_scalar(
    enum agx_apple9_scoreboard_slot scoreboard_slot, bool release_index,
    struct agx_apple9_packed_instruction *packed);
 bool agx_apple9_pack_device_store_vector_u32(
+   unsigned data, unsigned index, unsigned binding, unsigned components,
+   enum agx_apple9_scoreboard_slot scoreboard_slot, bool release_index,
+   struct agx_apple9_packed_instruction *packed);
+bool agx_apple9_pack_device_store_vector_u16(
    unsigned data, unsigned index, unsigned binding, unsigned components,
    enum agx_apple9_scoreboard_slot scoreboard_slot, bool release_index,
    struct agx_apple9_packed_instruction *packed);

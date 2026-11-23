@@ -1485,8 +1485,16 @@ TEST(Apple9MemEncoding, VectorSharedLoadAndStoreUint2Uint4)
       /* Reject non-adjacent data tuple on store. */
       uint8_t bad_phys[] = {4, 6, 7, 8, 9};
       EXPECT_FALSE(agx_apple9_pack_vir_instruction(&st, bad_phys, &packed, &reason));
-      /* Reject overflowing r63 boundary. */
-      uint8_t overflow_phys[] = {63, 64, 65, 66, 8};
+      /* Accept high GPR tuple in r64..r95 with high index register. */
+      uint8_t high_phys[] = {72, 73, 74, 75, 75};
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&st, high_phys, &packed, &reason))
+         << (reason ?: "");
+      EXPECT_EQ(packed.bytes[3], 72u << 1);
+      EXPECT_EQ(packed.bytes[5], (75u & 63u) << 2);
+      EXPECT_EQ(packed.bytes[6], 0x01u); /* bit 0 = index>>6, retained */
+
+      /* Reject overflowing r95 boundary. */
+      uint8_t overflow_phys[] = {95, 96, 97, 98, 8};
       EXPECT_FALSE(agx_apple9_pack_vir_instruction(&st, overflow_phys, &packed, &reason));
    }
 }
@@ -1687,4 +1695,256 @@ TEST(Apple9MemEncoding, FullDimensionMinLodClampModes)
       << (reason ?: "");
    EXPECT_EQ(packed.length, 100u);
    agx_apple9_vir_finish(&p);
+}
+
+TEST(Apple9MemEncoding, NarrowAndVectorSharedMemoryAndHighGprs)
+{
+   struct {
+      unsigned comps;
+      unsigned bits;
+      unsigned gprs;
+      uint8_t b8;
+      uint8_t ld11;
+      uint8_t ld12;
+      uint8_t st11;
+      uint8_t st12;
+   } cases[] = {
+      {1, 8,  1, 0x84, 0x40, 0x08, 0x10, 0x02},
+      {1, 16, 1, 0x04, 0x80, 0x08, 0x20, 0x02},
+      {2, 16, 1, 0x24, 0xc0, 0x08, 0x30, 0x02},
+      {4, 16, 2, 0x1c, 0x00, 0x09, 0x40, 0x02},
+      {1, 32, 1, 0x44, 0xc0, 0x08, 0x30, 0x02},
+      {2, 32, 2, 0x64, 0x00, 0x09, 0x40, 0x02},
+      {3, 32, 3, 0x74, 0x00, 0x08, 0x00, 0x02},
+      {4, 32, 4, 0x5c, 0x00, 0x08, 0x00, 0x02},
+   };
+   const uint8_t phys[] = {72, 73, 74, 75, 75};
+   agx_apple9_packed_instruction packed = {};
+   const char *reason = nullptr;
+
+   for (const auto &c : cases) {
+      agx_apple9_vir_instr ld = {};
+      ld.op = AGX_APPLE9_VIR_SHARED_LOAD;
+      ld.encoding = AGX_APPLE9_ENC_SHARED_LOAD;
+      ld.dest = 0;
+      ld.dest_components = c.gprs;
+      ld.memory_bits = c.bits == 32 ? 0 : c.bits;
+      ld.memory_components = c.comps;
+      ld.nr_srcs = 1;
+      ld.src[0] = 4; /* r75 */
+      ld.immediate = 2;
+      ld.producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_6;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ld, phys, &packed, &reason))
+         << (reason ?: "");
+      ASSERT_EQ(packed.length, 14u);
+      EXPECT_EQ(packed.bytes[0], 0x67u);
+      EXPECT_EQ(packed.bytes[1], 0x02u);
+      EXPECT_EQ(packed.bytes[2], 0x54u);
+      EXPECT_EQ(packed.bytes[3], 0x90u); /* r72 << 1 */
+      EXPECT_EQ(packed.bytes[4], 0x08u); /* root 2 << 2 */
+      EXPECT_EQ(packed.bytes[5], 0x2cu); /* (75 & 63) << 2 */
+      EXPECT_EQ(packed.bytes[6], 0x81u); /* discard | (75 >> 6) */
+      EXPECT_EQ(packed.bytes[8], c.b8);
+      EXPECT_EQ(packed.bytes[9], 0x0du); /* slot 6 */
+      EXPECT_EQ(packed.bytes[11], c.ld11);
+      EXPECT_EQ(packed.bytes[12], c.ld12);
+
+      agx_apple9_vir_instr st = {};
+      st.op = AGX_APPLE9_VIR_SHARED_STORE;
+      st.encoding = AGX_APPLE9_ENC_SHARED_STORE;
+      st.dest = AGX_APPLE9_VREG_INVALID;
+      st.memory_bits = c.bits == 32 ? 0 : c.bits;
+      st.memory_components = c.comps;
+      st.nr_srcs = c.gprs + 1;
+      for (unsigned k = 0; k < c.gprs; ++k)
+         st.src[k] = k;
+      st.src[c.gprs] = 4; /* r75 */
+      st.immediate = 2;
+      st.live_after_mask = BITFIELD_BIT(c.gprs);
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&st, phys, &packed, &reason))
+         << (reason ?: "");
+      ASSERT_EQ(packed.length, 14u);
+      EXPECT_EQ(packed.bytes[0], 0xe7u);
+      EXPECT_EQ(packed.bytes[1], 0x02u);
+      EXPECT_EQ(packed.bytes[2], 0x54u);
+      EXPECT_EQ(packed.bytes[3], 0x90u);
+      EXPECT_EQ(packed.bytes[4], 0x08u);
+      EXPECT_EQ(packed.bytes[5], 0x2cu);
+      EXPECT_EQ(packed.bytes[6], 0x01u); /* retained | (75 >> 6) */
+      EXPECT_EQ(packed.bytes[8], c.b8);
+      EXPECT_EQ(packed.bytes[9], 0x02u);
+      EXPECT_EQ(packed.bytes[11], c.st11);
+      EXPECT_EQ(packed.bytes[12], c.st12);
+   }
+
+   /* Shared atomic with high GPRs r76 = atomic_add(root=2, idx=r75, data=r73). */
+   const uint8_t aphys[] = {76, 73, 75};
+   agx_apple9_vir_instr at = {};
+   at.op = AGX_APPLE9_VIR_SHARED_ATOMIC;
+   at.encoding = AGX_APPLE9_ENC_SHARED_ATOMIC;
+   at.dest = 0;
+   at.dest_components = 1;
+   at.memory_components = 1;
+   at.atomic_op = AGX_APPLE9_ATOMIC_ADD;
+   at.nr_srcs = 2;
+   at.src[0] = 1;
+   at.src[1] = 2;
+   at.immediate = 2;
+   at.producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_5;
+   ASSERT_TRUE(agx_apple9_pack_vir_instruction(&at, aphys, &packed, &reason))
+      << (reason ?: "");
+   ASSERT_EQ(packed.length, 12u);
+   EXPECT_EQ(packed.bytes[3], 76u);
+   EXPECT_EQ(packed.bytes[4], 4u);
+   EXPECT_EQ(packed.bytes[5], 73u);
+   EXPECT_EQ(packed.bytes[6], 75u);
+   EXPECT_EQ(packed.bytes[8], 0x1au);
+}
+
+TEST(Apple9MemEncoding, PrivateLoadStoreNarrowAndWideWithWait)
+{
+   struct {
+      unsigned comps;
+      unsigned bits;
+      unsigned offset;
+      uint8_t fmt;
+      uint8_t ld_b9;
+      uint8_t ld_b10;
+      uint8_t st_b7;
+      uint8_t st_b8;
+      uint8_t st_b9;
+   } cases[] = {
+      {1, 8,  1,    0x21, 0x00, 0x02, 0x40, 0x00, 0x40},
+      {1, 16, 0x11, 0x01, 0x80, 0x02, 0x40, 0x04, 0x50},
+      {1, 32, 1,    0x09, 0x00, 0x03, 0x43, 0x00, 0x60},
+      {2, 32, 2,    0x19, 0x80, 0x03, 0x80, 0x00, 0x70},
+      {4, 32, 4,    0x17, 0x00, 0x02, 0x00, 0x01, 0x40},
+   };
+   const uint8_t phys[] = {4, 5, 6, 7, 1};
+   agx_apple9_packed_instruction packed = {};
+   const char *reason = nullptr;
+
+   for (const auto &c : cases) {
+      agx_apple9_vir_instr ld = {};
+      ld.op = AGX_APPLE9_VIR_PRIVATE_LOAD;
+      ld.encoding = AGX_APPLE9_ENC_PRIVATE_LOAD;
+      ld.dest = 0;
+      ld.dest_components = c.comps;
+      ld.memory_bits = c.bits == 32 ? 0 : c.bits;
+      ld.memory_components = c.comps;
+      ld.nr_srcs = 1;
+      ld.src[0] = 4; /* r1 */
+      ld.immediate = c.offset;
+      ld.producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_6;
+      ld.scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ld, phys, &packed, &reason))
+         << (reason ?: "");
+      ASSERT_EQ(packed.length, 12u);
+      EXPECT_EQ(packed.bytes[0], 0x6fu);
+      EXPECT_EQ(packed.bytes[1], 0x10u); /* wait slot 1 */
+      EXPECT_EQ(packed.bytes[2], 0x54u);
+      EXPECT_EQ(packed.bytes[3], 8u);
+      EXPECT_EQ(packed.bytes[4], 2u);
+      EXPECT_EQ(packed.bytes[6], uint8_t(c.fmt | 0x40u)); /* slot 6: s=5 */
+      EXPECT_EQ(packed.bytes[7], 0x01u);
+      EXPECT_EQ(packed.bytes[8], c.offset & 0xffu);
+      EXPECT_EQ(packed.bytes[9], c.ld_b9);
+      EXPECT_EQ(packed.bytes[10], c.ld_b10);
+
+      agx_apple9_vir_instr st = {};
+      st.op = AGX_APPLE9_VIR_PRIVATE_STORE;
+      st.encoding = AGX_APPLE9_ENC_PRIVATE_STORE;
+      st.dest = AGX_APPLE9_VREG_INVALID;
+      st.memory_bits = c.bits == 32 ? 0 : c.bits;
+      st.memory_components = c.comps;
+      st.nr_srcs = c.comps + 1;
+      for (unsigned k = 0; k < c.comps; ++k)
+         st.src[k] = k;
+      st.src[c.comps] = 4; /* r1 */
+      st.immediate = c.offset;
+      st.scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_2;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&st, phys, &packed, &reason))
+         << (reason ?: "");
+      ASSERT_EQ(packed.length, 10u);
+      EXPECT_EQ(packed.bytes[0], 0xefu);
+      EXPECT_EQ(packed.bytes[1], 0x20u); /* wait slot 2 */
+      EXPECT_EQ(packed.bytes[2], 0x54u);
+      EXPECT_EQ(packed.bytes[6], c.fmt);
+      EXPECT_EQ(packed.bytes[7], c.st_b7);
+      EXPECT_EQ(packed.bytes[8], c.st_b8);
+      EXPECT_EQ(packed.bytes[9], c.st_b9);
+   }
+}
+
+TEST(Apple9MemEncoding, DeviceLoadStoreVectorU16)
+{
+   agx_apple9_packed_instruction packed = {};
+
+   /* probe1_mem p_dev_u8x4 (i16x2 load & store) */
+   ASSERT_TRUE(agx_apple9_pack_device_load_vector_u16_raw(
+      1, 0, 1, 2, AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR, 0,
+      AGX_APPLE9_SCOREBOARD_SLOT_1, AGX_APPLE9_DEVICE_LOAD_TOKEN_5101,
+      &packed));
+   const uint8_t exp_ld2[14] = {0x67, 0x10, 0x44, 0x02, 0x01, 0x00, 0x20,
+                                0x00, 0x49, 0x01, 0x00, 0x40, 0x46, 0x00};
+   ASSERT_EQ(packed.length, 14u);
+   EXPECT_EQ(memcmp(packed.bytes, exp_ld2, 14), 0);
+
+   ASSERT_TRUE(agx_apple9_pack_device_store_vector_u16(
+      1, 0, 0, 2, AGX_APPLE9_SCOREBOARD_SLOT_NONE, true, &packed));
+   const uint8_t exp_st2[14] = {0xe7, 0x00, 0x54, 0x02, 0x00, 0x00, 0x21,
+                                0x00, 0x09, 0x00, 0x00, 0x90, 0x11, 0x00};
+   ASSERT_EQ(packed.length, 14u);
+   EXPECT_EQ(memcmp(packed.bytes, exp_st2, 14), 0);
+
+   /* probe1_mem p_dev_u16x4 (i16x4 load & store) */
+   ASSERT_TRUE(agx_apple9_pack_device_load_vector_u16_raw(
+      0, 2, 1, 4, AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR, 0,
+      AGX_APPLE9_SCOREBOARD_SLOT_1, AGX_APPLE9_DEVICE_LOAD_TOKEN_5101,
+      &packed));
+   const uint8_t exp_ld4[14] = {0x67, 0x10, 0x44, 0x00, 0x01, 0x02, 0x20,
+                                0x00, 0x47, 0x01, 0x00, 0x40, 0x48, 0x00};
+   ASSERT_EQ(packed.length, 14u);
+   EXPECT_EQ(memcmp(packed.bytes, exp_ld4, 14), 0);
+
+   ASSERT_TRUE(agx_apple9_pack_device_store_vector_u16(
+      0, 2, 0, 4, AGX_APPLE9_SCOREBOARD_SLOT_NONE, true, &packed));
+   const uint8_t exp_st4[14] = {0xe7, 0x00, 0x54, 0x00, 0x00, 0x02, 0x21,
+                                0x00, 0x07, 0x00, 0x00, 0x10, 0x12, 0x00};
+   ASSERT_EQ(packed.length, 14u);
+   EXPECT_EQ(memcmp(packed.bytes, exp_st4, 14), 0);
+}
+
+TEST(Apple9MemEncoding, MultiSlotGetSrAndExtendedHighGpr)
+{
+   agx_apple9_packed_instruction packed = {};
+
+   /* 4-byte form slots 1..6 */
+   for (unsigned s = 1; s <= 6; ++s) {
+      ASSERT_TRUE(agx_apple9_pack_get_sr_ex(
+         5, 0xa0, 0x10, (enum agx_apple9_scoreboard_slot)s, false, &packed));
+      ASSERT_EQ(packed.length, 4u);
+      EXPECT_EQ(packed.bytes[0], 0x5cu);
+      EXPECT_EQ(packed.bytes[1], 0xa0u);
+      EXPECT_EQ(packed.bytes[2], 0x10u);
+      EXPECT_EQ(packed.bytes[3], uint8_t(0x06u | ((s - 1) << 5)));
+   }
+   EXPECT_FALSE(agx_apple9_pack_get_sr_ex(
+      64, 0xa0, 0x10, AGX_APPLE9_SCOREBOARD_SLOT_1, false, &packed));
+
+   /* 8-byte extended form verified against probe r70 & r80 */
+   ASSERT_TRUE(agx_apple9_pack_get_sr_ex(
+      70, 0xa0, 0x10, AGX_APPLE9_SCOREBOARD_SLOT_1, true, &packed));
+   const uint8_t exp_r70[8] = {0x6c, 0xa0, 0x11, 0x06, 0x00, 0x00, 0x00, 0x10};
+   ASSERT_EQ(packed.length, 8u);
+   EXPECT_EQ(memcmp(packed.bytes, exp_r70, 8), 0);
+
+   ASSERT_TRUE(agx_apple9_pack_get_sr_ex(
+      80, 0xa0, 0x10, AGX_APPLE9_SCOREBOARD_SLOT_6, true, &packed));
+   const uint8_t exp_r80[8] = {0x0c, 0xa0, 0x51, 0xa6, 0x00, 0x00, 0x00, 0x10};
+   ASSERT_EQ(packed.length, 8u);
+   EXPECT_EQ(memcmp(packed.bytes, exp_r80, 8), 0);
+
+   EXPECT_FALSE(agx_apple9_pack_get_sr_ex(
+      96, 0xa0, 0x10, AGX_APPLE9_SCOREBOARD_SLOT_1, true, &packed));
 }

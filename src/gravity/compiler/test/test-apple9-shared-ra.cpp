@@ -1351,3 +1351,99 @@ TEST(Apple9SharedRa, NativeImageStoreExAndVolumeMinLodAllocateAndPack)
    agx_apple9_vir_finish(&p);
    ralloc_free(nir.shader);
 }
+
+TEST(Apple9SharedRa, TypedSharedPrivateDeviceU16AndAsyncGetSrAllocateAndPack)
+{
+   nir_builder nir = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "typed_mem_and_get_sr_async");
+   nir_block logical = {};
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+   p.private_size = 256;
+   auto block = agx_apple9_block_create(&p);
+   block->nir = &logical;
+   agx_apple9_block_begin(&p, block);
+
+   /* 6 independent async GET_SR reads spread across slots 1..6 and shrink to
+    * 4-byte GET_SR when allocated below r64. */
+   uint32_t srs[6];
+   for (unsigned i = 0; i < 6; ++i) {
+      srs[i] = agx_apple9_vir_emit_get_sr_async(&p, 0xa0 + (i % 3), 0x10);
+      ASSERT_NE(srs[i], AGX_APPLE9_VREG_INVALID);
+   }
+   uint32_t idx = srs[0];
+   for (unsigned i = 1; i < 6; ++i) {
+      uint32_t add[] = {idx, srs[i]};
+      idx = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IADD,
+                                AGX_APPLE9_ENC_INT_ADD_EXTENDED, add, 2, 0);
+   }
+
+   /* Narrow & vector shared loads/stores: u8, u16, u16x4, u32x3. */
+   uint32_t s8 = agx_apple9_vir_emit_shared_load_typed(&p, idx, 2, 1, 8);
+   uint32_t s16 = agx_apple9_vir_emit_shared_load_typed(&p, idx, 2, 1, 16);
+   uint32_t s16x4 = agx_apple9_vir_emit_shared_load_typed(&p, idx, 2, 4, 16);
+   uint32_t s32x3 = agx_apple9_vir_emit_shared_load_typed(&p, idx, 2, 3, 32);
+   ASSERT_NE(s8, AGX_APPLE9_VREG_INVALID);
+   ASSERT_NE(s16, AGX_APPLE9_VREG_INVALID);
+   ASSERT_NE(s16x4, AGX_APPLE9_VREG_INVALID);
+   ASSERT_NE(s32x3, AGX_APPLE9_VREG_INVALID);
+   uint32_t s16x4_data[] = {s16x4, s16x4 + 1};
+   uint32_t s32x3_data[] = {s32x3, s32x3 + 1, s32x3 + 2};
+   ASSERT_TRUE(agx_apple9_vir_emit_shared_store_typed(&p, &s8, 1, 8, idx, 2));
+   ASSERT_TRUE(agx_apple9_vir_emit_shared_store_typed(&p, &s16, 1, 16, idx, 2));
+   ASSERT_TRUE(agx_apple9_vir_emit_shared_store_typed(&p, s16x4_data, 4, 16, idx, 2));
+   ASSERT_TRUE(agx_apple9_vir_emit_shared_store_typed(&p, s32x3_data, 3, 32, idx, 2));
+
+   /* Narrow & wide private loads/stores: u8, u16, u32x2, u32x4. */
+   uint32_t p8 = agx_apple9_vir_emit_private_load(&p, idx, 1, 1, 8);
+   uint32_t p16 = agx_apple9_vir_emit_private_load(&p, idx, 17, 1, 16);
+   uint32_t p32x2 = agx_apple9_vir_emit_private_load(&p, idx, 2, 2, 32);
+   uint32_t p32x4 = agx_apple9_vir_emit_private_load(&p, idx, 4, 4, 32);
+   ASSERT_NE(p8, AGX_APPLE9_VREG_INVALID);
+   ASSERT_NE(p16, AGX_APPLE9_VREG_INVALID);
+   ASSERT_NE(p32x2, AGX_APPLE9_VREG_INVALID);
+   ASSERT_NE(p32x4, AGX_APPLE9_VREG_INVALID);
+   uint32_t p32x2_data[] = {p32x2, p32x2 + 1};
+   uint32_t p32x4_data[] = {p32x4, p32x4 + 1, p32x4 + 2, p32x4 + 3};
+   ASSERT_TRUE(agx_apple9_vir_emit_private_store(&p, &p8, 1, 8, idx, 1));
+   ASSERT_TRUE(agx_apple9_vir_emit_private_store(&p, &p16, 1, 16, idx, 17));
+   ASSERT_TRUE(agx_apple9_vir_emit_private_store(&p, p32x2_data, 2, 32, idx, 2));
+   ASSERT_TRUE(agx_apple9_vir_emit_private_store(&p, p32x4_data, 4, 32, idx, 4));
+
+   /* Packed i16x2 and i16x4 device loads & stores. */
+   agx_apple9_device_load_contract contract = {
+      .index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR,
+      .flags = AGX_APPLE9_DEVICE_LOAD_HAS_NEXT,
+      .raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_1100,
+   };
+   uint32_t d16x2 = agx_apple9_vir_emit_device_load_vector_u16(&p, 1, idx, 2, &contract);
+   uint32_t d16x4 = agx_apple9_vir_emit_device_load_vector_u16(&p, 1, idx, 4, &contract);
+   ASSERT_NE(d16x2, AGX_APPLE9_VREG_INVALID);
+   ASSERT_NE(d16x4, AGX_APPLE9_VREG_INVALID);
+   uint32_t d16x4_data[] = {d16x4, d16x4 + 1};
+   ASSERT_TRUE(agx_apple9_vir_emit_device_store_vector_u16(&p, 0, idx, &d16x2, 2));
+   ASSERT_TRUE(agx_apple9_vir_emit_device_store_vector_u16(&p, 0, idx, d16x4_data, 4));
+
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << reason;
+
+   unsigned get_sr_slots = 0, get_sr_count = 0, get_sr_compact = 0;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      const auto *I = p.instructions[i];
+      if (I->op == AGX_APPLE9_VIR_GET_SR) {
+         ASSERT_GE(I->producer_scoreboard_slot, 1u);
+         ASSERT_LE(I->producer_scoreboard_slot, 6u);
+         get_sr_slots |= BITFIELD_BIT(I->producer_scoreboard_slot - 1);
+         get_sr_compact += I->encoding == AGX_APPLE9_ENC_GET_SR;
+         ++get_sr_count;
+      }
+      agx_apple9_packed_instruction packed;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(I, p.phys, &packed, &reason))
+         << (reason ?: "");
+   }
+   EXPECT_EQ(get_sr_count, 6u);
+   EXPECT_EQ(get_sr_compact, 6u);
+   EXPECT_GT(util_bitcount(get_sr_slots), 1u);
+   agx_apple9_vir_finish(&p);
+   ralloc_free(nir.shader);
+}

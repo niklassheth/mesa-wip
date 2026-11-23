@@ -202,12 +202,16 @@ apple9_source_width(const struct agx_apple9_vir_instr *ins, unsigned source)
         ins->op == AGX_APPLE9_VIR_MESH_SUBMIT_SCALAR) && source == 0)
       return 2;
    if ((ins->op == AGX_APPLE9_VIR_DEVICE_STORE ||
-        (ins->op == AGX_APPLE9_VIR_SHARED_STORE && !ins->memory_bits) ||
-        ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
+        ins->encoding == AGX_APPLE9_ENC_SHARED_STORE ||
+        ins->op == AGX_APPLE9_VIR_PRIVATE_STORE) && source == 0)
+      return agx_apple9_mem_data_gprs(ins);
+   if ((ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
         ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC) && source == 0)
       return MAX2(ins->memory_components, 1);
-   if ((ins->encoding == AGX_APPLE9_ENC_DEVICE_STORE_INDIRECT ||
-        ins->encoding == AGX_APPLE9_ENC_DEVICE_ATOMIC_INDIRECT) &&
+   if (ins->encoding == AGX_APPLE9_ENC_DEVICE_STORE_INDIRECT &&
+       source == agx_apple9_mem_data_gprs(ins) + 1)
+      return 2;
+   if (ins->encoding == AGX_APPLE9_ENC_DEVICE_ATOMIC_INDIRECT &&
        source == ins->memory_components + 1)
       return 2;
    if ((ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT && source == 1) ||
@@ -247,7 +251,8 @@ apple9_source_constraint(const struct agx_apple9_vir_instr *ins, unsigned source
        source + ins->texture_bindless + ins->sampler_bindless >= ins->nr_srcs)
       return &apple9_table_index[ins->sampler_bindless &&
                                  source + 1 == ins->nr_srcs];
-   if (ins->op == AGX_APPLE9_VIR_SHARED_STORE && !ins->memory_bits) {
+   if (ins->encoding == AGX_APPLE9_ENC_SHARED_STORE ||
+       ins->op == AGX_APPLE9_VIR_PRIVATE_STORE) {
       return agx_apple9_find_operand(ins->encoding,
                                      source ? AGX_APPLE9_OPERAND_SRC1
                                             : AGX_APPLE9_OPERAND_SRC0);
@@ -255,11 +260,14 @@ apple9_source_constraint(const struct agx_apple9_vir_instr *ins, unsigned source
    if (ins->op == AGX_APPLE9_VIR_DEVICE_STORE ||
        ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
        ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC) {
+      unsigned data_gprs = ins->op == AGX_APPLE9_VIR_DEVICE_STORE
+                              ? agx_apple9_mem_data_gprs(ins)
+                              : MAX2(ins->memory_components, 1);
       if ((ins->encoding == AGX_APPLE9_ENC_DEVICE_STORE_INDIRECT ||
            ins->encoding == AGX_APPLE9_ENC_DEVICE_ATOMIC_INDIRECT) &&
-          source > ins->memory_components)
+          source > data_gprs)
          return agx_apple9_find_operand(ins->encoding,
-                                        source == ins->memory_components + 1
+                                        source == data_gprs + 1
                                            ? AGX_APPLE9_OPERAND_SRC1
                                            : AGX_APPLE9_OPERAND_SRC2);
       enum agx_apple9_operand_role role =
@@ -655,7 +663,13 @@ apple9_shared_dataflow(struct apple9_shared_ra *ra, nir_shader *nir,
              (ins->texture_bindless || ins->sampler_bindless))
             common->reg_constraints[0].max =
                AGX_APPLE9_HALF_REGISTER_COUNT - 2;
-         if (common->nr_dests && ins->op == AGX_APPLE9_VIR_SHARED_LOAD &&
+         if (common->nr_dests &&
+             (ins->op == AGX_APPLE9_VIR_SHARED_LOAD ||
+              ins->op == AGX_APPLE9_VIR_DEVICE_LOAD) &&
+             components > 1)
+            common->reg_constraints[0].max =
+               2 * (AGX_APPLE9_GPR_COUNT - components);
+         if (common->nr_dests && ins->op == AGX_APPLE9_VIR_PRIVATE_LOAD &&
              components > 1)
             common->reg_constraints[0].max = 2 * (64 - components);
          /* A synchronous instruction reads its sources before publishing its
@@ -675,9 +689,18 @@ apple9_shared_dataflow(struct apple9_shared_ra *ra, nir_shader *nir,
             unsigned source = first_source[s];
             struct agx_reg_constraint c =
                apple9_register_constraint(apple9_source_constraint(ins, source));
-            if (ins->op == AGX_APPLE9_VIR_SHARED_STORE && !ins->memory_bits &&
-                source == 0 && ins->memory_components > 1)
-               c.max = 2 * (64 - ins->memory_components);
+            if (source == 0) {
+               if ((ins->encoding == AGX_APPLE9_ENC_SHARED_STORE ||
+                    ins->op == AGX_APPLE9_VIR_DEVICE_STORE) &&
+                   agx_apple9_mem_data_gprs(ins) > 1)
+                  c.max = 2 * (AGX_APPLE9_GPR_COUNT - agx_apple9_mem_data_gprs(ins));
+               else if (ins->op == AGX_APPLE9_VIR_PRIVATE_STORE &&
+                        agx_apple9_mem_data_gprs(ins) > 1)
+                  c.max = 2 * (64 - agx_apple9_mem_data_gprs(ins));
+               else if (ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC &&
+                        ins->memory_components > 1)
+                  c.max = 2 * (AGX_APPLE9_GPR_COUNT - ins->memory_components);
+            }
             unsigned fixed = p->fixed_phys[ins->src[source]];
             if (fixed != AGX_APPLE9_PHYS_INVALID && !ra->publication[ins->src[source]])
                c.min = c.max = fixed * 2;
@@ -1035,6 +1058,9 @@ apple9_async(const struct agx_apple9_vir_instr *ins)
    case AGX_APPLE9_VIR_SPILL_STORE:
    case AGX_APPLE9_VIR_IMAGE_STORE:
       return true;
+   case AGX_APPLE9_VIR_GET_SR:
+      return ins->encoding == AGX_APPLE9_ENC_GET_SR_EXTENDED ||
+             ins->producer_scoreboard_slot != AGX_APPLE9_SCOREBOARD_SLOT_NONE;
    case AGX_APPLE9_VIR_DEVICE_ATOMIC:
       return !ins->atomic_discard;
    default:
@@ -1695,6 +1721,10 @@ apple9_select_compact_alu(struct agx_apple9_vir_instr *I)
    for (unsigned s = 0; s < I->nr_srcs; ++s) {
       if (I->src[s] >= 64)
          return;
+   }
+   if (I->encoding == AGX_APPLE9_ENC_GET_SR_EXTENDED) {
+      I->encoding = AGX_APPLE9_ENC_GET_SR;
+      return;
    }
    unsigned inline_mask = I->alu_src_uniform_mask | I->alu_src_immediate_mask;
    if (I->encoding == AGX_APPLE9_ENC_FLOAT2_COMPACT && !inline_mask &&
