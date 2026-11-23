@@ -8994,8 +8994,8 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       if (slot > AGX_APPLE9_SCOREBOARD_SLOT_6)
          return false;
       /* Data type in byte 13: bit 5 = float, bit 4 = 32-bit (clear for 16-bit),
-       * low nibble 0x0a -> 0x3a f32, 0x1a i32, 0x2a f16, 0x0a i16; fragment
-       * stage sets bits 6..7 (0xc0) and byte 14 = 0x08 (vs 0x89 for CS/VS).
+       * low nibble 0x0a -> 0x3a f32, 0x1a i32, 0x2a f16, 0x0a i16. Byte 14 is
+       * 0x89 for GPR-indexed bindless PBE writes across all stages (CS/VS/FS).
        * Dimension in byte 9: 0x04 (2D / 2D-array), 0x08 (3D), 0x0c (Cube).
        * Byte 5 bit 6 (0x40) marks non-layered 2D/3D/Cube; clearing it selects
        * layered 2D-array. Byte 1 waits on slot 1 for IMAGE_WRITE_PARAMS and
@@ -9005,14 +9005,13 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
                        : dim == 1 ? 0x0c
                                   : 0x04;
       uint8_t data_type = 0x0a | (bits == 32 ? 0x10 : 0x00) |
-                          (instruction->immediate ? 0x00 : 0x20) |
-                          (instruction->image_fragment ? 0xc0 : 0x00);
+                          (instruction->immediate ? 0x00 : 0x20);
       const uint8_t bytes[] = {
          0xd7, 0x10, 0x54, base << 1, 0, layered ? 0x00 : 0x40, 0,
          index << 1,
          0x20 | ((instruction->live_after_mask & (3u << 8)) ? 0 : 1),
          dim_byte, 0, 0, (uint8_t)(0x88 + (slot - 1)),
-         data_type, instruction->image_fragment ? 0x08 : 0x89, 0,
+         data_type, 0x89, 0,
       };
       packed_init(packed, bytes, sizeof(bytes));
       return true;

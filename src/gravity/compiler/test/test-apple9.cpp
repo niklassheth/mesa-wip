@@ -16542,10 +16542,10 @@ TEST(Apple9Compiler, Native16BitAndFragmentFencedImageStoreEndToEnd)
       {false, true,  nir_type_float16, 0x2a, 0x89},
       {false, false, nir_type_float32, 0x3a, 0x89},
       {false, false, nir_type_uint32,  0x1a, 0x89},
-      {true,  false, nir_type_float16, 0xea, 0x08},
-      {true,  false, nir_type_uint16,  0xca, 0x08},
-      {true,  false, nir_type_float32, 0xfa, 0x08},
-      {true,  true,  nir_type_uint32,  0xda, 0x08},
+      {true,  false, nir_type_float16, 0x2a, 0x89},
+      {true,  false, nir_type_uint16,  0x0a, 0x89},
+      {true,  false, nir_type_float32, 0x3a, 0x89},
+      {true,  true,  nir_type_uint32,  0x1a, 0x89},
    };
 
    const uint8_t fs_fence[] = {0x07, 0x14, 0x64, 0x50, 0x06, 0x00};

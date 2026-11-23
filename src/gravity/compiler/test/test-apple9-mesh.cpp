@@ -1525,11 +1525,11 @@ TEST(Apple9MemEncoding, NativeImageWrite3DCube16BitFragmentAndFences)
       {AGX_APPLE9_ENC_IMAGE_WRITE, 0, 16, 1, false, 24, 0x40, 0x04, 0x0a, 0x89},
       {AGX_APPLE9_ENC_IMAGE_WRITE, 3, 32, 0, false, 16, 0x40, 0x08, 0x3a, 0x89},
       {AGX_APPLE9_ENC_IMAGE_WRITE, 1, 32, 0, false, 8,  0x40, 0x0c, 0x3a, 0x89},
-      {AGX_APPLE9_ENC_IMAGE_WRITE, 0, 32, 0, true,  0,  0x40, 0x04, 0xfa, 0x08},
-      {AGX_APPLE9_ENC_IMAGE_WRITE, 3, 32, 0, true,  40, 0x40, 0x08, 0xfa, 0x08},
-      {AGX_APPLE9_ENC_IMAGE_WRITE, 0, 16, 0, true,  0,  0x40, 0x04, 0xea, 0x08},
-      {AGX_APPLE9_ENC_IMAGE_WRITE, 0, 16, 1, true,  0,  0x40, 0x04, 0xca, 0x08},
-      {AGX_APPLE9_ENC_IMAGE_WRITE_LAYERED, 0, 32, 1, true, 16, 0x00, 0x04, 0xda, 0x08},
+      {AGX_APPLE9_ENC_IMAGE_WRITE, 0, 32, 0, true,  0,  0x40, 0x04, 0x3a, 0x89},
+      {AGX_APPLE9_ENC_IMAGE_WRITE, 3, 32, 0, true,  40, 0x40, 0x08, 0x3a, 0x89},
+      {AGX_APPLE9_ENC_IMAGE_WRITE, 0, 16, 0, true,  0,  0x40, 0x04, 0x2a, 0x89},
+      {AGX_APPLE9_ENC_IMAGE_WRITE, 0, 16, 1, true,  0,  0x40, 0x04, 0x0a, 0x89},
+      {AGX_APPLE9_ENC_IMAGE_WRITE_LAYERED, 0, 32, 1, true, 16, 0x00, 0x04, 0x1a, 0x89},
    };
    for (const auto &c : cases) {
       agx_apple9_vir_instr I = {};

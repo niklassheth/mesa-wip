@@ -461,7 +461,8 @@ struct agx_apple9_vir_instr {
     * order, replace the immediate texture and sampler indices. */
    bool texture_bindless;
    bool sampler_bindless;
-   /* Fragment-stage PBE image write selects the fa/da/ea/ca + 0x08 form. */
+   /* Set when emitted from a fragment shader; GPR bindless PBE writes share
+    * the same byte 13/14 encoding as compute/vertex stages. */
    bool image_fragment;
    uint8_t texture_gather_component;
    /* Logical RGBA channels returned in ascending channel order, packed at
