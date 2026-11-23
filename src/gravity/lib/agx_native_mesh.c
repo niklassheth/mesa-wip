@@ -9,31 +9,41 @@
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
+static bool
+valid_classes_hash(const char *classes)
+{
+   if (!classes || strlen(classes) != 64)
+      return false;
+   for (unsigned i = 0; i < 64; ++i) {
+      if (!((classes[i] >= '0' && classes[i] <= '9') ||
+            (classes[i] >= 'a' && classes[i] <= 'f')))
+         return false;
+   }
+   return true;
+}
+
 struct agx_native_mesh_support
 agx_native_mesh_parse(const char *text, size_t size, const char *classes)
 {
    const struct agx_native_mesh_support no = {0};
    static const char prefix[] = "asahi-native-mesh v1 generation=";
-   static const char profile[] = " profile=qualified classes=";
-   if (!text || !classes || strlen(classes) != 64 ||
-       size > AGX_NATIVE_MESH_ADVERTISEMENT_MAX ||
+   static const char prof_qualified[] = " profile=qualified classes=";
+   static const char prof_research[] = " profile=research classes=-";
+   static const char prof_none[] = " profile=none classes=-";
+   if (!text || !size || size > AGX_NATIVE_MESH_ADVERTISEMENT_MAX ||
        size <= sizeof(prefix) - 1 ||
-       memcmp(text, prefix, sizeof(prefix) - 1))
+       memcmp(text, prefix, sizeof(prefix) - 1) ||
+       text[size - 1] != '\n')
       return no;
 
-   for (unsigned i = 0; i < 64; ++i) {
-      if (!((classes[i] >= '0' && classes[i] <= '9') ||
-            (classes[i] >= 'a' && classes[i] <= 'f')))
-         return no;
-   }
-
    size_t pos = sizeof(prefix) - 1;
-   if (text[pos] < '0' || text[pos] > '9')
+   size_t end = size - 1;
+   if (pos >= end || text[pos] < '0' || text[pos] > '9')
       return no;
    bool leading_zero = text[pos] == '0';
    uint64_t generation = 0;
    size_t digits = 0;
-   while (pos < size && text[pos] >= '0' && text[pos] <= '9') {
+   while (pos < end && text[pos] >= '0' && text[pos] <= '9') {
       unsigned digit = text[pos++] - '0';
       if (generation > (AGX_NATIVE_MESH_GENERATION_MAX - digit) / 10 ||
           (leading_zero && digits))
@@ -42,33 +52,65 @@ agx_native_mesh_parse(const char *text, size_t size, const char *classes)
       ++digits;
    }
 
-   if (size - pos != sizeof(profile) - 1 + 64 + 1 ||
-       memcmp(text + pos, profile, sizeof(profile) - 1) ||
-       memcmp(text + pos + sizeof(profile) - 1, classes, 64) ||
-       text[size - 1] != '\n')
-      return no;
+   if (end - pos == sizeof(prof_none) - 1 &&
+       !memcmp(text + pos, prof_none, sizeof(prof_none) - 1))
+      return (struct agx_native_mesh_support){
+         .profile = AGX_NATIVE_MESH_PROFILE_NONE,
+         .profile_generation = generation,
+      };
 
-   return (struct agx_native_mesh_support){true, generation};
+   if (end - pos == sizeof(prof_research) - 1 &&
+       !memcmp(text + pos, prof_research, sizeof(prof_research) - 1))
+      return (struct agx_native_mesh_support){
+         .profile = AGX_NATIVE_MESH_PROFILE_RESEARCH,
+         .profile_generation = generation,
+      };
+
+   if (valid_classes_hash(classes) &&
+       end - pos == sizeof(prof_qualified) - 1 + 64 &&
+       !memcmp(text + pos, prof_qualified, sizeof(prof_qualified) - 1) &&
+       !memcmp(text + pos + sizeof(prof_qualified) - 1, classes, 64))
+      return (struct agx_native_mesh_support){
+         .qualified = true,
+         .generation = generation,
+         .profile = AGX_NATIVE_MESH_PROFILE_QUALIFIED,
+         .profile_generation = generation,
+      };
+
+   return no;
 }
 
+enum agx_attr_read_status {
+   AGX_ATTR_READ_OK = 0,
+   AGX_ATTR_READ_ABSENT,
+   AGX_ATTR_READ_NOT_CHR,
+   AGX_ATTR_READ_ERROR,
+};
+
 /* Read the driver-local attribute NAME of the DRM device behind drm_fd.
- * Returns the byte count, or 0 on any error or an over-long attribute. */
-static size_t
-read_attribute(int drm_fd, const char *name, char *text, size_t capacity)
+ * Distinguishes confirmed absence (ENOENT/ENOTDIR on pre-sysfs kernels) from
+ * I/O, permission, FD-limit, or size errors so callers can fail closed. */
+static enum agx_attr_read_status
+read_attribute(int drm_fd, const char *name, char *text, size_t capacity,
+               size_t *size_out)
 {
+   *size_out = 0;
    struct stat st;
-   if (fstat(drm_fd, &st) || !S_ISCHR(st.st_mode))
-      return 0;
+   if (fstat(drm_fd, &st))
+      return AGX_ATTR_READ_ERROR;
+   if (!S_ISCHR(st.st_mode))
+      return AGX_ATTR_READ_NOT_CHR;
 
    char path[128];
    int n = snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/device/%s",
                     major(st.st_rdev), minor(st.st_rdev), name);
    if (n < 0 || (size_t)n >= sizeof(path))
-      return 0;
+      return AGX_ATTR_READ_ERROR;
 
    int fd = open(path, O_RDONLY | O_CLOEXEC);
    if (fd < 0)
-      return 0;
+      return (errno == ENOENT || errno == ENOTDIR) ? AGX_ATTR_READ_ABSENT
+                                                   : AGX_ATTR_READ_ERROR;
 
    size_t size = 0;
    bool complete = false;
@@ -86,18 +128,38 @@ read_attribute(int drm_fd, const char *name, char *text, size_t capacity)
       size += count;
    }
    close(fd);
-   return complete ? size : 0;
+   if (!complete)
+      return AGX_ATTR_READ_ERROR;
+   *size_out = size;
+   return AGX_ATTR_READ_OK;
 }
 
 struct agx_native_mesh_support
 agx_native_mesh_probe(int drm_fd, const char *classes)
 {
-   const struct agx_native_mesh_support no = {0};
+   const struct agx_native_mesh_support absent = {
+      .profile = AGX_NATIVE_MESH_PROFILE_UNKNOWN,
+   };
+   const struct agx_native_mesh_support fail = {
+      .profile = AGX_NATIVE_MESH_PROFILE_NONE,
+   };
    if (!classes)
-      return no;
+      return fail;
    char text[AGX_NATIVE_MESH_ADVERTISEMENT_MAX + 1];
-   size_t size = read_attribute(drm_fd, "asahi_native_mesh", text, sizeof(text));
-   return size ? agx_native_mesh_parse(text, size, classes) : no;
+   size_t size = 0;
+   enum agx_attr_read_status st =
+      read_attribute(drm_fd, "asahi_native_mesh", text, sizeof(text), &size);
+   if (st == AGX_ATTR_READ_ABSENT)
+      return absent;
+   if (st != AGX_ATTR_READ_OK || !size)
+      return fail;
+   struct agx_native_mesh_support parsed =
+      agx_native_mesh_parse(text, size, classes);
+   /* The sysfs attribute exists, so an unparseable advertisement fails closed
+    * instead of masquerading as a pre-sysfs kernel. */
+   if (parsed.profile == AGX_NATIVE_MESH_PROFILE_UNKNOWN)
+      return fail;
+   return parsed;
 }
 
 /* A decimal field without leading zeros, at most max, advancing *pos. */
@@ -173,8 +235,11 @@ agx_native_blocks_probe(int drm_fd)
 {
    const struct agx_native_blocks_support no = {0};
    char text[AGX_NATIVE_MESH_ADVERTISEMENT_MAX + 1];
-   size_t size = read_attribute(drm_fd, "asahi_native_blocks", text, sizeof(text));
-   return size ? agx_native_blocks_parse(text, size) : no;
+   size_t size = 0;
+   if (read_attribute(drm_fd, "asahi_native_blocks", text, sizeof(text),
+                      &size) != AGX_ATTR_READ_OK || !size)
+      return no;
+   return agx_native_blocks_parse(text, size);
 }
 
 bool
@@ -191,12 +256,51 @@ agx_native_mesh_parse_disabled(const char *text, size_t size)
    return parse_literal(text, end, &pos, " profile=none ");
 }
 
+static bool
+agx_native_mesh_parse_enabled_strict(const char *text, size_t size)
+{
+   static const char prefix[] = "asahi-native-mesh v1 generation=";
+   static const char prof_research[] = " profile=research classes=-";
+   static const char prof_qualified[] = " profile=qualified classes=";
+   if (!text || !size || size > AGX_NATIVE_MESH_ADVERTISEMENT_MAX ||
+       size <= sizeof(prefix) - 1 ||
+       memcmp(text, prefix, sizeof(prefix) - 1) ||
+       text[size - 1] != '\n')
+      return false;
+   size_t pos = sizeof(prefix) - 1, end = size - 1;
+   uint64_t generation;
+   if (!parse_decimal(text, end, &pos, AGX_NATIVE_MESH_GENERATION_MAX,
+                      &generation))
+      return false;
+   if (end - pos == sizeof(prof_research) - 1 &&
+       !memcmp(text + pos, prof_research, sizeof(prof_research) - 1))
+      return true;
+   if (end - pos == sizeof(prof_qualified) - 1 + 64 &&
+       !memcmp(text + pos, prof_qualified, sizeof(prof_qualified) - 1)) {
+      const char *hex = text + pos + sizeof(prof_qualified) - 1;
+      for (size_t i = 0; i < 64; ++i) {
+         char c = hex[i];
+         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+      }
+      return true;
+   }
+   return false;
+}
+
 bool
 agx_native_mesh_probe_disabled(int drm_fd)
 {
    if (drm_fd < 0)
       return false;
    char text[AGX_NATIVE_MESH_ADVERTISEMENT_MAX + 1];
-   size_t size = read_attribute(drm_fd, "asahi_native_mesh", text, sizeof(text));
-   return size ? agx_native_mesh_parse_disabled(text, size) : false;
+   size_t size = 0;
+   enum agx_attr_read_status st =
+      read_attribute(drm_fd, "asahi_native_mesh", text, sizeof(text), &size);
+   if (st == AGX_ATTR_READ_ABSENT || st == AGX_ATTR_READ_NOT_CHR)
+      return false;
+   if (st != AGX_ATTR_READ_OK || !size)
+      return true;
+   /* Fail closed for profile=none and any malformed present advertisement. */
+   return !agx_native_mesh_parse_enabled_strict(text, size);
 }

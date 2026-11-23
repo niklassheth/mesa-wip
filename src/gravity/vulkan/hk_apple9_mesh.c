@@ -6,7 +6,6 @@
 #include "hk_device.h"
 #include "hk_apple9_native_index_classes.h"
 #include "gravity/lib/agx_native_mesh.h"
-#include "util/simple_mtx.h"
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
 #include <string.h>
@@ -169,28 +168,15 @@ hk_apple9_native_mesh_available(const struct hk_physical_device *pdev)
 static bool
 native_mesh_kernel_disabled(const struct hk_device *dev)
 {
-   if (!dev || dev->dev.native_mesh_qualified || dev->dev.fd < 0)
+   if (!dev || dev->dev.native_mesh_qualified)
       return false;
-   /* Real DRM VMs latch their native-mesh profile for the VM lifetime; cache
-    * per (dev, fd, vm_id) to avoid per-draw sysfs open/read syscalls. */
-   if (!dev->dev.vm_id)
-      return agx_native_mesh_probe_disabled(dev->dev.fd);
-   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
-   static const struct hk_device *cached_dev;
-   static int cached_fd = -1;
-   static uint32_t cached_vm_id;
-   static bool cached_disabled;
-   simple_mtx_lock(&lock);
-   if (cached_dev != dev || cached_fd != dev->dev.fd ||
-       cached_vm_id != dev->dev.vm_id) {
-      cached_dev = dev;
-      cached_fd = dev->dev.fd;
-      cached_vm_id = dev->dev.vm_id;
-      cached_disabled = agx_native_mesh_probe_disabled(dev->dev.fd);
-   }
-   bool disabled = cached_disabled;
-   simple_mtx_unlock(&lock);
-   return disabled;
+   if (dev->dev.native_mesh_profile != AGX_NATIVE_MESH_PROFILE_UNKNOWN)
+      return dev->dev.native_mesh_profile == AGX_NATIVE_MESH_PROFILE_NONE;
+   /* Real DRM VMs probe and latch asahi_native_mesh around VM_CREATE; UNKNOWN
+    * on a real VM means the sysfs attribute was absent (older kernel). */
+   if (dev->dev.vm_id || dev->dev.fd < 0)
+      return false;
+   return agx_native_mesh_probe_disabled(dev->dev.fd);
 }
 
 bool

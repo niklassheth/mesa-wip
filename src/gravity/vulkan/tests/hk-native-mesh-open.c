@@ -53,7 +53,19 @@ struct agx_native_mesh_support __wrap_agx_native_mesh_probe(int fd, const char *
    CHECK(opening_device->chip ==
          (generation == 17 ? AGX_CHIP_G17P : AGX_CHIP_G16G));
    const char *text = probes++ ? after_text : before_text;
-   return agx_native_mesh_parse(text, strlen(text), classes);
+   if (!classes)
+      return (struct agx_native_mesh_support){
+         .profile = AGX_NATIVE_MESH_PROFILE_NONE,
+      };
+   if (!text)
+      return (struct agx_native_mesh_support){
+         .profile = AGX_NATIVE_MESH_PROFILE_UNKNOWN,
+      };
+   struct agx_native_mesh_support s =
+      agx_native_mesh_parse(text, strlen(text), classes);
+   if (s.profile == AGX_NATIVE_MESH_PROFILE_UNKNOWN)
+      s.profile = AGX_NATIVE_MESH_PROFILE_NONE;
+   return s;
 }
 struct agx_bo *__wrap_agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
                                    enum agx_bo_flags flags, const char *label);
@@ -66,7 +78,8 @@ struct agx_bo *__wrap_agx_bo_create(struct agx_device *dev, size_t size, unsigne
 }
 
 static uint64_t
-check(unsigned gen, const char *before, const char *after, bool qualified, bool kill)
+check(unsigned gen, const char *before, const char *after, bool qualified,
+      enum agx_native_mesh_profile expected_profile, bool kill)
 {
    struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
    CHECK(pdev);
@@ -81,6 +94,7 @@ check(unsigned gen, const char *before, const char *after, bool qualified, bool 
       CHECK(!"device open returned before allocation boundary");
    }
    CHECK(pdev->dev.native_mesh_qualified == qualified);
+   CHECK(pdev->dev.native_mesh_profile == expected_profile);
    CHECK(hk_apple9_native_index_enabled(pdev) == (qualified && !kill));
    uint64_t flags = hk_physical_device_compiler_flags(pdev);
    CHECK(!pdev->dev.bo_cache.started);
@@ -116,14 +130,20 @@ int main(void)
    CHECK(!agx_native_mesh_parse_disabled("", 0));
    CHECK(!agx_native_mesh_parse_disabled(NULL, 0));
    CHECK(!agx_native_mesh_parse_disabled("asahi-native-mesh v2 generation=1 profile=none classes=-\n", 56));
-   uint64_t positive = check(16, yes, yes, true, false);
-   uint64_t negative = check(16, none, none, false, false);
+   uint64_t positive = check(16, yes, yes, true, AGX_NATIVE_MESH_PROFILE_QUALIFIED, false);
+   uint64_t negative = check(16, none, none, false, AGX_NATIVE_MESH_PROFILE_NONE, false);
    CHECK((positive ^ negative) == (1ull << 60));
-   CHECK(check(16, yes, yes, true, true) == negative);
-   CHECK(check(16, yes, changed, false, false) == negative);
-   CHECK(check(16, yes, wrong, false, false) == negative);
-   CHECK(check(16, none, yes, false, false) == negative);
-   check(17, yes, yes, false, false);
-   puts("PASS: real device-open ordering, seven profile/policy cases, compiler bit 60; GPU execution=0");
+   CHECK(check(16, research, research, false, AGX_NATIVE_MESH_PROFILE_RESEARCH, false) == negative);
+   CHECK(check(16, research, none, false, AGX_NATIVE_MESH_PROFILE_NONE, false) == negative);
+   CHECK(check(16, yes, yes, true, AGX_NATIVE_MESH_PROFILE_QUALIFIED, true) == negative);
+   CHECK(check(16, yes, changed, false, AGX_NATIVE_MESH_PROFILE_NONE, false) == negative);
+   CHECK(check(16, yes, wrong, false, AGX_NATIVE_MESH_PROFILE_NONE, false) == negative);
+   CHECK(check(16, none, yes, false, AGX_NATIVE_MESH_PROFILE_NONE, false) == negative);
+   /* Confirmed absent sysfs attribute (NULL) preserves UNKNOWN; read/parse
+    * failures ("") fail closed to NONE on both samples. */
+   CHECK(check(16, NULL, NULL, false, AGX_NATIVE_MESH_PROFILE_UNKNOWN, false) == negative);
+   CHECK(check(16, "", "", false, AGX_NATIVE_MESH_PROFILE_NONE, false) == negative);
+   check(17, yes, yes, false, AGX_NATIVE_MESH_PROFILE_NONE, false);
+   puts("PASS: real device-open ordering, profile latching, compiler bit 60; GPU execution=0");
    return 0;
 }

@@ -45,6 +45,17 @@ routes(struct hk_cmd_buffer *cmd)
    dyn->rs.polygon_mode = VK_POLYGON_MODE_FILL;
    const uint32_t direct[] = {2, 3, 4}, oversized[] = {1024, 1024, 1};
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   /* Latched VM profile=none refuses native submission even with HK_APPLE9_NATIVE_MESH=1,
+    * while latched research and qualified profiles admit it. */
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_NONE;
+   CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
+   dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_RESEARCH;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_QUALIFIED;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_UNKNOWN;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
    CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
    CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0x1000));
    CHECK(!hk_apple9_use_native_mesh(cmd, oversized, 0));

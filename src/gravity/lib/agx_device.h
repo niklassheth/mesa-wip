@@ -95,6 +95,7 @@ struct agx_device {
     * entries are allocated, so their 8 MiB arena is not created. */
    bool probe_only;
    bool native_mesh_qualified;
+   enum agx_native_mesh_profile native_mesh_profile;
    /* The VM's latched asahi_native_blocks profile; qualified only together
     * with native_mesh_qualified, at the same generation. */
    struct agx_native_blocks_support native_blocks;
