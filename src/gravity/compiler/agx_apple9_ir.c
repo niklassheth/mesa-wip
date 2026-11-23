@@ -8187,6 +8187,8 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       const unsigned mem_components =
          instruction->memory_components ? instruction->memory_components
                                         : components;
+      if (instruction->memory_coherent && memory_bits == 32 && components == 3)
+         return false;
       bool ok;
       if (memory_bits == 16 && (mem_components == 2 || mem_components == 4))
          ok = components == mem_components / 2 &&
@@ -8234,6 +8236,8 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
          if (!(instruction->live_after_mask & 6))
             packed->bytes[9] |= 4;
       }
+      if (instruction->memory_coherent)
+         packed->bytes[11] &= ~0x40;
       return pack_memory_address(instruction, packed);
    }
    case AGX_APPLE9_VIR_DEVICE_STORE: {
@@ -8256,6 +8260,9 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
             return false;
       }
 
+      if (instruction->memory_coherent && instruction->memory_bits == 32 &&
+          components == 3)
+         return false;
       bool ok;
       if (instruction->memory_bits == 16 &&
           (components == 2 || components == 4))
@@ -8281,6 +8288,8 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
          packed->bytes[4] = address;
          packed->bytes[12] |= 0x08;
       }
+      if (instruction->memory_coherent)
+         packed->bytes[11] &= ~0x10;
       return pack_memory_address(instruction, packed);
    }
    case AGX_APPLE9_VIR_DEVICE_ATOMIC: {
@@ -9372,6 +9381,8 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
                                   : 0x04;
       uint8_t data_type = 0x0a | (bits == 32 ? 0x10 : 0x00) |
                           (instruction->immediate ? 0x00 : 0x20);
+      if (instruction->memory_coherent)
+         data_type &= ~0x02;
       const uint8_t bytes[] = {
          0xd7, 0x10, 0x54, base << 1, 0, layered ? 0x00 : 0x40, 0,
          index << 1,
@@ -9473,6 +9484,8 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
          0x0c | (((dst >> 5) & 1) << 6), 0xb8 | (coord >> 3),
          0xb0 | (sampler >> 1), 0, 0, 0, texture_hi,
          sampler & 1, 0x10, 0, 1, 0};
+      if (instruction->memory_coherent)
+         bytes[3] |= 0x40;
       /* Texture completion uses paired zero-based tag fields. Matching both
        * fields is the native form, validated by retagging our own T8132
        * read and filtered-sample shaders with multiple outstanding results. */

@@ -3377,8 +3377,18 @@ system_value("is_viewport_z_transform_emulated_kk", 1, bit_sizes=[1])
 load("viewport_z_range_kk", [1], [], [CAN_ELIMINATE, CAN_REORDER])
 
 # Apple9 native storage write. src0 is a USC-relative 32-byte PBE index;
-# src1 is (x, y, layer) with layer used when IMAGE_ARRAY is set; src2 is data.
-intrinsic("image_store_apple9_agx", [1, 3, 4], indices=[ACCESS, SRC_TYPE, IMAGE_ARRAY])
+# src1 is (x, y, z/layer/face) with the third component used for 3D/Cube/array;
+# src2 is data.
+intrinsic("image_store_apple9_agx", [1, 3, 4],
+          indices=[ACCESS, SRC_TYPE, IMAGE_DIM, IMAGE_ARRAY])
+# Apple9 native storage load. src0 is a USC-relative 32-byte texture index;
+# src1 is (x, y, z/layer); src2 is lod (or sample index for MSAA); src3 is a
+# bindless fetch-sampler index when BASE != 0. FLAGS bit 0 selects sparse
+# residency return (dest has 4 + 1 components). Intentionally omits
+# CAN_REORDER and CAN_ELIMINATE so CSE/DCE preserve ordering and volatile/
+# coherent accesses.
+intrinsic("image_load_apple9_agx", [1, 3, 1, 1], dest_comp=0,
+          indices=[BASE, ACCESS, DEST_TYPE, IMAGE_DIM, IMAGE_ARRAY, FLAGS])
 # Apple9: drain the invocation's image_store_apple9_agx writes to memory (0x0650).
 intrinsic("fence_image_write_apple9_agx")
 # Apple9: invalidate the texture cache so later texture reads see written memory (0x06d0).

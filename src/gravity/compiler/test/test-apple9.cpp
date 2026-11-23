@@ -18358,3 +18358,353 @@ TEST(Apple9Vir, MmaSharedRaForcedSpill)
    ralloc_free(nir.shader);
 }
 
+TEST(Apple9Compiler, MemoryCoherentDeviceBits)
+{
+   /* Verify exact single-bit memory_coherence_device diffs across all 4 Apple9
+    * memory/image instruction families against clean-room Metal probes. */
+   uint8_t phys[32];
+   for (unsigned i = 0; i < ARRAY_SIZE(phys); ++i)
+      phys[i] = i;
+   const char *reason = nullptr;
+
+   /* 1. DEVICE_LOAD: byte 11 bit 6 cleared (0x40 -> 0x00) across widths. */
+   struct {
+      unsigned bits;
+      unsigned mem_comps;
+      unsigned dst_comps;
+   } load_cases[] = {
+      {8, 1, 1}, {16, 1, 1}, {16, 2, 1}, {16, 4, 2},
+      {32, 1, 1}, {32, 2, 2}, {32, 4, 4},
+   };
+   for (const auto &c : load_cases) {
+      for (int mode = 0; mode < 2; ++mode) {
+         agx_apple9_vir_instr ins = {};
+         ins.op = AGX_APPLE9_VIR_DEVICE_LOAD;
+         ins.encoding = mode ? AGX_APPLE9_ENC_DEVICE_LOAD_POINTER
+                             : AGX_APPLE9_ENC_DEVICE_LOAD;
+         ins.dest = 0;
+         ins.dest_components = c.dst_comps;
+         ins.memory_bits = c.bits;
+         ins.memory_components = c.mem_comps;
+         ins.nr_srcs = mode ? 2 : 1;
+         ins.src[0] = 4;
+         ins.src[1] = 5;
+         ins.device_load_index_kind = mode
+            ? AGX_APPLE9_DEVICE_LOAD_INDEX_NONE
+            : AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR;
+         ins.producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1;
+         ins.device_load_raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_1100;
+
+         agx_apple9_packed_instruction norm = {}, coh = {};
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &norm, &reason))
+            << (reason ?: "");
+         ins.memory_coherent = true;
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &coh, &reason))
+            << (reason ?: "");
+         ASSERT_EQ(norm.length, 14u);
+         ASSERT_EQ(coh.length, 14u);
+         EXPECT_EQ(norm.bytes[11] & 0x40, 0x40);
+         EXPECT_EQ(coh.bytes[11], norm.bytes[11] & ~0x40);
+         for (unsigned b = 0; b < 14; ++b) {
+            if (b != 11) {
+               EXPECT_EQ(coh.bytes[b], norm.bytes[b]) << "byte " << b;
+            }
+         }
+      }
+   }
+   /* Coherent u32x3 DEVICE_LOAD must be rejected by packer (scalarized in NIR). */
+   {
+      agx_apple9_vir_instr ins = {};
+      ins.op = AGX_APPLE9_VIR_DEVICE_LOAD;
+      ins.encoding = AGX_APPLE9_ENC_DEVICE_LOAD;
+      ins.dest = 0;
+      ins.dest_components = 3;
+      ins.memory_bits = 32;
+      ins.memory_components = 3;
+      ins.nr_srcs = 1;
+      ins.src[0] = 4;
+      ins.device_load_index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR;
+      ins.producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1;
+      ins.device_load_raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_1100;
+      ins.memory_coherent = true;
+      agx_apple9_packed_instruction packed = {};
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+   }
+
+   /* 2. DEVICE_STORE: byte 11 bit 4 cleared (0x90->0x80, 0x10->0x00). */
+   struct {
+      unsigned bits;
+      unsigned comps;
+      unsigned gprs;
+   } store_cases[] = {
+      {8, 1, 1}, {16, 1, 1}, {16, 2, 1}, {16, 4, 2},
+      {32, 1, 1}, {32, 2, 2}, {32, 4, 4},
+   };
+   for (const auto &c : store_cases) {
+      for (int indirect = 0; indirect < 2; ++indirect) {
+         agx_apple9_vir_instr ins = {};
+         ins.op = AGX_APPLE9_VIR_DEVICE_STORE;
+         ins.encoding = indirect ? AGX_APPLE9_ENC_DEVICE_STORE_INDIRECT
+                                 : AGX_APPLE9_ENC_DEVICE_STORE;
+         ins.memory_bits = c.bits;
+         ins.memory_components = c.comps;
+         ins.nr_srcs = c.gprs + (indirect ? 3 : 1);
+         for (unsigned g = 0; g < c.gprs; ++g)
+            ins.src[g] = g;
+         ins.src[c.gprs] = 6;
+         if (indirect) {
+            ins.src[c.gprs + 1] = 8;
+            ins.src[c.gprs + 2] = 9;
+         }
+
+         agx_apple9_packed_instruction norm = {}, coh = {};
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &norm, &reason))
+            << (reason ?: "");
+         ins.memory_coherent = true;
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &coh, &reason))
+            << (reason ?: "");
+         ASSERT_EQ(norm.length, 14u);
+         ASSERT_EQ(coh.length, 14u);
+         EXPECT_EQ(norm.bytes[11] & 0x10, 0x10);
+         EXPECT_EQ(coh.bytes[11], norm.bytes[11] & ~0x10);
+         for (unsigned b = 0; b < 14; ++b) {
+            if (b != 11) {
+               EXPECT_EQ(coh.bytes[b], norm.bytes[b]) << "byte " << b;
+            }
+         }
+      }
+   }
+   /* Coherent u32x3 DEVICE_STORE must be rejected by packer. */
+   {
+      agx_apple9_vir_instr ins = {};
+      ins.op = AGX_APPLE9_VIR_DEVICE_STORE;
+      ins.encoding = AGX_APPLE9_ENC_DEVICE_STORE;
+      ins.memory_bits = 32;
+      ins.memory_components = 3;
+      ins.nr_srcs = 4;
+      ins.src[0] = 0; ins.src[1] = 1; ins.src[2] = 2; ins.src[3] = 4;
+      ins.memory_coherent = true;
+      agx_apple9_packed_instruction packed = {};
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(&ins, phys, &packed, &reason));
+   }
+
+   /* 3. IMAGE_WRITE: byte 13 bit 1 cleared (3A->38, 1A->18, 2A->28, 0A->08). */
+   struct {
+      unsigned dim;
+      bool layered;
+      unsigned bits;
+      unsigned integer;
+      uint8_t expect_b9;
+      uint8_t expect_b13_norm;
+   } img_cases[] = {
+      {0, false, 32, 0, 0x04, 0x3a},
+      {0, false, 32, 1, 0x04, 0x1a},
+      {0, false, 16, 0, 0x04, 0x2a},
+      {0, false, 16, 1, 0x04, 0x0a},
+      {0, true,  32, 0, 0x04, 0x3a},
+      {3, false, 32, 0, 0x08, 0x3a},
+      {1, false, 32, 0, 0x0c, 0x3a},
+   };
+   for (const auto &c : img_cases) {
+      agx_apple9_vir_instr ins = {};
+      ins.op = AGX_APPLE9_VIR_IMAGE_STORE;
+      ins.encoding = c.layered ? AGX_APPLE9_ENC_IMAGE_WRITE_LAYERED
+                               : AGX_APPLE9_ENC_IMAGE_WRITE;
+      ins.texture_dimension = c.dim;
+      ins.memory_bits = c.bits;
+      ins.immediate = c.integer;
+      ins.nr_srcs = 10;
+      for (unsigned i = 0; i < 8; ++i)
+         ins.src[i] = i;
+      ins.src[8] = 8;
+      ins.src[9] = 9;
+      ins.producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1;
+
+      agx_apple9_packed_instruction norm = {}, coh = {};
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &norm, &reason))
+         << (reason ?: "");
+      ins.memory_coherent = true;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &coh, &reason))
+         << (reason ?: "");
+      ASSERT_EQ(norm.length, 16u);
+      ASSERT_EQ(coh.length, 16u);
+      EXPECT_EQ(norm.bytes[9], c.expect_b9);
+      EXPECT_EQ(norm.bytes[13], c.expect_b13_norm);
+      EXPECT_EQ(coh.bytes[13], (uint8_t)(c.expect_b13_norm & ~0x02));
+      for (unsigned b = 0; b < 16; ++b) {
+         if (b != 13) {
+            EXPECT_EQ(coh.bytes[b], norm.bytes[b]) << "byte " << b;
+         }
+      }
+   }
+
+   /* 4. TEXTURE_LOAD / TEXTURE_LOAD_MS: byte 3 bit 6 set (|= 0x40), direct & bindless. */
+   for (int bindless = 0; bindless < 2; ++bindless) {
+      for (int ms = 0; ms < 2; ++ms) {
+         agx_apple9_vir_instr ins = {};
+         ins.op = AGX_APPLE9_VIR_TEXTURE_SAMPLE;
+         ins.encoding = AGX_APPLE9_ENC_TEXTURE_LOD;
+         ins.dest = 0;
+         ins.dest_components = 4;
+         ins.texture_result_mask = 0xf;
+         ins.texture_fetch = !ms;
+         ins.texture_multisampled = ms != 0;
+         ins.texture_bindless = bindless != 0;
+         ins.nr_srcs = 4 + bindless;
+         ins.src[0] = 4; ins.src[1] = 5; ins.src[2] = 6; ins.src[3] = 7;
+         if (bindless)
+            ins.src[4] = 10;
+         ins.producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1;
+
+         agx_apple9_packed_instruction norm = {}, coh = {};
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &norm, &reason))
+            << (reason ?: "");
+         ins.memory_coherent = true;
+         ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins, phys, &coh, &reason))
+            << (reason ?: "");
+         ASSERT_EQ(norm.length, bindless ? 20u : 14u);
+         ASSERT_EQ(coh.length, norm.length);
+         EXPECT_EQ(norm.bytes[3] & 0x40, 0x00);
+         EXPECT_EQ(coh.bytes[3], (uint8_t)(norm.bytes[3] | 0x40));
+         for (unsigned b = 0; b < norm.length; ++b) {
+            if (b != 3) {
+               EXPECT_EQ(coh.bytes[b], norm.bytes[b]) << "byte " << b;
+            }
+         }
+      }
+   }
+}
+
+TEST(Apple9Compiler, ImageLoadApple9OrderingAndCoherentU32x3)
+{
+   /* Two identical coherent image_load_apple9_agx separated by a coherent
+    * 3D image_store_apple9_agx + fences must NOT be CSE'd and must set the
+    * hardware memory_coherence_device bits on both loads and the store. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "img_load_order");
+      b.shader->info.workgroup_size[0] = 64;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.num_ssbos = 1;
+      b.shader->info.num_ubos = 1;
+      nir_def *tex = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                                  .align_mul = 4, .range = 4);
+      nir_def *pbe = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 4),
+                                  .align_mul = 4, .range = 4);
+      nir_def *coord = nir_imm_ivec3(&b, 1, 2, 3);
+      nir_def *a = nir_image_load_apple9_agx(&b, 4, 32, tex, coord, nir_imm_int(&b, 0),
+         nir_imm_int(&b, 0), .base = 0, .access = ACCESS_COHERENT,
+         .dest_type = nir_type_float32, .image_dim = GLSL_SAMPLER_DIM_3D,
+         .image_array = false, .flags = 0);
+      nir_image_store_apple9_agx(&b, pbe, coord, a,
+         .access = ACCESS_COHERENT, .src_type = nir_type_float32,
+         .image_dim = GLSL_SAMPLER_DIM_3D, .image_array = false);
+      nir_fence_image_write_apple9_agx(&b);
+      nir_fence_tex_invalidate_apple9_agx(&b);
+      nir_def *c = nir_image_load_apple9_agx(&b, 4, 32, tex, coord, nir_imm_int(&b, 0),
+         nir_imm_int(&b, 0), .base = 0, .access = ACCESS_COHERENT,
+         .dest_type = nir_type_float32, .image_dim = GLSL_SAMPLER_DIM_3D,
+         .image_array = false, .flags = 0);
+      /* Dead volatile load must survive DCE. */
+      nir_image_load_apple9_agx(&b, 4, 32, tex, coord, nir_imm_int(&b, 0),
+         nir_imm_int(&b, 0), .base = 0, .access = ACCESS_VOLATILE,
+         .dest_type = nir_type_float32, .image_dim = GLSL_SAMPLER_DIM_2D,
+         .image_array = false, .flags = 0);
+      nir_store_ssbo(&b, nir_fadd(&b, a, c), nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                     .write_mask = 0xf, .align_mul = 16);
+
+      agx_shader_part compiled = {};
+      agx_apple9_compute_profile profile = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(compiled.info.apple9_uses_texel_fetch);
+
+      /* Verify exact program order via byte offsets:
+       * load0 < 3D store < PBE drain (0x0650) < tex invalidate (0x06d0) < load1 < dead volatile load. */
+      const uint8_t *bytes = static_cast<const uint8_t *>(compiled.binary);
+      std::vector<size_t> tex_offs;
+      size_t store_off = SIZE_MAX, drain_off = SIZE_MAX, inv_off = SIZE_MAX;
+      for (size_t i = 0; i + 20 <= compiled.info.binary_size; i += 2) {
+         if ((bytes[i] & 0x07) == 5 && (bytes[i + 1] & 0x80) == 0x80 &&
+             (bytes[i + 2] & 0x0f) == 0x0c && (bytes[i + 3] & 0xe4) == 0xe0 &&
+             (bytes[i + 9] & 0x02) == 0x02 && (bytes[i + 10] & 0x80) == 0x80 &&
+             bytes[i + 18] == 0x40)
+            tex_offs.push_back(i);
+      }
+      for (size_t i = 0; i + 16 <= compiled.info.binary_size; i += 2) {
+         if (bytes[i] == 0xd7 && bytes[i + 2] == 0x54 &&
+             bytes[i + 9] == 0x08 && bytes[i + 13] == 0x38 &&
+             bytes[i + 14] == 0x89)
+            store_off = i;
+      }
+      const uint8_t tex_inv[] = {0x07, 0x04, 0x54, 0xd0, 0x06, 0x00};
+      for (size_t i = 0; i + 6 <= compiled.info.binary_size; i += 2) {
+         if (bytes[i] == 0x07 && (bytes[i + 1] & 0x0f) == 0x04 &&
+             (bytes[i + 2] & 0xfc) == 0x54 && bytes[i + 3] == 0x50 &&
+             bytes[i + 4] == 0x06 && bytes[i + 5] == 0x00)
+            drain_off = i;
+         if (!memcmp(bytes + i, tex_inv, 6))
+            inv_off = i;
+      }
+      ASSERT_EQ(tex_offs.size(), 3u);
+      ASSERT_NE(store_off, SIZE_MAX);
+      ASSERT_NE(drain_off, SIZE_MAX);
+      ASSERT_NE(inv_off, SIZE_MAX);
+      EXPECT_LT(tex_offs[0], store_off);
+      EXPECT_LT(store_off, drain_off);
+      EXPECT_LT(drain_off, inv_off);
+      EXPECT_LT(inv_off, tex_offs[1]);
+      EXPECT_LT(tex_offs[1], tex_offs[2]);
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* Coherent u32x3 SSBO load & store must split into coherent u32x2 + u32
+    * DEVICE_LOAD (bytes[11] & 0x40 == 0) and DEVICE_STORE (bytes[11] & 0x10 == 0). */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "coh_u32x3");
+      b.shader->info.workgroup_size[0] = 64;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.num_ssbos = 1;
+      nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *off = nir_imul_imm(&b, gid, 12);
+      nir_def *val = nir_load_ssbo(&b, 3, 32, nir_imm_int(&b, 0), off,
+                                   .access = ACCESS_COHERENT, .align_mul = 4);
+      nir_store_ssbo(&b, nir_iadd_imm(&b, val, 1), nir_imm_int(&b, 0), off,
+                     .write_mask = 0x7, .access = ACCESS_COHERENT,
+                     .align_mul = 4);
+
+      agx_shader_part compiled = {};
+      agx_apple9_compute_profile profile = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason))
+         << (reason ?: "");
+      const uint8_t *bytes = static_cast<const uint8_t *>(compiled.binary);
+      unsigned coh_loads = 0, coh_stores = 0;
+      unsigned non_coh_loads = 0, non_coh_stores = 0;
+      for (size_t i = 0; i + 14 <= compiled.info.binary_size; i += 2) {
+         if (bytes[i] == 0x67 && (bytes[i + 1] & 0x0f) == 0x00 &&
+             (bytes[i + 2] & 0xec) == 0x44 && bytes[i + 13] == 0x00) {
+            if ((bytes[i + 11] & 0x40) == 0)
+               ++coh_loads;
+            else
+               ++non_coh_loads;
+         }
+         if (bytes[i] == 0xe7 && (bytes[i + 1] & 0x0f) == 0x00 &&
+             (bytes[i + 2] & 0xfc) == 0x54 && bytes[i + 13] == 0x00) {
+            if ((bytes[i + 11] & 0x10) == 0)
+               ++coh_stores;
+            else
+               ++non_coh_stores;
+         }
+      }
+      EXPECT_GE(coh_loads, 2u);
+      EXPECT_GE(coh_stores, 2u);
+      EXPECT_EQ(non_coh_loads, 0u);
+      EXPECT_EQ(non_coh_stores, 0u);
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+}

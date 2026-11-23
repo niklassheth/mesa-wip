@@ -750,6 +750,14 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
                      load_may_tear(state, instr);
       break;
 
+   case nir_intrinsic_image_load_apple9_agx:
+      is_divergent = src_divergent(instr->src[0], state) ||
+                     src_divergent(instr->src[1], state) ||
+                     src_divergent(instr->src[2], state) ||
+                     src_divergent(instr->src[3], state) ||
+                     load_may_tear(state, instr);
+      break;
+
    case nir_intrinsic_optimization_barrier_vgpr_amd:
    case nir_intrinsic_pack_format_agx:
       is_divergent = src_divergent(instr->src[0], state);

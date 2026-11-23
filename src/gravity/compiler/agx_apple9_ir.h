@@ -452,6 +452,8 @@ struct agx_apple9_vir_instr {
    bool atomic_discard;
    /* Preserve required memory reads even when their SSA results are dead. */
    bool memory_volatile;
+   /* Device-coherent / L1-bypass access (memory_coherence_device). */
+   bool memory_coherent;
    /* The access uses a global address rather than a binding, through a GPR
     * pair or a uniform pair, and may alias any other global access. */
    bool memory_global;

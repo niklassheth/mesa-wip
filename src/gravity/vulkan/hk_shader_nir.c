@@ -3748,6 +3748,8 @@ hk_apple9_lower_image_barriers(nir_shader *nir, bool fenced,
          if (intr->intrinsic == nir_intrinsic_image_store_apple9_agx)
             has_native_store = true;
          if (nir_intrinsic_has_image_dim(intr) &&
+             intr->intrinsic != nir_intrinsic_image_store_apple9_agx &&
+             intr->intrinsic != nir_intrinsic_image_load_apple9_agx &&
              intr->intrinsic != nir_intrinsic_image_size &&
              intr->intrinsic != nir_intrinsic_bindless_image_size &&
              intr->intrinsic != nir_intrinsic_image_samples &&
