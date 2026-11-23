@@ -302,17 +302,28 @@ union drm_asahi_cmd {
    struct drm_asahi_cmd_render render;
 };
 
-/* XXX: Batching multiple commands per submission is causing rare (7ppm) flakes
- * on the CTS once lossless compression is enabled. This needs to be
- * investigated before we can reenable this mechanism. We are likely missing a
- * cache flush or barrier somewhere.
+/* Batch up to the kernel's per-submission command limit so a submission uses
+ * one ioctl, preserves intra-submit barrier indices, and avoids forced
+ * cross-engine joins on mixed-engine batches.
  */
 static inline unsigned
 max_commands_per_submit(struct hk_device *dev)
 {
-   return HK_PERF(dev, BATCH) ?
-      MAX2(1, MIN2(dev->dev.params.max_commands_per_submission,
-                   DRM_ASAHI_BARRIER_NONE - 1)) : 1;
+   return MAX2(1, MIN2(dev->dev.params.max_commands_per_submission,
+                       DRM_ASAHI_BARRIER_NONE - 1));
+}
+
+/* Cap renders per submit ioctl to 1 while shipping against Apple9 kernels
+ * where shared_notifier=1 can attach a second render in the same submission
+ * to a JobNotifier already flushed and drained in an earlier flush() pass
+ * under EBUSY backpressure (g16_runtime_render.rs). Batching compute/transfer
+ * commands alongside a single render still eliminates cross-engine ioctl
+ * overhead without ever triggering multi-render notifier sharing.
+ */
+static inline unsigned
+max_renders_per_submit(UNUSED struct hk_device *dev)
+{
+   return 1;
 }
 
 static VkResult
@@ -409,28 +420,37 @@ queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
    uint64_t out_syncs =
       submit->syncs + sizeof(struct drm_asahi_sync) * submit->in_sync_count;
    bool seen_vdm = false, seen_cdm = false;
+   const unsigned slice_limit = max_commands_per_submit(dev);
+   const unsigned vdm_limit = max_renders_per_submit(dev);
+   unsigned cmd_index = 0;
 
    while (commands_remaining) {
-      bool last = commands_remaining <= max_commands_per_submit(dev);
-
-      unsigned count = MIN2(commands_remaining, max_commands_per_submit(dev));
-      commands_remaining -= count;
-
-      assert(!last || commands_remaining == 0);
-      assert(count > 0);
-
       unsigned base_offs = offs;
+      unsigned count = 0;
+      unsigned slice_vdms = 0;
       bool slice_has_vdm = false, slice_has_cdm = false;
 
-      /* Headers already contain slice-relative barriers. */
-      for (unsigned i = 0; i < count; ++i) {
+      /* Headers already contain slice-relative barriers. Keep each slice
+       * within both slice_limit commands and vdm_limit renders.
+       */
+      while (count < commands_remaining && count < slice_limit) {
          struct drm_asahi_cmd_header *cmd = (void *)(cmdbuf + offs);
-         if (cmd->cmd_type == DRM_ASAHI_CMD_RENDER)
+         bool is_vdm = cmd->cmd_type == DRM_ASAHI_CMD_RENDER;
+         if (is_vdm && slice_vdms >= vdm_limit)
+            break;
+         if (is_vdm) {
             slice_has_vdm = true;
-         else if (cmd->cmd_type == DRM_ASAHI_CMD_COMPUTE)
+            slice_vdms++;
+         } else if (cmd->cmd_type == DRM_ASAHI_CMD_COMPUTE) {
             slice_has_cdm = true;
+         }
          offs += sizeof(*cmd) + cmd->size;
+         count++;
       }
+
+      assert(count > 0);
+      commands_remaining -= count;
+      bool last = commands_remaining == 0;
 
       /* Attach in_syncs to the first slice that touches each subqueue so an
        * independent command on the other engine in a later slice cannot start
@@ -454,13 +474,12 @@ queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
          .out_sync_count = has_out_syncs ? submit->out_sync_count : 0,
       };
 
-      const uint16_t *slice_reasons =
-         reasons ? reasons + (command_count - commands_remaining - count) : NULL;
+      const uint16_t *slice_reasons = reasons ? reasons + cmd_index : NULL;
+      cmd_index += count;
       VkResult result =
          queue_submit_single(dev, &submit_ioctl, queue, slice_reasons);
       if (result != VK_SUCCESS)
          return result;
-
    }
 
    return VK_SUCCESS;
@@ -1111,9 +1130,12 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    struct util_dynarray payload = UTIL_DYNARRAY_INIT;
 
    unsigned nr_vdm = 0, nr_cdm = 0;
-   unsigned slice_vdm = 0, slice_cdm = 0, emitted = 0;
-   unsigned last_slice_offset = 0;
+   unsigned slice_vdm = 0, slice_cdm = 0;
+   unsigned slice_cmds = 0, slice_vdms = 0;
+   size_t last_cmd_offset = 0;
+   bool slice_waits_vdm = false, slice_waits_cdm = false;
    const unsigned slice_limit = max_commands_per_submit(dev);
+   const unsigned vdm_limit = max_renders_per_submit(dev);
 
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
       struct hk_cmd_buffer *cmdbuf =
@@ -1127,17 +1149,28 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       }
 
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
-         if ((emitted++ % slice_limit) == 0) {
+         bool is_vdm = cs->type == HK_CS_VDM;
+         if (slice_cmds == 0 || slice_cmds >= slice_limit ||
+             (is_vdm && slice_vdms >= vdm_limit)) {
             slice_vdm = nr_vdm;
             slice_cdm = nr_cdm;
-            last_slice_offset = payload.size;
+            slice_cmds = 0;
+            slice_vdms = 0;
+            slice_waits_vdm = false;
+            slice_waits_cdm = false;
          }
+         slice_cmds++;
+         if (is_vdm)
+            slice_vdms++;
          const struct hk_sync_dep *wait = &streams[cs->sync_id].wait;
          struct drm_asahi_cmd_header header =
             agx_cmd_header(cs->type == HK_CS_CDM,
                            hk_ioctl_barrier(wait->engine[HK_SYNC_RENDER], slice_vdm),
                            hk_ioctl_barrier(wait->engine[HK_SYNC_CDM], slice_cdm));
 
+         last_cmd_offset = payload.size;
+         slice_waits_vdm |= header.vdm_barrier == 0;
+         slice_waits_cdm |= header.cdm_barrier == 0;
          util_dynarray_append(&payload, header);
 
          if (cs->type == HK_CS_CDM) {
@@ -1203,13 +1236,19 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
 
    /* Output semaphores and the queue timeline cover all preceding work. Each
     * engine present in the final ioctl covers its own older work by subqueue
-    * order. Join any absent engine explicitly, including for a single ioctl.
+    * order. If an engine is absent from the final ioctl and no command in the
+    * final ioctl already waits on it, join it on the final command so earlier
+    * commands in the slice are not stalled unnecessarily.
     */
-   struct drm_asahi_cmd_header *join = payload.data + last_slice_offset;
-   if (nr_vdm == slice_vdm && join->vdm_barrier == DRM_ASAHI_BARRIER_NONE)
+   struct drm_asahi_cmd_header *join = payload.data + last_cmd_offset;
+   if (nr_vdm == slice_vdm && !slice_waits_vdm) {
+      assert(join->vdm_barrier == DRM_ASAHI_BARRIER_NONE);
       join->vdm_barrier = 0;
-   if (nr_cdm == slice_cdm && join->cdm_barrier == DRM_ASAHI_BARRIER_NONE)
+   }
+   if (nr_cdm == slice_cdm && !slice_waits_cdm) {
+      assert(join->cdm_barrier == DRM_ASAHI_BARRIER_NONE);
       join->cdm_barrier = 0;
+   }
 
    struct drm_asahi_submit submit_ioctl = {
       .flags = 0,
@@ -1234,7 +1273,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    }
 
    VkResult result;
-   if (command_count <= max_commands_per_submit(dev)) {
+   if (command_count <= slice_limit && nr_vdm <= vdm_limit) {
       result = queue_submit_single(dev, &submit_ioctl, queue, reasons);
    } else {
       result = queue_submit_looped(dev, &submit_ioctl, command_count,

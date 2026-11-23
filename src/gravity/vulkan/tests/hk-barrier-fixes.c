@@ -373,6 +373,250 @@ test_query_flush_space_check(void)
    return 0;
 }
 
+/* Commit 2: Multi-command submit batching enabled unconditionally up to the
+ * kernel limit, preserving exact intra-submit barrier indices, avoiding
+ * unnecessary cross-engine joins, and slicing cleanly with rebasing +
+ * mixed-engine in_syncs.
+ */
+static int
+test_batched_submit_and_intra_barriers(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_queue *queue = calloc(1, sizeof(*queue));
+   struct hk_cmd_buffer *cmd = calloc(1, sizeof(*cmd));
+   CHECK(dev && queue && cmd);
+
+   dev->dev.chip = AGX_CHIP_G16G;
+   dev->dev.ops.submit = mock_submit;
+   dev->dev.params.max_commands_per_submission = 64;
+
+   vk_object_base_init(&dev->vk, &queue->vk.base, VK_OBJECT_TYPE_QUEUE);
+   hk_gpu_busy_init(queue);
+   hk_sync_init(&queue->sync);
+   queue->drm.id = 1;
+   queue->drm.syncobj = 99;
+
+   vk_object_base_init(&dev->vk, &cmd->vk.base, VK_OBJECT_TYPE_COMMAND_BUFFER);
+   cmd->sync_events = UTIL_DYNARRAY_INIT;
+   cmd->sync_remap = UTIL_DYNARRAY_INIT;
+   cmd->sync_first_event = UTIL_DYNARRAY_INIT;
+   list_inithead(&cmd->control_streams);
+
+   uint8_t buf[256] = {0};
+   /* Case A: Single-render mixed-engine batch
+    * [CDM_1, VDM_1 (waits CDM_1), CDM_2 (waits VDM_1), CDM_3 (indep)]
+    * executes in one ioctl with exact intra-submit barriers and no forced join.
+    */
+   add_test_cs(cmd, HK_CS_CDM, HK_SYNC_COMPUTE, buf, sizeof(buf));
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_WRITE_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT);
+   add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, buf, sizeof(buf));
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT);
+   add_test_cs(cmd, HK_CS_CDM, HK_SYNC_COMPUTE, buf, sizeof(buf));
+   add_test_cs(cmd, HK_CS_CDM, HK_SYNC_TRANSFER, buf, sizeof(buf));
+
+   struct vk_sync_type syncobj_type = {.finish = vk_drm_syncobj_finish};
+   struct vk_drm_syncobj wait_syncobj = {
+      .base = {.type = &syncobj_type},
+      .syncobj = 42,
+   };
+   struct vk_drm_syncobj signal_syncobj = {
+      .base = {.type = &syncobj_type},
+      .syncobj = 77,
+   };
+   struct vk_sync_wait wait = {.sync = &wait_syncobj.base};
+   struct vk_sync_signal signal = {.sync = &signal_syncobj.base};
+   struct vk_command_buffer *cbs[] = {&cmd->vk};
+   struct vk_queue_submit submit = {
+      .wait_count = 1,
+      .waits = &wait,
+      .command_buffer_count = 1,
+      .command_buffers = cbs,
+      .signal_count = 1,
+      .signals = &signal,
+   };
+
+   mock_slice_count = 0;
+   CHECK(hk_queue_submit(&queue->vk, &submit) == VK_SUCCESS);
+   CHECK(mock_slice_count == 1);
+   CHECK(mock_slices[0].cmd_count == 4);
+   CHECK(mock_slices[0].in_sync_count == 1 && mock_slices[0].out_sync_count == 2);
+   /* CDM_1: no waits. */
+   CHECK(mock_slices[0].cmds[0].cmd_type == DRM_ASAHI_CMD_COMPUTE);
+   CHECK(mock_slices[0].cmds[0].vdm_barrier == DRM_ASAHI_BARRIER_NONE);
+   CHECK(mock_slices[0].cmds[0].cdm_barrier == DRM_ASAHI_BARRIER_NONE);
+   /* VDM_1: waits on intra-submit CDM #1. */
+   CHECK(mock_slices[0].cmds[1].cmd_type == DRM_ASAHI_CMD_RENDER);
+   CHECK(mock_slices[0].cmds[1].vdm_barrier == DRM_ASAHI_BARRIER_NONE);
+   CHECK(mock_slices[0].cmds[1].cdm_barrier == 1);
+   /* CDM_2: waits on intra-submit VDM #1 (and transitively CDM #1). */
+   CHECK(mock_slices[0].cmds[2].cmd_type == DRM_ASAHI_CMD_COMPUTE);
+   CHECK(mock_slices[0].cmds[2].vdm_barrier == 1);
+   CHECK(mock_slices[0].cmds[2].cdm_barrier == 1);
+   /* CDM_3: independent, no forced cross-engine join since both engines present. */
+   CHECK(mock_slices[0].cmds[3].cmd_type == DRM_ASAHI_CMD_COMPUTE);
+   CHECK(mock_slices[0].cmds[3].vdm_barrier == DRM_ASAHI_BARRIER_NONE);
+   CHECK(mock_slices[0].cmds[3].cdm_barrier == DRM_ASAHI_BARRIER_NONE);
+
+   /* Case B: Multi-render mixed-engine batch
+    * [VDM_1, CDM_1 (waits VDM_1), VDM_2 (waits CDM_1), CDM_2 (indep)]
+    * caps each ioctl to 1 render (avoiding kernel shared_notifier=1 multi-render
+    * flush-boundary bugs) while batching each render with its adjacent CDMs.
+    */
+   list_for_each_entry_safe(struct hk_cs, cs, &cmd->control_streams, node) {
+      list_del(&cs->node);
+      hk_cs_destroy(cs);
+   }
+   util_dynarray_clear(&cmd->sync_events);
+   util_dynarray_clear(&cmd->sync_remap);
+   util_dynarray_clear(&cmd->sync_first_event);
+   hk_sync_init(&queue->sync);
+
+   add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, buf, sizeof(buf));
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT);
+   add_test_cs(cmd, HK_CS_CDM, HK_SYNC_COMPUTE, buf, sizeof(buf));
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_WRITE_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT);
+   add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, buf, sizeof(buf));
+   add_test_cs(cmd, HK_CS_CDM, HK_SYNC_TRANSFER, buf, sizeof(buf));
+
+   mock_slice_count = 0;
+   CHECK(hk_queue_submit(&queue->vk, &submit) == VK_SUCCESS);
+   CHECK(mock_slice_count == 2);
+   /* Slice 0: [VDM_1, CDM_1] covers both engines -> receives in_syncs. */
+   CHECK(mock_slices[0].cmd_count == 2);
+   CHECK(mock_slices[0].in_sync_count == 1 && mock_slices[0].out_sync_count == 0);
+   CHECK(mock_slices[0].cmds[0].cmd_type == DRM_ASAHI_CMD_RENDER);
+   CHECK(mock_slices[0].cmds[0].vdm_barrier == DRM_ASAHI_BARRIER_NONE);
+   CHECK(mock_slices[0].cmds[1].cmd_type == DRM_ASAHI_CMD_COMPUTE);
+   CHECK(mock_slices[0].cmds[1].vdm_barrier == 1);
+   /* Slice 1: [VDM_2, CDM_2] rebases cross-slice waits to 0; both engines
+    * already saw in_syncs in Slice 0.
+    */
+   CHECK(mock_slices[1].cmd_count == 2);
+   CHECK(mock_slices[1].in_sync_count == 0 && mock_slices[1].out_sync_count == 2);
+   CHECK(mock_slices[1].cmds[0].cmd_type == DRM_ASAHI_CMD_RENDER);
+   CHECK(mock_slices[1].cmds[0].vdm_barrier == 0);
+   CHECK(mock_slices[1].cmds[0].cdm_barrier == 0);
+   CHECK(mock_slices[1].cmds[1].cmd_type == DRM_ASAHI_CMD_COMPUTE);
+   CHECK(mock_slices[1].cmds[1].vdm_barrier == DRM_ASAHI_BARRIER_NONE);
+   CHECK(mock_slices[1].cmds[1].cdm_barrier == DRM_ASAHI_BARRIER_NONE);
+
+   /* Case C: Kernel limit 0 safely clamps to 1 command per ioctl slice. */
+   hk_sync_init(&queue->sync);
+   dev->dev.params.max_commands_per_submission = 0;
+   mock_slice_count = 0;
+   CHECK(hk_queue_submit(&queue->vk, &submit) == VK_SUCCESS);
+   CHECK(mock_slice_count == 4);
+   CHECK(mock_slices[0].in_sync_count == 1);
+   CHECK(mock_slices[1].in_sync_count == 1); /* first CDM slice */
+   CHECK(mock_slices[2].in_sync_count == 0);
+   CHECK(mock_slices[3].in_sync_count == 0);
+   CHECK(mock_slices[3].out_sync_count == 2);
+   dev->dev.params.max_commands_per_submission = 64;
+
+   /* Case D: Multi-slice batch (limit=2) with
+    * [VDM_1, VDM_2, CDM_1 (waits VDM_2), CDM_2 (waits CDM_1), CDM_3 (indep)].
+    * VDM_1 runs alone (VDM_2 starts slice 1); [VDM_2, CDM_1] share slice 1
+    * (receiving in_syncs as the first CDM slice); [CDM_2, CDM_3] share slice 2
+    * with rebased cross-slice barriers and no redundant VDM join on CDM_3.
+    */
+   list_for_each_entry_safe(struct hk_cs, cs, &cmd->control_streams, node) {
+      list_del(&cs->node);
+      hk_cs_destroy(cs);
+   }
+   util_dynarray_clear(&cmd->sync_events);
+   util_dynarray_clear(&cmd->sync_remap);
+   util_dynarray_clear(&cmd->sync_first_event);
+   hk_sync_init(&queue->sync);
+   dev->dev.params.max_commands_per_submission = 2;
+
+   add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, buf, sizeof(buf));
+   add_test_cs(cmd, HK_CS_VDM, HK_SYNC_GRAPHICS, buf, sizeof(buf));
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT);
+   add_test_cs(cmd, HK_CS_CDM, HK_SYNC_COMPUTE, buf, sizeof(buf));
+   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_WRITE_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT);
+   add_test_cs(cmd, HK_CS_CDM, HK_SYNC_COMPUTE, buf, sizeof(buf));
+   add_test_cs(cmd, HK_CS_CDM, HK_SYNC_TRANSFER, buf, sizeof(buf));
+
+   mock_slice_count = 0;
+   CHECK(hk_queue_submit(&queue->vk, &submit) == VK_SUCCESS);
+   CHECK(mock_slice_count == 3);
+   /* Slice 0: [VDM_1] with in_syncs. */
+   CHECK(mock_slices[0].cmd_count == 1);
+   CHECK(mock_slices[0].in_sync_count == 1 && mock_slices[0].out_sync_count == 0);
+   /* Slice 1: [VDM_2, CDM_1] receives in_syncs (first CDM slice); CDM_1 gets
+    * intra-slice vdm_barrier=1 pointing to VDM_2.
+    */
+   CHECK(mock_slices[1].cmd_count == 2);
+   CHECK(mock_slices[1].in_sync_count == 1 && mock_slices[1].out_sync_count == 0);
+   CHECK(mock_slices[1].cmds[0].cmd_type == DRM_ASAHI_CMD_RENDER);
+   CHECK(mock_slices[1].cmds[1].cmd_type == DRM_ASAHI_CMD_COMPUTE);
+   CHECK(mock_slices[1].cmds[1].vdm_barrier == 1);
+   /* Slice 2: [CDM_2, CDM_3] gets out_syncs only. CDM_2 rebases VDM and CDM
+    * waits to 0; CDM_3 does NOT need a redundant vdm_barrier=0 since CDM_2
+    * already waited on 0 in this slice.
+    */
+   CHECK(mock_slices[2].cmd_count == 2);
+   CHECK(mock_slices[2].in_sync_count == 0 && mock_slices[2].out_sync_count == 2);
+   CHECK(mock_slices[2].cmds[0].vdm_barrier == 0);
+   CHECK(mock_slices[2].cmds[0].cdm_barrier == 0);
+   CHECK(mock_slices[2].cmds[1].vdm_barrier == DRM_ASAHI_BARRIER_NONE);
+   CHECK(mock_slices[2].cmds[1].cdm_barrier == DRM_ASAHI_BARRIER_NONE);
+
+   /* Case E: Single-engine multi-command final slice [CDM_1, CDM_2] with no
+    * VDM barrier joins VDM only on the LAST command (CDM_2), not CDM_1.
+    */
+   list_for_each_entry_safe(struct hk_cs, cs, &cmd->control_streams, node) {
+      list_del(&cs->node);
+      hk_cs_destroy(cs);
+   }
+   util_dynarray_clear(&cmd->sync_events);
+   util_dynarray_clear(&cmd->sync_remap);
+   util_dynarray_clear(&cmd->sync_first_event);
+   hk_sync_init(&queue->sync);
+   dev->dev.params.max_commands_per_submission = 64;
+
+   add_test_cs(cmd, HK_CS_CDM, HK_SYNC_COMPUTE, buf, sizeof(buf));
+   add_test_cs(cmd, HK_CS_CDM, HK_SYNC_TRANSFER, buf, sizeof(buf));
+   mock_slice_count = 0;
+   CHECK(hk_queue_submit(&queue->vk, &submit) == VK_SUCCESS);
+   CHECK(mock_slice_count == 1 && mock_slices[0].cmd_count == 2);
+   CHECK(mock_slices[0].cmds[0].vdm_barrier == DRM_ASAHI_BARRIER_NONE);
+   CHECK(mock_slices[0].cmds[1].vdm_barrier == 0);
+
+   list_for_each_entry_safe(struct hk_cs, cs, &cmd->control_streams, node) {
+      list_del(&cs->node);
+      hk_cs_destroy(cs);
+   }
+   util_dynarray_fini(&cmd->sync_events);
+   util_dynarray_fini(&cmd->sync_remap);
+   util_dynarray_fini(&cmd->sync_first_event);
+   vk_object_base_finish(&cmd->vk.base);
+   hk_gpu_busy_finish(queue);
+   vk_object_base_finish(&queue->vk.base);
+   free(cmd);
+   free(queue);
+   free(dev);
+   return 0;
+}
+
 int
 main(void)
 {
@@ -382,6 +626,8 @@ main(void)
       return 1;
    if (test_mixed_engine_multislice_in_syncs())
       return 1;
-   puts("PASS barrier-vk Commit 1: hoisted barrier_group, query flush space, mixed-engine in_syncs");
+   if (test_batched_submit_and_intra_barriers())
+      return 1;
+   puts("PASS barrier-vk Commits 1-2: hoisted barrier_group, query flush space, mixed-engine in_syncs, default submit batching");
    return 0;
 }
