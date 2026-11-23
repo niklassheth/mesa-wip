@@ -4541,11 +4541,11 @@ retry:
       unsigned bound = apple9_publication_bound(ins);
       unsigned align = MAX2(agx_apple9_encoding_info(ins->encoding)
                               ->operands[0].alignment_halves / 2, 1);
-      /* Rotate 8-word image-write publication tuples across p0..p40 so up to
-       * 6 back-to-back async IMAGE_STORE ops overlap with zero joins. */
-      bool rotate = ins->encoding == AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS ||
-                    ins->encoding == AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS_16 ||
-                    ins->encoding == AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS_2D;
+      /* Rotate texture and image-write publication tuples LRU across the
+       * publication bank so back-to-back async samples and stores overlap
+       * without colliding on p0..p3. */
+      bool rotate = ins->op == AGX_APPLE9_VIR_PUBLICATION_TUPLE &&
+                    ins->encoding != AGX_APPLE9_ENC_PUBLICATION_PAIR;
       unsigned slot = bound;
       unsigned best_end = UINT_MAX;
       for (unsigned cand = 0; cand + width <= bound; cand += align) {

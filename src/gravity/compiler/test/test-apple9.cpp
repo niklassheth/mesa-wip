@@ -8925,7 +8925,8 @@ TEST(Apple9Compiler, SixteenIndependentTextureAndSamplerBindings)
    const auto *code = static_cast<const uint8_t *>(compiled.binary);
    unsigned seen = 0;
    for (unsigned i = 0; i + 14 <= compiled.info.binary_size; ++i) {
-      if ((code[i] & 7) != 5 || code[i+2] != 0x0c || code[i+3] != 0xb8 ||
+      if ((code[i] & 7) != 5 || (code[i+2] & 0xbf) != 0x0c ||
+          (code[i+3] & 0xfc) != 0xb8 ||
           (code[i+4] & 0xf8) != 0xb0 || code[i+12] != 1)
          continue;
       unsigned texture = ((code[i+1] >> 3) & 7)*2 + (code[i+8] >> 7);
@@ -9377,7 +9378,9 @@ TEST(Apple9Allocator, TexturePublicationsHaveIndependentStorageAndPendingLifetim
          agx_apple9_vir_move_before(&p, p.instructions[second_params], p.instructions[2]);
       }
       ASSERT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << (reason ?: "");
-      EXPECT_EQ(p.publication_count, overlap ? 4u : 2u);
+      /* Texture parameter tuples rotate LRU across the publication bank so
+       * consecutive samples do not collide on p0..p1 even when non-overlapping. */
+      EXPECT_EQ(p.publication_count, 4u);
       uint32_t pubs[2];
       unsigned count = 0;
       for (unsigned i = 0; i < p.instruction_count; ++i) {

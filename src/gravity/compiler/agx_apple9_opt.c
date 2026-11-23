@@ -121,6 +121,18 @@ agx_apple9_instr_is_pure_alu(const struct agx_apple9_vir_instr *I)
    }
 }
 
+static bool
+apple9_instr_is_cse_eligible(const struct agx_apple9_vir_instr *I)
+{
+   if (agx_apple9_instr_is_pure_alu(I))
+      return true;
+   if (I->publication_handoff)
+      return false;
+   return (I->op == AGX_APPLE9_VIR_ITER && I->dest_components == 1) ||
+          (I->op == AGX_APPLE9_VIR_CUBE &&
+           (I->dest_components == 1 || I->dest_components == 2));
+}
+
 struct expression {
    uint32_t op, encoding, immediate, nr_srcs, components;
    uint32_t src_abs, src_neg, saturate;
@@ -1273,7 +1285,8 @@ agx_apple9_optimize_vir_with_constants(
       default:
          break;
       }
-      if (!agx_apple9_instr_is_pure_alu(I)) {
+      const bool pure_alu = agx_apple9_instr_is_pure_alu(I);
+      if (!pure_alu && !apple9_instr_is_cse_eligible(I)) {
          /* A predicate has no SSA destination and cannot be CSE'd as an ALU
           * value, but its explicit operands may still read uniforms. */
          if (I->op == AGX_APPLE9_VIR_PREDICATE_COMPARE) {
@@ -1291,12 +1304,14 @@ agx_apple9_optimize_vir_with_constants(
       if (constrained)
          continue;
 
-      fold_integer(I, constant, values);
-      fold_select_xor(I, definitions, constant, values, uniform_writes);
-      select_float_sources(I, definitions, constant, values);
-      inline_integer_immediates(I, constant, values);
-      inline_compare_literal(I, constant, values);
-      inline_alu_sources(I, uniform_read, constant, values);
+      if (pure_alu) {
+         fold_integer(I, constant, values);
+         fold_select_xor(I, definitions, constant, values, uniform_writes);
+         select_float_sources(I, definitions, constant, values);
+         inline_integer_immediates(I, constant, values);
+         inline_compare_literal(I, constant, values);
+         inline_alu_sources(I, uniform_read, constant, values);
+      }
       for (unsigned c = 0; c < I->dest_components; ++c)
          definitions[I->dest + c] = I;
       if (I->op == AGX_APPLE9_VIR_IMM) {

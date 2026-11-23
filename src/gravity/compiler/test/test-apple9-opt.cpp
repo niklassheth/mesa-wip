@@ -1399,3 +1399,61 @@ TEST_F(Apple9Optimization, SelectXorKeepsNoncomplementaryArms)
    ASSERT_TRUE(agx_apple9_analyze_uses(&p));
    EXPECT_EQ(agx_apple9_definition(&p, p.output)->op, AGX_APPLE9_VIR_IXOR);
 }
+
+TEST_F(Apple9Optimization, CseDeduplicatesIterAndCubeRespectingControlFlow)
+{
+   auto x = agx_apple9_vir_input(&p, 0);
+   auto y = agx_apple9_vir_input(&p, 1);
+   auto z = agx_apple9_vir_input(&p, 2);
+   uint32_t xyz[] = {x, y, z};
+
+   /* Duplicate VIR_ITER in the same block CSEs; across EXEC_MASK_PUSH it does not. */
+   auto it0 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_ITER, AGX_APPLE9_ENC_ITER,
+                                  nullptr, 0, 0);
+   auto it1 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_ITER, AGX_APPLE9_ENC_ITER,
+                                  nullptr, 0, 0);
+   /* Duplicate VIR_CUBE (both 2-comp imm=0 and 1-comp imm=1) CSE in-block. */
+   auto c0a = agx_apple9_vir_emit_cube(&p, xyz, 0);
+   auto c0b = agx_apple9_vir_emit_cube(&p, xyz, 0);
+   auto c1a = agx_apple9_vir_emit_cube(&p, xyz, 1);
+   auto c1b = agx_apple9_vir_emit_cube(&p, xyz, 1);
+
+   uint32_t s_it[] = {it0, it1};
+   auto sum_it = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FADD,
+                                     AGX_APPLE9_ENC_FLOAT2_COMPACT, s_it, 2, 0);
+   uint32_t s_c0[] = {c0a + 1, c0b + 1};
+   auto sum_c0 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FADD,
+                                     AGX_APPLE9_ENC_FLOAT2_COMPACT, s_c0, 2, 0);
+   uint32_t s_c1[] = {c1a, c1b};
+   auto sum_c1 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FADD,
+                                     AGX_APPLE9_ENC_FLOAT2_COMPACT, s_c1, 2, 0);
+
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(&p, AGX_APPLE9_VIR_EXEC_MASK_PUSH,
+      AGX_APPLE9_ENC_EXEC_MASK_PUSH, nullptr, 0, AGX_APPLE9_EXEC_MASK_SOURCE(0)));
+   auto it_after = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_ITER,
+                                       AGX_APPLE9_ENC_ITER, nullptr, 0, 0);
+   auto c1_after = agx_apple9_vir_emit_cube(&p, xyz, 1);
+   uint32_t s_cf[] = {it_after, c1_after};
+   auto sum_cf = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FADD,
+                                     AGX_APPLE9_ENC_FLOAT2_COMPACT, s_cf, 2, 0);
+   uint32_t s_all0[] = {sum_it, sum_c0};
+   auto t0 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FADD,
+                                 AGX_APPLE9_ENC_FLOAT2_COMPACT, s_all0, 2, 0);
+   uint32_t s_all1[] = {sum_c1, sum_cf};
+   auto t1 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FADD,
+                                 AGX_APPLE9_ENC_FLOAT2_COMPACT, s_all1, 2, 0);
+   uint32_t s_out[] = {t0, t1};
+   p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FADD,
+                                  AGX_APPLE9_ENC_FLOAT2_COMPACT, s_out, 2, 0);
+
+   ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+   EXPECT_EQ(agx_apple9_definition(&p, sum_it)->src[0], it0);
+   EXPECT_EQ(agx_apple9_definition(&p, sum_it)->src[1], it0);
+   EXPECT_EQ(agx_apple9_definition(&p, sum_c0)->src[0], c0a + 1);
+   EXPECT_EQ(agx_apple9_definition(&p, sum_c0)->src[1], c0a + 1);
+   EXPECT_EQ(agx_apple9_definition(&p, sum_c1)->src[0], c1a);
+   EXPECT_EQ(agx_apple9_definition(&p, sum_c1)->src[1], c1a);
+   /* Across EXEC_MASK_PUSH, CSE must NOT reuse pre-mask definitions. */
+   EXPECT_EQ(agx_apple9_definition(&p, sum_cf)->src[0], it_after);
+   EXPECT_EQ(agx_apple9_definition(&p, sum_cf)->src[1], c1_after);
+}

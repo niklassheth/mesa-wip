@@ -1217,6 +1217,8 @@ struct apple9_dag_lower {
    bool object_region;
    bool has_abi_return;
    uint32_t entry_vreg[AGX_APPLE9_GPR_COUNT];
+   /* Top-level perspective 1/w reciprocal, reusable across all dominated blocks. */
+   uint32_t perspective_root_reciprocal;
    bool tile_access;
    bool tile_coords;
    bool tile_preamble_needed;
@@ -2143,19 +2145,26 @@ apple9_emit_interpolation(struct apple9_dag_lower *lower, unsigned coefficient,
    }
    uint32_t reciprocal;
    /* A reciprocal first emitted in one arm does not dominate sibling arms.
-    * Reuse it only within the block where it was computed. */
-   if (at_position || lower->cache.perspective_block != lower->program.current_block) {
+    * Reuse a top-level reciprocal across dominated blocks, and otherwise
+    * reuse only within the block where it was computed. */
+   if (!at_position &&
+       lower->perspective_root_reciprocal != AGX_APPLE9_VREG_INVALID) {
+      reciprocal = lower->perspective_root_reciprocal;
+   } else if (!at_position &&
+              lower->cache.perspective_block == lower->program.current_block) {
+      reciprocal = lower->cache.perspective_reciprocal;
+   } else {
       uint32_t denominator = apple9_dag_emit(
          lower, AGX_APPLE9_VIR_ITER, encoding,
          at_position ? &position : NULL, at_position, 0);
       reciprocal = apple9_dag_emit(lower, AGX_APPLE9_VIR_FRCP,
          AGX_APPLE9_ENC_FLOAT_SPECIAL, &denominator, 1, 3);
       if (!at_position) {
+         if (!lower->mask_depth && !lower->loop_depth && !lower->object_region)
+            lower->perspective_root_reciprocal = reciprocal;
          lower->cache.perspective_reciprocal = reciprocal;
          lower->cache.perspective_block = lower->program.current_block;
       }
-   } else {
-      reciprocal = lower->cache.perspective_reciprocal;
    }
    uint32_t value = apple9_dag_emit(
       lower, AGX_APPLE9_VIR_ITER, encoding,
@@ -7437,6 +7446,7 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
    struct apple9_dag_lower lower = {
       .share_exports = varying_exports > AGX_APPLE9_PUBLICATION_COUNT,
       .nir = nir,
+      .perspective_root_reciprocal = AGX_APPLE9_VREG_INVALID,
       .has_abi_return = !preamble && resources->force_abi_return,
       .defer_zs_release = !preamble && resources->defer_zs_release,
       .cf_base = preamble ? 0 : resources->cf_base,

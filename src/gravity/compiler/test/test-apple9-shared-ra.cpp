@@ -1561,3 +1561,72 @@ TEST(Apple9SharedRa, SubgroupAluUnlocksAndCompactImageStoreAllocateAndPack)
    agx_apple9_vir_finish(&p);
    ralloc_free(nir.shader);
 }
+
+TEST(Apple9SharedRa, TexturePublicationRotationAndBindlessHandleWarExemption)
+{
+   nir_builder nir = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "tex_pub_rotate_and_handle_war");
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+
+   /* Issue 6 back-to-back bindless texture samples whose handle GPRs die at
+    * issue so RA can recycle the handle GPR immediately, while publication
+    * tuples rotate across p0..p31 without colliding on p0..p3. */
+   uint32_t u = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+                                    AGX_APPLE9_ENC_GET_SR, nullptr, 0, 0);
+   uint32_t v = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+                                    AGX_APPLE9_ENC_GET_SR, nullptr, 0, 1);
+   uint32_t lod = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                      AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+   uint32_t coords[2] = {u, v};
+   uint32_t results[6];
+   for (unsigned i = 0; i < 6; ++i) {
+      uint32_t tex_h = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                           AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, i + 1);
+      uint32_t smp_h = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                           AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, i + 10);
+      results[i] = agx_apple9_vir_emit_texture_lod(&p, coords, lod, 0, 0, false);
+      ASSERT_NE(results[i], AGX_APPLE9_VREG_INVALID);
+      auto *sample = p.instructions[p.instruction_count - 1];
+      ASSERT_EQ(sample->op, AGX_APPLE9_VIR_TEXTURE_SAMPLE);
+      sample->texture_bindless = true;
+      sample->sampler_bindless = true;
+      sample->src[sample->nr_srcs++] = tex_h;
+      sample->src[sample->nr_srcs++] = smp_h;
+   }
+   uint32_t acc = results[0];
+   for (unsigned i = 1; i < 6; ++i) {
+      uint32_t add_srcs[] = {acc, results[i]};
+      acc = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FADD,
+                                AGX_APPLE9_ENC_FLOAT2_COMPACT, add_srcs, 2, 0);
+   }
+   ASSERT_TRUE(agx_apple9_vir_emit_device_store(&p, 0, u, &acc, 1, 32));
+
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason)) << (reason ?: "");
+
+   unsigned samples = 0, waits_during_issue = 0;
+   unsigned pub_bases = 0;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      const auto *I = p.instructions[i];
+      if (I->op == AGX_APPLE9_VIR_WAIT && samples < 6)
+         ++waits_during_issue;
+      if (I->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE) {
+         unsigned base = p.phys[I->src[0]];
+         ASSERT_LT(base, 32u);
+         pub_bases |= BITFIELD_BIT(base / 4);
+         ++samples;
+      }
+      agx_apple9_packed_instruction packed;
+      ASSERT_TRUE(agx_apple9_pack_vir_instruction(I, p.phys, &packed, &reason))
+         << (reason ?: "");
+   }
+   EXPECT_EQ(samples, 6u);
+   /* All 6 samples use distinct 4-word publication tuples and emit 0 WAITs while
+    * issuing despite bindless handle GPR reuse. */
+   EXPECT_EQ(util_bitcount(pub_bases), 6u);
+   EXPECT_EQ(waits_during_issue, 0u);
+
+   agx_apple9_vir_finish(&p);
+   ralloc_free(nir.shader);
+}

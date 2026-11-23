@@ -1331,12 +1331,13 @@ apple9_lane_hazard(const struct agx_apple9_vir_instr *ins,
          return true;
       /* Includes texture and image-store parameter publications, which remain
        * borrowed until completion, and scratch SAVE's destructive input.
-       * Image-store bindless index GPRs (src[8..9], < PUB_BASE) are read at
-       * issue, like device-load address/index GPRs. */
+       * Bindless index GPRs (< PUB_BASE) for image stores and texture samples
+       * are read at issue, like device-load address/index GPRs. */
       for (unsigned s = 0;
            !apple9_reads_sources_at_issue(producer) && s < producer->nr_srcs;
            ++s) {
-         if (producer->op == AGX_APPLE9_VIR_IMAGE_STORE &&
+         if ((producer->op == AGX_APPLE9_VIR_IMAGE_STORE ||
+              producer->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE) &&
              producer->src[s] < PUB_BASE)
             continue;
          if (producer->src[s] == reg)
