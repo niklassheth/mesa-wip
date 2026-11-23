@@ -624,9 +624,15 @@ apple9_ra_block_logical_end_anchor(const struct agx_apple9_block *block)
    struct agx_apple9_vir_instr *anchor = NULL;
    for (struct agx_apple9_vir_instr *ins = agx_apple9_block_last_instr(block);
         ins; ins = agx_apple9_instr_prev(ins)) {
-      /* EXEC_MASK_ELSE opens an else-arm; copies for that arm must execute
-       * after it, never before it. */
-      if (ins->op == AGX_APPLE9_VIR_EXEC_MASK_ELSE && !ins->local_control)
+      /* In NIR-lowered Apple9 VIR, when the then-arm has no skip target,
+       * EXEC_MASK_ELSE (and any trailing JMP_EXEC_NONE) are emitted at the
+       * tail of the then-arm block. Phi-edge copies for the then-arm must
+       * execute under the then-arm mask, strictly BEFORE EXEC_MASK_ELSE.
+       * The only case where EXEC_MASK_ELSE opens a block is a synthetic test
+       * fixture that places both EXEC_MASK_ELSE and EXEC_MASK_POP in one
+       * empty else-arm block. */
+      if (ins->op == AGX_APPLE9_VIR_EXEC_MASK_ELSE && !ins->local_control &&
+          anchor && anchor->op == AGX_APPLE9_VIR_EXEC_MASK_POP)
          break;
       if (apple9_ra_after_logical_end(ins) || ins->op == AGX_APPLE9_VIR_HALT) {
          anchor = ins;

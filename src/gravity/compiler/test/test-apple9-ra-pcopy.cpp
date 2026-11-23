@@ -1279,3 +1279,92 @@ TEST_F(Apple9RaPcopyTest, ValidatePostRaCatchesClobberAndReuseKilledAndTuple)
          << err.message;
    }
 }
+
+TEST_F(Apple9RaPcopyTest, ThenArmTrailingExecMaskElsePlacesPhiCopiesBeforeElse)
+{
+   /* Mirrors agx_compile_apple9.c when the then-arm has no skip target:
+    * EXEC_MASK_ELSE (and optional JMP_EXEC_NONE over the else-arm) sit at the
+    * tail of the then-arm block. Phi-edge copies MUST execute before
+    * EXEC_MASK_ELSE under the then-arm execution mask. */
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block *b_then = agx_apple9_block_create(&p);
+   agx_apple9_block *b_else = agx_apple9_block_create(&p);
+   agx_apple9_block *b_pop = agx_apple9_block_create(&p);
+   agx_apple9_block *b_merge = agx_apple9_block_create(&p);
+
+   agx_apple9_block_begin(&p, b0);
+   uint32_t v0 = emit_imm(7);
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_EXEC_MASK_PUSH, AGX_APPLE9_ENC_EXEC_MASK_PUSH, nullptr,
+      0, AGX_APPLE9_EXEC_MASK_TRUE));
+
+   /* Non-empty then-arm ending with EXEC_MASK_ELSE + JMP_EXEC_NONE b_pop */
+   agx_apple9_block_begin(&p, b_then);
+   uint32_t v_then = emit_imm(42);
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_EXEC_MASK_ELSE, AGX_APPLE9_ENC_EXEC_MASK_ELSE, nullptr,
+      0, 0));
+   ASSERT_TRUE(agx_apple9_vir_emit_branch(
+      &p, AGX_APPLE9_VIR_JMP_EXEC_NONE, AGX_APPLE9_ENC_JMP_EXEC_NONE, b_pop));
+
+   agx_apple9_block_begin(&p, b_else);
+   uint32_t v_else = emit_iadd(v0, v0);
+
+   agx_apple9_block_begin(&p, b_pop);
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_EXEC_MASK_POP, AGX_APPLE9_ENC_EXEC_MASK_POP, nullptr,
+      0, 0));
+
+   agx_apple9_block_begin(&p, b_merge);
+   uint32_t phi = agx_apple9_vir_emit_phi_canonical(&p, b_merge, 2);
+   uint32_t out = emit_iadd(phi, v0);
+   (void)out;
+
+   cfg_set_active(&p, {b0, b_then, b_else, b_merge});
+   cfg_add_edge(b0, b_then);
+   cfg_add_edge(b0, b_else);
+   cfg_add_edge(b_then, b_merge);
+   cfg_add_edge(b_else, b_merge);
+
+   agx_apple9_vir_instr *phi_ins = agx_apple9_block_first_instr(b_merge);
+   *agx_apple9_vir_src_ptr(phi_ins, 0) = v_then;
+   *agx_apple9_vir_src_ptr(phi_ins, 1) = v_else;
+   agx_apple9_vir_reindex(&p);
+
+   /* Anchor for b_then must be EXEC_MASK_ELSE, not JMP_EXEC_NONE. */
+   agx_apple9_vir_instr *anchor = apple9_ra_block_logical_end_anchor(b_then);
+   ASSERT_NE(anchor, nullptr);
+   EXPECT_EQ(anchor->op, AGX_APPLE9_VIR_EXEC_MASK_ELSE);
+
+   std::vector<uint8_t> gpr(p.value_count, 0);
+   gpr[v0] = 2;
+   gpr[v_then] = 3;
+   gpr[v_else] = 4;
+   gpr[phi] = 4;
+   gpr[out] = 5;
+
+   apple9_ra_assignment assign = {};
+   assign.gpr = gpr.data();
+   auto opts = make_zero_free_opts();
+   ASSERT_TRUE(apple9_ra_lower_all_phi_edges(&p, &assign, &opts, false));
+
+   /* Expect b_then order: IMM(v_then), MOV(r4<-r3), EXEC_MASK_ELSE, JMP_EXEC_NONE */
+   agx_apple9_vir_instr *i0 = agx_apple9_block_first_instr(b_then);
+   ASSERT_NE(i0, nullptr);
+   EXPECT_EQ(i0->op, AGX_APPLE9_VIR_IMM);
+   agx_apple9_vir_instr *i1 = agx_apple9_instr_next(i0);
+   ASSERT_NE(i1, nullptr);
+   EXPECT_EQ(i1->op, AGX_APPLE9_VIR_MOV);
+   EXPECT_EQ(i1->dest, 4u);
+   agx_apple9_vir_instr *i2 = agx_apple9_instr_next(i1);
+   ASSERT_NE(i2, nullptr);
+   EXPECT_EQ(i2->op, AGX_APPLE9_VIR_EXEC_MASK_ELSE);
+   agx_apple9_vir_instr *i3 = agx_apple9_instr_next(i2);
+   ASSERT_NE(i3, nullptr);
+   EXPECT_EQ(i3->op, AGX_APPLE9_VIR_JMP_EXEC_NONE);
+   EXPECT_EQ(agx_apple9_instr_next(i3), nullptr);
+
+   assign.phis_lowered = true;
+   apple9_ra_validate_error err = {};
+   EXPECT_TRUE(apple9_ra_validate_post_ra(&p, &assign, &err)) << err.message;
+}

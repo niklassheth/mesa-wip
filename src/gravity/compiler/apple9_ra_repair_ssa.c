@@ -526,6 +526,21 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
       }
    }
 
+   uint8_t *new_phys = NULL;
+   if (program->phys) {
+      new_phys = malloc(alloc_count);
+      if (!new_phys) {
+         free(new_pub);
+         free(new_fixed);
+         free(new_max);
+         free(remap);
+         free(has_def);
+         free(referenced);
+         return false;
+      }
+      memset(new_phys, AGX_APPLE9_PHYS_INVALID, alloc_count);
+   }
+
    BITSET_WORD *new_mem = NULL;
    uint8_t *new_width = NULL;
    uint32_t *new_homes = NULL;
@@ -538,6 +553,7 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
          free(new_mem);
          free(new_width);
          free(new_homes);
+         free(new_phys);
          free(new_pub);
          free(new_fixed);
          free(new_max);
@@ -559,6 +575,8 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
          new_max[nv] = program->max_phys[v];
       if (new_pub && v < program->publication_capacity)
          new_pub[nv] = program->publication[v];
+      if (new_phys && v < program->phys_capacity)
+         new_phys[nv] = program->phys[v];
       if (state) {
          if (apple9_ra_value_is_mem(state, v)) {
             BITSET_SET(new_mem, nv);
@@ -579,6 +597,11 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
       free(program->publication);
       program->publication = new_pub;
       program->publication_capacity = alloc_count;
+   }
+   if (new_phys) {
+      free(program->phys);
+      program->phys = new_phys;
+      program->phys_capacity = alloc_count;
    }
    program->value_count = new_count;
 

@@ -710,6 +710,16 @@ apple9_ra_schedule_resources(const struct agx_apple9_vir_instr *ins,
       return;
    }
 
+   if (ins->encoding == AGX_APPLE9_ENC_FLOAT2_EXPORT ||
+       ins->encoding == AGX_APPLE9_ENC_LOGIC_EXPORT) {
+      /* Scalar publication exports have 1-cycle latency and borrow their
+       * source GPRs until the publication consumer retires their slot; keep
+       * them ordered with surrounding ALU so RA does not clobber a borrowed
+       * source and force a standalone WAIT. */
+      *reads = *writes = APPLE9_RA_SCHED_ALL;
+      return;
+   }
+
    if (ins->publication_handoff || apple9_ra_is_publication_instr(ins)) {
       *reads |= APPLE9_RA_SCHED_PUBLICATION;
       *writes |= APPLE9_RA_SCHED_PUBLICATION;
@@ -998,7 +1008,17 @@ serialize_node(struct vir_sched_node *a, struct vir_sched_node **b)
 static inline bool
 is_pinned_entry(const struct agx_apple9_vir_instr *ins)
 {
-   return ins->op == AGX_APPLE9_VIR_PHI || ins->op == AGX_APPLE9_VIR_ENTRY_REG;
+   switch (ins->op) {
+   case AGX_APPLE9_VIR_PHI:
+   case AGX_APPLE9_VIR_ENTRY_REG:
+   case AGX_APPLE9_VIR_EXEC_MASK_ELSE:
+   case AGX_APPLE9_VIR_EXEC_MASK_POP:
+   case AGX_APPLE9_VIR_LOOP_MASK_PUSH:
+   case AGX_APPLE9_VIR_LOOP_MASK_POP:
+      return !ins->local_control;
+   default:
+      return false;
+   }
 }
 
 static inline bool
@@ -1489,9 +1509,12 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
          continue;
 
       /* Partition block into:
-       *   [entry: leading VIR_PHI / VIR_ENTRY_REG]
+       *   [entry: leading VIR_PHI / VIR_ENTRY_REG / opening mask-restore ops]
        *   [body:  schedulable instructions]
-       *   [tail:  first after_logical_end / VIR_PHI_SRC .. end] */
+       *   [tail:  trailing after_logical_end / VIR_PHI_SRC ops]
+       * Scan the tail backwards from block end so opening EXEC_MASK_ELSE /
+       * EXEC_MASK_POP / LOOP_MASK_POP or mid-block control barriers never
+       * truncate the schedulable body. */
       struct agx_apple9_vir_instr *last_entry = NULL;
       struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(blk);
       while (I && is_pinned_entry(I)) {
@@ -1499,12 +1522,24 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
          I = agx_apple9_instr_next(I);
       }
       struct agx_apple9_vir_instr *first_body = I;
-      unsigned body_count = 0;
-      while (I && !is_pinned_tail(I)) {
-         body_count++;
-         I = agx_apple9_instr_next(I);
+      if (!first_body)
+         continue;
+
+      struct agx_apple9_vir_instr *first_tail = NULL;
+      for (struct agx_apple9_vir_instr *T = agx_apple9_block_last_instr(blk);
+           T; T = agx_apple9_instr_prev(T)) {
+         if (is_pinned_tail(T)) {
+            first_tail = T;
+         } else {
+            break;
+         }
+         if (T == first_body)
+            break;
       }
-      struct agx_apple9_vir_instr *first_tail = I;
+
+      unsigned body_count = 0;
+      for (I = first_body; I && I != first_tail; I = agx_apple9_instr_next(I))
+         body_count++;
       if (body_count <= 1)
          continue;
 
@@ -1620,9 +1655,12 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
          ralloc_free(lat_ctx);
       }
 
-      /* Run pure pressure minimization if latency mode is disabled or did not
-       * commit an improvement (so high-pressure blocks always reduce peak GPRs). */
-      if (!committed) {
+      /* Run pure pressure minimization when latency mode is disabled, when
+       * zero slack is requested, or when pressure exceeds the register file
+       * (avoiding undoing latency hiding in low-pressure blocks where the
+       * caller explicitly granted occupancy-tier pressure slack). */
+      if (!committed && (!cfg->latency || cfg->pressure_slack == 0 ||
+                         orig_all > (int32_t)AGX_APPLE9_GPR_COUNT)) {
          void *pres_ctx = ralloc_context(blk_ctx);
          struct vir_sched_result pres = run_block_schedule_attempt(
             p, defs, pub_defs, val_max_gpr, first_body, first_tail,

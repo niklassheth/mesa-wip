@@ -533,14 +533,16 @@ apple9_ra_spill_coalesce_color(const struct agx_apple9_vir_program *program,
       unsigned cursor = base_words;
       bool any_mem = false;
       for (unsigned v = 0; v < program->value_count; ++v) {
-         if (!apple9_ra_value_is_mem(state, v))
+         if (!apple9_ra_value_is_mem(state, v) || mem_slot[v] != UINT32_MAX)
             continue;
          any_mem = true;
-         unsigned w = util_next_power_of_two(apple9_ra_value_width(state, v));
+         unsigned raw_w = apple9_ra_value_width(state, v);
+         unsigned w = util_next_power_of_two(raw_w);
          cursor = ALIGN_POT(cursor, w);
          if (cursor + w > max_words)
             return false;
-         mem_slot[v] = cursor;
+         for (unsigned c = 0; c < raw_w && v + c < program->value_count; ++c)
+            mem_slot[v + c] = cursor + c;
          cursor += w;
       }
       *frame_words = any_mem ? cursor : 0u;
@@ -569,8 +571,12 @@ apple9_ra_spill_coalesce_color(const struct agx_apple9_vir_program *program,
 
    if (ok) {
       for (unsigned v = 0; v < g->alloc; ++v) {
-         if (g->node[v] != UINT32_MAX)
-            mem_slot[v] = color[group[g->node[v]]];
+         if (g->node[v] != UINT32_MAX) {
+            unsigned base = color[group[g->node[v]]];
+            unsigned w = apple9_ra_value_width(state, v);
+            for (unsigned c = 0; c < w && v + c < g->alloc; ++c)
+               mem_slot[v + c] = base + c;
+         }
       }
       *frame_words = high;
    }

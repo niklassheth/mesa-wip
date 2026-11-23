@@ -834,6 +834,7 @@ TEST_F(Apple9MeshCompletion, AlreadyRetiredControlDoesNotWaitAgain)
 {
    control();
    fence();
+   logical[0].successors[0] = &logical[1];
    begin(1);
    submit(true);
    fence();
@@ -1119,6 +1120,7 @@ TEST_F(Apple9MeshCompletion, StoreAndForwardExecScopeLeaveControlPending)
    ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
       &p, AGX_APPLE9_VIR_EXEC_MASK_PUSH, AGX_APPLE9_ENC_EXEC_MASK_PUSH,
       nullptr, 0, AGX_APPLE9_EXEC_MASK_PREDICATE(0)));
+   logical[0].successors[0] = &logical[1];
    begin(1);
    submit(true);
    ASSERT_TRUE(agx_apple9_vir_emit_side_effect(

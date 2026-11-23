@@ -64,6 +64,11 @@ struct apple9_ra_assign_options {
    /* Force the spiller to run even when natural GPR demand fits in max_gprs
     * (clamps the GPR budget to the minimum legal ceiling). */
    bool force_spill;
+
+   /* Extra free GPR headroom reserved in the spiller below max_gprs (0 by
+    * default). Used when extreme 96-GPR spilling shaders need temporary
+    * registers for post-spill tuple re-collection or constrained eviction. */
+   unsigned spill_headroom;
 };
 
 struct apple9_ra_assign_result {
@@ -84,6 +89,7 @@ struct apple9_ra_assign_result {
    bool has_spills;              /* True if any RA_MEM spill occurred */
    bool uniform_remat_used;      /* True if immutable-uniform remat fired */
    bool needs_copy_register;     /* True if a high-bank immediate needed COPY_REG */
+   bool needs_spill_headroom;    /* True if eviction ran out of free GPRs */
 };
 
 static inline struct apple9_ra_assign_options
@@ -102,6 +108,7 @@ apple9_ra_assign_default_options(void)
    opts.skip_schedule = false;
    opts.skip_physical_schedule = false;
    opts.force_spill = false;
+   opts.spill_headroom = 0;
    return opts;
 }
 

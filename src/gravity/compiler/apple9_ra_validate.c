@@ -119,13 +119,15 @@ validate_logical_cfg(const struct agx_apple9_vir_program *program,
                     "inactive block %u carries logical CFG edges", b->index);
             return false;
          }
-         for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(b);
-              ins; ins = agx_apple9_instr_next(ins)) {
-            if (ins->dest != AGX_APPLE9_VREG_INVALID ||
-                agx_apple9_vir_nr_srcs(ins) > 0) {
-               set_err(err, b->index, agx_apple9_instr_position(ins),
-                       "inactive synthetic block %u has SSA dataflow", b->index);
-               return false;
+         if (!b->nir) {
+            for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(b);
+                 ins; ins = agx_apple9_instr_next(ins)) {
+               if (ins->dest != AGX_APPLE9_VREG_INVALID ||
+                   agx_apple9_vir_nr_srcs(ins) > 0) {
+                  set_err(err, b->index, agx_apple9_instr_position(ins),
+                          "inactive synthetic block %u has SSA dataflow", b->index);
+                  return false;
+               }
             }
          }
       }
@@ -673,6 +675,8 @@ val_source_width(const struct agx_apple9_vir_instr *ins, unsigned source)
       return 2;
    if (ins->op == AGX_APPLE9_VIR_MMA)
       return agx_apple9_mma_source_width(ins, source);
+   if (ins->op == AGX_APPLE9_VIR_IMAGE_STORE && source == 8)
+      return 2;
    return 1;
 }
 
@@ -991,9 +995,12 @@ validate_encoding_constraints(const struct agx_apple9_vir_program *program,
          unsigned align_gprs =
             dc ? MAX2(dc->alignment_halves, 2u) / 2u : 1u;
 
-         if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE &&
-             (ins->texture_bindless || ins->sampler_bindless))
-            max_gpr = AGX_APPLE9_GPR_COUNT - 1u;
+         if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE) {
+            unsigned limit = (ins->texture_bindless || ins->sampler_bindless)
+                                ? AGX_APPLE9_GPR_COUNT
+                                : 64u;
+            max_gpr = limit - comps;
+         }
          if ((ins->op == AGX_APPLE9_VIR_SHARED_LOAD ||
               ins->op == AGX_APPLE9_VIR_DEVICE_LOAD) &&
              comps > 1)
