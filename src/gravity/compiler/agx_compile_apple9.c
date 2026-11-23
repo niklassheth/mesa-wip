@@ -263,18 +263,34 @@ apple9_memory_format(nir_intrinsic_op op, uint8_t bytes, uint8_t bit_size,
                      bool offset_is_const, enum gl_access_qualifier access,
                      const void *data)
 {
-   if (op == nir_intrinsic_load_scratch || op == nir_intrinsic_store_scratch)
-      return (nir_mem_access_size_align){.num_components = 1, .bit_size = 32,
-         .align = 4, .shift = nir_mem_access_shift_method_scalar};
    unsigned alignment = nir_combined_align(align_mul, align_offset);
    /* 64-bit data, such as a descriptor's pointer, moves as dword tuples so
     * both halves arrive in one register pair. */
    const bool dwords = bit_size == 32 || bit_size == 64;
+   if (op == nir_intrinsic_load_scratch || op == nir_intrinsic_store_scratch) {
+      if (dwords && alignment >= 16 && bytes >= 16)
+         return (nir_mem_access_size_align){.num_components = 4, .bit_size = 32,
+            .align = 16, .shift = nir_mem_access_shift_method_scalar};
+      if (dwords && alignment >= 8 && bytes >= 8)
+         return (nir_mem_access_size_align){.num_components = 2, .bit_size = 32,
+            .align = 8, .shift = nir_mem_access_shift_method_scalar};
+      if (dwords && alignment >= 4 && bytes >= 4)
+         return (nir_mem_access_size_align){.num_components = 1, .bit_size = 32,
+            .align = 4, .shift = nir_mem_access_shift_method_scalar};
+      unsigned size = MIN2(MIN2(alignment, bytes), 4);
+      size = 1u << util_logbase2(size);
+      return (nir_mem_access_size_align){.num_components = 1, .bit_size = size * 8,
+         .align = size, .shift = nir_mem_access_shift_method_scalar};
+   }
    if (dwords && alignment >= 4 && bytes >= 12)
       return (nir_mem_access_size_align){.num_components = MIN2(bytes / 4, 4),
                                          .bit_size = 32, .align = 4};
    if (dwords && alignment >= 4 && bytes >= 8)
       return (nir_mem_access_size_align){.num_components = 2, .bit_size = 32, .align = 4};
+   if (bit_size == 16 && alignment >= 8 && bytes >= 8)
+      return (nir_mem_access_size_align){.num_components = 4, .bit_size = 16, .align = 8};
+   if (bit_size == 16 && alignment >= 4 && bytes >= 4)
+      return (nir_mem_access_size_align){.num_components = 2, .bit_size = 16, .align = 4};
    if (bit_size == 32 && bytes >= 4 &&
        (op == nir_intrinsic_load_ssbo || op == nir_intrinsic_load_ubo))
       return (nir_mem_access_size_align){.num_components = 1, .bit_size = 32,
@@ -1379,23 +1395,21 @@ apple9_dag_system(struct apple9_dag_lower *lower,
       memset(lower->cache.system_vreg, 0xff, sizeof(lower->cache.system_vreg));
    }
    if (lower->cache.system_vreg[system.selector] == AGX_APPLE9_VREG_INVALID) {
-      enum agx_apple9_vir_opcode op = system.global_id
-                                         ? AGX_APPLE9_VIR_GET_GLOBAL_ID
-                                         : AGX_APPLE9_VIR_GET_SR;
-      enum agx_apple9_encoding encoding =
-         (system.selector == 0xdd || system.selector == 0xd8)
-                                 ? AGX_APPLE9_ENC_GET_DRAW_ID
-         : system.zext16         ? AGX_APPLE9_ENC_GET_SR_ZEXT16
-                                 : AGX_APPLE9_ENC_GET_SR;
-      uint32_t immediate =
-         system.global_id
-            ? system.selector - 0xa0
-            : system.selector | (system.zext16 ? 0 : (0x10u << 8));
-
-      /* Keep the system value in SSA; allocation applies the six-bit
-       * destination field shared by the short SR forms. */
-      lower->cache.system_vreg[system.selector] =
-         apple9_dag_emit(lower, op, encoding, NULL, 0, immediate);
+      if (system.selector == 0xdd || system.selector == 0xd8) {
+         lower->cache.system_vreg[system.selector] = apple9_dag_emit(
+            lower, AGX_APPLE9_VIR_GET_SR, AGX_APPLE9_ENC_GET_DRAW_ID, NULL, 0,
+            system.selector | (0x10u << 8));
+      } else if (system.zext16) {
+         lower->cache.system_vreg[system.selector] = apple9_dag_emit(
+            lower, AGX_APPLE9_VIR_GET_SR, AGX_APPLE9_ENC_GET_SR_ZEXT16, NULL, 0,
+            system.selector);
+      } else {
+         /* Multi-slot async GET_SR reaches r0..r95 and auto-compacts to the
+          * 4-byte form when allocated below r64. */
+         lower->cache.system_vreg[system.selector] =
+            agx_apple9_vir_emit_get_sr_async(&lower->program, system.selector,
+                                             0x10);
+      }
    }
 
    return lower->cache.system_vreg[system.selector];
@@ -2229,13 +2243,15 @@ apple9_shared_align(const nir_intrinsic_instr *intr, unsigned src_idx,
       return nir_combined_align(16, addr & 15u);
    }
    unsigned mul = nir_intrinsic_align_mul(intr);
+   if (!mul)
+      return 1;
    unsigned off = (nir_intrinsic_align_offset(intr) + offset_B) & (mul - 1u);
    return nir_combined_align(mul, off);
 }
 
 static uint32_t
 apple9_shared_index(struct apple9_dag_lower *lower, uint32_t base,
-                    unsigned offset_B, unsigned components)
+                    unsigned offset_B, unsigned shift)
 {
    uint32_t address = base;
    if (offset_B) {
@@ -2243,8 +2259,23 @@ apple9_shared_index(struct apple9_dag_lower *lower, uint32_t base,
       address = apple9_dag_emit(lower, AGX_APPLE9_VIR_IADD,
          AGX_APPLE9_ENC_INT_ADD_EXTENDED, add, 2, 0);
    }
-   return apple9_dag_shift_imm(lower, nir_op_ushr, address,
-                               util_logbase2(4 * components));
+   if (address == AGX_APPLE9_VREG_INVALID || !shift)
+      return address;
+   return apple9_dag_shift_imm(lower, nir_op_ushr, address, shift);
+}
+
+static uint32_t
+apple9_pack_u16x2(struct apple9_dag_lower *lower, uint32_t lo, uint32_t hi)
+{
+   /* Narrow 16-bit SSA values may carry undefined upper bits; mask lo to
+    * 16 bits with a single bitfield extract before ORing with hi << 16. */
+   uint32_t lo16 = apple9_dag_extract(lower, lo, 0, 16);
+   uint32_t hi16 = apple9_dag_shift_imm(lower, nir_op_ishl, hi, 16);
+   if (lo16 == AGX_APPLE9_VREG_INVALID || hi16 == AGX_APPLE9_VREG_INVALID)
+      return AGX_APPLE9_VREG_INVALID;
+   uint32_t pair[2] = {lo16, hi16};
+   return apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR,
+                          AGX_APPLE9_ENC_LOGIC_EXTENDED, pair, 2, 0);
 }
 
 static uint32_t
@@ -2545,19 +2576,58 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
          value = apple9_dag_emit(lower, AGX_APPLE9_VIR_SUBGROUP_BALLOT,
                                  AGX_APPLE9_ENC_SUBGROUP_BALLOT, &source, 1, 0);
       } else if (intr && intr->intrinsic == nir_intrinsic_load_scratch) {
-         if (scalar.def->bit_size != 32 || nir_intrinsic_align_mul(intr) < 4 ||
-             (nir_intrinsic_align_offset(intr) & 3))
+         const unsigned bits = scalar.def->bit_size;
+         if ((bits != 8 && bits != 16 && bits != 32) ||
+             apple9_shared_align(intr, 0, 0) < bits / 8)
             return AGX_APPLE9_VREG_INVALID;
-         uint32_t address = apple9_lower_dag_scalar(lower,
+         uint32_t base = apple9_lower_dag_scalar(lower,
             nir_get_scalar(intr->src[0].ssa, 0));
-         address = apple9_dag_shift_imm(lower, nir_op_ushr, address, 2);
-         value = apple9_dag_emit(lower, AGX_APPLE9_VIR_PRIVATE_LOAD,
-            AGX_APPLE9_ENC_PRIVATE_LOAD, &address, 1, scalar.comp);
-         if (value != AGX_APPLE9_VREG_INVALID) {
-            lower->program.private_size = lower->nir->scratch_size;
-            lower->program.instructions[lower->program.instruction_count - 1]
-               ->producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_6;
+         if (base == AGX_APPLE9_VREG_INVALID)
+            return AGX_APPLE9_VREG_INVALID;
+         const bool is_volatile = !!(nir_intrinsic_access(intr) & ACCESS_VOLATILE);
+         const nir_component_mask_t read =
+            (is_volatile ? BITFIELD_MASK(scalar.def->num_components)
+                         : nir_def_components_read(scalar.def)) |
+            BITFIELD_BIT(scalar.comp);
+         for (unsigned c = 0; c < scalar.def->num_components;) {
+            if (!(read & BITFIELD_BIT(c))) {
+               ++c;
+               continue;
+            }
+            unsigned offset_B = (bits / 8) * c;
+            unsigned align = apple9_shared_align(intr, 0, offset_B);
+            unsigned w = 1;
+            unsigned shift = util_logbase2(bits / 8);
+            unsigned word_offset = 0;
+            uint32_t idx;
+            if (bits == 32 && c + 4 <= scalar.def->num_components &&
+                align >= 16 && util_bitcount(read & (0xfu << c)) >= 3) {
+               w = 4;
+               /* Private uint4 uses shift=0 with a byte-scaled dynamic index. */
+               idx = apple9_shared_index(lower, base, offset_B, 0);
+            } else if (bits == 32 && c + 2 <= scalar.def->num_components &&
+                       align >= 8 && (read & (0x3u << c)) == (0x3u << c)) {
+               w = 2;
+               idx = apple9_shared_index(lower, base, offset_B, 3);
+            } else if (bits == 32) {
+               idx = apple9_shared_index(lower, base, 0, 2);
+               word_offset = c;
+            } else {
+               idx = apple9_shared_index(lower, base, offset_B, shift);
+            }
+            if (idx == AGX_APPLE9_VREG_INVALID)
+               return AGX_APPLE9_VREG_INVALID;
+            uint32_t loaded = agx_apple9_vir_emit_private_load(
+               &lower->program, idx, word_offset, w, bits);
+            if (loaded == AGX_APPLE9_VREG_INVALID)
+               return AGX_APPLE9_VREG_INVALID;
+            for (unsigned k = 0; k < w; ++k)
+               lower->ssa_to_vreg[scalar.def->index * APPLE9_SSA_COMPONENTS + c + k] =
+                  loaded + k;
+            c += w;
          }
+         lower->program.private_size = lower->nir->scratch_size;
+         value = lower->ssa_to_vreg[key];
       } else if (intr && intr->intrinsic ==
                             nir_intrinsic_load_native_pointer_apple9_agx) {
          unsigned word = nir_intrinsic_base(intr) + scalar.comp;
@@ -2577,9 +2647,9 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
             lower->program.instructions[lower->program.instruction_count - 1]
                ->producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_6;
       } else if (intr && intr->intrinsic == nir_intrinsic_load_shared) {
-         if (scalar.def->bit_size != 32 ||
-             nir_intrinsic_align_mul(intr) < 4 ||
-             (nir_intrinsic_align_offset(intr) & 3) ||
+         const unsigned bits = scalar.def->bit_size;
+         if ((bits != 8 && bits != 16 && bits != 32) ||
+             apple9_shared_align(intr, 0, nir_intrinsic_base(intr)) < bits / 8 ||
              lower->shared_root == UINT_MAX)
             return AGX_APPLE9_VREG_INVALID;
          uint32_t base = apple9_lower_dag_scalar(lower,
@@ -2596,26 +2666,60 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
                ++c;
                continue;
             }
-            unsigned offset_B = nir_intrinsic_base(intr) + 4 * c;
+            unsigned offset_B = nir_intrinsic_base(intr) + (bits / 8) * c;
             unsigned align = apple9_shared_align(intr, 0, offset_B);
             unsigned w = 1;
-            if (c + 4 <= scalar.def->num_components && align >= 16 &&
-                util_bitcount(read & (0xfu << c)) >= 3) {
-               w = 4;
-            } else if (c + 2 <= scalar.def->num_components && align >= 8 &&
-                       (read & (0x3u << c)) == (0x3u << c)) {
-               w = 2;
+            unsigned shift = util_logbase2(bits / 8);
+            if (bits == 32) {
+               if (c + 4 <= scalar.def->num_components && align >= 16 &&
+                   (read & (0x8u << c)) &&
+                   util_bitcount(read & (0xfu << c)) >= 3) {
+                  w = 4;
+                  shift = 4;
+               } else if (c + 3 <= scalar.def->num_components && align >= 16 &&
+                          (read & (0x7u << c)) == (0x7u << c)) {
+                  w = 3;
+                  shift = 4;
+               } else if (c + 2 <= scalar.def->num_components && align >= 8 &&
+                          (read & (0x3u << c)) == (0x3u << c)) {
+                  w = 2;
+                  shift = 3;
+               }
+            } else if (bits == 16) {
+               if (c + 4 <= scalar.def->num_components && align >= 8 &&
+                   (read & (0x3u << c)) && (read & (0xcu << c))) {
+                  w = 4;
+                  shift = 3;
+               } else if (c + 2 <= scalar.def->num_components && align >= 4 &&
+                          (read & (0x3u << c)) == (0x3u << c)) {
+                  w = 2;
+                  shift = 2;
+               }
             }
-            uint32_t idx = apple9_shared_index(lower, base, offset_B, w);
+            uint32_t idx = apple9_shared_index(lower, base, offset_B, shift);
             if (idx == AGX_APPLE9_VREG_INVALID)
                return AGX_APPLE9_VREG_INVALID;
-            uint32_t loaded = agx_apple9_vir_emit_shared_load(
-               &lower->program, idx, lower->shared_root, w);
+            uint32_t loaded = agx_apple9_vir_emit_shared_load_typed(
+               &lower->program, idx, lower->shared_root, w, bits);
             if (loaded == AGX_APPLE9_VREG_INVALID)
                return AGX_APPLE9_VREG_INVALID;
-            for (unsigned k = 0; k < w; ++k)
-               lower->ssa_to_vreg[scalar.def->index * APPLE9_SSA_COMPONENTS + c + k] =
-                  loaded + k;
+            if (bits == 16 && (w == 2 || w == 4)) {
+               for (unsigned p = 0; p < w / 2; ++p) {
+                  lower->ssa_to_vreg[scalar.def->index * APPLE9_SSA_COMPONENTS + c + 2 * p] =
+                     loaded + p;
+                  if (read & BITFIELD_BIT(c + 2 * p + 1)) {
+                     uint32_t hi = apple9_dag_shift_imm(lower, nir_op_ushr,
+                                                        loaded + p, 16);
+                     if (hi == AGX_APPLE9_VREG_INVALID)
+                        return AGX_APPLE9_VREG_INVALID;
+                     lower->ssa_to_vreg[scalar.def->index * APPLE9_SSA_COMPONENTS + c + 2 * p + 1] = hi;
+                  }
+               }
+            } else {
+               for (unsigned k = 0; k < w; ++k)
+                  lower->ssa_to_vreg[scalar.def->index * APPLE9_SSA_COMPONENTS + c + k] =
+                     loaded + k;
+            }
             c += w;
          }
          value = lower->ssa_to_vreg[key];
@@ -2878,14 +2982,19 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
           * scale and byte displacement do not depend on that extent. */
          if (read_count >= 2) {
             const unsigned components = load->intr->def.num_components;
+            const bool u16_vec =
+               load->bit_size == 16 && (components == 2 || components == 4);
             uint8_t flags = apple9_current_load_flags(lower);
             const struct agx_apple9_device_load_contract contract = {
                .index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR,
                .flags = flags,
                .raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_5101,
             };
-            const uint32_t base = agx_apple9_vir_emit_device_load_vector(
-               &lower->program, binding, index, components, &contract);
+            const uint32_t base = u16_vec
+               ? agx_apple9_vir_emit_device_load_vector_u16(
+                    &lower->program, binding, index, components, &contract)
+               : agx_apple9_vir_emit_device_load_vector(
+                    &lower->program, binding, index, components, &contract);
             if (base == AGX_APPLE9_VREG_INVALID ||
                 !agx_apple9_vir_set_device_load_contract(
                    &lower->program, base, flags,
@@ -2905,9 +3014,28 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
                                                  address))
                return AGX_APPLE9_VREG_INVALID;
 
-            for (unsigned c = 0; c < components; ++c) {
-               const unsigned lane_key = scalar.def->index * APPLE9_SSA_COMPONENTS + c;
-               lower->ssa_to_vreg[lane_key] = base + c;
+            if (u16_vec) {
+               const nir_component_mask_t read_mask =
+                  ((nir_intrinsic_access(load->intr) & ACCESS_VOLATILE)
+                      ? BITFIELD_MASK(components)
+                      : nir_def_components_read(scalar.def)) |
+                  BITFIELD_BIT(scalar.comp);
+               for (unsigned p = 0; p < components / 2; ++p) {
+                  lower->ssa_to_vreg[scalar.def->index * APPLE9_SSA_COMPONENTS + 2 * p] =
+                     base + p;
+                  if (read_mask & BITFIELD_BIT(2 * p + 1)) {
+                     uint32_t hi = apple9_dag_shift_imm(lower, nir_op_ushr,
+                                                        base + p, 16);
+                     if (hi == AGX_APPLE9_VREG_INVALID)
+                        return AGX_APPLE9_VREG_INVALID;
+                     lower->ssa_to_vreg[scalar.def->index * APPLE9_SSA_COMPONENTS + 2 * p + 1] = hi;
+                  }
+               }
+            } else {
+               for (unsigned c = 0; c < components; ++c) {
+                  const unsigned lane_key = scalar.def->index * APPLE9_SSA_COMPONENTS + c;
+                  lower->ssa_to_vreg[lane_key] = base + c;
+               }
             }
             ++lower->active_emitted_load_count;
             ++lower->emitted_load_count;
@@ -3882,12 +4010,16 @@ apple9_find_buffer_dag(nir_shader *nir, const struct apple9_buffer_map *map,
             };
             util_dynarray_append(atomics, entry);
          } else if (load) {
+            const bool u16_vec =
+               intr->def.bit_size == 16 &&
+               (intr->def.num_components == 2 || intr->def.num_components == 4);
             if (intr->def.num_components == 0 || intr->def.num_components > 4 ||
                 (intr->def.bit_size != 8 && intr->def.bit_size != 16 &&
                  intr->def.bit_size != 32) ||
-                (intr->def.bit_size != 32 && intr->def.num_components != 1)) {
+                (intr->def.bit_size != 32 && intr->def.num_components != 1 &&
+                 !u16_vec)) {
                *reason =
-                  "Apple9 inputs must be scalar 8/16-bit or one-to-four-component 32-bit buffer loads";
+                  "Apple9 inputs must be scalar 8/16-bit, u16x2/u16x4, or u32 vector buffer loads";
                return false;
             }
             enum agx_apple9_compute_resource_kind kind =
@@ -3927,10 +4059,12 @@ apple9_find_buffer_dag(nir_shader *nir, const struct apple9_buffer_map *map,
                *reason = "Apple9 store requires one to four components";
                return false;
             }
+            const bool u16_vec =
+               bit_size == 16 && (components == 2 || components == 4);
             if (nir_intrinsic_write_mask(intr) != BITFIELD_MASK(components) ||
                 (bit_size != 8 && bit_size != 16 && bit_size != 32) ||
-                (bit_size != 32 && components != 1)) {
-               *reason = "Apple9 requires complete scalar or u32 tuple stores";
+                (bit_size != 32 && components != 1 && !u16_vec)) {
+               *reason = "Apple9 requires complete scalar, u16x2/u16x4, or u32 tuple stores";
                return false;
             }
             unsigned argument = global ? 0 : apple9_buffer_argument(
@@ -4016,10 +4150,26 @@ apple9_emit_buffer_store(struct apple9_dag_lower *lower,
    if (!uniform_base && (store->address || lower->buffer_table) &&
        address == AGX_APPLE9_VREG_INVALID)
       return false;
-   if (!agx_apple9_vir_emit_device_store(&lower->program, binding,
-                                         store->lowered_index, store->output,
-                                         store->components, store->bit_size))
+   if (store->bit_size == 16 &&
+       (store->components == 2 || store->components == 4)) {
+      uint32_t packed[2];
+      for (unsigned p = 0; p < store->components / 2; ++p) {
+         packed[p] = apple9_pack_u16x2(lower, store->output[2 * p],
+                                       store->output[2 * p + 1]);
+         if (packed[p] == AGX_APPLE9_VREG_INVALID)
+            return false;
+      }
+      if (!agx_apple9_vir_emit_device_store_vector_u16(
+             &lower->program, binding, store->lowered_index, packed,
+             store->components))
+         return false;
+   } else if (!agx_apple9_vir_emit_device_store(&lower->program, binding,
+                                                store->lowered_index,
+                                                store->output,
+                                                store->components,
+                                                store->bit_size)) {
       return false;
+   }
    struct agx_apple9_vir_instr *memory =
       lower->program.instructions[lower->program.instruction_count - 1];
    memory->memory_global = uniform_base;
@@ -4535,24 +4685,54 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
             continue;
          }
          if (intr->intrinsic == nir_intrinsic_store_scratch) {
-            if (intr->src[0].ssa->bit_size != 32 ||
-                nir_intrinsic_align_mul(intr) < 4 ||
-                (nir_intrinsic_align_offset(intr) & 3))
+            const unsigned bits = intr->src[0].ssa->bit_size;
+            if ((bits != 8 && bits != 16 && bits != 32) ||
+                apple9_shared_align(intr, 1, 0) < bits / 8)
                return false;
-            uint32_t address = apple9_lower_dag_scalar(lower,
+            uint32_t base = apple9_lower_dag_scalar(lower,
                nir_get_scalar(intr->src[1].ssa, 0));
-            address = apple9_dag_shift_imm(lower, nir_op_ushr, address, 2);
-            for (unsigned c = 0; c < intr->num_components; ++c) {
-               if (!(nir_intrinsic_write_mask(intr) & BITFIELD_BIT(c)))
+            if (base == AGX_APPLE9_VREG_INVALID)
+               return false;
+            const unsigned wmask = nir_intrinsic_write_mask(intr);
+            for (unsigned c = 0; c < intr->num_components;) {
+               if (!(wmask & BITFIELD_BIT(c))) {
+                  ++c;
                   continue;
-               uint32_t sources[] = {
-                  apple9_lower_dag_scalar(lower, nir_get_scalar(intr->src[0].ssa, c)),
-                  address,
-               };
-               if (!agx_apple9_vir_emit_side_effect(&lower->program,
-                      AGX_APPLE9_VIR_PRIVATE_STORE, AGX_APPLE9_ENC_PRIVATE_STORE,
-                      sources, 2, c))
+               }
+               unsigned offset_B = (bits / 8) * c;
+               unsigned align = apple9_shared_align(intr, 1, offset_B);
+               unsigned w = 1;
+               unsigned shift = util_logbase2(bits / 8);
+               unsigned word_offset = 0;
+               uint32_t idx;
+               if (bits == 32 && c + 4 <= intr->num_components &&
+                   align >= 16 && (wmask & (0xfu << c)) == (0xfu << c)) {
+                  w = 4;
+                  /* Private uint4 uses shift=0 with a byte-scaled index. */
+                  idx = apple9_shared_index(lower, base, offset_B, 0);
+               } else if (bits == 32 && c + 2 <= intr->num_components &&
+                          align >= 8 && (wmask & (0x3u << c)) == (0x3u << c)) {
+                  w = 2;
+                  idx = apple9_shared_index(lower, base, offset_B, 3);
+               } else if (bits == 32) {
+                  idx = apple9_shared_index(lower, base, 0, 2);
+                  word_offset = c;
+               } else {
+                  idx = apple9_shared_index(lower, base, offset_B, shift);
+               }
+               if (idx == AGX_APPLE9_VREG_INVALID)
                   return false;
+               uint32_t data[4];
+               for (unsigned k = 0; k < w; ++k) {
+                  data[k] = apple9_lower_dag_scalar(
+                     lower, nir_get_scalar(intr->src[0].ssa, c + k));
+                  if (data[k] == AGX_APPLE9_VREG_INVALID)
+                     return false;
+               }
+               if (!agx_apple9_vir_emit_private_store(
+                      &lower->program, data, w, bits, idx, word_offset))
+                  return false;
+               c += w;
             }
             lower->program.private_size = lower->nir->scratch_size;
             continue;
@@ -4706,9 +4886,9 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
             continue;
          }
          if (intr->intrinsic == nir_intrinsic_store_shared) {
-            if (intr->src[0].ssa->bit_size != 32 ||
-                nir_intrinsic_align_mul(intr) < 4 ||
-                (nir_intrinsic_align_offset(intr) & 3) ||
+            const unsigned bits = intr->src[0].ssa->bit_size;
+            if ((bits != 8 && bits != 16 && bits != 32) ||
+                apple9_shared_align(intr, 1, nir_intrinsic_base(intr)) < bits / 8 ||
                 lower->shared_root == UINT_MAX)
                return false;
             uint32_t base = apple9_lower_dag_scalar(lower,
@@ -4721,27 +4901,61 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
                   ++c;
                   continue;
                }
-               unsigned offset_B = nir_intrinsic_base(intr) + 4 * c;
+               unsigned offset_B = nir_intrinsic_base(intr) + (bits / 8) * c;
                unsigned align = apple9_shared_align(intr, 1, offset_B);
                unsigned w = 1;
-               if (c + 4 <= intr->num_components && align >= 16 &&
-                   (wmask & (0xfu << c)) == (0xfu << c)) {
-                  w = 4;
-               } else if (c + 2 <= intr->num_components && align >= 8 &&
-                          (wmask & (0x3u << c)) == (0x3u << c)) {
-                  w = 2;
+               unsigned shift = util_logbase2(bits / 8);
+               if (bits == 32) {
+                  if (c + 4 <= intr->num_components && align >= 16 &&
+                      (wmask & (0xfu << c)) == (0xfu << c)) {
+                     w = 4;
+                     shift = 4;
+                  } else if (c + 3 <= intr->num_components && align >= 16 &&
+                             (wmask & (0x7u << c)) == (0x7u << c)) {
+                     w = 3;
+                     shift = 4;
+                  } else if (c + 2 <= intr->num_components && align >= 8 &&
+                             (wmask & (0x3u << c)) == (0x3u << c)) {
+                     w = 2;
+                     shift = 3;
+                  }
+               } else if (bits == 16) {
+                  if (c + 4 <= intr->num_components && align >= 8 &&
+                      (wmask & (0xfu << c)) == (0xfu << c)) {
+                     w = 4;
+                     shift = 3;
+                  } else if (c + 2 <= intr->num_components && align >= 4 &&
+                             (wmask & (0x3u << c)) == (0x3u << c)) {
+                     w = 2;
+                     shift = 2;
+                  }
                }
                uint32_t data[4];
-               for (unsigned k = 0; k < w; ++k) {
-                  data[k] = apple9_lower_dag_scalar(
-                     lower, nir_get_scalar(intr->src[0].ssa, c + k));
-                  if (data[k] == AGX_APPLE9_VREG_INVALID)
-                     return false;
+               if (bits == 16 && (w == 2 || w == 4)) {
+                  for (unsigned p = 0; p < w / 2; ++p) {
+                     uint32_t lo = apple9_lower_dag_scalar(
+                        lower, nir_get_scalar(intr->src[0].ssa, c + 2 * p));
+                     uint32_t hi = apple9_lower_dag_scalar(
+                        lower, nir_get_scalar(intr->src[0].ssa, c + 2 * p + 1));
+                     if (lo == AGX_APPLE9_VREG_INVALID ||
+                         hi == AGX_APPLE9_VREG_INVALID)
+                        return false;
+                     data[p] = apple9_pack_u16x2(lower, lo, hi);
+                     if (data[p] == AGX_APPLE9_VREG_INVALID)
+                        return false;
+                  }
+               } else {
+                  for (unsigned k = 0; k < w; ++k) {
+                     data[k] = apple9_lower_dag_scalar(
+                        lower, nir_get_scalar(intr->src[0].ssa, c + k));
+                     if (data[k] == AGX_APPLE9_VREG_INVALID)
+                        return false;
+                  }
                }
-               uint32_t idx = apple9_shared_index(lower, base, offset_B, w);
+               uint32_t idx = apple9_shared_index(lower, base, offset_B, shift);
                if (idx == AGX_APPLE9_VREG_INVALID ||
-                   !agx_apple9_vir_emit_shared_store(&lower->program, data, w,
-                                                     idx, lower->shared_root))
+                   !agx_apple9_vir_emit_shared_store_typed(
+                      &lower->program, data, w, bits, idx, lower->shared_root))
                   return false;
                c += w;
             }
@@ -5783,6 +5997,8 @@ apple9_widen_shared_offset(nir_builder *b, nir_intrinsic_instr *intr,
    case nir_intrinsic_store_shared:
    case nir_intrinsic_shared_atomic:
    case nir_intrinsic_shared_atomic_swap:
+   case nir_intrinsic_load_scratch:
+   case nir_intrinsic_store_scratch:
       break;
    default:
       return false;
@@ -5795,74 +6011,9 @@ apple9_widen_shared_offset(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
-/* Shared and scratch memory are addressed in words. Narrow loads extract
- * from the containing word. Narrow shared stores update only their own bits
- * with an atomic AND/OR pair, so invocations storing neighbouring bytes do
- * not race; private scratch stores read, modify and write the word.
- */
-static bool
-apple9_lower_narrow_shared(nir_builder *b, nir_intrinsic_instr *intr,
-                           UNUSED void *data)
-{
-   bool scratch = intr->intrinsic == nir_intrinsic_load_scratch ||
-                  intr->intrinsic == nir_intrinsic_store_scratch;
-   bool store = intr->intrinsic == nir_intrinsic_store_shared ||
-                intr->intrinsic == nir_intrinsic_store_scratch;
-   if (!store && intr->intrinsic != nir_intrinsic_load_shared &&
-       intr->intrinsic != nir_intrinsic_load_scratch)
-      return false;
-   unsigned bits = store ? intr->src[0].ssa->bit_size : intr->def.bit_size;
-   if (bits >= 32)
-      return false;
-
-   b->cursor = nir_before_instr(&intr->instr);
-   nir_def *base = nir_u2u32(b, nir_get_io_offset_src(intr)->ssa);
-   if (!scratch)
-      base = nir_iadd_imm(b, base, nir_intrinsic_base(intr));
-   unsigned components = store ? intr->src[0].ssa->num_components
-                               : intr->def.num_components;
-   nir_def *values[NIR_MAX_VEC_COMPONENTS];
-   for (unsigned c = 0; c < components; ++c) {
-      if (store && !(nir_intrinsic_write_mask(intr) & BITFIELD_BIT(c)))
-         continue;
-      nir_def *offset = nir_iadd_imm(b, base, c * bits / 8);
-      nir_def *word = nir_iand_imm(b, offset, ~3u);
-      nir_def *shift = nir_imul_imm(b, nir_iand_imm(b, offset, 3), 8);
-      if (store) {
-         nir_def *mask = nir_ishl(b, nir_imm_int(b, BITFIELD_MASK(bits)), shift);
-         nir_def *value = nir_ishl(b,
-            nir_iand_imm(b, nir_u2u32(b, nir_channel(b, intr->src[0].ssa, c)),
-                         BITFIELD_MASK(bits)), shift);
-         if (scratch) {
-            /* Scratch is private to the invocation: read-modify-write. */
-            nir_def *old = nir_load_scratch(b, 1, 32, word, .align_mul = 4);
-            nir_store_scratch(b, nir_ior(b, nir_iand(b, old, nir_inot(b, mask)),
-                                         value), word, .align_mul = 4);
-         } else {
-            nir_shared_atomic(b, 32, word, nir_inot(b, mask),
-                              .atomic_op = nir_atomic_op_iand);
-            nir_shared_atomic(b, 32, word, value,
-                              .atomic_op = nir_atomic_op_ior);
-         }
-      } else {
-         nir_def *loaded = scratch
-            ? nir_load_scratch(b, 1, 32, word, .align_mul = 4)
-            : nir_load_shared(b, 1, 32, word, .align_mul = 4);
-         values[c] = nir_u2uN(b, nir_ushr(b, loaded, shift), bits);
-      }
-   }
-   if (store)
-      nir_instr_remove(&intr->instr);
-   else
-      nir_def_replace(&intr->def, nir_vec(b, values, components));
-   return true;
-}
-
 static void
 apple9_legalize_buffer_accesses(nir_shader *nir)
 {
-   nir_shader_intrinsics_pass(nir, apple9_lower_narrow_shared,
-                              nir_metadata_control_flow, NULL);
    nir_shader_alu_pass(nir, apple9_lower_interleave,
                        nir_metadata_control_flow, NULL);
    nir_shader_alu_pass(nir, apple9_lower_half_conversion,
@@ -5948,10 +6099,23 @@ apple9_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
 {
    if (low->intrinsic == nir_intrinsic_load_shared ||
        low->intrinsic == nir_intrinsic_store_shared) {
-      if (bit_size != 32 || (num_components != 2 && num_components != 4))
-         return false;
       unsigned align = nir_combined_align(align_mul, align_offset);
-      if (align < num_components * 4)
+      if (bit_size == 16) {
+         if ((num_components != 2 && num_components != 4) ||
+             align < num_components * 2)
+            return false;
+      } else if (bit_size == 32) {
+         unsigned req = num_components == 2 ? 8 : 16;
+         if (num_components < 2 || num_components > 4 || align < req)
+            return false;
+      } else {
+         return false;
+      }
+   } else if (low->intrinsic == nir_intrinsic_load_scratch ||
+              low->intrinsic == nir_intrinsic_store_scratch) {
+      unsigned align = nir_combined_align(align_mul, align_offset);
+      if (bit_size != 32 || (num_components != 2 && num_components != 4) ||
+          align < num_components * 4)
          return false;
    }
    return agx_mem_vectorize_cb(align_mul, align_offset, bit_size,
@@ -5974,9 +6138,8 @@ apple9_prepare_dag(nir_shader *nir)
    nir_opt_cse(nir);
    nir_opt_dce(nir);
    /* Vulkan buffers and descriptors are global memory; their 64-bit
-    * addresses are still unsplit here. Vectorize aligned 32-bit shared
-    * accesses to native uint2/uint4 while leaving narrow <32-bit shared
-    * for apple9_lower_narrow_shared. */
+    * addresses are still unsplit here. Vectorize aligned 16/32-bit shared
+    * and 32-bit scratch accesses to native vector forms. */
    const nir_load_store_vectorize_options vector_options = {
       .modes = nir_var_mem_ubo | nir_var_mem_ssbo | nir_var_mem_global |
                nir_var_mem_constant | nir_var_mem_shared,

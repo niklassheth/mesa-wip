@@ -11602,9 +11602,9 @@ TEST(Apple9Compiler, PrivateArraysUseNativeScratchInAllStages)
                   if (instr->type != nir_instr_type_intrinsic) continue;
                   auto *intr = nir_instr_as_intrinsic(instr);
                   if (intr->intrinsic == nir_intrinsic_load_scratch) {
-                     ++reads; EXPECT_EQ(intr->def.bit_size, 32u);
+                     ++reads; EXPECT_EQ(intr->def.bit_size, bits);
                   } else if (intr->intrinsic == nir_intrinsic_store_scratch) {
-                     ++writes; EXPECT_EQ(intr->src[0].ssa->bit_size, 32u);
+                     ++writes; EXPECT_EQ(intr->src[0].ssa->bit_size, bits);
                   }
                }
             }
@@ -16743,14 +16743,15 @@ TEST(Apple9Compiler, VectorizedSharedLoadAndStoreEmitNativeUint2AndUint4)
       unsigned comps;
       unsigned align_mul;
       unsigned expect_u4;
+      unsigned expect_u3;
       unsigned expect_u2;
       unsigned expect_u1;
    } cases[] = {
-      {2, 8,  0, 1, 0}, /* aligned vec2 -> single uint2 */
-      {4, 16, 1, 0, 0}, /* aligned vec4 -> single uint4 */
-      {3, 16, 0, 1, 1}, /* aligned vec3 -> uint2 + scalar u32 */
-      {4, 8,  0, 2, 0}, /* 8B-aligned vec4 -> 2x uint2 */
-      {4, 4,  0, 0, 4}, /* 4B-aligned vec4 -> 4x scalar u32 */
+      {2, 8,  0, 0, 1, 0}, /* aligned vec2 -> single uint2 */
+      {4, 16, 1, 0, 0, 0}, /* aligned vec4 -> single uint4 */
+      {3, 16, 0, 1, 0, 0}, /* aligned vec3 -> single uint3 */
+      {4, 8,  0, 0, 2, 0}, /* 8B-aligned vec4 -> 2x uint2 */
+      {4, 4,  0, 0, 0, 4}, /* 4B-aligned vec4 -> 4x scalar u32 */
    };
 
    for (const auto &c : cases) {
@@ -16783,9 +16784,11 @@ TEST(Apple9Compiler, VectorizedSharedLoadAndStoreEmitNativeUint2AndUint4)
       ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason))
          << (reason ?: "");
       EXPECT_EQ(count_shared_width(compiled, true, 0x5c), c.expect_u4);
+      EXPECT_EQ(count_shared_width(compiled, true, 0x74), c.expect_u3);
       EXPECT_EQ(count_shared_width(compiled, true, 0x64), c.expect_u2);
       EXPECT_EQ(count_shared_width(compiled, true, 0x44), c.expect_u1);
       EXPECT_EQ(count_shared_width(compiled, false, 0x5c), c.expect_u4);
+      EXPECT_EQ(count_shared_width(compiled, false, 0x74), c.expect_u3);
       EXPECT_EQ(count_shared_width(compiled, false, 0x64), c.expect_u2);
       EXPECT_EQ(count_shared_width(compiled, false, 0x44), c.expect_u1);
       free(compiled.binary);
@@ -17020,6 +17023,235 @@ TEST(Apple9Compiler, Native16BitAndFragmentFencedImageStoreEndToEnd)
       }
       EXPECT_TRUE(apple9_binary_contains(compiled, tex_inv, sizeof(tex_inv)));
       EXPECT_TRUE(has_img_write(compiled, c.expect_b13, c.expect_b14));
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(Apple9Compiler, NarrowAndVectorSharedEmitNativeOpsWithoutAtomics)
+{
+   auto count_shared_width = [](const agx_shader_part &out, bool load,
+                                uint8_t width_tag) {
+      const uint8_t *bytes = static_cast<const uint8_t *>(out.binary);
+      uint8_t op = load ? 0x67 : 0xe7;
+      unsigned n = 0;
+      for (size_t i = 0; i + 14 <= out.info.binary_size; i += 2) {
+         if (bytes[i] == op && bytes[i + 1] == 0x02 && bytes[i + 2] == 0x54 &&
+             bytes[i + 7] == 0x00 && bytes[i + 8] == width_tag &&
+             bytes[i + 10] == 0x00 && bytes[i + 13] == 0x00)
+            ++n;
+      }
+      return n;
+   };
+   auto count_shared_atomic = [](const agx_shader_part &out) {
+      const uint8_t *bytes = static_cast<const uint8_t *>(out.binary);
+      unsigned n = 0;
+      for (size_t i = 0; i + 12 <= out.info.binary_size; i += 2) {
+         if (bytes[i] == 0x67 && (bytes[i + 1] & 0x0f) == 0x03 &&
+             (bytes[i + 2] & 0xdc) == 0x54)
+            ++n;
+      }
+      return n;
+   };
+
+   struct {
+      unsigned bits;
+      unsigned comps;
+      unsigned align_mul;
+      uint8_t expect_tag;
+      unsigned expect_count;
+   } cases[] = {
+      {8,  1, 1, 0x84, 1}, /* aligned u8 -> native u8 */
+      {16, 1, 2, 0x04, 1}, /* aligned u16 -> native u16 */
+      {16, 2, 4, 0x24, 1}, /* aligned u16x2 -> native u16x2 */
+      {16, 4, 8, 0x1c, 1}, /* aligned u16x4 -> native u16x4 */
+      {16, 1, 1, 0x84, 2}, /* unaligned u16 -> 2x native u8, zero atomics */
+      {32, 3, 16, 0x74, 1}, /* aligned u32x3 -> native u32x3 */
+   };
+
+   for (const auto &c : cases) {
+      SCOPED_TRACE(c.bits * 1000 + c.comps * 100 + c.align_mul);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "typed_shared");
+      b.shader->info.workgroup_size[0] = 64;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.shared_size = 4096;
+      b.shader->info.num_ssbos = 1;
+      nir_def *lid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *addr = nir_imul_imm(&b, lid, MAX2(c.align_mul, 1u));
+      nir_def *in = nir_load_ssbo(&b, c.comps, c.bits, nir_imm_int(&b, 0), addr,
+                                  .align_mul = c.align_mul);
+      nir_store_shared(&b, in, addr, .write_mask = BITFIELD_MASK(c.comps),
+                       .align_mul = c.align_mul);
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_shared);
+      nir_def *out_v = nir_load_shared(&b, c.comps, c.bits, addr,
+                                       .align_mul = c.align_mul);
+      nir_store_ssbo(&b, out_v, nir_imm_int(&b, 0), addr,
+                     .write_mask = BITFIELD_MASK(c.comps),
+                     .align_mul = c.align_mul);
+
+      agx_shader_part compiled = {};
+      agx_apple9_compute_profile profile = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason))
+         << (reason ?: "");
+      EXPECT_EQ(count_shared_atomic(compiled), 0u);
+      EXPECT_EQ(count_shared_width(compiled, true, c.expect_tag), c.expect_count);
+      EXPECT_EQ(count_shared_width(compiled, false, c.expect_tag), c.expect_count);
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* Adjacent aligned scalar u16 shared loads/stores auto-vectorize to u16x4. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "vec_u16_shared_auto");
+      b.shader->info.workgroup_size[0] = 64;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.shared_size = 4096;
+      b.shader->info.num_ssbos = 1;
+      nir_def *lid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *base = nir_imul_imm(&b, lid, 8);
+      for (unsigned i = 0; i < 4; ++i) {
+         nir_def *v = nir_load_ssbo(&b, 1, 16, nir_imm_int(&b, 0),
+                                    nir_iadd_imm(&b, base, 2 * i),
+                                    .align_mul = 8, .align_offset = 2 * i);
+         nir_store_shared(&b, v, nir_iadd_imm(&b, base, 2 * i),
+                          .write_mask = 1, .align_mul = 8, .align_offset = 2 * i);
+      }
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_shared);
+      for (unsigned i = 0; i < 4; ++i) {
+         nir_def *v = nir_load_shared(&b, 1, 16, nir_iadd_imm(&b, base, 2 * i),
+                                      .align_mul = 8, .align_offset = 2 * i);
+         nir_store_ssbo(&b, v, nir_imm_int(&b, 0),
+                        nir_iadd_imm(&b, base, 2 * i),
+                        .write_mask = 1, .align_mul = 8, .align_offset = 2 * i);
+      }
+      agx_shader_part compiled = {};
+      agx_apple9_compute_profile profile = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason))
+         << (reason ?: "");
+      EXPECT_EQ(count_shared_atomic(compiled), 0u);
+      EXPECT_EQ(count_shared_width(compiled, true, 0x1c), 1u);
+      EXPECT_EQ(count_shared_width(compiled, false, 0x1c), 1u);
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(Apple9Compiler, WidePrivateMemoryAndU16DeviceVectors)
+{
+   auto count_private_fmt = [](const agx_shader_part &out, bool load,
+                               uint8_t fmt) {
+      const uint8_t *bytes = static_cast<const uint8_t *>(out.binary);
+      uint8_t op = load ? 0x6f : 0xef;
+      unsigned len = load ? 12 : 10;
+      unsigned n = 0;
+      for (size_t i = 0; i + len <= out.info.binary_size; i += 2) {
+         if (bytes[i] == op && (bytes[i + 2] & 0xdc) == 0x54 &&
+             bytes[i + 5] == 0x02 && (bytes[i + 6] & 0x3f) == fmt) {
+            if (load && fmt == 0x17) {
+               /* uint4 private load must encode shift=0 (byte-scaled index). */
+               EXPECT_EQ(bytes[i + 9] & 0x80u, 0u);
+               EXPECT_EQ(bytes[i + 10] & 0x01u, 0u);
+            }
+            ++n;
+         }
+      }
+      return n;
+   };
+
+   struct {
+      unsigned bits;
+      unsigned comps;
+      unsigned align_mul;
+      uint8_t expect_fmt;
+   } priv_cases[] = {
+      {8,  1, 1,  0x21},
+      {16, 1, 2,  0x01},
+      {32, 2, 8,  0x19},
+      {32, 4, 16, 0x17},
+   };
+   for (const auto &c : priv_cases) {
+      SCOPED_TRACE(c.bits * 100 + c.comps);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "typed_private");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->scratch_size = 512;
+      b.shader->info.num_ssbos = 1;
+      nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *idx = nir_imul_imm(&b, nir_iand_imm(&b, gid, 7), c.align_mul);
+      nir_def *in = nir_load_ssbo(&b, c.comps, c.bits, nir_imm_int(&b, 0),
+                                  nir_imul_imm(&b, gid, c.align_mul),
+                                  .align_mul = c.align_mul);
+      nir_store_scratch(&b, in, idx, .align_mul = c.align_mul,
+                        .write_mask = BITFIELD_MASK(c.comps));
+      nir_def *read_idx =
+         nir_imul_imm(&b, nir_iand_imm(&b, nir_ixor(&b, gid, nir_imm_int(&b, 1)), 7),
+                      c.align_mul);
+      nir_def *out_v = nir_load_scratch(&b, c.comps, c.bits, read_idx,
+                                        .align_mul = c.align_mul);
+      nir_store_ssbo(&b, out_v, nir_imm_int(&b, 0),
+                     nir_imul_imm(&b, gid, c.align_mul),
+                     .write_mask = BITFIELD_MASK(c.comps),
+                     .align_mul = c.align_mul);
+
+      agx_shader_part compiled = {};
+      agx_apple9_compute_profile profile = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason))
+         << (reason ?: "");
+      EXPECT_EQ(count_private_fmt(compiled, true, c.expect_fmt), 1u);
+      EXPECT_EQ(count_private_fmt(compiled, false, c.expect_fmt), 1u);
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* Aligned i16x2 & i16x4 SSBO device load/store emit native packed 16-bit vectors. */
+   auto count_dev_u16_vec = [](const agx_shader_part &out, bool load,
+                               unsigned comps) {
+      const uint8_t *bytes = static_cast<const uint8_t *>(out.binary);
+      uint8_t op = load ? 0x67 : 0xe7;
+      uint8_t b8_low = comps == 4 ? 0x07 : 0x09;
+      unsigned n = 0;
+      for (size_t i = 0; i + 14 <= out.info.binary_size; i += 2) {
+         if (bytes[i] == op && (bytes[i + 1] & 0x0f) == 0x00 &&
+             (bytes[i + 2] & 0xcc) == 0x44 &&
+             (bytes[i + 8] & 0x3f) == b8_low && bytes[i + 13] == 0x00)
+            ++n;
+      }
+      return n;
+   };
+   for (unsigned comps : {2u, 4u}) {
+      SCOPED_TRACE(comps);
+      unsigned align = comps * 2;
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "u16_device_vec");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.num_ssbos = 2;
+      nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *addr = nir_imul_imm(&b, gid, align);
+      nir_def *v = nir_load_ssbo(&b, comps, 16, nir_imm_int(&b, 1), addr,
+                                 .align_mul = align);
+      nir_def *one = nir_imm_intN_t(&b, 1, 16);
+      nir_store_ssbo(&b, nir_iadd(&b, v, one), nir_imm_int(&b, 0), addr,
+                     .write_mask = BITFIELD_MASK(comps), .align_mul = align);
+      agx_shader_part compiled = {};
+      agx_apple9_compute_profile profile = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason))
+         << (reason ?: "");
+      EXPECT_GE(count_dev_u16_vec(compiled, true, comps), 1u);
+      EXPECT_GE(count_dev_u16_vec(compiled, false, comps), 1u);
       free(compiled.binary);
       ralloc_free(b.shader);
    }
