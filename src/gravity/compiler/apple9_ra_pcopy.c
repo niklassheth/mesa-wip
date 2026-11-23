@@ -953,6 +953,9 @@ collect_phi_copies_for_succ(const struct agx_apple9_vir_program *program,
                             const struct agx_apple9_block *pred,
                             const struct agx_apple9_block *succ,
                             const struct apple9_ra_assignment *assign,
+                            const bool *ssa_is_imm,
+                            const uint32_t *ssa_imm_val,
+                            unsigned ssa_imm_count,
                             struct util_dynarray *copies)
 {
    unsigned pred_idx = agx_apple9_block_pred_index(succ, pred);
@@ -970,16 +973,29 @@ collect_phi_copies_for_succ(const struct agx_apple9_vir_program *program,
       if (pred_idx >= agx_apple9_vir_nr_srcs(ins))
          return false;
 
+      uint32_t src_v = agx_apple9_vir_src(ins, pred_idx);
       struct apple9_ra_copy cp = {
          .count = MAX2((unsigned)ins->dest_components, 1u),
       };
       if (!value_to_loc(program, assign, ins->dest, &cp.dst) ||
-          !value_to_loc(program, assign, agx_apple9_vir_src(ins, pred_idx),
-                        &cp.src))
+          !value_to_loc(program, assign, src_v, &cp.src))
          return false;
 
       if (cp.dst.kind != APPLE9_RA_LOC_GPR && cp.dst.kind != APPLE9_RA_LOC_MEM)
          return false;
+
+      /* Lower known scalar literal phi sources directly as APPLE9_RA_LOC_IMM
+       * when compact (2B IMM for dst < 16 & imm <= 0x7f) or 4B ZERO (dst < 64
+       * & imm == 0), avoiding register-read WAR cycles and shrinking copies.
+       * Never convert dst >= 64 (would require a 2-op scratch bridge). */
+      if (ssa_is_imm && src_v < ssa_imm_count && ssa_is_imm[src_v] &&
+          cp.count == 1 && cp.dst.kind == APPLE9_RA_LOC_GPR &&
+          cp.src.kind == APPLE9_RA_LOC_GPR && cp.dst.value != cp.src.value) {
+         uint32_t imm = ssa_imm_val[src_v];
+         if ((cp.dst.value < 16u && imm <= 0x7fu) ||
+             (cp.dst.value < 64u && imm == 0u))
+            cp.src = apple9_ra_loc_imm(imm);
+      }
 
       util_dynarray_append(copies, cp);
    }
@@ -987,12 +1003,15 @@ collect_phi_copies_for_succ(const struct agx_apple9_vir_program *program,
    return true;
 }
 
-bool
-apple9_ra_lower_phi_edge(struct agx_apple9_vir_program *program,
-                         struct agx_apple9_block *pred,
-                         struct agx_apple9_block *succ,
-                         const struct apple9_ra_assignment *assign,
-                         const struct apple9_ra_pcopy_opts *opts)
+static bool
+apple9_ra_lower_phi_edge_internal(struct agx_apple9_vir_program *program,
+                                  struct agx_apple9_block *pred,
+                                  struct agx_apple9_block *succ,
+                                  const struct apple9_ra_assignment *assign,
+                                  const struct apple9_ra_pcopy_opts *opts,
+                                  const bool *ssa_is_imm,
+                                  const uint32_t *ssa_imm_val,
+                                  unsigned ssa_imm_count)
 {
    if (!program || !pred || !pred->cfg_active)
       return false;
@@ -1002,12 +1021,15 @@ apple9_ra_lower_phi_edge(struct agx_apple9_vir_program *program,
 
    bool ok = true;
    if (succ) {
-      ok = collect_phi_copies_for_succ(program, pred, succ, assign, &copies);
+      ok = collect_phi_copies_for_succ(program, pred, succ, assign,
+                                       ssa_is_imm, ssa_imm_val, ssa_imm_count,
+                                       &copies);
    } else {
       for (unsigned s = 0; s < 2 && ok; ++s) {
          if (pred->cfg_succs[s])
             ok = collect_phi_copies_for_succ(program, pred, pred->cfg_succs[s],
-                                             assign, &copies);
+                                             assign, ssa_is_imm, ssa_imm_val,
+                                             ssa_imm_count, &copies);
       }
    }
 
@@ -1032,6 +1054,17 @@ apple9_ra_lower_phi_edge(struct agx_apple9_vir_program *program,
 }
 
 bool
+apple9_ra_lower_phi_edge(struct agx_apple9_vir_program *program,
+                         struct agx_apple9_block *pred,
+                         struct agx_apple9_block *succ,
+                         const struct apple9_ra_assignment *assign,
+                         const struct apple9_ra_pcopy_opts *opts)
+{
+   return apple9_ra_lower_phi_edge_internal(program, pred, succ, assign, opts,
+                                            NULL, NULL, 0);
+}
+
+bool
 apple9_ra_lower_all_phi_edges(struct agx_apple9_vir_program *program,
                               const struct apple9_ra_assignment *assign,
                               const struct apple9_ra_pcopy_opts *opts,
@@ -1040,12 +1073,38 @@ apple9_ra_lower_all_phi_edges(struct agx_apple9_vir_program *program,
    if (!program)
       return false;
 
+   /* Snapshot scalar VIR_IMM SSA definitions once before emitting any physical
+    * edge copies (which tag physical GPRs with APPLE9_RA_PHYS_OP_TAG). */
+   unsigned vcount = program->value_count;
+   bool *ssa_is_imm = vcount ? calloc(vcount, sizeof(bool)) : NULL;
+   uint32_t *ssa_imm_val = vcount ? calloc(vcount, sizeof(uint32_t)) : NULL;
+   if (ssa_is_imm && ssa_imm_val) {
+      for (unsigned i = 0; i < program->instruction_count; ++i) {
+         const struct agx_apple9_vir_instr *ins = program->instructions[i];
+         if (ins->op == AGX_APPLE9_VIR_IMM &&
+             ins->target != APPLE9_RA_PHYS_OP_TAG &&
+             ins->dest < vcount && ins->dest_components == 1) {
+            ssa_is_imm[ins->dest] = true;
+            ssa_imm_val[ins->dest] = ins->immediate;
+         }
+      }
+   }
+
+   bool ok = true;
    for (struct agx_apple9_block *b = program->blocks; b; b = b->next) {
       if (!b->cfg_active)
          continue;
-      if (!apple9_ra_lower_phi_edge(program, b, NULL, assign, opts))
-         return false;
+      if (!apple9_ra_lower_phi_edge_internal(program, b, NULL, assign, opts,
+                                             ssa_is_imm, ssa_imm_val,
+                                             ssa_is_imm && ssa_imm_val ? vcount : 0)) {
+         ok = false;
+         break;
+      }
    }
+   free(ssa_is_imm);
+   free(ssa_imm_val);
+   if (!ok)
+      return false;
 
    if (remove_phis) {
       struct util_dynarray to_remove;

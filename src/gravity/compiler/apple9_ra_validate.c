@@ -2036,12 +2036,27 @@ apple9_ra_validate_post_ra(const struct agx_apple9_vir_program *program,
                }
                struct reg_slot actual = *file_slot(cur, check_loc);
                bool ok_slot = (actual.state == SLOT_SSA && actual.value == expect_val);
-               if (!ok_slot && assign && assign->is_imm &&
-                   expect_val < program->value_count &&
-                   BITSET_TEST(assign->is_imm, expect_val) &&
-                   actual.state == SLOT_CONST &&
-                   actual.value == assign->imm_val[expect_val])
-                  ok_slot = true;
+               if (!ok_slot && actual.state == SLOT_CONST &&
+                   expect_val < program->value_count) {
+                  if (assign && assign->is_imm &&
+                      BITSET_TEST(assign->is_imm, expect_val) &&
+                      actual.value == assign->imm_val[expect_val]) {
+                     ok_slot = true;
+                  } else {
+                     for (unsigned ii = 0; ii < program->instruction_count; ++ii) {
+                        const struct agx_apple9_vir_instr *def =
+                           program->instructions[ii];
+                        if (def->op == AGX_APPLE9_VIR_IMM &&
+                            def->target != APPLE9_RA_PHYS_OP_TAG &&
+                            def->dest == expect_val &&
+                            def->dest_components == 1) {
+                           if (def->immediate == actual.value)
+                              ok_slot = true;
+                           break;
+                        }
+                     }
+                  }
+               }
                if (!ok_slot) {
                   set_err(err, b->index, UINT_MAX,
                           "clobbered PHI edge value on block %u -> block %u: expected v%u in %c%u, found %s (v%u)",

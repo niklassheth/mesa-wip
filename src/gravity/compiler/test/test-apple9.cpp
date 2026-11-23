@@ -9371,10 +9371,11 @@ TEST(Apple9Allocator, TexturePublicationsHaveIndependentStorageAndPendingLifetim
          inputs[i] = agx_apple9_vir_input(&p, i);
          ASSERT_TRUE(agx_apple9_vir_add_live_out(&p, inputs[i]));
       }
-      uint32_t coords[] = {inputs[0], inputs[1]};
-      ASSERT_NE(agx_apple9_vir_emit_texture_sample(&p, coords, inputs[2], 0, 0),
+      uint32_t coords0[] = {inputs[0], inputs[1]};
+      uint32_t coords1[] = {inputs[3], inputs[4]};
+      ASSERT_NE(agx_apple9_vir_emit_texture_sample(&p, coords0, inputs[2], 0, 0),
                 AGX_APPLE9_VREG_INVALID);
-      p.output = agx_apple9_vir_emit_texture_sample(&p, coords, inputs[2], 1, 0);
+      p.output = agx_apple9_vir_emit_texture_sample(&p, coords1, inputs[5], 1, 0);
       ASSERT_NE(p.output, AGX_APPLE9_VREG_INVALID);
       /* Move the second parameter definition ahead of the first sample.
        * Both publications must coexist until the first result handoff. */
@@ -19957,5 +19958,74 @@ TEST(Apple9CompilerP0, ShadowGatherCustomBorderSamplesNativeShadowBorder)
       }
    }
    EXPECT_TRUE(found_shadow_border_txl);
+   ralloc_free(b.shader);
+}
+
+TEST(Apple9Compiler, CondSignFlipNormalFoldEliminatesPerChannelSelects)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "cond_sign_flip_normal");
+   nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *n = nir_load_ssbo(&b, 4, 32, nir_imm_int(&b, 0),
+                              nir_imul_imm(&b, gid, 16), .align_mul = 16);
+   nir_def *nx = nir_channel(&b, n, 0);
+   nir_def *ny = nir_channel(&b, n, 1);
+   nir_def *nz = nir_channel(&b, n, 2);
+   nir_def *inv_len = nir_frsq(&b, nir_fadd(&b, nir_fmul(&b, nx, nx),
+                                            nir_fadd(&b, nir_fmul(&b, ny, ny),
+                                                     nir_fmul(&b, nz, nz))));
+   nir_def *ff = nir_ine_imm(&b, nir_channel(&b, n, 3), 0);
+   nir_def *not_ff = nir_inot(&b, ff);
+
+   nir_def *mx = nir_fmul(&b, inv_len, nx);
+   nir_def *my = nir_fmul(&b, inv_len, ny);
+   nir_def *mz = nir_fmul(&b, inv_len, nz);
+
+   nir_def *fx = nir_bcsel(&b, not_ff, nir_fneg(&b, mx), mx);
+   nir_def *fy = nir_bcsel(&b, not_ff, nir_fneg(&b, my), my);
+   nir_def *fz = nir_bcsel(&b, not_ff, nir_fneg(&b, mz), mz);
+   nir_def *out = nir_vec4(&b, fx, fy, fz, nir_imm_float(&b, 1.0f));
+   nir_store_ssbo(&b, out, nir_imm_int(&b, 1), nir_imul_imm(&b, gid, 16),
+                  .write_mask = 0xf, .align_mul = 16);
+
+   agx_shader_part compiled = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, nullptr, &reason))
+      << (reason ?: "");
+   /* Folding bcsel(!ff, -fmul(inv_len, c), fmul(inv_len, c)) onto inv_len
+    * eliminates the 3 per-channel SELECTs + the inot SELECT. */
+   EXPECT_LT(compiled.info.binary_size, 180u);
+   free(compiled.binary);
+   ralloc_free(b.shader);
+}
+
+TEST(Apple9Compiler, CondSignFlipChainedCandidatesPreserveSSA)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "cond_sign_flip_chained");
+   nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *n = nir_load_ssbo(&b, 4, 32, nir_imm_int(&b, 0),
+                              nir_imul_imm(&b, gid, 16), .align_mul = 16);
+   nir_def *x = nir_channel(&b, n, 0);
+   nir_def *y = nir_channel(&b, n, 1);
+   nir_def *c0 = nir_ine_imm(&b, nir_channel(&b, n, 2), 0);
+   nir_def *c1 = nir_ine_imm(&b, nir_channel(&b, n, 3), 0);
+   nir_def *nc0 = nir_inot(&b, c0);
+   nir_def *nc1 = nir_inot(&b, c1);
+
+   /* Second sign-flip directly consumes the first sign-flip's bcsel result. */
+   nir_def *s0 = nir_bcsel(&b, nc0, nir_fneg(&b, x), x);
+   nir_def *s1 = nir_bcsel(&b, nc1, nir_fneg(&b, s0), s0);
+   nir_def *s2 = nir_bcsel(&b, nc1, nir_fneg(&b, y), y);
+   nir_def *out = nir_vec4(&b, s0, s1, s2, nir_imm_float(&b, 1.0f));
+   nir_store_ssbo(&b, out, nir_imm_int(&b, 1), nir_imul_imm(&b, gid, 16),
+                  .write_mask = 0xf, .align_mul = 16);
+
+   agx_shader_part compiled = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, nullptr, &reason))
+      << (reason ?: "");
+   EXPECT_GT(compiled.info.binary_size, 0u);
+   free(compiled.binary);
    ralloc_free(b.shader);
 }

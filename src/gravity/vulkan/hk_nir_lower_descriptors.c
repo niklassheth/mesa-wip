@@ -12,6 +12,7 @@
 #include "hk_descriptor_set.h"
 #include "hk_descriptor_buffer.h"
 #include "hk_descriptor_set_layout.h"
+#include "hk_sampler.h"
 #include "hk_shader.h"
 
 #include "nir.h"
@@ -674,8 +675,8 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       tex->backend_flags |= AGX_TEXTURE_FLAG_METADATA_QUERY;
    bool combined = false;
    uint32_t s_set = 0, s_binding = 0;
+   nir_def *s_index = NULL;
    if (sampler) {
-      nir_def *s_index;
       get_resource_deref_binding(b, nir_src_as_deref(nir_src_for_ssa(sampler)),
                                  &s_set, &s_binding, &s_index);
       /* Resource derefs are variable-rooted (get_resource_deref_binding). */
@@ -703,10 +704,46 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
    }
 
    /* LOD bias is passed in the descriptor set, rather than embedded into
-    * the sampler descriptor.
+    * the sampler descriptor. For immutable samplers, fold the compile-time
+    * constant directly so constant-LOD samples can use inline immediate LOD
+    * and zero-bias samples avoid preamble descriptor loads.
     */
    if (tex->op == nir_texop_lod_bias) {
       const bool nudge = tex->backend_flags & HK_TEX_TXL_NUDGE;
+      const struct hk_descriptor_set_binding_layout *s_bl =
+         sampler ? get_binding_layout(s_set, s_binding, ctx) : NULL;
+      if (s_bl && s_bl->immutable_samplers != NULL && s_bl->array_size > 0) {
+         bool const_val = false;
+         uint16_t val = 0;
+         if (s_index && nir_src_is_const(nir_src_for_ssa(s_index))) {
+            uint32_t idx =
+               MIN2(nir_src_as_uint(nir_src_for_ssa(s_index)),
+                    s_bl->array_size - 1);
+            const struct hk_sampler *imm_s = s_bl->immutable_samplers[idx];
+            if (imm_s) {
+               val = nudge ? imm_s->txl_nudge_fp16 : imm_s->lod_bias_fp16;
+               const_val = true;
+            }
+         } else if (s_bl->immutable_samplers[0]) {
+            val = nudge ? s_bl->immutable_samplers[0]->txl_nudge_fp16
+                        : s_bl->immutable_samplers[0]->lod_bias_fp16;
+            const_val = true;
+            for (uint32_t i = 1; i < s_bl->array_size; ++i) {
+               const struct hk_sampler *imm_s = s_bl->immutable_samplers[i];
+               if (!imm_s ||
+                   (nudge ? imm_s->txl_nudge_fp16 : imm_s->lod_bias_fp16) !=
+                      val) {
+                  const_val = false;
+                  break;
+               }
+            }
+         }
+         if (const_val) {
+            nir_def_replace(&tex->def, nir_imm_intN_t(b, val, 16));
+            return true;
+         }
+      }
+
       unsigned offs =
          sampler_part_B +
          (nudge ? offsetof(struct hk_apple9_sampler_part, txl_nudge_fp16)

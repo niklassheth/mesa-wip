@@ -598,8 +598,8 @@ TEST_F(Apple9RaPcopyTest, LowerPhiEdgeDiamondBeforeLogicalEnd)
    ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
       &p, AGX_APPLE9_VIR_EXEC_MASK_ELSE, AGX_APPLE9_ENC_EXEC_MASK_ELSE, nullptr,
       0, 0));
-   uint32_t v4 = emit_imm(100);
-   uint32_t v5 = emit_imm(200);
+   uint32_t v4 = emit_imm(1000);
+   uint32_t v5 = emit_imm(2000);
    ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
       &p, AGX_APPLE9_VIR_EXEC_MASK_POP, AGX_APPLE9_ENC_EXEC_MASK_POP, nullptr,
       0, 0));
@@ -1300,7 +1300,7 @@ TEST_F(Apple9RaPcopyTest, ThenArmTrailingExecMaskElsePlacesPhiCopiesBeforeElse)
 
    /* Non-empty then-arm ending with EXEC_MASK_ELSE + JMP_EXEC_NONE b_pop */
    agx_apple9_block_begin(&p, b_then);
-   uint32_t v_then = emit_imm(42);
+   uint32_t v_then = emit_imm(1042);
    ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
       &p, AGX_APPLE9_VIR_EXEC_MASK_ELSE, AGX_APPLE9_ENC_EXEC_MASK_ELSE, nullptr,
       0, 0));
@@ -1460,4 +1460,92 @@ TEST(Apple9RaPcopy, MemFanOutReusesSingleFillAndRotatesStagingGprs)
    EXPECT_EQ(imms, 2u);
    ASSERT_EQ(imm_regs.size(), 2u);
    EXPECT_NE(imm_regs[0], imm_regs[1]);
+}
+
+TEST_F(Apple9RaPcopyTest, PhiEdgeCompactImmediateLoweringAndValidator)
+{
+   /* Verify scalar literal phi sources lower to 2B compact IMM for dst < 16
+    * (imm <= 0x7f), 4B zero IMM for dst < 64 (imm == 0), and remain GPR MOV
+    * for dst >= 64 (avoiding 2-op bridge), while passing post-RA validation. */
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block *b1 = agx_apple9_block_create(&p);
+   agx_apple9_block *b2 = agx_apple9_block_create(&p);
+   agx_apple9_block *b3 = agx_apple9_block_create(&p);
+
+   agx_apple9_block_begin(&p, b0);
+   uint32_t c_zero = emit_imm(0);
+   uint32_t c_small = emit_imm(7);
+   uint32_t c_big = emit_imm(0);
+
+   agx_apple9_block_begin(&p, b1);
+   uint32_t v1 = emit_imm(500);
+
+   agx_apple9_block_begin(&p, b2);
+   /* Uses c_small, c_zero, c_big from b0 into b3's phis. */
+
+   agx_apple9_block_begin(&p, b3);
+   uint32_t p_lo = agx_apple9_vir_emit_phi_canonical(&p, b3, 2);
+   uint32_t p_mid = agx_apple9_vir_emit_phi_canonical(&p, b3, 2);
+   uint32_t p_hi = agx_apple9_vir_emit_phi_canonical(&p, b3, 2);
+   uint32_t sum = emit_iadd(emit_iadd(p_lo, p_mid), p_hi);
+   p.output = sum;
+
+   cfg_set_active(&p, {b0, b1, b2, b3});
+   cfg_add_edge(b0, b1);
+   cfg_add_edge(b0, b2);
+   cfg_add_edge(b1, b3);
+   cfg_add_edge(b2, b3);
+
+   agx_apple9_vir_instr *i_lo = agx_apple9_block_first_instr(b3);
+   agx_apple9_vir_instr *i_mid = agx_apple9_instr_next(i_lo);
+   agx_apple9_vir_instr *i_hi = agx_apple9_instr_next(i_mid);
+   *agx_apple9_vir_src_ptr(i_lo, 0) = v1;
+   *agx_apple9_vir_src_ptr(i_lo, 1) = c_small;
+   *agx_apple9_vir_src_ptr(i_mid, 0) = v1;
+   *agx_apple9_vir_src_ptr(i_mid, 1) = c_zero;
+   *agx_apple9_vir_src_ptr(i_hi, 0) = v1;
+   *agx_apple9_vir_src_ptr(i_hi, 1) = c_big;
+   agx_apple9_vir_reindex(&p);
+
+   std::vector<uint8_t> gpr(p.value_count, 0);
+   gpr[c_zero] = 10;
+   gpr[c_small] = 11;
+   gpr[c_big] = 12;
+   gpr[v1] = 13;
+   gpr[p_lo] = 5;   /* < 16: c_small (7) -> 2B compact IMM */
+   gpr[p_mid] = 20; /* < 64: c_zero (0) -> 4B IMM zero */
+   gpr[p_hi] = 70;  /* >= 64: c_big (0) -> keep GPR MOV (no 2-op bridge) */
+   gpr[sum] = 6;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      if (p.instructions[i]->op == AGX_APPLE9_VIR_IADD &&
+          p.instructions[i]->dest != sum)
+         gpr[p.instructions[i]->dest] = 7;
+   }
+
+   apple9_ra_assignment assign = {};
+   assign.gpr = gpr.data();
+   auto opts = make_opts(0, 0, 1, 2);
+   ASSERT_TRUE(apple9_ra_lower_all_phi_edges(&p, &assign, &opts, false));
+
+   unsigned imm_compact = 0, imm_zero = 0, hi_mov = 0;
+   for (agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(b2); ins;
+        ins = agx_apple9_instr_next(ins)) {
+      if (ins->op == AGX_APPLE9_VIR_IMM &&
+          ins->encoding == AGX_APPLE9_ENC_MOV_IMM_COMPACT && ins->dest == 5u &&
+          ins->immediate == 7u)
+         imm_compact++;
+      if (ins->op == AGX_APPLE9_VIR_IMM &&
+          ins->encoding == AGX_APPLE9_ENC_MOV_IMM32 && ins->dest == 20u &&
+          ins->immediate == 0u)
+         imm_zero++;
+      if (ins->op == AGX_APPLE9_VIR_MOV && ins->dest == 70u)
+         hi_mov++;
+   }
+   EXPECT_EQ(imm_compact, 1u);
+   EXPECT_EQ(imm_zero, 1u);
+   EXPECT_EQ(hi_mov, 1u);
+
+   assign.phis_lowered = true;
+   apple9_ra_validate_error err = {};
+   EXPECT_TRUE(apple9_ra_validate_post_ra(&p, &assign, &err)) << err.message;
 }

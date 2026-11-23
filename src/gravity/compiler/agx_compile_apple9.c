@@ -2927,27 +2927,38 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
          } else {
             /* 2D explicit constant LOD: use inline UQ4.2 mode 0x0009 (2 coords,
              * 0 LOD GPRs) for exact quarter-integers 0.00..15.75 in 14B direct
-             * mode, and for level(0.0f) in 20B bindless mode. */
+             * mode, and for level(0.0f) in 20B bindless mode. Also fold 2D
+             * zero-bias txb (e.g. immutable sampler with mipLodBias == 0) back
+             * to the 2-word implicit sample form. */
             uint32_t packed_const = 0;
             bool use_imm_lod = false;
+            bool use_zero_bias = false;
             uint8_t uq4_2 = 0;
-            if (tex->op == nir_texop_txl && dimension == 0 && !tex->is_array &&
-                !tex->is_shadow && !tex->is_sparse &&
+            if ((tex->op == nir_texop_txl || tex->op == nir_texop_txb) &&
+                dimension == 0 && !tex->is_array && !tex->is_shadow &&
+                !tex->is_sparse &&
                 !(tex->backend_flags & AGX_APPLE9_TEXTURE_LOD_QUERY) &&
                 nir_tex_instr_src_index(tex, nir_tex_src_offset) < 0 &&
                 lod_source >= 0 &&
                 apple9_const_u32(nir_get_scalar(tex->src[lod_source].src.ssa, 0),
                                  &packed_const) &&
                 (packed_const & ~0x0fff0000u) == 0) {
-               int32_t q6 = ((int32_t)(packed_const << 4)) >> 20;
-               if (q6 >= 0 && q6 <= 63 * 16 && (q6 & 15) == 0) {
-                  uq4_2 = (uint8_t)(q6 >> 4);
-                  use_imm_lod = !handle_count || uq4_2 == 0;
+               if (tex->op == nir_texop_txl) {
+                  int32_t q6 = ((int32_t)(packed_const << 4)) >> 20;
+                  if (q6 >= 0 && q6 <= 63 * 16 && (q6 & 15) == 0) {
+                     uq4_2 = (uint8_t)(q6 >> 4);
+                     use_imm_lod = !handle_count || uq4_2 == 0;
+                  }
+               } else if (packed_const == 0) {
+                  use_zero_bias = true;
                }
             }
             if (use_imm_lod) {
                result = agx_apple9_vir_emit_texture_lod_imm(
                   &lower->program, coords, uq4_2, texture, sampler);
+            } else if (use_zero_bias) {
+               result = agx_apple9_vir_emit_texture_sample_mov(
+                  &lower->program, coords, texture, sampler);
             } else {
                result = agx_apple9_vir_emit_texture_lod(
                   &lower->program, coords, packed_lod, texture, sampler, bias);
@@ -7177,6 +7188,208 @@ apple9_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
                                num_components, hole_size, low, high, data);
 }
 
+struct apple9_sign_flip_cand {
+   nir_alu_instr *bcsel;
+   nir_scalar cond;
+   bool flip_when_true;
+   bool cond_was_inot;
+   nir_scalar val;
+   bool exact_neg;
+   nir_alu_instr *fmul;
+   nir_scalar mul_a;
+   nir_scalar mul_b;
+};
+
+static bool
+apple9_match_fneg_of(nir_scalar maybe_neg, nir_scalar base, bool *exact_out)
+{
+   if (!nir_scalar_is_alu(maybe_neg))
+      return false;
+   nir_alu_instr *alu = nir_def_as_alu(maybe_neg.def);
+   if (alu->op == nir_op_fneg) {
+      nir_scalar s0 = nir_scalar_chase_alu_src(maybe_neg, 0);
+      if (nir_scalar_equal(s0, base)) {
+         *exact_out = (alu->fp_math_ctrl & nir_fp_exact) != 0;
+         return true;
+      }
+   } else if (alu->op == nir_op_ixor) {
+      nir_scalar s0 = nir_scalar_chase_alu_src(maybe_neg, 0);
+      nir_scalar s1 = nir_scalar_chase_alu_src(maybe_neg, 1);
+      if (nir_scalar_is_const(s1) && nir_scalar_as_uint(s1) == 0x80000000u &&
+          nir_scalar_equal(s0, base)) {
+         *exact_out = false;
+         return true;
+      }
+      if (nir_scalar_is_const(s0) && nir_scalar_as_uint(s0) == 0x80000000u &&
+          nir_scalar_equal(s1, base)) {
+         *exact_out = false;
+         return true;
+      }
+   }
+   return false;
+}
+
+static bool
+apple9_fmul_used_only_by_sign_flip(nir_alu_instr *fmul, nir_alu_instr *bcsel,
+                                   nir_def *neg_def)
+{
+   nir_foreach_use_including_if(src, &fmul->def) {
+      if (nir_src_is_if(src))
+         return false;
+      nir_instr *parent = nir_src_use_instr(src);
+      if (parent == &bcsel->instr)
+         continue;
+      if (neg_def && parent == nir_def_instr(neg_def))
+         continue;
+      return false;
+   }
+   return true;
+}
+
+/* Fold repeated conditional IEEE-754 sign flips (e.g., gl_FrontFacing normal
+ * flips: bcsel(!ff, -n.c, n.c) across x/y/z) into a single shared sign-mask
+ * select + bitwise IXOR — and when multiple flips multiply by a shared scalar
+ * factor (e.g. inv_len from normalization), flip the shared factor once! */
+static bool
+apple9_opt_cond_sign_flip(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   struct util_dynarray cands;
+   util_dynarray_init(&cands, NULL);
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         if (alu->op != nir_op_bcsel || alu->def.num_components != 1 ||
+             alu->def.bit_size != 32)
+            continue;
+         nir_scalar cond = nir_get_scalar(alu->src[0].src.ssa,
+                                          alu->src[0].swizzle[0]);
+         if (cond.def->bit_size != 1)
+            continue;
+         nir_scalar s1 = nir_get_scalar(alu->src[1].src.ssa,
+                                        alu->src[1].swizzle[0]);
+         nir_scalar s2 = nir_get_scalar(alu->src[2].src.ssa,
+                                        alu->src[2].swizzle[0]);
+         bool flip_when_true = false;
+         bool exact_neg = false;
+         nir_scalar base;
+         nir_def *neg_def = NULL;
+         if (apple9_match_fneg_of(s1, s2, &exact_neg)) {
+            flip_when_true = true;
+            base = s2;
+            neg_def = s1.def;
+         } else if (apple9_match_fneg_of(s2, s1, &exact_neg)) {
+            flip_when_true = false;
+            base = s1;
+            neg_def = s2.def;
+         } else {
+            continue;
+         }
+
+         bool cond_was_inot = false;
+         if (nir_scalar_is_alu(cond) &&
+             nir_def_as_alu(cond.def)->op == nir_op_inot) {
+            cond = nir_scalar_chase_alu_src(cond, 0);
+            flip_when_true = !flip_when_true;
+            cond_was_inot = true;
+         }
+
+         nir_alu_instr *fmul = NULL;
+         nir_scalar mul_a = {0}, mul_b = {0};
+         if (!exact_neg && nir_scalar_is_alu(base)) {
+            nir_alu_instr *ba = nir_def_as_alu(base.def);
+            if (ba->op == nir_op_fmul && ba->def.num_components == 1 &&
+                ba->def.bit_size == 32 &&
+                !(ba->fp_math_ctrl & (nir_fp_exact | nir_fp_preserve_nan)) &&
+                apple9_fmul_used_only_by_sign_flip(ba, alu, neg_def)) {
+               fmul = ba;
+               mul_a = nir_scalar_chase_alu_src(base, 0);
+               mul_b = nir_scalar_chase_alu_src(base, 1);
+            }
+         }
+
+         struct apple9_sign_flip_cand cand = {
+            .bcsel = alu,
+            .cond = cond,
+            .flip_when_true = flip_when_true,
+            .cond_was_inot = cond_was_inot,
+            .val = base,
+            .exact_neg = exact_neg,
+            .fmul = fmul,
+            .mul_a = mul_a,
+            .mul_b = mul_b,
+         };
+         util_dynarray_append(&cands, cand);
+      }
+   }
+
+   unsigned n = util_dynarray_num_elements(&cands, struct apple9_sign_flip_cand);
+   if (n == 0) {
+      util_dynarray_fini(&cands);
+      return false;
+   }
+
+   struct apple9_sign_flip_cand *arr = util_dynarray_begin(&cands);
+   nir_builder b = nir_builder_create(impl);
+   bool progress = false;
+
+   /* Process candidates in reverse definition order so downstream consumers are
+    * rewritten while upstream bcsel definitions are still live; replacing an
+    * upstream bcsel then updates every rewritten consumer via nir_def_replace. */
+   for (unsigned i = n; i-- > 0;) {
+      unsigned same_cond = 0;
+      unsigned share_a = 0, share_b = 0;
+      for (unsigned j = 0; j < n; ++j) {
+         if (nir_scalar_equal(arr[i].cond, arr[j].cond) &&
+             arr[i].flip_when_true == arr[j].flip_when_true) {
+            same_cond++;
+            if (arr[i].fmul && arr[j].fmul) {
+               if (nir_scalar_equal(arr[i].mul_a, arr[j].mul_a) ||
+                   nir_scalar_equal(arr[i].mul_a, arr[j].mul_b))
+                  share_a++;
+               if (nir_scalar_equal(arr[i].mul_b, arr[j].mul_a) ||
+                   nir_scalar_equal(arr[i].mul_b, arr[j].mul_b))
+                  share_b++;
+            }
+         }
+      }
+      if (same_cond < 2 && !arr[i].cond_was_inot)
+         continue;
+
+      b.cursor = nir_before_instr(&arr[i].bcsel->instr);
+      nir_def *cond_def = nir_mov_scalar(&b, arr[i].cond);
+      nir_def *sign_bit = nir_imm_int(&b, 0x80000000u);
+      nir_def *zero = nir_imm_int(&b, 0u);
+      nir_def *mask = arr[i].flip_when_true
+                         ? nir_bcsel(&b, cond_def, sign_bit, zero)
+                         : nir_bcsel(&b, cond_def, zero, sign_bit);
+
+      nir_def *res;
+      if (arr[i].fmul && (share_a >= 2 || share_b >= 2)) {
+         nir_scalar shared = share_a >= share_b ? arr[i].mul_a : arr[i].mul_b;
+         nir_scalar other = share_a >= share_b ? arr[i].mul_b : arr[i].mul_a;
+         nir_def *flipped_shared =
+            nir_ixor(&b, nir_mov_scalar(&b, shared), mask);
+         uint32_t saved_fp = b.fp_math_ctrl;
+         b.fp_math_ctrl = arr[i].fmul->fp_math_ctrl;
+         res = nir_fmul(&b, flipped_shared, nir_mov_scalar(&b, other));
+         b.fp_math_ctrl = saved_fp;
+      } else {
+         res = nir_ixor(&b, nir_mov_scalar(&b, arr[i].val), mask);
+      }
+      nir_def_replace(&arr[i].bcsel->def, res);
+      progress = true;
+   }
+
+   util_dynarray_fini(&cands);
+   if (progress)
+      nir_progress(true, impl, nir_metadata_control_flow);
+   return progress;
+}
+
 static void
 apple9_prepare_dag(nir_shader *nir)
 {
@@ -7226,6 +7439,7 @@ apple9_prepare_dag(nir_shader *nir)
    nir_opt_algebraic_late(nir);
    nir_shader_alu_pass(nir, apple9_lower_memory_pack,
                       nir_metadata_control_flow, NULL);
+   apple9_opt_cond_sign_flip(nir);
    do {
       progress = nir_opt_constant_folding(nir);
       progress |= nir_opt_copy_prop(nir);

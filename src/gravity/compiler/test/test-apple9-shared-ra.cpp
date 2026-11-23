@@ -339,9 +339,12 @@ TEST(Apple9SharedRa, TexturePublicationPressurePreservesEarlyHandoffs)
          AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
       uint32_t coords[] = {zero, zero};
       std::vector<uint32_t> samples;
-      for (unsigned t = 0; t < count; ++t)
+      for (unsigned t = 0; t < count; ++t) {
+         uint32_t lod_t = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+            AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, t << 16);
          samples.push_back(agx_apple9_vir_emit_texture_lod(
-            &p, coords, zero, t, 0, true));
+            &p, coords, lod_t, t, 0, true));
+      }
       for (auto sample : samples) {
          uint32_t rgba[] = {sample, sample + 1, sample + 2, sample + 3};
          ASSERT_TRUE(agx_apple9_vir_emit_device_store(&p, 0, zero, rgba, 4, 32));
@@ -422,8 +425,11 @@ TEST(Apple9SharedRa, PublicationHandoffStaysInProducerBlock)
    auto first = agx_apple9_vir_emit_texture_lod(&p, coords, zero, 0, 0, true);
    auto successor = agx_apple9_block_create(&p);
    agx_apple9_block_begin(&p, successor);
-   for (unsigned t = 1; t <= 8; ++t)
-      agx_apple9_vir_emit_texture_lod(&p, coords, zero, t, 0, true);
+   for (unsigned t = 1; t <= 8; ++t) {
+      uint32_t lod_t = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+         AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, t << 16);
+      agx_apple9_vir_emit_texture_lod(&p, coords, lod_t, t, 0, true);
+   }
    p.output = first;
    const char *reason = nullptr;
    ASSERT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << reason;
@@ -1107,8 +1113,6 @@ TEST(Apple9SharedRa, TexturePublicationRotationAndBindlessHandleWarExemption)
                                     AGX_APPLE9_ENC_GET_SR, nullptr, 0, 0);
    uint32_t v = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
                                     AGX_APPLE9_ENC_GET_SR, nullptr, 0, 1);
-   uint32_t lod = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
-                                      AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
    uint32_t coords[2] = {u, v};
    uint32_t results[6];
    for (unsigned i = 0; i < 6; ++i) {
@@ -1116,7 +1120,9 @@ TEST(Apple9SharedRa, TexturePublicationRotationAndBindlessHandleWarExemption)
                                            AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, i + 1);
       uint32_t smp_h = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
                                            AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, i + 10);
-      results[i] = agx_apple9_vir_emit_texture_lod(&p, coords, lod, 0, 0, false);
+      uint32_t lod_i = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                           AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, i << 16);
+      results[i] = agx_apple9_vir_emit_texture_lod(&p, coords, lod_i, 0, 0, false);
       ASSERT_NE(results[i], AGX_APPLE9_VREG_INVALID);
       auto *sample = p.instructions[p.instruction_count - 1];
       ASSERT_EQ(sample->op, AGX_APPLE9_VIR_TEXTURE_SAMPLE);
@@ -1369,4 +1375,89 @@ TEST(Apple9SharedRa, EmptyProgramAllocatesCleanly)
    EXPECT_TRUE(p.dependencies_finalized);
    agx_apple9_vir_finish(&p);
    ralloc_free(nir.shader);
+}
+
+TEST(Apple9SharedRa, PublicationTupleDedupAndLateHandoffPlacement)
+{
+   /* 1. Four overlapping textures sharing identical (u, v, lod) operands must
+    *    deduplicate into a single 4-word PUBLICATION_TUPLE (4 pub words, not 16). */
+   {
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      nir_block nb = {};
+      auto *blk = agx_apple9_block_create(&p);
+      blk->nir = &nb;
+      agx_apple9_block_begin(&p, blk);
+
+      uint32_t u = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+                                       AGX_APPLE9_ENC_GET_SR, nullptr, 0, 0);
+      uint32_t v = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+                                       AGX_APPLE9_ENC_GET_SR, nullptr, 0, 1);
+      uint32_t lod = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                         AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+      uint32_t coords[2] = {u, v};
+      uint32_t samples[4];
+      for (unsigned t = 0; t < 4; ++t)
+         samples[t] = agx_apple9_vir_emit_texture_lod(&p, coords, lod, t, 0, false);
+      for (unsigned t = 0; t < 4; ++t) {
+         uint32_t rgba[4] = {samples[t], samples[t] + 1, samples[t] + 2, samples[t] + 3};
+         ASSERT_TRUE(agx_apple9_vir_emit_device_store(&p, 0, u, rgba, 4, 32));
+      }
+
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << (reason ?: "");
+      unsigned pub_tuples = 0;
+      for (unsigned i = 0; i < p.instruction_count; ++i)
+         pub_tuples += (p.instructions[i]->op == AGX_APPLE9_VIR_PUBLICATION_TUPLE);
+      EXPECT_EQ(pub_tuples, 1u);
+      EXPECT_EQ(p.publication_count, 4u);
+      agx_apple9_vir_finish(&p);
+   }
+
+   /* 2. Nine distinct overlapping textures exceed the 32-word p0..p31 bank:
+    *    the publication-relief handoff must be placed right before the 9th
+    *    texture's PUBLICATION_TUPLE (AFTER textures 0..7 have all issued),
+    *    NOT immediately at t+1 after texture 0! */
+   {
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      nir_block nb = {};
+      auto *blk = agx_apple9_block_create(&p);
+      blk->nir = &nb;
+      agx_apple9_block_begin(&p, blk);
+
+      uint32_t u = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+                                       AGX_APPLE9_ENC_GET_SR, nullptr, 0, 0);
+      uint32_t v = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_GET_GLOBAL_ID,
+                                       AGX_APPLE9_ENC_GET_SR, nullptr, 0, 1);
+      uint32_t coords[2] = {u, v};
+      uint32_t samples[9];
+      for (unsigned t = 0; t < 9; ++t) {
+         uint32_t lod = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                            AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0,
+                                            t << 16);
+         samples[t] = agx_apple9_vir_emit_texture_lod(&p, coords, lod, t, 0, false);
+      }
+      for (unsigned t = 0; t < 9; ++t) {
+         uint32_t rgba[4] = {samples[t], samples[t] + 1, samples[t] + 2, samples[t] + 3};
+         ASSERT_TRUE(agx_apple9_vir_emit_device_store(&p, 0, u, rgba, 4, 32));
+      }
+
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << (reason ?: "");
+      unsigned samples_before_handoff = 0;
+      bool found_handoff = false;
+      for (unsigned i = 0; i < p.instruction_count; ++i) {
+         const auto *ins = p.instructions[i];
+         if (ins->publication_handoff) {
+            found_handoff = true;
+            break;
+         }
+         if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE)
+            samples_before_handoff++;
+      }
+      EXPECT_TRUE(found_handoff);
+      EXPECT_EQ(samples_before_handoff, 8u);
+      agx_apple9_vir_finish(&p);
+   }
 }

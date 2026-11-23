@@ -4882,10 +4882,129 @@ apple9_materialize_pending_result_at(struct agx_apple9_vir_program *program,
                                      unsigned producer_index,
                                      unsigned insertion, const char **reason);
 
+/* Deduplicate identical texture-parameter PUBLICATION_TUPLEs within the same
+ * basic block whenever the earlier tuple is still live at the duplicate site.
+ * Because the earlier tuple's publication lifetime already spans the duplicate,
+ * sharing it strictly reduces live publication words and eliminates redundant
+ * publication moves without risking publication-slot exhaustion. */
+static void
+apple9_dedup_publication_tuples(struct agx_apple9_vir_program *program)
+{
+   if (program->physical || program->instruction_count < 2 ||
+       !agx_apple9_analyze_uses(program))
+      return;
+
+   unsigned count = program->instruction_count;
+   unsigned *pub_end = malloc(count * sizeof(unsigned));
+   bool *eligible = calloc(count, sizeof(bool));
+   if (!pub_end || !eligible) {
+      free(pub_end);
+      free(eligible);
+      return;
+   }
+
+   for (unsigned i = 0; i < count; ++i) {
+      const struct agx_apple9_vir_instr *ins = program->instructions[i];
+      if (ins->op != AGX_APPLE9_VIR_PUBLICATION_TUPLE ||
+          ins->encoding == AGX_APPLE9_ENC_PUBLICATION_PAIR ||
+          ins->dest == AGX_APPLE9_VREG_INVALID || ins->dest_components == 0)
+         continue;
+      bool tex_only = true;
+      bool any_use = false;
+      for (unsigned c = 0; c < ins->dest_components && tex_only; ++c) {
+         for (const struct agx_apple9_use *u =
+                 agx_apple9_uses(program, ins->dest + c);
+              u; u = u->next) {
+            any_use = true;
+            if (u->instruction->op != AGX_APPLE9_VIR_TEXTURE_SAMPLE) {
+               tex_only = false;
+               break;
+            }
+         }
+      }
+      if (!any_use || !tex_only)
+         continue;
+      eligible[i] = true;
+      pub_end[i] = apple9_publication_end(program, i);
+   }
+
+   struct util_dynarray to_remove = UTIL_DYNARRAY_INIT;
+   for (unsigned i = 0; i < count; ++i) {
+      if (!eligible[i])
+         continue;
+      struct agx_apple9_vir_instr *cur = program->instructions[i];
+      struct agx_apple9_block *blk = agx_apple9_instr_block(cur);
+      unsigned match = UINT_MAX;
+      for (unsigned j = i; j-- > 0; ) {
+         struct agx_apple9_vir_instr *prev = program->instructions[j];
+         if (agx_apple9_instr_block(prev) != blk)
+            break;
+         if (apple9_vir_is_control_side_effect(prev->op) ||
+             prev->op == AGX_APPLE9_VIR_COVERAGE)
+            break;
+         if (!eligible[j] || pub_end[j] < i)
+            continue;
+         if (prev->encoding != cur->encoding ||
+             prev->dest_components != cur->dest_components ||
+             prev->nr_srcs != cur->nr_srcs ||
+             prev->immediate != cur->immediate)
+            continue;
+         bool same_srcs = true;
+         for (unsigned s = 0; s < cur->nr_srcs; ++s) {
+            if (prev->src[s] != cur->src[s]) {
+               same_srcs = false;
+               break;
+            }
+         }
+         if (!same_srcs)
+            continue;
+         match = j;
+         break;
+      }
+      if (match == UINT_MAX)
+         continue;
+
+      struct agx_apple9_vir_instr *prev = program->instructions[match];
+      for (unsigned c = 0; c < cur->dest_components; ++c) {
+         uint32_t old_v = cur->dest + c;
+         uint32_t new_v = prev->dest + c;
+         for (const struct agx_apple9_use *u = agx_apple9_uses(program, old_v);
+              u; u = u->next) {
+            struct agx_apple9_vir_instr *user =
+               (struct agx_apple9_vir_instr *)u->instruction;
+            for (unsigned s = 0; s < user->nr_srcs; ++s) {
+               if (user->src[s] == old_v)
+                  user->src[s] = new_v;
+            }
+         }
+         if (program->max_phys &&
+             program->max_phys[old_v] != AGX_APPLE9_PHYS_INVALID &&
+             (program->max_phys[new_v] == AGX_APPLE9_PHYS_INVALID ||
+              program->max_phys[old_v] < program->max_phys[new_v]))
+            program->max_phys[new_v] = program->max_phys[old_v];
+      }
+      pub_end[match] = MAX2(pub_end[match], pub_end[i]);
+      eligible[i] = false;
+      util_dynarray_append(&to_remove, cur);
+   }
+
+   unsigned remove_count =
+      util_dynarray_num_elements(&to_remove, struct agx_apple9_vir_instr *);
+   if (remove_count > 0) {
+      agx_apple9_vir_remove_many(program, to_remove.data, remove_count);
+      agx_apple9_invalidate_uses(program);
+   }
+
+   util_dynarray_fini(&to_remove);
+   free(pub_end);
+   free(eligible);
+}
+
 bool
 agx_apple9_allocate_publications(struct agx_apple9_vir_program *program,
                                  const char **reason)
 {
+   apple9_dedup_publication_tuples(program);
 retry:
    free(program->publication);
    free(program->phys);
@@ -4951,13 +5070,16 @@ retry:
       }
       if (slot + width > bound) {
          /* A texture borrows its parameter publication until its result
-          * handoff. Under pressure, consume an outstanding result in the
-          * producer's block, then retry with the shortened lifetime. The
-          * explicit copies must survive shared-IR copy propagation and DCE.
-          * Each repair consumes one previously pending result, so retries
-          * terminate even when the pressure cannot be relieved. */
+          * handoff. Under pressure, materialize the oldest outstanding result
+          * right before the conflicting publication (or at the logical end of
+          * the producer's block across blocks) so all preceding textures
+          * overlap in flight before waiting, then retry with the shortened
+          * lifetime. Each repair completes one previously pending result, so
+          * retries terminate even when the pressure cannot be relieved. */
+         unsigned victim = UINT_MAX;
          for (unsigned t = 0; t < i; ++t) {
-            const struct agx_apple9_vir_instr *sample = program->instructions[t];
+            const struct agx_apple9_vir_instr *sample =
+               program->instructions[t];
             if (sample->op != AGX_APPLE9_VIR_TEXTURE_SAMPLE ||
                 apple9_texture_handoff(program, t) < i)
                continue;
@@ -4966,12 +5088,29 @@ retry:
                borrows_publication |= program->publication[sample->src[s]];
             if (!borrows_publication)
                continue;
-            if (!apple9_materialize_pending_result_at(program, t, t + 1, reason))
+            victim = t;
+            break;
+         }
+         if (victim != UINT_MAX) {
+            struct agx_apple9_block *victim_blk =
+               agx_apple9_instr_block(program->instructions[victim]);
+            unsigned insert_pos = victim + 1;
+            while (insert_pos < i) {
+               const struct agx_apple9_vir_instr *k_ins =
+                  program->instructions[insert_pos];
+               if (agx_apple9_instr_block(k_ins) != victim_blk ||
+                   k_ins->op == AGX_APPLE9_VIR_PHI_SRC ||
+                   apple9_vir_is_control_side_effect(k_ins->op))
+                  break;
+               insert_pos++;
+            }
+            if (!apple9_materialize_pending_result_at(program, victim,
+                                                      insert_pos, reason))
                return false;
             /* One result read completes the entire tuple. Keep that handoff
              * even if its scalar result is dead; ordinary identity copies
              * for the other components can coalesce through shared SSA. */
-            program->instructions[t + 1]->publication_handoff = true;
+            program->instructions[insert_pos]->publication_handoff = true;
             goto retry;
          }
          *reason = "Apple9 allocator exhausted export publication slots";
