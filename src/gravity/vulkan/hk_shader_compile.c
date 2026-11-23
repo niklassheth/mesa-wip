@@ -2012,6 +2012,145 @@ hk_apple9_graphics_key_device(struct hk_apple9_graphics_key *key,
    key->native_stages = hk_apple9_native_stage_policy(pdev);
 }
 
+static bool
+hk_apple9_fs_uses_per_vertex_or_bary(const nir_shader *fs)
+{
+   nir_foreach_function_impl(impl, fs) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            if (op == nir_intrinsic_load_input_vertex ||
+                hk_is_barycentric_coord(op))
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static VkResult
+hk_apple9_compile_fs_stage(struct hk_device *dev, nir_shader *nir,
+                           const struct hk_apple9_graphics_key *key_in,
+                           const struct agx_apple9_varying_layout *producer,
+                           bool zs_self_dep, uint64_t flat_mask,
+                           uint64_t linear_mask, uint8_t line_stipple_start,
+                           bool polygon_points, uint8_t polygon_face_slot,
+                           const struct hk_per_vertex_copies *per_vertex,
+                           bool native_mesh, bool *native_unsupported,
+                           struct hk_api_shader *obj,
+                           struct hk_shader *shader, const char **reason_out)
+{
+   struct agx_apple9_blend blend[8];
+   memcpy(blend, key_in->blend, sizeof(blend));
+
+   obj->zs_self_dep = zs_self_dep;
+   shader->info.fs.interp.linear = linear_mask;
+   shader->info.fs.interp.flat = flat_mask;
+   shader->info.fs.line_stipple_start = line_stipple_start;
+   shader->info.fs.polygon_points = polygon_points;
+   shader->info.fs.polygon_face_slot = polygon_face_slot;
+   if (per_vertex && hk_per_vertex_copies_used(per_vertex)) {
+      shader->info.fs.per_vertex_copies = per_vertex->count;
+      memcpy(shader->info.fs.per_vertex_bary, per_vertex->bary,
+             sizeof(per_vertex->bary));
+   }
+   if (per_vertex) {
+      memcpy(shader->info.fs.per_vertex_location, per_vertex->location,
+             sizeof(per_vertex->location));
+      memcpy(shader->info.fs.per_vertex_copy_base, per_vertex->copy_base,
+             sizeof(per_vertex->copy_base));
+   }
+   /* The statistics counter is the only memory write or wave-wide
+    * operation of many shaders, but it runs only while a query is
+    * active and counts correctly in merged waves. Keep triangle
+    * merging unless the shader itself requires disabling it. */
+   bool tri_merging = true;
+   bool real_writes_memory = false;
+   bool inline_statistics = false;
+   if (!nir->info.internal) {
+      if (key_in->zs_self_dep && !key_in->fs_use_epilog)
+         hk_apple9_late_zs(nir);
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+      real_writes_memory = nir->info.writes_memory;
+      const bool per_sample =
+         key_in->sample_shading || nir->info.fs.uses_sample_shading;
+      tri_merging = !nir->info.uses_wide_subgroup_intrinsics &&
+                    !nir->info.fs.needs_coarse_quad_helper_invocations &&
+                    !nir->info.writes_memory &&
+                    !per_sample &&
+                    !hk_apple9_interpolates_off_center(nir);
+      /* Normal epilog fragment shaders count invocations via a
+       * draw-time linked stats prolog only when queried. Keep the
+       * counter inline for early_fragment_tests (must execute after
+       * fs_main's early Z/S test), per-sample shaders (must count per
+       * covered sample inside the trampoline loop), and non-epilog
+       * shaders. */
+      if (dev->vk.enabled_features.pipelineStatisticsQuery &&
+          !key_in->no_fs_statistics &&
+          (!key_in->fs_use_epilog || nir->info.fs.early_fragment_tests ||
+           per_sample)) {
+         hk_apple9_lower_fs_statistics(nir);
+         inline_statistics = true;
+      }
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+               hk_apple9_clamp_depth_export,
+               nir_metadata_control_flow, NULL);
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+               hk_apple9_lower_viewport_fs,
+               nir_metadata_control_flow, NULL);
+   }
+   shader->info.fs.writes_memory = real_writes_memory;
+   shader->info.fs.early_fragment_tests = nir->info.fs.early_fragment_tests;
+   shader->info.fs.inline_statistics = inline_statistics;
+   if (key_in->sample_shading) {
+      nir->info.fs.uses_sample_shading = true;
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+               hk_apple9_lower_bary_to_sample,
+               nir_metadata_control_flow, NULL);
+   }
+   NIR_PASS(_, nir, hk_apple9_lower_api_vertex_order);
+   if (key_in->fs_use_epilog && !nir->info.internal) {
+      blend[0].use_epilog = true;
+      blend[0].dynamic_samples = true;
+      blend[0].per_sample =
+         key_in->sample_shading || nir->info.fs.uses_sample_shading;
+      blend[0].writes_memory_stats_only = !real_writes_memory;
+      shader->info.apple9_undefined_colors = key_in->undefined_colors;
+   } else {
+      hk_apple9_remap_fs_outputs(nir, key_in->color_map);
+   }
+   struct blob dump_nir;
+   const bool dump = hk_apple9_fragment_dump_begin(nir, &dump_nir);
+   hk_assert_final_push_mask(nir, shader);
+   const char *reason = NULL;
+   const bool compiled = agx_compile_apple9_fragment_mrt(
+      nir, producer, blend, key_in->targets, &shader->b, &reason);
+   if (dump) {
+      const struct agx_apple9_varying_layout empty_varyings = {0};
+      hk_apple9_fragment_dump_end(&dump_nir, compiled,
+                                  producer ?: &empty_varyings, blend,
+                                  key_in->targets, &shader->b);
+   }
+   if (!compiled) {
+      reason = reason ?: "unsupported fragment NIR";
+      *reason_out = reason;
+      if (native_mesh && native_unsupported)
+         *native_unsupported = true;
+      return native_mesh
+                ? VK_ERROR_FEATURE_NOT_PRESENT
+                : vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                            "Apple9 fragment: %s", reason);
+   }
+   /* hk's decision covers the backend's reasons for the shader as
+    * written (before the statistics counter, which counts correctly
+    * in merged waves) and adds sample shading and off-centre
+    * interpolation, which the backend can't see. */
+   shader->b.info.disable_tri_merging = !tri_merging;
+   return VK_SUCCESS;
+}
+
 VkResult
 hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                            struct vk_shader_compile_info *infos,
@@ -2029,6 +2168,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
    else
       hk_apple9_graphics_key_device(&key, state, hk_device_physical(dev));
    struct agx_apple9_varying_layout varyings = {0};
+   nir_shader *native_pv_nir = NULL;
    const char *reason = NULL;
    simple_mtx_t *lock = agx_get_compiler_debug()
                            ? &hk_device_physical(dev)->debug_compile_lock
@@ -2087,10 +2227,24 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
          else if (infos[i].stage == MESA_SHADER_FRAGMENT)
             fs_nir = infos[i].nir;
       }
+      if (fs_nir && !pre_nir && !stage_nir[MESA_SHADER_GEOMETRY] &&
+          !stage_nir[MESA_SHADER_TESS_EVAL] && !native_mesh &&
+          !fs_nir->info.internal &&
+          hk_apple9_fs_uses_per_vertex_or_bary(fs_nir)) {
+         native_pv_nir = nir_shader_clone(NULL, fs_nir);
+         if (!native_pv_nir) {
+            result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+            goto done;
+         }
+      }
       if (fs_nir && !stage_nir[MESA_SHADER_GEOMETRY] &&
           hk_apple9_lower_per_vertex_copies(
-             fs_nir, pre_nir ? pre_nir->info.outputs_written : 0, &per_vertex))
+             fs_nir, pre_nir ? pre_nir->info.outputs_written : 0, &per_vertex)) {
          copies_from_gs = !pre_nir || pre_nir->info.stage != MESA_SHADER_MESH;
+      } else if (native_pv_nir) {
+         ralloc_free(native_pv_nir);
+         native_pv_nir = NULL;
+      }
 
       /* Stippled lines use dedicated Vulkan-unused slots TEX6 (flat start +
        * counter) and TEX7 (noperspective axis). For VS/TES, the passthrough
@@ -2161,6 +2315,13 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                   hk_apple9_lower_polygon_slot, nir_metadata_control_flow,
                   &polygon_face_slot);
          nir_shader_gather_info(fs_nir, nir_shader_get_entrypoint(fs_nir));
+         if (native_pv_nir) {
+            NIR_PASS(_, native_pv_nir, nir_shader_intrinsics_pass,
+                     hk_apple9_lower_polygon_slot, nir_metadata_control_flow,
+                     &polygon_face_slot);
+            nir_shader_gather_info(native_pv_nir,
+                                   nir_shader_get_entrypoint(native_pv_nir));
+         }
       }
 
       /* Polygon-mode points take the software polygon stage when the last
@@ -2649,85 +2810,10 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             varyings = obj->variants[HK_MESH_VARIANT_RAST].b.info.apple9_varyings;
             continue;
          } else {
-            obj->zs_self_dep =
+            const bool zs_self_dep =
                state &&
                (state->pipeline_flags &
                 VK_PIPELINE_CREATE_2_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
-            shader->info.fs.interp.linear = key.vertex.outputs_linear;
-            shader->info.fs.interp.flat = key.vertex.outputs_flat;
-            shader->info.fs.line_stipple_start =
-               fs_lowered_stipple ? stipple.start : 0;
-            shader->info.fs.polygon_points = may_polygon_points || polygon_points;
-            shader->info.fs.polygon_face_slot = polygon_face_slot;
-            if (hk_per_vertex_copies_used(&per_vertex)) {
-               shader->info.fs.per_vertex_copies = per_vertex.count;
-               memcpy(shader->info.fs.per_vertex_bary, per_vertex.bary,
-                      sizeof(per_vertex.bary));
-            }
-            memcpy(shader->info.fs.per_vertex_location, per_vertex.location,
-                   sizeof(per_vertex.location));
-            memcpy(shader->info.fs.per_vertex_copy_base, per_vertex.copy_base,
-                   sizeof(per_vertex.copy_base));
-            /* The statistics counter is the only memory write or wave-wide
-             * operation of many shaders, but it runs only while a query is
-             * active and counts correctly in merged waves. Keep triangle
-             * merging unless the shader itself requires disabling it. */
-            bool tri_merging = true;
-            bool real_writes_memory = false;
-            bool inline_statistics = false;
-            if (!nir->info.internal) {
-               if (key.zs_self_dep && !key.fs_use_epilog)
-                  hk_apple9_late_zs(nir);
-               nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-               real_writes_memory = nir->info.writes_memory;
-               const bool per_sample =
-                  key.sample_shading || nir->info.fs.uses_sample_shading;
-               tri_merging = !nir->info.uses_wide_subgroup_intrinsics &&
-                             !nir->info.fs.needs_coarse_quad_helper_invocations &&
-                             !nir->info.writes_memory &&
-                             !per_sample &&
-                             !hk_apple9_interpolates_off_center(nir);
-               /* Normal epilog fragment shaders count invocations via a
-                * draw-time linked stats prolog only when queried. Keep the
-                * counter inline for early_fragment_tests (must execute after
-                * fs_main's early Z/S test), per-sample shaders (must count per
-                * covered sample inside the trampoline loop), and non-epilog
-                * shaders. */
-               if (dev->vk.enabled_features.pipelineStatisticsQuery &&
-                   !key.no_fs_statistics &&
-                   (!key.fs_use_epilog || nir->info.fs.early_fragment_tests ||
-                    per_sample)) {
-                  hk_apple9_lower_fs_statistics(nir);
-                  inline_statistics = true;
-               }
-               NIR_PASS(_, nir, nir_shader_intrinsics_pass,
-                        hk_apple9_clamp_depth_export,
-                        nir_metadata_control_flow, NULL);
-               NIR_PASS(_, nir, nir_shader_intrinsics_pass,
-                        hk_apple9_lower_viewport_fs,
-                        nir_metadata_control_flow, NULL);
-            }
-            shader->info.fs.writes_memory = real_writes_memory;
-            shader->info.fs.early_fragment_tests =
-               nir->info.fs.early_fragment_tests;
-            shader->info.fs.inline_statistics = inline_statistics;
-            if (key.sample_shading) {
-               nir->info.fs.uses_sample_shading = true;
-               NIR_PASS(_, nir, nir_shader_intrinsics_pass,
-                        hk_apple9_lower_bary_to_sample,
-                        nir_metadata_control_flow, NULL);
-            }
-            NIR_PASS(_, nir, hk_apple9_lower_api_vertex_order);
-            if (key.fs_use_epilog && !nir->info.internal) {
-               key.blend[0].use_epilog = true;
-               key.blend[0].dynamic_samples = true;
-               key.blend[0].per_sample =
-                  key.sample_shading || nir->info.fs.uses_sample_shading;
-               key.blend[0].writes_memory_stats_only = !real_writes_memory;
-               shader->info.apple9_undefined_colors = key.undefined_colors;
-            } else {
-               hk_apple9_remap_fs_outputs(nir, key.color_map);
-            }
             /* The passthrough geometry shader produces the flat copies,
              * line-stipple TEX6/TEX7, and polygon-point FOGC. Keep them in
              * the producer layout passed to the fragment compiler so
@@ -2780,30 +2866,90 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                varyings.group[polygon_face_slot] = 1;
                varyings.count += 1;
             }
-            struct blob dump_nir;
-            const bool dump = hk_apple9_fragment_dump_begin(nir, &dump_nir);
-            hk_assert_final_push_mask(nir, shader);
             const bool has_prerast = last_prerast != MESA_SHADER_NONE;
-            const bool compiled = agx_compile_apple9_fragment_mrt(
-               nir, has_prerast ? &varyings : NULL, key.blend, key.targets,
-               &shader->b, &reason);
-            if (dump)
-               hk_apple9_fragment_dump_end(&dump_nir, compiled, &varyings,
-                                           key.blend, key.targets, &shader->b);
-            if (!compiled) {
-               reason = reason ?: "unsupported fragment NIR";
-               if (native_mesh)
-                  *native_unsupported = true;
-               result = native_mesh ? VK_ERROR_FEATURE_NOT_PRESENT :
-                  vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                            "Apple9 fragment: %s", reason);
+            result = hk_apple9_compile_fs_stage(
+               dev, nir, &key, has_prerast ? &varyings : NULL, zs_self_dep,
+               key.vertex.outputs_flat, key.vertex.outputs_linear,
+               fs_lowered_stipple ? stipple.start : 0,
+               may_polygon_points || polygon_points, polygon_face_slot,
+               &per_vertex, native_mesh, native_unsupported, obj, shader,
+               &reason);
+            if (result != VK_SUCCESS)
                goto done;
+            if (native_pv_nir) {
+               struct hk_api_shader *pv_obj =
+                  vk_shader_zalloc(&dev->vk, &hk_shader_ops, stage, alloc, size);
+               if (!pv_obj) {
+                  result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+                  goto done;
+               }
+               struct hk_shader *pv_shader = &pv_obj->variants[0];
+               pv_shader->info.stage = stage;
+               pv_shader->b.info.stats.instrs = 1;
+#ifndef NDEBUG
+               pv_shader->debug_owner = pv_obj;
+#endif
+               nir_shader_gather_info(native_pv_nir,
+                                      nir_shader_get_entrypoint(native_pv_nir));
+               pv_obj->writes_memory = native_pv_nir->info.writes_memory;
+               pv_obj->pre_raster_reads = hk_nir_pre_raster_reads(native_pv_nir);
+               pv_obj->reads_draw_id = hk_nir_reads_draw_id(native_pv_nir);
+               pv_obj->push_constant_mask =
+                  hk_nir_push_constant_mask(native_pv_nir);
+               pv_shader->info.set_count = shader->info.set_count;
+               pv_shader->info.apple9_render_targets = key.targets;
+               const uint64_t pv_flat =
+                  native_pv_nir->info.inputs_read &
+                  ~(native_pv_nir->info.perspective_varyings |
+                    native_pv_nir->info.linear_varyings);
+               const uint64_t pv_linear = native_pv_nir->info.linear_varyings;
+               const char *pv_reason = NULL;
+               VkResult pv_res = VK_SUCCESS;
+               if (!hk_apple9_texture_bindings(native_pv_nir) ||
+                   !agx_nir_lower_apple9_runtime_sampler_state(native_pv_nir,
+                                                               &pv_reason)) {
+                  pv_res = VK_ERROR_FEATURE_NOT_PRESENT;
+               } else {
+                  NIR_PASS(_, native_pv_nir, nir_shader_intrinsics_pass,
+                           hk_apple9_lower_roots, nir_metadata_control_flow,
+                           NULL);
+                  pv_res = hk_apple9_compile_fs_stage(
+                     dev, native_pv_nir, &key, NULL, zs_self_dep, pv_flat,
+                     pv_linear, 0, may_polygon_points || polygon_points,
+                     polygon_face_slot, NULL, false, NULL, pv_obj, pv_shader,
+                     &pv_reason);
+               }
+               if (pv_res == VK_SUCCESS) {
+                  pv_shader->code_ptr = pv_shader->b.binary;
+                  pv_shader->code_size = pv_shader->b.info.binary_size;
+                  hk_gpu_busy_shader_source(pv_shader->code_ptr,
+                                            pv_shader->code_size,
+                                            native_pv_nir->info.name,
+                                            native_pv_nir->info.source_blake3,
+                                            native_pv_nir->info.stage);
+                  pv_shader->info.clip_distance_array_size =
+                     native_pv_nir->info.clip_distance_array_size;
+                  pv_shader->info.cull_distance_array_size =
+                     native_pv_nir->info.cull_distance_array_size;
+                  pv_res = hk_copy_shader_constant_data(dev, pv_shader,
+                                                        native_pv_nir);
+                  if (pv_res == VK_SUCCESS)
+                     pv_res = hk_upload_shader(dev, pv_shader);
+               }
+               ralloc_free(native_pv_nir);
+               native_pv_nir = NULL;
+               if (pv_res == VK_SUCCESS) {
+                  hk_api_shader_init_constant_data(pv_obj);
+                  obj->apple9_fs_native_per_vertex = pv_obj;
+               } else {
+                  hk_api_shader_destroy(&dev->vk, &pv_obj->vk, alloc);
+                  if (pv_res == VK_ERROR_OUT_OF_HOST_MEMORY ||
+                      pv_res == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+                     result = pv_res;
+                     goto done;
+                  }
+               }
             }
-            /* hk's decision covers the backend's reasons for the shader as
-             * written (before the statistics counter, which counts correctly
-             * in merged waves) and adds sample shading and off-centre
-             * interpolation, which the backend can't see. */
-            shader->b.info.disable_tri_merging = !tri_merging;
          }
          shader->code_ptr = shader->b.binary;
          shader->code_size = shader->b.info.binary_size;
@@ -2822,6 +2968,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
    }
 
 done:
+   ralloc_free(native_pv_nir);
    if (result != VK_SUCCESS && agx_get_compiler_debug())
       fprintf(stderr, "Apple9 graphics compilation failed: %s\n",
               reason ?: vk_Result_to_str(result));

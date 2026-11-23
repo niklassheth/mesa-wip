@@ -2307,6 +2307,9 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       fragment_api = hk_api_shader_native(fragment_api);
       if (!fragment_api)
          UNSUPPORTED();
+   } else if (!null_fs && gs && !gs->is_passthrough &&
+              fragment_api && fragment_api->apple9_fs_native_per_vertex) {
+      fragment_api = fragment_api->apple9_fs_native_per_vertex;
    }
    shaders[0] =
       native_grid ? hk_native_producer_main(mesh)

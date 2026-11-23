@@ -13812,7 +13812,8 @@ apple9_collect_varyings(nir_shader *nir,
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
          if (fragment
                 ? (intr->intrinsic != nir_intrinsic_load_interpolated_input &&
-                   intr->intrinsic != nir_intrinsic_load_input)
+                   intr->intrinsic != nir_intrinsic_load_input &&
+                   intr->intrinsic != nir_intrinsic_load_input_vertex)
                 : intr->intrinsic != nir_intrinsic_store_output)
             continue;
          unsigned location = nir_intrinsic_io_semantics(intr).location;
@@ -13846,7 +13847,8 @@ apple9_collect_varyings(nir_shader *nir,
          nir_alu_type type = fragment ? nir_intrinsic_dest_type(intr)
                                       : nir_intrinsic_src_type(intr);
          if (type != nir_type_float32 &&
-             !((!fragment || intr->intrinsic == nir_intrinsic_load_input) &&
+             !((!fragment || intr->intrinsic == nir_intrinsic_load_input ||
+                intr->intrinsic == nir_intrinsic_load_input_vertex) &&
                (type == nir_type_int32 || type == nir_type_uint32)))
             goto unsupported;
          if (!agx_apple9_varying_supported(location) ||

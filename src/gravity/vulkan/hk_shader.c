@@ -512,6 +512,12 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
                             pAllocator);
    }
 
+   if (obj->apple9_fs_native_per_vertex) {
+      assert(!obj->apple9_fs_native_per_vertex->apple9_fs_native_per_vertex);
+      hk_api_shader_destroy(vk_dev, &obj->apple9_fs_native_per_vertex->vk,
+                            pAllocator);
+   }
+
    hk_foreach_variant(obj, shader) {
       hk_shader_destroy(dev, shader);
    }
@@ -663,7 +669,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 }
 
 /* Version the container independently of the hardware programs it owns. */
-#define HK_SHADER_CONTAINER_VERSION 0x484b0010u
+#define HK_SHADER_CONTAINER_VERSION 0x484b0011u
 
 static VkResult
 hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *blob,
@@ -787,6 +793,28 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
       }
    }
 
+   bool has_fs_pv = blob_read_uint8(blob);
+   if (blob->overrun ||
+       (has_fs_pv && (!allow_native || stage != MESA_SHADER_FRAGMENT))) {
+      hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
+      return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+   }
+   if (has_fs_pv) {
+      struct vk_shader *fs_pv = NULL;
+      VkResult result = hk_deserialize_api_shader_inner(
+         vk_dev, blob, binary_version, pAllocator, &fs_pv, false);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
+         return result;
+      }
+      obj->apple9_fs_native_per_vertex =
+         container_of(fs_pv, struct hk_api_shader, vk);
+      if (fs_pv->stage != MESA_SHADER_FRAGMENT) {
+         hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      }
+   }
+
    hk_api_shader_init_constant_data(obj);
    *shader_out = &obj->vk;
    return VK_SUCCESS;
@@ -861,6 +889,14 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
       assert(obj->vk.stage == MESA_SHADER_GEOMETRY &&
              !obj->apple9_gs_polygon_points->apple9_gs_polygon_points);
       hk_api_shader_serialize(vk_dev, &obj->apple9_gs_polygon_points->vk, blob);
+   }
+
+   blob_write_uint8(blob, obj->apple9_fs_native_per_vertex != NULL);
+   if (obj->apple9_fs_native_per_vertex) {
+      assert(obj->vk.stage == MESA_SHADER_FRAGMENT &&
+             !obj->apple9_fs_native_per_vertex->apple9_fs_native_per_vertex);
+      hk_api_shader_serialize(vk_dev, &obj->apple9_fs_native_per_vertex->vk,
+                              blob);
    }
 
    return !blob->out_of_memory;

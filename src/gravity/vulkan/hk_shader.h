@@ -474,6 +474,12 @@ struct hk_api_shader {
     * geometry shader compiled with dynamic polygon mode / ESO / GPL. */
    struct hk_api_shader *apple9_gs_polygon_points;
 
+   /* Optional native per-vertex / barycentric realization for a standalone
+    * fragment shader (GPL/ESO) whose primary realization lowered per-vertex
+    * inputs to passthrough-GS flat copies. Used when linked at draw time
+    * with an application geometry shader, which exports ordinary varyings. */
+   struct hk_api_shader *apple9_fs_native_per_vertex;
+
    /* Native mesh/FS realizations have the same content-derived compile ID.
     * Store the ID in cache blobs so independently reloaded stages can still
     * prove that their producer/consumer interfaces were compiled together. */
@@ -593,7 +599,11 @@ static inline void
 hk_api_shader_init_constant_data(struct hk_api_shader *shader)
 {
    const struct hk_shader *data = NULL;
-   const struct hk_api_shader *paths[] = {shader, shader->apple9_native};
+   const struct hk_api_shader *paths[] = {
+      shader,
+      shader->apple9_native,
+      shader->apple9_fs_native_per_vertex,
+   };
    for (unsigned p = 0; p < ARRAY_SIZE(paths); ++p) {
       if (!paths[p])
          continue;
