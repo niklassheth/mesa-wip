@@ -498,13 +498,22 @@ apple9_lane_hazard(const struct agx_apple9_vir_instr *ins,
             return true;
       }
    }
-   bool scratch = ins->op == AGX_APPLE9_VIR_SPILL_LOAD ||
-                  ins->op == AGX_APPLE9_VIR_SPILL_STORE;
-   bool previous_scratch = producer->op == AGX_APPLE9_VIR_SPILL_LOAD ||
-                           producer->op == AGX_APPLE9_VIR_SPILL_STORE;
-   if (scratch && previous_scratch && ins->immediate == producer->immediate &&
-       (ins->op == AGX_APPLE9_VIR_SPILL_STORE ||
-        producer->op == AGX_APPLE9_VIR_SPILL_STORE))
+   bool is_spill_load =
+      ins->op == AGX_APPLE9_VIR_SPILL_LOAD ||
+      (ins->spill_access && ins->op == AGX_APPLE9_VIR_PRIVATE_LOAD);
+   bool is_spill_store =
+      ins->op == AGX_APPLE9_VIR_SPILL_STORE ||
+      (ins->spill_access && ins->op == AGX_APPLE9_VIR_PRIVATE_STORE);
+   bool prev_spill_load =
+      producer->op == AGX_APPLE9_VIR_SPILL_LOAD ||
+      (producer->spill_access && producer->op == AGX_APPLE9_VIR_PRIVATE_LOAD);
+   bool prev_spill_store =
+      producer->op == AGX_APPLE9_VIR_SPILL_STORE ||
+      (producer->spill_access && producer->op == AGX_APPLE9_VIR_PRIVATE_STORE);
+   if ((is_spill_load || is_spill_store) &&
+       (prev_spill_load || prev_spill_store) &&
+       ins->immediate == producer->immediate &&
+       (is_spill_store || prev_spill_store))
       return true;
    /* Bindings name distinct buffers; global addresses may alias each other. */
    if ((ins->op == AGX_APPLE9_VIR_DEVICE_STORE ||
@@ -957,6 +966,12 @@ static bool
 apple9_schedule_physical(struct agx_apple9_vir_program *program,
                           const char **reason)
 {
+   if (!program->blocks || !program->last_block ||
+       program->instruction_count == 0) {
+      program->physical = true;
+      program->dependencies_finalized = true;
+      return true;
+   }
    struct agx_apple9_vir_program out;
    if (!apple9_init_physical(&out)) {
       agx_apple9_vir_finish(&out);
@@ -1369,7 +1384,8 @@ apple9_allocation_cost(const struct agx_apple9_vir_program *p)
       }
       issue = earliest + 1;
       cost.spills += weight * (I->op == AGX_APPLE9_VIR_SPILL_STORE ||
-                               I->op == AGX_APPLE9_VIR_SPILL_LOAD);
+                               I->op == AGX_APPLE9_VIR_SPILL_LOAD ||
+                               I->spill_access);
       if (I->encoding == AGX_APPLE9_ENC_PSEUDO)
          continue;
       cost.instructions += weight;

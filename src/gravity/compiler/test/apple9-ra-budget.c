@@ -103,10 +103,103 @@ check_pressure(unsigned count, bool banks, bool latency, bool masks)
    ralloc_free(nir.shader);
 }
 
+static void
+check_indexed_spill_hazard_and_cost(void)
+{
+   /* Verify words 1023, 1024, 2047, and 2048 with a killed compact SAVE source
+    * (r8) followed by an indexed PRIVATE_LOAD (r1) wait on the store's slot
+    * and count in apple9_allocation_cost().spills. */
+   const unsigned words[] = {1023u, 1024u, 2047u, 2048u};
+   for (unsigned wi = 0; wi < ARRAY_SIZE(words); ++wi) {
+      unsigned word = words[wi];
+      struct agx_apple9_vir_program p;
+      CHECK(apple9_init_physical(&p));
+      struct agx_apple9_block *blk = agx_apple9_block_create(&p);
+      CHECK(blk);
+      agx_apple9_block_begin(&p, blk);
+
+      struct agx_apple9_vir_instr store;
+      if (word >= AGX_APPLE9_SAVE_WORD_COUNT) {
+         store = apple9_physical_instruction(AGX_APPLE9_VIR_PRIVATE_STORE,
+                                             AGX_APPLE9_ENC_PRIVATE_STORE,
+                                             AGX_APPLE9_VREG_INVALID);
+         store.src[0] = 1;
+         store.src[1] = 2;
+         store.nr_srcs = 2;
+         store.live_after_mask = 2;
+         store.immediate = word;
+         store.spill_access = true;
+      } else {
+         store = apple9_physical_instruction(AGX_APPLE9_VIR_SPILL_STORE,
+                                             AGX_APPLE9_ENC_SPILL_STORE,
+                                             AGX_APPLE9_VREG_INVALID);
+         store.src[0] = 8; /* killed ordinary GPR, disjoint from r1 */
+         store.nr_srcs = 1;
+         store.immediate = word;
+         store.producer_scoreboard_slot = 6;
+         store.spill_access = true;
+      }
+      CHECK(apple9_emit_physical(&p, &store));
+
+      struct agx_apple9_vir_instr load;
+      if (word >= AGX_APPLE9_FILL_WORD_COUNT) {
+         load = apple9_physical_instruction(AGX_APPLE9_VIR_PRIVATE_LOAD,
+                                            AGX_APPLE9_ENC_PRIVATE_LOAD, 1);
+         load.src[0] = 1;
+         load.nr_srcs = 1;
+         load.immediate = word;
+         load.producer_scoreboard_slot = 6;
+         load.spill_access = true;
+      } else {
+         load = apple9_physical_instruction(AGX_APPLE9_VIR_SPILL_LOAD,
+                                            AGX_APPLE9_ENC_SPILL_LOAD, 9);
+         load.immediate = word;
+         load.producer_scoreboard_slot = 6;
+         load.spill_access = true;
+      }
+      CHECK(apple9_emit_physical(&p, &load));
+      p.physical = true;
+
+      const char *reason = NULL;
+      CHECK(apple9_schedule_physical(&p, &reason));
+
+      /* For compact SAVE (word < 2048) followed by reload (compact or indexed)
+       * of the same word, the scheduler MUST emit or fold a wait on store_slot
+       * before the load! */
+      if (word < AGX_APPLE9_SAVE_WORD_COUNT) {
+         unsigned store_slot = 0;
+         bool waited = false, seen_load = false;
+         for (unsigned i = 0; i < p.instruction_count; ++i) {
+            const struct agx_apple9_vir_instr *I = p.instructions[i];
+            if (I->op == AGX_APPLE9_VIR_SPILL_STORE && !store_slot)
+               store_slot = I->producer_scoreboard_slot;
+            if (store_slot && !seen_load) {
+               if (I->op == AGX_APPLE9_VIR_WAIT &&
+                   (I->immediate & BITFIELD_BIT(store_slot - 1)))
+                  waited = true;
+               if (I->op == AGX_APPLE9_VIR_SPILL_LOAD ||
+                   I->op == AGX_APPLE9_VIR_PRIVATE_LOAD) {
+                  if (I->scoreboard_slot == store_slot)
+                     waited = true;
+                  seen_load = true;
+               }
+            }
+         }
+         CHECK(store_slot != 0 && seen_load && waited);
+      }
+
+      /* Both compact and indexed spill ops must contribute to spill cost. */
+      struct agx_apple9_allocation_cost cost = apple9_allocation_cost(&p);
+      CHECK(cost.spills >= 2u);
+      agx_apple9_vir_finish(&p);
+   }
+}
+
 int
 main(void)
 {
    glsl_type_singleton_init_or_ref();
+   check_indexed_spill_hazard_and_cost();
    const unsigned pressure[] = {8, 96, 128};
    for (unsigned i = 0; i < ARRAY_SIZE(pressure); ++i)
       for (unsigned banks = 0; banks < 2; ++banks)
@@ -114,7 +207,6 @@ main(void)
             for (unsigned masks = 0; masks < 2; ++masks)
                check_pressure(pressure[i], banks, latency, masks);
    glsl_type_singleton_decref();
-   puts(
-      "spill budgets preserve completed allocations and reject mandatory traffic above budget");
+   puts("native Apple9 RA preserves deterministic allocations across pressure, bank-cost, latency, and loop-mask policies");
    return 0;
 }

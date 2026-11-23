@@ -1355,3 +1355,18 @@ TEST(Apple9SharedRa, CrossDomainAcquireBarrierDeviceAndShared)
       ralloc_free(nir.shader);
    }
 }
+
+TEST(Apple9SharedRa, EmptyProgramAllocatesCleanly)
+{
+   nir_builder nir = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "empty_vir");
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_apple9_allocate_shared(&p, nir.shader, &reason))
+      << (reason ?: "");
+   EXPECT_TRUE(p.physical);
+   EXPECT_TRUE(p.dependencies_finalized);
+   agx_apple9_vir_finish(&p);
+   ralloc_free(nir.shader);
+}

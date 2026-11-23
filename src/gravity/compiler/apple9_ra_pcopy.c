@@ -853,6 +853,13 @@ default_phi_opts(const struct agx_apple9_vir_program *program,
              loc.kind == APPLE9_RA_LOC_GPR)
             gpr_bit_set(opts.live_gprs, loc.value);
       }
+      /* Never hand out a reserved scratch GPR that still holds a live value. */
+      if (opts.scratch_gpr != AGX_APPLE9_PHYS_INVALID &&
+          gpr_bit_test(opts.live_gprs, opts.scratch_gpr))
+         opts.scratch_gpr = AGX_APPLE9_PHYS_INVALID;
+      if (opts.scratch_gpr2 != AGX_APPLE9_PHYS_INVALID &&
+          gpr_bit_test(opts.live_gprs, opts.scratch_gpr2))
+         opts.scratch_gpr2 = AGX_APPLE9_PHYS_INVALID;
    } else {
       /* Without explicit liveness, conservatively preserve all GPRs. */
       opts.live_gprs[0] = ~0ull;
@@ -884,7 +891,9 @@ collect_phi_copies_for_succ(const struct agx_apple9_vir_program *program,
       if (pred_idx >= agx_apple9_vir_nr_srcs(ins))
          return false;
 
-      struct apple9_ra_copy cp = { .count = 1 };
+      struct apple9_ra_copy cp = {
+         .count = MAX2((unsigned)ins->dest_components, 1u),
+      };
       if (!value_to_loc(program, assign, ins->dest, &cp.dst) ||
           !value_to_loc(program, assign, agx_apple9_vir_src(ins, pred_idx),
                         &cp.src))

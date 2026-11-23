@@ -1112,11 +1112,14 @@ create_vir_dag(const struct agx_apple9_vir_program *p,
    struct vir_sched_node *resource_writer[32] = {0};
    struct vir_resource_reader *resource_readers[32] = {0};
 
+   bool ok = true;
    for (struct agx_apple9_vir_instr *I = first_body; I && I != first_tail;
         I = agx_apple9_instr_next(I)) {
       struct vir_sched_node *node = rzalloc(memctx, struct vir_sched_node);
-      if (!node)
-         return NULL;
+      if (!node) {
+         ok = false;
+         break;
+      }
       node->instr = I;
       dag_init_node(dag, &node->dag);
       util_dynarray_append(orig_order, node);
@@ -1166,16 +1169,20 @@ create_vir_dag(const struct agx_apple9_vir_program *p,
          } else {
             struct vir_resource_reader *rr =
                rzalloc(memctx, struct vir_resource_reader);
-            if (!rr)
-               return NULL;
+            if (!rr) {
+               ok = false;
+               break;
+            }
             rr->node = node;
             rr->next = resource_readers[r];
             resource_readers[r] = rr;
          }
       }
+      if (!ok)
+         break;
    }
 
-   /* Clear last_write entries touched by this block in O(block_size). */
+   /* Always clear last_write entries touched by this block (even on OOM). */
    for (struct agx_apple9_vir_instr *I = first_body; I && I != first_tail;
         I = agx_apple9_instr_next(I)) {
       if (I->dest != AGX_APPLE9_VREG_INVALID && I->dest_components > 0) {
@@ -1186,7 +1193,7 @@ create_vir_dag(const struct agx_apple9_vir_program *p,
       }
    }
 
-   return dag;
+   return ok ? dag : NULL;
 }
 
 static struct vir_sched_node *

@@ -529,21 +529,33 @@ apple9_ra_spill_coalesce_color(const struct agx_apple9_vir_program *program,
    struct apple9_ra_spill_interference *g =
       apple9_ra_spill_coalesce_prepare(program, state);
    if (!g) {
-      /* Either 0 RA_MEM values (done) or >4096 fallback (linear aligned slots). */
+      /* Either 0 RA_MEM definitions (done) or >4096 fallback: walk only
+       * surviving active-block definitions so DCE'd RA_MEM values stay
+       * UINT32_MAX and never inflate the scratch frame. */
       unsigned cursor = base_words;
       bool any_mem = false;
-      for (unsigned v = 0; v < program->value_count; ++v) {
-         if (!apple9_ra_value_is_mem(state, v) || mem_slot[v] != UINT32_MAX)
+      for (struct agx_apple9_block *b = program->blocks; b; b = b->next) {
+         if (!b->cfg_active)
             continue;
-         any_mem = true;
-         unsigned raw_w = apple9_ra_value_width(state, v);
-         unsigned w = util_next_power_of_two(raw_w);
-         cursor = ALIGN_POT(cursor, w);
-         if (cursor + w > max_words)
-            return false;
-         for (unsigned c = 0; c < raw_w && v + c < program->value_count; ++c)
-            mem_slot[v + c] = cursor + c;
-         cursor += w;
+         for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(b);
+              I; I = agx_apple9_instr_next(I)) {
+            uint32_t v = I->dest;
+            if (v == AGX_APPLE9_VREG_INVALID || I->dest_components == 0 ||
+                v >= program->value_count ||
+                !apple9_ra_value_is_mem(state, v) ||
+                mem_slot[v] != UINT32_MAX)
+               continue;
+            any_mem = true;
+            unsigned raw_w = MAX2((unsigned)I->dest_components,
+                                  apple9_ra_value_width(state, v));
+            unsigned w = util_next_power_of_two(raw_w);
+            cursor = ALIGN_POT(cursor, w);
+            if (cursor + w > max_words)
+               return false;
+            for (unsigned c = 0; c < raw_w && v + c < program->value_count; ++c)
+               mem_slot[v + c] = cursor + c;
+            cursor += w;
+         }
       }
       *frame_words = any_mem ? cursor : 0u;
       return true;

@@ -90,9 +90,13 @@ alloc_ssa_like(struct repair_ctx *ctx, uint32_t orig_var, unsigned width)
 
    bool is_mem = apple9_ra_value_is_mem(ctx->state, orig_var);
    if (ctx->state) {
-      if (is_mem)
-         BITSET_SET(ctx->state->is_mem, val);
-      ctx->state->value_width[val] = width;
+      for (unsigned c = 0; c < MAX2(width, 1u); ++c) {
+         if (val + c < ctx->state->is_mem_capacity) {
+            if (is_mem)
+               BITSET_SET(ctx->state->is_mem, val + c);
+            ctx->state->value_width[val + c] = (c == 0) ? (uint8_t)width : 1u;
+         }
+      }
    }
    if (!is_mem && orig_var < ctx->n && ctx->program->max_phys)
       ctx->program->max_phys[val] = ctx->program->max_phys[orig_var];
@@ -132,9 +136,13 @@ emit_repair_phi(struct repair_ctx *ctx, struct agx_apple9_block *block,
 
    bool is_mem = apple9_ra_value_is_mem(ctx->state, orig_var);
    if (ctx->state) {
-      if (is_mem)
-         BITSET_SET(ctx->state->is_mem, val);
-      ctx->state->value_width[val] = width;
+      for (unsigned c = 0; c < MAX2(width, 1u); ++c) {
+         if (val + c < ctx->state->is_mem_capacity) {
+            if (is_mem)
+               BITSET_SET(ctx->state->is_mem, val + c);
+            ctx->state->value_width[val + c] = (c == 0) ? (uint8_t)width : 1u;
+         }
+      }
    }
    if (!is_mem && orig_var < ctx->n && ctx->program->max_phys)
       ctx->program->max_phys[val] = ctx->program->max_phys[orig_var];

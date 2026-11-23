@@ -880,6 +880,36 @@ a9_calc_gpr_demand(const struct agx_apple9_vir_program *program,
    unsigned max_demand = reserved;
    unsigned min_single = reserved;
 
+   unsigned vcount = program->value_count;
+   uint8_t *def_w = NULL;
+   if (min_single_insn_out && vcount > 0) {
+      def_w = malloc(vcount * sizeof(*def_w));
+      if (def_w) {
+         memset(def_w, 1, vcount * sizeof(*def_w));
+         for (struct agx_apple9_block *b = program->blocks; b; b = b->next) {
+            if (!b->cfg_active)
+               continue;
+            for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(b);
+                 ins; ins = agx_apple9_instr_next(ins)) {
+               if (ins->dest != AGX_APPLE9_VREG_INVALID &&
+                   ins->dest < vcount && ins->dest_components > 1 &&
+                   !a9_is_pub_val(program, ins->dest))
+                  def_w[ins->dest] = ins->dest_components;
+            }
+         }
+      }
+   }
+
+   /* Ensure pre-defined fixed VIR inputs are never excluded by assign_bound. */
+   if (program->fixed_phys) {
+      for (unsigned v = 0; v < vcount; ++v) {
+         if (!a9_is_pub_val(program, v) &&
+             program->fixed_phys[v] != AGX_APPLE9_PHYS_INVALID &&
+             program->fixed_phys[v] < AGX_APPLE9_GPR_COUNT)
+            max_demand = MAX2(max_demand, (unsigned)program->fixed_phys[v] + 1u);
+      }
+   }
+
    for (struct agx_apple9_block *b = program->blocks; b; b = b->next) {
       if (!b->cfg_active)
          continue;
@@ -981,9 +1011,25 @@ a9_calc_gpr_demand(const struct agx_apple9_vir_program *program,
                dup |= (agx_apple9_vir_src(ins, p) == sv);
             if (dup)
                continue;
-            insn_need += 1;
+            unsigned sw = (def_w && sv < vcount) ? def_w[sv] : 1u;
+            insn_need += util_next_power_of_two(sw);
             if (agx_apple9_vir_src_killed(ins, s))
                late_kill += 1;
+         }
+         if (ins->op == AGX_APPLE9_VIR_ABI_RETURN) {
+            for (unsigned k = 0; k < program->live_out_count; ++k) {
+               uint32_t sv = program->live_out[k];
+               if (a9_is_pub_val(program, sv) ||
+                   apple9_ra_value_is_mem(spill, sv))
+                  continue;
+               bool dup = false;
+               for (unsigned p = 0; p < k; ++p)
+                  dup |= (program->live_out[p] == sv);
+               if (!dup) {
+                  unsigned sw = (def_w && sv < vcount) ? def_w[sv] : 1u;
+                  insn_need += util_next_power_of_two(sw);
+               }
+            }
          }
 
          if (ins->dest != AGX_APPLE9_VREG_INVALID && ins->dest_components > 0 &&
@@ -1002,6 +1048,7 @@ a9_calc_gpr_demand(const struct agx_apple9_vir_program *program,
       demand -= late_kill;
    }
 
+   free(def_w);
    if (min_single_insn_out)
       *min_single_insn_out = min_single;
    return max_demand;
@@ -1400,34 +1447,44 @@ a9_ra_ensure_val_cap(struct a9_ra_ctx *rctx, unsigned needed)
 
    unsigned old_cap = rctx->val_cap;
    unsigned new_cap = MAX2(old_cap ? old_cap * 2u : 64u, needed);
-
-   uint8_t *phys = realloc(rctx->phys, new_cap * sizeof(*phys));
-   uint32_t *orig = realloc(rctx->orig_ssa, new_cap * sizeof(*orig));
-   uint32_t *last = realloc(rctx->last_reg, new_cap * sizeof(*last));
    unsigned old_words = old_cap ? BITSET_WORDS(old_cap) : 0u;
    unsigned new_words = BITSET_WORDS(new_cap);
-   BITSET_WORD *vis = realloc(rctx->visited, new_words * sizeof(*vis));
-   if (!phys || !orig || !last || !vis) {
-      free(phys);
-      free(orig);
-      free(last);
-      free(vis);
+
+   uint8_t *phys = realloc(rctx->phys, new_cap * sizeof(*phys));
+   if (!phys) {
       rctx->error = "out of memory growing RA value tables";
       return false;
    }
-
+   rctx->phys = phys;
    memset(phys + old_cap, AGX_APPLE9_PHYS_INVALID, new_cap - old_cap);
-   for (unsigned v = old_cap; v < new_cap; ++v) {
-      orig[v] = v;
-      last[v] = UINT32_MAX;
+
+   uint32_t *orig = realloc(rctx->orig_ssa, new_cap * sizeof(*orig));
+   if (!orig) {
+      rctx->error = "out of memory growing RA value tables";
+      return false;
    }
+   rctx->orig_ssa = orig;
+   for (unsigned v = old_cap; v < new_cap; ++v)
+      orig[v] = v;
+
+   uint32_t *last = realloc(rctx->last_reg, new_cap * sizeof(*last));
+   if (!last) {
+      rctx->error = "out of memory growing RA value tables";
+      return false;
+   }
+   rctx->last_reg = last;
+   for (unsigned v = old_cap; v < new_cap; ++v)
+      last[v] = UINT32_MAX;
+
+   BITSET_WORD *vis = realloc(rctx->visited, new_words * sizeof(*vis));
+   if (!vis) {
+      rctx->error = "out of memory growing RA value tables";
+      return false;
+   }
+   rctx->visited = vis;
    if (new_words > old_words)
       memset(vis + old_words, 0, (new_words - old_words) * sizeof(*vis));
 
-   rctx->phys = phys;
-   rctx->orig_ssa = orig;
-   rctx->last_reg = last;
-   rctx->visited = vis;
    rctx->val_cap = new_cap;
    return true;
 }
@@ -1796,7 +1853,8 @@ a9_evict_register(struct a9_ra_ctx *rctx, unsigned r_victim,
       rctx->program->instructions[rctx->program->instruction_count - 1];
    mov->dest = u_new;
    mov->dest_components = 1;
-   agx_apple9_vir_move_before(rctx->program, mov, before);
+   if (before)
+      agx_apple9_vir_move_before(rctx->program, mov, before);
 
    /* Update register file and SSA version mapping. */
    uint32_t orig_v = rctx->orig_ssa[u];
@@ -1812,10 +1870,12 @@ a9_evict_register(struct a9_ra_ctx *rctx, unsigned r_victim,
    a9_assign_gpr_val(rctx, u_new, r_free);
 
    /* If the instruction about to execute also reads `u`, point it at `u_new`. */
-   unsigned nr_srcs = agx_apple9_vir_nr_srcs(before);
-   for (unsigned s = 0; s < nr_srcs; ++s) {
-      if (agx_apple9_vir_src(before, s) == u)
-         *agx_apple9_vir_src_ptr(before, s) = u_new;
+   if (before) {
+      unsigned nr_srcs = agx_apple9_vir_nr_srcs(before);
+      for (unsigned s = 0; s < nr_srcs; ++s) {
+         if (agx_apple9_vir_src(before, s) == u)
+            *agx_apple9_vir_src_ptr(before, s) = u_new;
+      }
    }
 
    return true;
@@ -1984,6 +2044,7 @@ a9_assign_constrained_sources(struct a9_ra_ctx *rctx,
          unsigned r_dst =
             a9_choose_window(rctx, s0, 1, first, last, c.align, UINT_MAX, &moves);
          if (r_dst == UINT_MAX) {
+            rctx->needs_spill_headroom = true;
             rctx->error = "instruction source constraints are unsatisfiable";
             return false;
          }
@@ -2166,6 +2227,7 @@ a9_assign_constrained_sources(struct a9_ra_ctx *rctx,
                                   &moves);
       }
       if (r_dst == UINT_MAX) {
+         rctx->needs_spill_headroom = true;
          rctx->error = "multi-word source tuple constraints are unsatisfiable";
          return false;
       }
@@ -2353,6 +2415,7 @@ a9_assign_dest(struct a9_ra_ctx *rctx, struct agx_apple9_vir_instr *ins,
    rctx->pinned[1] = saved_pin[1];
 
    if (chosen == UINT_MAX) {
+      rctx->needs_spill_headroom = true;
       rctx->error = "could not find legal GPR window for instruction dest";
       return false;
    }
@@ -2719,6 +2782,7 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
       unsigned chosen = a9_choose_window(rctx, dv, 1, rctx->reserved,
                                          rctx->bound - 1u, 1, UINT_MAX, &moves);
       if (chosen == UINT_MAX || moves > 0) {
+         rctx->needs_spill_headroom = true;
          rctx->error = "no free GPR available for VIR_PHI destination";
          return false;
       }
@@ -2741,6 +2805,7 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
    }
 
    /* Step 2: Walk all non-PHI instructions in program order. */
+   bool vacated_reserved = (bi != 0 || rctx->reserved == 0);
    for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(block);
         ins; ins = agx_apple9_instr_next(ins)) {
       if (ins->op == AGX_APPLE9_VIR_PHI)
@@ -2748,6 +2813,39 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
 
       rctx->cur_instr = ins;
       rctx->pinned[0] = rctx->pinned[1] = 0;
+
+      /* Handle VIR_ENTRY_REG directly (preloaded physical GPR). */
+      if (ins->op == AGX_APPLE9_VIR_ENTRY_REG) {
+         unsigned r = ins->immediate;
+         if (r >= AGX_APPLE9_GPR_COUNT) {
+            rctx->error = "ENTRY_REG physical GPR out of range";
+            return false;
+         }
+         a9_assign_gpr_val(rctx, ins->dest, r);
+         if (!(ins->dead_dest_mask & 1u)) {
+            gpr_set(rctx->used_gprs, r);
+            rctx->reg_to_ssa[r] = ins->dest;
+         }
+         continue;
+      }
+
+      /* Once all ENTRY_REG preloads in the entry block are registered, vacate
+       * any live ABI/fixed inputs occupying the reserved scratch prefix
+       * [0 .. reserved - 1] so later spill/fill/high-imm/pcopy lowering can
+       * never clobber a live input. */
+      if (!vacated_reserved) {
+         vacated_reserved = true;
+         uint64_t empty_forbid[2] = {0, 0};
+         for (unsigned r = 0; r < rctx->reserved && r < AGX_APPLE9_GPR_COUNT;
+              ++r) {
+            if (gpr_test(rctx->used_gprs, r) &&
+                rctx->reg_to_ssa[r] != AGX_APPLE9_VREG_INVALID) {
+               if (!a9_evict_register(rctx, r, empty_forbid, ins))
+                  return false;
+               gpr_set(rctx->used_gprs, r);
+            }
+         }
+      }
 
       /* Rewrite source references through active split mapping. */
       if (util_dynarray_num_elements(&rctx->active_splits, uint32_t) > 0) {
@@ -2763,21 +2861,6 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                rctx->program->live_out[k] =
                   a9_resolve_cur(rctx, rctx->program->live_out[k]);
          }
-      }
-
-      /* Handle VIR_ENTRY_REG directly (preloaded physical GPR). */
-      if (ins->op == AGX_APPLE9_VIR_ENTRY_REG) {
-         unsigned r = ins->immediate;
-         if (r >= AGX_APPLE9_GPR_COUNT) {
-            rctx->error = "ENTRY_REG physical GPR out of range";
-            return false;
-         }
-         a9_assign_gpr_val(rctx, ins->dest, r);
-         if (!(ins->dead_dest_mask & 1u)) {
-            gpr_set(rctx->used_gprs, r);
-            rctx->reg_to_ssa[r] = ins->dest;
-         }
-         continue;
       }
 
       /* Handle VIR_SPLIT (zero-copy coalescing when source tuple dies). */
@@ -2903,6 +2986,22 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
             rctx->async_pending[slot].dead[1] = dead_mask[1];
             rctx->async_pending[slot].active = true;
             a9_recompute_async_dead(rctx);
+         }
+      }
+   }
+
+   /* If block 0 had only ENTRY_REGs (or pre-defined fixed inputs), still vacate
+    * any live values occupying [0 .. reserved - 1] before leaving block 0. */
+   if (!vacated_reserved) {
+      vacated_reserved = true;
+      uint64_t empty_forbid[2] = {0, 0};
+      for (unsigned r = 0; r < rctx->reserved && r < AGX_APPLE9_GPR_COUNT;
+           ++r) {
+         if (gpr_test(rctx->used_gprs, r) &&
+             rctx->reg_to_ssa[r] != AGX_APPLE9_VREG_INVALID) {
+            if (!a9_evict_register(rctx, r, empty_forbid, NULL))
+               return false;
+            gpr_set(rctx->used_gprs, r);
          }
       }
    }
@@ -3113,6 +3212,7 @@ a9_emit_phys_spill_load(struct agx_apple9_vir_program *out, unsigned dst,
       load.nr_srcs = 1;
       load.immediate = word;
       load.producer_scoreboard_slot = A9_SPILL_TAG;
+      load.spill_access = true;
       return a9_emit_phys_imm(out, A9_COPY_REG, 0, copy_counter, NULL) &&
              a9_emit_phys(out, &load) &&
              a9_emit_phys_copy(out, dst, A9_COPY_REG, copy_counter);
@@ -3121,6 +3221,7 @@ a9_emit_phys_spill_load(struct agx_apple9_vir_program *out, unsigned dst,
       AGX_APPLE9_VIR_SPILL_LOAD, AGX_APPLE9_ENC_SPILL_LOAD, dst);
    load.immediate = word;
    load.producer_scoreboard_slot = A9_SPILL_TAG;
+   load.spill_access = true;
    return a9_emit_phys(out, &load);
 }
 
@@ -3142,6 +3243,7 @@ a9_emit_phys_spill_store(struct agx_apple9_vir_program *out, unsigned src,
       store.nr_srcs = 2;
       store.live_after_mask = 2;
       store.immediate = word;
+      store.spill_access = true;
       return a9_emit_phys_copy(out, A9_COPY_REG, src, copy_counter) &&
              a9_emit_phys_imm(out, A9_SPILL_INDEX_REG, 0, copy_counter, NULL) &&
              a9_emit_phys(out, &store);
@@ -3154,6 +3256,7 @@ a9_emit_phys_spill_store(struct agx_apple9_vir_program *out, unsigned src,
    save.nr_srcs = 1;
    save.immediate = word;
    save.producer_scoreboard_slot = A9_SPILL_TAG;
+   save.spill_access = true;
    return (killed || a9_emit_phys_copy(out, A9_COPY_REG, src, copy_counter)) &&
           a9_emit_phys(out, &save);
 }
@@ -3347,14 +3450,23 @@ a9_sb_needs_wait(const struct agx_apple9_vir_instr *ins,
       }
    }
 
-   /* Scratch slot hazard. */
-   bool is_scratch = (ins->op == AGX_APPLE9_VIR_SPILL_LOAD ||
-                      ins->op == AGX_APPLE9_VIR_SPILL_STORE);
-   bool prev_scratch = (prod->op == AGX_APPLE9_VIR_SPILL_LOAD ||
-                        prod->op == AGX_APPLE9_VIR_SPILL_STORE);
-   if (is_scratch && prev_scratch && ins->immediate == prod->immediate &&
-       (ins->op == AGX_APPLE9_VIR_SPILL_STORE ||
-        prod->op == AGX_APPLE9_VIR_SPILL_STORE))
+   /* Scratch slot hazard (covers both compact SPILL_* and indexed PRIVATE_*). */
+   bool is_spill_load =
+      (ins->op == AGX_APPLE9_VIR_SPILL_LOAD ||
+       (ins->spill_access && ins->op == AGX_APPLE9_VIR_PRIVATE_LOAD));
+   bool is_spill_store =
+      (ins->op == AGX_APPLE9_VIR_SPILL_STORE ||
+       (ins->spill_access && ins->op == AGX_APPLE9_VIR_PRIVATE_STORE));
+   bool prev_spill_load =
+      (prod->op == AGX_APPLE9_VIR_SPILL_LOAD ||
+       (prod->spill_access && prod->op == AGX_APPLE9_VIR_PRIVATE_LOAD));
+   bool prev_spill_store =
+      (prod->op == AGX_APPLE9_VIR_SPILL_STORE ||
+       (prod->spill_access && prod->op == AGX_APPLE9_VIR_PRIVATE_STORE));
+   if ((is_spill_load || is_spill_store) &&
+       (prev_spill_load || prev_spill_store) &&
+       ins->immediate == prod->immediate &&
+       (is_spill_store || prev_spill_store))
       return true;
 
    /* Memory hazards. */
@@ -4126,8 +4238,9 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
       unsigned spill_res = MAX2(reserved, APPLE9_RA_SPILL_RESERVED_GPRS);
       unsigned floor_gprs = MAX2(min_single + spill_res, 12u);
       floor_gprs = ALIGN_POT(floor_gprs, 4u);
-      if (floor_gprs < spill_target)
-         spill_target = floor_gprs;
+      unsigned forced_target = MIN2(floor_gprs + opts.spill_headroom, max_gprs);
+      if (forced_target < spill_target)
+         spill_target = forced_target;
       if (floor_gprs + opts.spill_headroom < max_gprs)
          max_gprs = floor_gprs + opts.spill_headroom;
    } else if (opts.spill_headroom > 0) {
@@ -4156,6 +4269,8 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
       sopts.track_spill_homes = true;
 
       if (!apple9_ra_spill(program, &spill_state, &sopts)) {
+         if (spill_target < max_gprs)
+            res->needs_spill_headroom = true;
          res->error = "Braun-Hack spiller failed";
          goto cleanup;
       }
@@ -4213,34 +4328,17 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
    const unsigned valloc = MAX2(orig_vcount, 1u);
 
    /* Round up effective demand to the Apple9 occupancy tier ceiling when using
-    * the default full register file (matches agx_register_allocate.c) so
-    * coalescing and async-WAW avoidance never cross an occupancy cliff (e.g.,
-    * <= 52 GPRs stays strictly in the 1024-thread tier). */
+    * the default full register file so coalescing and async-WAW avoidance
+    * never cross an occupancy cliff (e.g. <= 52 GPRs stays strictly in the
+    * 1024-thread tier) and never over-round 5-word sparse results past a tier. */
    unsigned assign_bound = max_gprs;
    if (opts.max_gprs == 0 && !opts.force_spill && opts.spill_headroom == 0 &&
        effective_demand <= max_gprs) {
-      unsigned max_tuple_w = 4u;
-      for (unsigned i = 0; i < program->instruction_count; ++i) {
-         const struct agx_apple9_vir_instr *I = program->instructions[i];
-         if (I->dest_components > 1 && !a9_is_pub_val(program, I->dest))
-            max_tuple_w = MAX2(max_tuple_w,
-                               util_next_power_of_two(I->dest_components));
-         if (I->encoding != AGX_APPLE9_ENC_PSEUDO) {
-            for (unsigned s = 0; s < I->nr_srcs; ) {
-               unsigned sw = a9_source_width(I, s);
-               if (sw > 1)
-                  max_tuple_w = MAX2(max_tuple_w, util_next_power_of_two(sw));
-               s += sw;
-            }
-         }
-      }
-      unsigned aligned_demand =
-         MIN2(ALIGN_POT(MAX2(effective_demand, 6u), max_tuple_w), max_gprs);
       unsigned tier_gprs =
-         agx_occupancy_for_register_count(2u * aligned_demand).max_registers / 2u;
+         agx_occupancy_for_register_count(2u * MAX2(effective_demand, 6u))
+            .max_registers / 2u;
       tier_gprs = MIN2(tier_gprs, max_gprs);
-      tier_gprs = ROUND_DOWN_TO(tier_gprs, max_tuple_w);
-      assign_bound = MAX2(aligned_demand, tier_gprs);
+      assign_bound = MIN2(MAX2(effective_demand, tier_gprs), max_gprs);
    }
 
    rctx.memctx = memctx;
@@ -4731,26 +4829,33 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
     * temporarily so post-RA validation can verify every lowered edge). */
    for (unsigned bi = 0; bi < num_blocks; ++bi) {
       struct agx_apple9_block *pred = rctx.cfg_blocks[bi];
+      uint64_t actual_live[2] = {0, 0};
+      U_SPARSE_BITSET_FOREACH_SET(&liveness.live_out[bi], v) {
+         if (v < program->value_count && !a9_is_pub_val(program, v) &&
+             !apple9_ra_value_is_mem(&spill_state, v) &&
+             program->phys[v] < AGX_APPLE9_GPR_COUNT)
+            gpr_set(actual_live, program->phys[v]);
+      }
+      uint8_t s0 = reserved >= 5
+                      ? APPLE9_RA_DEFAULT_SWAP_REG0
+                      : (reserved >= 2 ? A9_COPY_REG
+                                       : AGX_APPLE9_PHYS_INVALID);
+      uint8_t s1 = reserved >= 5 ? APPLE9_RA_DEFAULT_SWAP_REG1
+                                 : AGX_APPLE9_PHYS_INVALID;
+      if (s0 != AGX_APPLE9_PHYS_INVALID && gpr_test(actual_live, s0))
+         s0 = AGX_APPLE9_PHYS_INVALID;
+      if (s1 != AGX_APPLE9_PHYS_INVALID && gpr_test(actual_live, s1))
+         s1 = AGX_APPLE9_PHYS_INVALID;
       struct apple9_ra_pcopy_opts edge_opts = {
-         .live_gprs = {0, 0},
-         .scratch_gpr = reserved >= 5
-                           ? APPLE9_RA_DEFAULT_SWAP_REG0
-                           : (reserved >= 2 ? A9_COPY_REG
-                                            : AGX_APPLE9_PHYS_INVALID),
-         .scratch_gpr2 = reserved >= 5 ? APPLE9_RA_DEFAULT_SWAP_REG1
-                                       : AGX_APPLE9_PHYS_INVALID,
+         .live_gprs = {actual_live[0], actual_live[1]},
+         .scratch_gpr = s0,
+         .scratch_gpr2 = s1,
          .max_temp_gpr = (uint8_t)rctx.bound,
          .mov_imm_max_gpr = 64u,
          .prefer_swap_2cycle = false,
       };
       for (unsigned r = 0; r < reserved && r < AGX_APPLE9_GPR_COUNT; ++r)
          gpr_set(edge_opts.live_gprs, r);
-      U_SPARSE_BITSET_FOREACH_SET(&liveness.live_out[bi], v) {
-         if (v < program->value_count && !a9_is_pub_val(program, v) &&
-             !apple9_ra_value_is_mem(&spill_state, v) &&
-             program->phys[v] < AGX_APPLE9_GPR_COUNT)
-            gpr_set(edge_opts.live_gprs, program->phys[v]);
-      }
       if (!apple9_ra_lower_phi_edge(program, pred, NULL, &assign, &edge_opts)) {
          res->error = "parallel-copy phi-edge lowering failed";
          goto cleanup;

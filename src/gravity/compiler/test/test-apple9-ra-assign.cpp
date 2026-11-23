@@ -1439,3 +1439,167 @@ TEST_F(Apple9RaAssignTest, MmaForcedSpillAndPacking)
    EXPECT_GT(p.scratch_size, 0u);
    EXPECT_GT(verify_binary_emission(&p), 0u);
 }
+
+/* =========================================================================
+ * 17. Live ABI Inputs in Reserved Scratch Prefix (r1/r3) Across Phi Cycles
+ * ========================================================================= */
+
+TEST_F(Apple9RaAssignTest, ReservedScratchPrefixVacatesLiveEntryRegsAcrossPhiCycleAndSpill)
+{
+   auto *b_entry = agx_apple9_block_create(&p);
+   auto *b_hdr = agx_apple9_block_create(&p);
+   auto *b_body = agx_apple9_block_create(&p);
+   auto *b_exit = agx_apple9_block_create(&p);
+
+   /* Live incoming ABI inputs in r1 (COPY_REG) and r3 (SWAP_REG0). */
+   agx_apple9_block_begin(&p, b_entry);
+   uint32_t in_r1 = agx_apple9_vir_emit_entry_reg(&p, 1);
+   uint32_t in_r3 = agx_apple9_vir_emit_entry_reg(&p, 3);
+   constexpr unsigned kCount = 20;
+   uint32_t init[kCount];
+   for (unsigned i = 0; i < kCount; ++i)
+      init[i] = emit_imm(100u + i);
+
+   agx_apple9_block_begin(&p, b_hdr);
+   b_hdr->loop_header = true;
+   uint32_t phi[kCount];
+   agx_apple9_vir_instr *phi_ins[kCount];
+   for (unsigned i = 0; i < kCount; ++i) {
+      phi[i] = agx_apple9_vir_emit_phi_canonical(&p, b_hdr, 2);
+      phi_ins[i] = p.instructions[p.instruction_count - 1];
+   }
+
+   /* Rotating phi cycle (phi[i] <- phi[(i+1) % kCount] + 1) under tight budget
+    * forces both GPR and MEM-to-MEM cycles while in_r1 and in_r3 stay live! */
+   agx_apple9_block_begin(&p, b_body);
+   uint32_t one = emit_imm(1);
+   uint32_t next_v[kCount];
+   for (unsigned i = 0; i < kCount; ++i)
+      next_v[i] = emit_iadd(phi[(i + 1) % kCount], one);
+
+   agx_apple9_block_begin(&p, b_exit);
+   uint32_t acc = emit_iadd(in_r1, in_r3);
+   for (unsigned i = 0; i < kCount; ++i)
+      acc = emit_iadd(acc, phi[i]);
+   ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, acc, 8));
+   ASSERT_TRUE(agx_apple9_vir_emit_abi_return(&p));
+
+   cfg_init(&p, {b_entry, b_hdr, b_body, b_exit});
+   cfg_edge(b_entry, b_hdr);
+   cfg_edge(b_hdr, b_body);
+   cfg_edge(b_hdr, b_exit);
+   cfg_edge(b_body, b_hdr);
+
+   for (unsigned i = 0; i < kCount; ++i) {
+      *agx_apple9_vir_src_ptr(phi_ins[i], 0) = init[i];
+      *agx_apple9_vir_src_ptr(phi_ins[i], 1) = next_v[i];
+   }
+   agx_apple9_vir_reindex(&p);
+
+   auto opts = validated_opts();
+   opts.max_gprs = 16;
+   opts.reserved_gprs = 5;
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+   EXPECT_TRUE(res.has_spills);
+
+   auto *pb_entry = p.blocks;
+   auto *pb_hdr = pb_entry->next;
+   auto *pb_body = pb_hdr->next;
+   auto *pb_exit = pb_body->next;
+
+   PhysVirSim sim;
+   sim.gpr[1] = 0x11110001u;
+   sim.gpr[3] = 0x22220003u;
+   sim.exec_block(pb_entry);
+   for (unsigned it = 0; it < 3; ++it) {
+      sim.exec_block(pb_hdr);
+      sim.exec_block(pb_body);
+   }
+   sim.exec_block(pb_hdr);
+   sim.exec_block(pb_exit);
+
+   uint32_t expected = 0x11110001u + 0x22220003u;
+   for (unsigned i = 0; i < kCount; ++i)
+      expected += (100u + i) + 3u;
+   EXPECT_EQ(sim.gpr[8], expected);
+   EXPECT_GT(verify_binary_emission(&p), 0u);
+}
+
+/* =========================================================================
+ * 18. Multi-Word Spilled Tuple Across Diamond CFG Validates Every Lane
+ * ========================================================================= */
+
+TEST_F(Apple9RaAssignTest, MultiwordSpilledTupleAcrossDiamondValidatesAllLanes)
+{
+   auto *b0 = agx_apple9_block_create(&p);
+   auto *b1 = agx_apple9_block_create(&p);
+   auto *b2 = agx_apple9_block_create(&p);
+   auto *b3 = agx_apple9_block_create(&p);
+
+   agx_apple9_device_load_contract contract = {
+      .index_kind = AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR,
+      .flags = 0,
+      .raw_token = AGX_APPLE9_DEVICE_LOAD_TOKEN_1100,
+   };
+
+   agx_apple9_block_begin(&p, b0);
+   uint32_t idx = emit_imm(0);
+   uint32_t v0 = agx_apple9_vir_emit_device_load_vector(&p, 0, idx, 4, &contract);
+   uint32_t v1 = agx_apple9_vir_emit_device_load_vector(&p, 1, idx, 4, &contract);
+   uint32_t v2 = agx_apple9_vir_emit_device_load_vector(&p, 2, idx, 4, &contract);
+   ASSERT_NE(v0, AGX_APPLE9_VREG_INVALID);
+   ASSERT_NE(v1, AGX_APPLE9_VREG_INVALID);
+   ASSERT_NE(v2, AGX_APPLE9_VREG_INVALID);
+
+   agx_apple9_block_begin(&p, b1);
+   uint32_t t0 = emit_iadd(v0 + 0, v1 + 0);
+   uint32_t t1 = emit_iadd(v0 + 1, v1 + 1);
+   uint32_t t2 = emit_iadd(v0 + 2, v1 + 2);
+   uint32_t t3 = emit_iadd(v0 + 3, v1 + 3);
+
+   agx_apple9_block_begin(&p, b2);
+   uint32_t e0 = emit_iadd(v1 + 0, v2 + 0);
+   uint32_t e1 = emit_iadd(v1 + 1, v2 + 1);
+   uint32_t e2 = emit_iadd(v1 + 2, v2 + 2);
+   uint32_t e3 = emit_iadd(v1 + 3, v2 + 3);
+
+   agx_apple9_block_begin(&p, b3);
+   uint32_t p0 = agx_apple9_vir_emit_phi_canonical(&p, b3, 2);
+   auto *p0_ins = p.instructions[p.instruction_count - 1];
+   uint32_t p1 = agx_apple9_vir_emit_phi_canonical(&p, b3, 2);
+   auto *p1_ins = p.instructions[p.instruction_count - 1];
+   uint32_t p2 = agx_apple9_vir_emit_phi_canonical(&p, b3, 2);
+   auto *p2_ins = p.instructions[p.instruction_count - 1];
+   uint32_t p3 = agx_apple9_vir_emit_phi_canonical(&p, b3, 2);
+   auto *p3_ins = p.instructions[p.instruction_count - 1];
+
+   uint32_t s0 = emit_iadd(p0, v0 + 0);
+   uint32_t s1 = emit_iadd(p1, v0 + 1);
+   uint32_t s2 = emit_iadd(p2, v2 + 2);
+   uint32_t s3 = emit_iadd(p3, v2 + 3);
+   uint32_t sum = emit_iadd(emit_iadd(s0, s1), emit_iadd(s2, s3));
+   ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, sum, 8));
+   ASSERT_TRUE(agx_apple9_vir_emit_abi_return(&p));
+
+   cfg_init(&p, {b0, b1, b2, b3});
+   cfg_edge(b0, b1);
+   cfg_edge(b0, b2);
+   cfg_edge(b1, b3);
+   cfg_edge(b2, b3);
+
+   *agx_apple9_vir_src_ptr(p0_ins, 0) = t0; *agx_apple9_vir_src_ptr(p0_ins, 1) = e0;
+   *agx_apple9_vir_src_ptr(p1_ins, 0) = t1; *agx_apple9_vir_src_ptr(p1_ins, 1) = e1;
+   *agx_apple9_vir_src_ptr(p2_ins, 0) = t2; *agx_apple9_vir_src_ptr(p2_ins, 1) = e2;
+   *agx_apple9_vir_src_ptr(p3_ins, 0) = t3; *agx_apple9_vir_src_ptr(p3_ins, 1) = e3;
+   agx_apple9_vir_reindex(&p);
+
+   auto opts = validated_opts();
+   opts.force_spill = true;
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+   EXPECT_TRUE(res.has_spills);
+   EXPECT_GT(verify_binary_emission(&p), 0u);
+}

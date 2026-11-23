@@ -1039,6 +1039,19 @@ remat_to_at(struct spill_ctx *ctx, struct agx_apple9_block *block,
    return copy;
 }
 
+static inline void
+mark_mem_tuple(struct apple9_ra_spill_state *state, uint32_t base,
+               unsigned width)
+{
+   unsigned w = MAX2(width, 1u);
+   for (unsigned c = 0; c < w; ++c) {
+      if (base + c < state->is_mem_capacity) {
+         BITSET_SET(state->is_mem, base + c);
+         state->value_width[base + c] = (c == 0) ? (uint8_t)w : 1u;
+      }
+   }
+}
+
 static void
 insert_spill_at(struct spill_ctx *ctx, struct agx_apple9_block *block,
                 struct agx_apple9_vir_instr *before, unsigned node)
@@ -1053,8 +1066,7 @@ insert_spill_at(struct spill_ctx *ctx, struct agx_apple9_block *block,
 
    uint32_t mem_v = ctx->spill_base + node;
    unsigned width = ctx->widths[node];
-   BITSET_SET(ctx->state->is_mem, mem_v);
-   ctx->state->value_width[mem_v] = width;
+   mark_mem_tuple(ctx->state, mem_v, width);
    ctx->state->has_spills = true;
 
    if (!vir_emit_mov_at(ctx->program, block, before, mem_v, node, width))
@@ -1070,8 +1082,7 @@ insert_reload_at(struct spill_ctx *ctx, struct agx_apple9_block *block,
    } else {
       uint32_t mem_v = ctx->spill_base + node;
       unsigned width = ctx->widths[node];
-      BITSET_SET(ctx->state->is_mem, mem_v);
-      ctx->state->value_width[mem_v] = width;
+      mark_mem_tuple(ctx->state, mem_v, width);
       if (!vir_emit_mov_at(ctx->program, block, before, node, mem_v, width))
          ctx->failed = true;
    }
@@ -1290,8 +1301,7 @@ min_algorithm(struct spill_ctx *ctx)
             unsigned width = ctx->widths[I->dest];
             I->dest = mem_v;
             I->dest_components = width;
-            BITSET_SET(ctx->state->is_mem, mem_v);
-            ctx->state->value_width[mem_v] = width;
+            mark_mem_tuple(ctx->state, mem_v, width);
             ctx->state->has_spills = true;
          }
          ctx->ip += 1u;
@@ -1791,8 +1801,7 @@ insert_coupling_code(struct spill_ctx *ctx, struct agx_apple9_block *pred,
             remat_to_at(ctx, entry, anchor, tmp, sv);
 
             uint32_t mem_v = ctx->spill_base + sv;
-            BITSET_SET(ctx->state->is_mem, mem_v);
-            ctx->state->value_width[mem_v] = ctx->widths[sv];
+            mark_mem_tuple(ctx->state, mem_v, ctx->widths[sv]);
             ctx->state->has_spills = true;
             vir_emit_mov_at(ctx->program, entry, anchor, mem_v, tmp,
                             ctx->widths[sv]);
@@ -1805,8 +1814,7 @@ insert_coupling_code(struct spill_ctx *ctx, struct agx_apple9_block *pred,
       }
 
       uint32_t mem_sv = ctx->spill_base + sv;
-      BITSET_SET(ctx->state->is_mem, mem_sv);
-      ctx->state->value_width[mem_sv] = ctx->widths[sv];
+      mark_mem_tuple(ctx->state, mem_sv, ctx->widths[sv]);
       *agx_apple9_vir_src_ptr(phi, pred_idx) = mem_sv;
    }
 

@@ -1409,15 +1409,19 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
       if (ins->op == AGX_APPLE9_VIR_PHI) {
          if (ins->dest != AGX_APPLE9_VREG_INVALID &&
              !is_publication_val(program, ins->dest)) {
-            struct apple9_ra_loc dloc;
-            if (!get_val_loc(program, assign, mem_slots, ins->dest, &dloc)) {
-               if (check_errors)
-                  set_err(err, b->index, pos,
-                          "VIR_PHI dest v%u has invalid assignment", ins->dest);
-               free(live_after_table);
-               return false;
+            unsigned comps = MAX2((unsigned)ins->dest_components, 1u);
+            for (unsigned c = 0; c < comps; ++c) {
+               uint32_t dv = ins->dest + c;
+               struct apple9_ra_loc dloc;
+               if (!get_val_loc(program, assign, mem_slots, dv, &dloc)) {
+                  if (check_errors)
+                     set_err(err, b->index, pos,
+                             "VIR_PHI dest v%u has invalid assignment", dv);
+                  free(live_after_table);
+                  return false;
+               }
+               *file_slot(cur, dloc) = slot_ssa(dv);
             }
-            *file_slot(cur, dloc) = slot_ssa(ins->dest);
          }
          continue;
       }
@@ -1486,6 +1490,34 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
                if (actual.state != SLOT_SSA || actual.value != sv) {
                   set_err(err, b->index, pos,
                           "clobbered value: VIR_SPLIT src v%u expected in %c%u, found %s (v%u)",
+                          sv, sloc.kind == APPLE9_RA_LOC_MEM ? 'm' : 'r',
+                          sloc.value,
+                          actual.state == SLOT_SSA     ? "other SSA"
+                          : actual.state == SLOT_CONST ? "const"
+                                                       : "undef",
+                          actual.value);
+                  free(live_after_table);
+                  return false;
+               }
+            }
+         } else if (ins->op == AGX_APPLE9_VIR_MOV && ins->dest_components > 1 &&
+                    ins->nr_srcs == 1) {
+            uint32_t s0 = ins->src[0];
+            for (unsigned c = 0; c < ins->dest_components; ++c) {
+               uint32_t sv = s0 + c;
+               if (is_publication_val(program, sv))
+                  continue;
+               struct apple9_ra_loc sloc;
+               if (!get_val_loc(program, assign, mem_slots, sv, &sloc)) {
+                  set_err(err, b->index, pos,
+                          "VIR_MOV src v%u+%u has invalid assignment", s0, c);
+                  free(live_after_table);
+                  return false;
+               }
+               struct reg_slot actual = *file_slot(cur, sloc);
+               if (actual.state != SLOT_SSA || actual.value != sv) {
+                  set_err(err, b->index, pos,
+                          "clobbered value: VIR_MOV src v%u expected in %c%u, found %s (v%u)",
                           sv, sloc.kind == APPLE9_RA_LOC_MEM ? 'm' : 'r',
                           sloc.value,
                           actual.state == SLOT_SSA     ? "other SSA"
@@ -1894,27 +1926,31 @@ apple9_ra_validate_post_ra(const struct agx_apple9_vir_program *program,
             if (sv == AGX_APPLE9_VREG_INVALID || is_publication_val(program, sv))
                continue;
 
-            struct apple9_ra_loc check_loc;
-            uint32_t loc_owner = phis_lowered ? phi->dest : sv;
-            if (!get_val_loc(program, assign, mem_slots, loc_owner,
-                             &check_loc)) {
-               set_err(err, b->index, UINT_MAX,
-                       "PHI edge block %u -> block %u value v%u has invalid assignment",
-                       b->index, succ->index, loc_owner);
-               goto fail;
-            }
-            struct reg_slot actual = *file_slot(cur, check_loc);
-            if (actual.state != SLOT_SSA || actual.value != sv) {
-               set_err(err, b->index, UINT_MAX,
-                       "clobbered PHI edge value on block %u -> block %u: expected v%u in %c%u, found %s (v%u)",
-                       b->index, succ->index, sv,
-                       check_loc.kind == APPLE9_RA_LOC_MEM ? 'm' : 'r',
-                       check_loc.value,
-                       actual.state == SLOT_SSA     ? "other SSA"
-                       : actual.state == SLOT_CONST ? "const"
-                                                    : "undef",
-                       actual.value);
-               goto fail;
+            unsigned comps = MAX2((unsigned)phi->dest_components, 1u);
+            for (unsigned c = 0; c < comps; ++c) {
+               struct apple9_ra_loc check_loc;
+               uint32_t loc_owner = (phis_lowered ? phi->dest : sv) + c;
+               uint32_t expect_val = sv + c;
+               if (!get_val_loc(program, assign, mem_slots, loc_owner,
+                                &check_loc)) {
+                  set_err(err, b->index, UINT_MAX,
+                          "PHI edge block %u -> block %u value v%u has invalid assignment",
+                          b->index, succ->index, loc_owner);
+                  goto fail;
+               }
+               struct reg_slot actual = *file_slot(cur, check_loc);
+               if (actual.state != SLOT_SSA || actual.value != expect_val) {
+                  set_err(err, b->index, UINT_MAX,
+                          "clobbered PHI edge value on block %u -> block %u: expected v%u in %c%u, found %s (v%u)",
+                          b->index, succ->index, expect_val,
+                          check_loc.kind == APPLE9_RA_LOC_MEM ? 'm' : 'r',
+                          check_loc.value,
+                          actual.state == SLOT_SSA     ? "other SSA"
+                          : actual.state == SLOT_CONST ? "const"
+                                                       : "undef",
+                          actual.value);
+                  goto fail;
+               }
             }
          }
       }

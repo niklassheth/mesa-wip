@@ -502,6 +502,10 @@ struct agx_apple9_vir_instr {
    /* A mask transition within a straight-line leaf region, rather than a
     * NIR CFG edge. It remains an ordered effect inside the allocation block. */
    bool local_control;
+   /* Physical spill/fill traffic lowered from RA_MEM (covers both compact
+    * SPILL_LOAD/SPILL_STORE and indexed PRIVATE_LOAD/PRIVATE_STORE >= 1024/2048
+    * words, where `immediate` is the exact scratch word). */
+   bool spill_access;
    /* Phi declaration and incoming edge uses remain SSA until packing. */
    struct agx_apple9_block *phi_block;
    struct agx_apple9_vir_instr *phi_edge;
