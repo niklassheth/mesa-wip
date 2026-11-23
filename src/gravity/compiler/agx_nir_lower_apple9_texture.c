@@ -595,6 +595,9 @@ agx_apple9_texture_native_offset(const nir_tex_instr *tex, uint16_t *bits)
    /* The shape of an encodable offset. Whether the sample's final form has
     * a measured offset variant is decided by the backend, which lowers the
     * offset otherwise (AGX_APPLE9_TEXTURE_OFFSET_FALLBACK). */
+   bool has_min_lod =
+      nir_tex_instr_src_index(tex, nir_tex_src_min_lod) >= 0 ||
+      nir_tex_instr_src_index(tex, nir_tex_src_backend2) >= 0;
    if (offset < 0 || !nir_src_is_const(tex->src[offset].src) ||
        tex->op == nir_texop_txf ||
        (tex->backend_flags & AGX_APPLE9_TEXTURE_OFFSET_FALLBACK) ||
@@ -603,8 +606,12 @@ agx_apple9_texture_native_offset(const nir_tex_instr *tex, uint16_t *bits)
         tex->op != nir_texop_tg4) ||
        (tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
         tex->sampler_dim != GLSL_SAMPLER_DIM_3D) ||
-       /* The minimum-LOD forms are native only without an offset. */
-       nir_tex_instr_src_index(tex, nir_tex_src_min_lod) >= 0)
+       /* Minimum-LOD + offset is native for non-shadow 2D tex/txb/txd
+        * (0x02c1 / 0x0249) and 2D-array tex/txb (0x67db). */
+       (has_min_lod &&
+        (tex->is_shadow || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+         (tex->op != nir_texop_tex && tex->op != nir_texop_txb &&
+          (tex->op != nir_texop_txd || tex->is_array)))))
       return false;
    unsigned dims = tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 3 : 2;
    nir_src src = tex->src[offset].src;

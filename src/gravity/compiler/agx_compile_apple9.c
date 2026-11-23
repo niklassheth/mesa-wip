@@ -864,14 +864,34 @@ apple9_texture_supported(const nir_tex_instr *tex)
    int comparator = nir_tex_instr_src_index(tex, nir_tex_src_comparator);
    if (tex->is_shadow && (comparator < 0 || tex->src[comparator].src.ssa->bit_size != 32))
       return false;
-   /* A packed minimum LOD accompanies 2D and 2D array gradients and biased
-    * samples. */
+   /* A packed minimum LOD accompanies 2D/2D-array/3D gradients and native
+    * volume/cube/shadow/offset implicit and biased samples. */
    int min_lod = nir_tex_instr_src_index(tex, nir_tex_src_backend2);
-   if (min_lod >= 0 && ((!gradient && tex->op != nir_texop_txb) ||
-                        tex->is_shadow ||
-                        tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
-                        tex->src[min_lod].src.ssa->bit_size != 32))
-      return false;
+   if (min_lod >= 0) {
+      bool cube_as_array = !!(tex->backend_flags & AGX_APPLE9_TEXTURE_CUBE_AS_ARRAY);
+      bool ok = tex->src[min_lod].src.ssa->bit_size == 32;
+      if (gradient) {
+         ok &= !tex->is_shadow &&
+               (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
+                tex->sampler_dim == GLSL_SAMPLER_DIM_3D);
+      } else if (tex->op == nir_texop_txb) {
+         ok &= tex->is_shadow
+            ? (tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array)
+            : (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
+               tex->sampler_dim == GLSL_SAMPLER_DIM_3D ||
+               (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
+                (!tex->is_array || cube_as_array)));
+      } else if (tex->op == nir_texop_tex) {
+         ok &= tex->is_shadow
+            ? (tex->sampler_dim == GLSL_SAMPLER_DIM_2D)
+            : (tex->sampler_dim == GLSL_SAMPLER_DIM_3D ||
+               (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && !cube_as_array));
+      } else {
+         ok = false;
+      }
+      if (!ok)
+         return false;
+   }
    return coord >= 0 && tex->src[coord].src.ssa->bit_size == 32 &&
           (!explicit_lod || (lod >= 0 && tex->src[lod].src.ssa->bit_size == 32 &&
                       tex->src[lod].src.ssa->num_components == 1));
@@ -2200,6 +2220,33 @@ apple9_lower_input_vertex(struct apple9_dag_lower *lower, nir_scalar scalar)
    return base + nir_src_as_uint(intr->src[0]);
 }
 
+static unsigned
+apple9_shared_align(const nir_intrinsic_instr *intr, unsigned src_idx,
+                    unsigned offset_B)
+{
+   if (nir_src_is_const(intr->src[src_idx])) {
+      unsigned addr = nir_src_as_uint(intr->src[src_idx]) + offset_B;
+      return nir_combined_align(16, addr & 15u);
+   }
+   unsigned mul = nir_intrinsic_align_mul(intr);
+   unsigned off = (nir_intrinsic_align_offset(intr) + offset_B) & (mul - 1u);
+   return nir_combined_align(mul, off);
+}
+
+static uint32_t
+apple9_shared_index(struct apple9_dag_lower *lower, uint32_t base,
+                    unsigned offset_B, unsigned components)
+{
+   uint32_t address = base;
+   if (offset_B) {
+      uint32_t add[] = {address, apple9_dag_imm(lower, offset_B)};
+      address = apple9_dag_emit(lower, AGX_APPLE9_VIR_IADD,
+         AGX_APPLE9_ENC_INT_ADD_EXTENDED, add, 2, 0);
+   }
+   return apple9_dag_shift_imm(lower, nir_op_ushr, address,
+                               util_logbase2(4 * components));
+}
+
 static uint32_t
 apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
 {
@@ -2313,7 +2360,7 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
             tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 3 : 0;
          unsigned axes = dimension == 3 ? 3 : 2;
          int min_lod = nir_tex_instr_src_index(tex, nir_tex_src_backend2);
-         unsigned prefix = dimension == 3 ? 3 :
+         unsigned prefix = (dimension == 3 && min_lod < 0) ? 3 :
             dimension || tex->is_shadow || min_lod >= 0 ? 4 : 2;
          uint32_t sources[10] = {coords[0], coords[1]};
          if (dimension == 3)
@@ -2343,15 +2390,17 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
             dimension, tex->is_shadow, min_lod >= 0);
       } else if (tex->op == nir_texop_txl || tex->op == nir_texop_txb ||
                  tex->op == nir_texop_txf ||
+                 (tex->op == nir_texop_tex &&
+                  nir_tex_instr_src_index(tex, nir_tex_src_backend2) >= 0) ||
                  (tex->op == nir_texop_tg4 &&
                   (tex->coord_components >= 3 || tex->is_shadow))) {
          bool bias = tex->op == nir_texop_txb;
          int lod_source = nir_tex_instr_src_index(tex, nir_tex_src_backend1);
-         if (lod_source < 0 && tex->op != nir_texop_tg4) {
+         if (lod_source < 0 && tex->op != nir_texop_tg4 && tex->op != nir_texop_tex) {
             lower->reason = "Apple9 texture LOD was not packed before selection";
             return AGX_APPLE9_VREG_INVALID;
          }
-         /* Gather reads the base level; its LOD word carries only the layer. */
+         /* Gather reads the base level; implicit min_lod carries no bias. */
          uint32_t packed_lod = lod_source < 0 ? apple9_dag_zero(lower) :
             apple9_lower_dag_scalar(
                lower, nir_get_scalar(tex->src[lod_source].src.ssa, 0));
@@ -2360,37 +2409,63 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
          uint32_t min_word = min_lod < 0 ? AGX_APPLE9_VREG_INVALID :
             apple9_lower_dag_scalar(lower,
                nir_get_scalar(tex->src[min_lod].src.ssa, 0));
-         if (tex->coord_components >= 3 || tex->is_shadow) {
+         unsigned sampler =
+            util_bitcount(lower->sampler_mask & BITFIELD_MASK(tex->sampler_index));
+         unsigned dimension =
+            (tex->backend_flags & AGX_APPLE9_TEXTURE_CUBE_AS_ARRAY) ? 2 :
+            tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ? (tex->is_array ? 4 : 1) :
+            tex->is_array ? 2 :
+               tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 3 : 0;
+         if (min_lod >= 0) {
+            bool has_offset = nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0;
+            if (dimension == 2 && !tex->is_shadow) {
+               uint32_t fields[] = {packed_lod, layer_or_face};
+               packed_lod = apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR,
+                  AGX_APPLE9_ENC_LOGIC_EXTENDED, fields, 2, 0);
+               /* A biased 2D-array sample takes its minimum LOD (Q6 << 16) in
+                * word 2 and (bias << 16 | layer) in word 3; with offset it uses
+                * mode 0x67db, without offset mode 0x040c. */
+               coords[2] = min_word;
+               result = has_offset
+                  ? agx_apple9_vir_emit_texture_volume_min_lod(
+                       &lower->program, coords, packed_lod, texture, sampler,
+                       2, true, false)
+                  : agx_apple9_vir_emit_texture_volume(
+                       &lower->program, coords, packed_lod, texture, sampler,
+                       2, true, false);
+            } else if (dimension == 0 && !tex->is_shadow) {
+               uint32_t fields[] = {packed_lod, min_word};
+               uint32_t word3 = apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR,
+                  AGX_APPLE9_ENC_LOGIC_EXTENDED, fields, 2, 0);
+               uint32_t c3[3] = {coords[0], coords[1], apple9_dag_zero(lower)};
+               result = agx_apple9_vir_emit_texture_volume_min_lod(
+                  &lower->program, c3, word3, texture, sampler, 0, true, false);
+            } else {
+               uint32_t word3 = min_word;
+               if (dimension == 4 || (dimension == 2 && tex->is_shadow)) {
+                  uint32_t fields[] = {min_word, layer_or_face};
+                  word3 = apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR,
+                     AGX_APPLE9_ENC_LOGIC_EXTENDED, fields, 2, 0);
+               } else if (bias) {
+                  uint32_t fields[] = {packed_lod, min_word};
+                  word3 = apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR,
+                     AGX_APPLE9_ENC_LOGIC_EXTENDED, fields, 2, 0);
+               }
+               result = agx_apple9_vir_emit_texture_volume_min_lod(
+                  &lower->program, coords, word3, texture, sampler,
+                  dimension, bias, tex->is_shadow);
+            }
+         } else if (tex->coord_components >= 3 || tex->is_shadow) {
             if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE || tex->is_array) {
                uint32_t fields[] = {packed_lod, layer_or_face};
                packed_lod = apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR,
                   AGX_APPLE9_ENC_LOGIC_EXTENDED, fields, 2, 0);
             }
-            /* A biased array sample takes its minimum LOD (Q6 << 16) in the
-             * third parameter word, which otherwise repeats the layer. */
-            if (min_lod >= 0)
-               coords[2] = min_word;
             result = agx_apple9_vir_emit_texture_volume(&lower->program, coords,
-               packed_lod, texture,
-               util_bitcount(lower->sampler_mask & BITFIELD_MASK(tex->sampler_index)),
-               (tex->backend_flags & AGX_APPLE9_TEXTURE_CUBE_AS_ARRAY) ? 2 :
-               tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ? (tex->is_array ? 4 : 1) :
-               tex->is_array ? 2 :
-                  tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 3 : 0,
-               bias, tex->is_shadow);
-         } else if (min_lod >= 0) {
-            uint32_t fields[] = {packed_lod, min_word};
-            result = agx_apple9_vir_emit_texture_min_lod(
-               &lower->program, coords, apple9_dag_zero(lower),
-               apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR,
-                  AGX_APPLE9_ENC_LOGIC_EXTENDED, fields, 2, 0),
-               texture,
-               util_bitcount(lower->sampler_mask & BITFIELD_MASK(tex->sampler_index)));
+               packed_lod, texture, sampler, dimension, bias, tex->is_shadow);
          } else
             result = agx_apple9_vir_emit_texture_lod(
-            &lower->program, coords, packed_lod, texture,
-            util_bitcount(lower->sampler_mask & BITFIELD_MASK(tex->sampler_index)),
-            bias);
+               &lower->program, coords, packed_lod, texture, sampler, bias);
          if (fetch && result != AGX_APPLE9_VREG_INVALID)
             lower->program.instructions[lower->program.instruction_count - 1]->texture_fetch = true;
       } else {
@@ -2507,21 +2582,43 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
              (nir_intrinsic_align_offset(intr) & 3) ||
              lower->shared_root == UINT_MAX)
             return AGX_APPLE9_VREG_INVALID;
-         uint32_t address = apple9_lower_dag_scalar(lower,
+         uint32_t base = apple9_lower_dag_scalar(lower,
             nir_get_scalar(intr->src[0].ssa, 0));
-         unsigned offset = nir_intrinsic_base(intr) + 4 * scalar.comp;
-         if (offset) {
-            uint32_t add[] = {address, apple9_dag_imm(lower, offset)};
-            address = apple9_dag_emit(lower, AGX_APPLE9_VIR_IADD,
-               AGX_APPLE9_ENC_INT_ADD_EXTENDED, add, 2, 0);
+         if (base == AGX_APPLE9_VREG_INVALID)
+            return AGX_APPLE9_VREG_INVALID;
+         const bool is_volatile = !!(nir_intrinsic_access(intr) & ACCESS_VOLATILE);
+         const nir_component_mask_t read =
+            (is_volatile ? BITFIELD_MASK(scalar.def->num_components)
+                         : nir_def_components_read(scalar.def)) |
+            BITFIELD_BIT(scalar.comp);
+         for (unsigned c = 0; c < scalar.def->num_components;) {
+            if (!(read & BITFIELD_BIT(c))) {
+               ++c;
+               continue;
+            }
+            unsigned offset_B = nir_intrinsic_base(intr) + 4 * c;
+            unsigned align = apple9_shared_align(intr, 0, offset_B);
+            unsigned w = 1;
+            if (c + 4 <= scalar.def->num_components && align >= 16 &&
+                util_bitcount(read & (0xfu << c)) >= 3) {
+               w = 4;
+            } else if (c + 2 <= scalar.def->num_components && align >= 8 &&
+                       (read & (0x3u << c)) == (0x3u << c)) {
+               w = 2;
+            }
+            uint32_t idx = apple9_shared_index(lower, base, offset_B, w);
+            if (idx == AGX_APPLE9_VREG_INVALID)
+               return AGX_APPLE9_VREG_INVALID;
+            uint32_t loaded = agx_apple9_vir_emit_shared_load(
+               &lower->program, idx, lower->shared_root, w);
+            if (loaded == AGX_APPLE9_VREG_INVALID)
+               return AGX_APPLE9_VREG_INVALID;
+            for (unsigned k = 0; k < w; ++k)
+               lower->ssa_to_vreg[scalar.def->index * APPLE9_SSA_COMPONENTS + c + k] =
+                  loaded + k;
+            c += w;
          }
-         address = apple9_dag_shift_imm(lower, nir_op_ushr, address, 2);
-         value = apple9_dag_emit(lower, AGX_APPLE9_VIR_SHARED_LOAD,
-            AGX_APPLE9_ENC_SHARED_LOAD, &address, 1,
-            lower->shared_root);
-         if (value != AGX_APPLE9_VREG_INVALID)
-            lower->program.instructions[lower->program.instruction_count - 1]
-               ->producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_6;
+         value = lower->ssa_to_vreg[key];
       } else if (intr && intr->intrinsic == nir_intrinsic_reduce) {
          if (scalar.def->bit_size != 32 ||
              nir_intrinsic_reduction_op(intr) != nir_op_umax ||
@@ -4616,25 +4713,37 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
                return false;
             uint32_t base = apple9_lower_dag_scalar(lower,
                nir_get_scalar(intr->src[1].ssa, 0));
-            for (unsigned c = 0; c < intr->num_components; ++c) {
-               if (!(nir_intrinsic_write_mask(intr) & BITFIELD_BIT(c)))
+            if (base == AGX_APPLE9_VREG_INVALID)
+               return false;
+            const unsigned wmask = nir_intrinsic_write_mask(intr);
+            for (unsigned c = 0; c < intr->num_components;) {
+               if (!(wmask & BITFIELD_BIT(c))) {
+                  ++c;
                   continue;
-               uint32_t address = base;
-               unsigned offset = nir_intrinsic_base(intr) + 4 * c;
-               if (offset) {
-                  uint32_t add[] = {address, apple9_dag_imm(lower, offset)};
-                  address = apple9_dag_emit(lower, AGX_APPLE9_VIR_IADD,
-                     AGX_APPLE9_ENC_INT_ADD_EXTENDED, add, 2, 0);
                }
-               address = apple9_dag_shift_imm(lower, nir_op_ushr, address, 2);
-               uint32_t sources[] = {
-                  apple9_lower_dag_scalar(lower, nir_get_scalar(intr->src[0].ssa, c)),
-                  address,
-               };
-               if (!agx_apple9_vir_emit_side_effect(&lower->program,
-                      AGX_APPLE9_VIR_SHARED_STORE, AGX_APPLE9_ENC_SHARED_STORE,
-                      sources, 2, lower->shared_root))
+               unsigned offset_B = nir_intrinsic_base(intr) + 4 * c;
+               unsigned align = apple9_shared_align(intr, 1, offset_B);
+               unsigned w = 1;
+               if (c + 4 <= intr->num_components && align >= 16 &&
+                   (wmask & (0xfu << c)) == (0xfu << c)) {
+                  w = 4;
+               } else if (c + 2 <= intr->num_components && align >= 8 &&
+                          (wmask & (0x3u << c)) == (0x3u << c)) {
+                  w = 2;
+               }
+               uint32_t data[4];
+               for (unsigned k = 0; k < w; ++k) {
+                  data[k] = apple9_lower_dag_scalar(
+                     lower, nir_get_scalar(intr->src[0].ssa, c + k));
+                  if (data[k] == AGX_APPLE9_VREG_INVALID)
+                     return false;
+               }
+               uint32_t idx = apple9_shared_index(lower, base, offset_B, w);
+               if (idx == AGX_APPLE9_VREG_INVALID ||
+                   !agx_apple9_vir_emit_shared_store(&lower->program, data, w,
+                                                     idx, lower->shared_root))
                   return false;
+               c += w;
             }
             continue;
          }
@@ -4751,7 +4860,9 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
              intr->intrinsic == nir_intrinsic_fence_tex_invalidate_apple9_agx) {
             unsigned mode =
                intr->intrinsic == nir_intrinsic_fence_image_write_apple9_agx
-                  ? AGX_APPLE9_FENCE_IMAGE_WRITE
+                  ? (lower->nir->info.stage == MESA_SHADER_FRAGMENT
+                        ? AGX_APPLE9_FENCE_IMAGE_WRITE_FS
+                        : AGX_APPLE9_FENCE_IMAGE_WRITE)
                   : AGX_APPLE9_FENCE_TEX_INVALIDATE;
             if (!agx_apple9_vir_emit_side_effect(&lower->program,
                    AGX_APPLE9_VIR_DEVICE_FENCE, AGX_APPLE9_ENC_DEVICE_FENCE,
@@ -4760,29 +4871,64 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
             continue;
          }
          if (intr->intrinsic == nir_intrinsic_image_store_apple9_agx) {
-            /* Only the 32-bit data forms are encoded. */
-            unsigned data_bits = nir_alu_type_get_type_size(nir_intrinsic_src_type(intr));
-            if (data_bits != 0 && data_bits != 32) {
-               lower->reason = "Apple9 native image store with 16-bit data";
+            nir_alu_type src_type = nir_intrinsic_src_type(intr);
+            unsigned data_bits = intr->src[2].ssa->bit_size;
+            if (data_bits != 16 && data_bits != 32) {
+               lower->reason = "Apple9 native image store requires 16-bit or 32-bit data";
                return false;
             }
+            unsigned type_bits = nir_alu_type_get_type_size(src_type);
+            if (type_bits != 0 && type_bits != data_bits) {
+               lower->reason = "Apple9 native image store data width mismatch";
+               return false;
+            }
+            bool integer = nir_alu_type_get_base_type(src_type) != nir_type_float &&
+                           src_type != nir_type_invalid;
+            bool fragment = lower->nir->info.stage == MESA_SHADER_FRAGMENT;
+            bool layered = nir_intrinsic_image_array(intr);
             uint32_t index = apple9_lower_dag_scalar(lower, nir_get_scalar(intr->src[0].ssa, 0));
-            uint32_t xy[2], rgba[4];
-            for (unsigned c = 0; c < 2; ++c)
-               xy[c] = apple9_lower_dag_scalar(lower, nir_get_scalar(intr->src[1].ssa, c));
-            uint32_t layer = nir_intrinsic_image_array(intr)
+            uint32_t coords[3];
+            coords[0] = apple9_lower_dag_scalar(lower, nir_get_scalar(intr->src[1].ssa, 0));
+            coords[1] = apple9_lower_dag_scalar(lower, nir_get_scalar(intr->src[1].ssa, 1));
+            coords[2] = layered
                ? apple9_lower_dag_scalar(lower, nir_get_scalar(intr->src[1].ssa, 2))
-               : AGX_APPLE9_VREG_INVALID;
-            for (unsigned c = 0; c < 4; ++c)
-               rgba[c] = apple9_lower_dag_scalar(lower, nir_get_scalar(intr->src[2].ssa, c));
+               : 0;
+            uint32_t data[4];
+            if (data_bits == 16) {
+               uint32_t mask16 = apple9_dag_imm(lower, 0xffff);
+               for (unsigned p = 0; p < 2; ++p) {
+                  uint32_t lo = apple9_lower_dag_scalar(
+                     lower, nir_get_scalar(intr->src[2].ssa, 2 * p));
+                  uint32_t hi = apple9_lower_dag_scalar(
+                     lower, nir_get_scalar(intr->src[2].ssa, 2 * p + 1));
+                  if (lo == AGX_APPLE9_VREG_INVALID || hi == AGX_APPLE9_VREG_INVALID)
+                     return false;
+                  uint32_t lo_src[] = {lo, mask16};
+                  uint32_t lo_masked = apple9_dag_emit(lower, AGX_APPLE9_VIR_IAND,
+                     AGX_APPLE9_ENC_LOGIC_EXTENDED, lo_src, 2, 0);
+                  uint32_t hi_shifted = apple9_dag_shift_imm(lower, nir_op_ishl, hi, 16);
+                  uint32_t or_src[] = {lo_masked, hi_shifted};
+                  data[p] = apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR,
+                     AGX_APPLE9_ENC_LOGIC_EXTENDED, or_src, 2, 0);
+                  if (data[p] == AGX_APPLE9_VREG_INVALID)
+                     return false;
+               }
+            } else {
+               for (unsigned c = 0; c < 4; ++c) {
+                  data[c] = apple9_lower_dag_scalar(
+                     lower, nir_get_scalar(intr->src[2].ssa, c));
+                  if (data[c] == AGX_APPLE9_VREG_INVALID)
+                     return false;
+               }
+            }
             if (index == AGX_APPLE9_VREG_INVALID ||
-                (nir_intrinsic_image_array(intr) && layer == AGX_APPLE9_VREG_INVALID) ||
-                (lower->nir->info.stage == MESA_SHADER_FRAGMENT &&
-                 !apple9_acquire_tile_preamble(lower)) ||
-                !agx_apple9_vir_emit_image_store(&lower->program, xy, rgba, index, layer,
-                   nir_alu_type_get_base_type(nir_intrinsic_src_type(intr)) !=
-                      nir_type_float &&
-                   nir_intrinsic_src_type(intr) != nir_type_invalid))
+                coords[0] == AGX_APPLE9_VREG_INVALID ||
+                coords[1] == AGX_APPLE9_VREG_INVALID ||
+                (layered && coords[2] == AGX_APPLE9_VREG_INVALID) ||
+                (fragment && !apple9_acquire_tile_preamble(lower)) ||
+                !agx_apple9_vir_emit_image_store_ex(
+                   &lower->program, coords, data, index,
+                   layered ? 2 : 0, data_bits, integer, fragment))
                return false;
             continue;
          }
@@ -5794,6 +5940,24 @@ apple9_legalize_buffer_accesses(nir_shader *nir)
    nir->options = saved_options;
 }
 
+static bool
+apple9_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
+                        unsigned bit_size, unsigned num_components,
+                        int64_t hole_size, nir_intrinsic_instr *low,
+                        nir_intrinsic_instr *high, void *data)
+{
+   if (low->intrinsic == nir_intrinsic_load_shared ||
+       low->intrinsic == nir_intrinsic_store_shared) {
+      if (bit_size != 32 || (num_components != 2 && num_components != 4))
+         return false;
+      unsigned align = nir_combined_align(align_mul, align_offset);
+      if (align < num_components * 4)
+         return false;
+   }
+   return agx_mem_vectorize_cb(align_mul, align_offset, bit_size,
+                               num_components, hole_size, low, high, data);
+}
+
 static void
 apple9_prepare_dag(nir_shader *nir)
 {
@@ -5810,11 +5974,13 @@ apple9_prepare_dag(nir_shader *nir)
    nir_opt_cse(nir);
    nir_opt_dce(nir);
    /* Vulkan buffers and descriptors are global memory; their 64-bit
-    * addresses are still unsplit here. */
+    * addresses are still unsplit here. Vectorize aligned 32-bit shared
+    * accesses to native uint2/uint4 while leaving narrow <32-bit shared
+    * for apple9_lower_narrow_shared. */
    const nir_load_store_vectorize_options vector_options = {
       .modes = nir_var_mem_ubo | nir_var_mem_ssbo | nir_var_mem_global |
-               nir_var_mem_constant,
-      .callback = agx_mem_vectorize_cb,
+               nir_var_mem_constant | nir_var_mem_shared,
+      .callback = apple9_mem_vectorize_cb,
    };
    nir_opt_load_store_vectorize(nir, &vector_options);
 
@@ -9450,29 +9616,51 @@ apple9_lower_buffer_texture(nir_builder *b, nir_instr *instr, UNUSED void *data)
    return true;
 }
 
-/* 2D gradient samples of non-shadow textures take a minimum LOD. */
+/* Native hardware min_lod_clamp for gradient samples: 2D (0x0114 / 0x0249
+ * with offset), 2D-array (0x051c), and 3D (0x219c). */
 static bool
-apple9_native_min_lod(const nir_tex_instr *tex)
+apple9_native_min_lod_grad(const nir_tex_instr *tex)
 {
-   return tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_shadow &&
-          nir_tex_instr_src_index(tex, nir_tex_src_min_lod) >= 0 &&
-          nir_tex_instr_src_index(tex, nir_tex_src_offset) < 0;
+   if (tex->op != nir_texop_txd || tex->is_shadow ||
+       nir_tex_instr_src_index(tex, nir_tex_src_min_lod) < 0)
+      return false;
+   if (nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0)
+      return tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
+             agx_apple9_texture_native_offset(tex, NULL);
+   return tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
+          tex->sampler_dim == GLSL_SAMPLER_DIM_3D;
 }
 
-/* Implicit and biased 2D and 2D array samples with a minimum LOD have a
- * native biased form; an implicit sample is one with zero bias. */
+/* Native hardware min_lod_clamp for fragment implicit and biased samples:
+ * 2D (0x0804 / 0x02c1), 2D-array (0x040c / 0x67db), 3D (0x2180 / 0x2190),
+ * Cube (0x0810 / 0x0814), bindless Cube-array (0x6553), Depth2D (0x0820 /
+ * 0x0824), and bindless Depth2D-array (0x64ad). */
 static bool
-apple9_native_biased_min_lod(const nir_tex_instr *tex)
+apple9_native_min_lod_sample(const nir_tex_instr *tex, mesa_shader_stage stage)
 {
-   return apple9_native_min_lod(tex) &&
-          (tex->op == nir_texop_tex || tex->op == nir_texop_txb);
+   if (stage != MESA_SHADER_FRAGMENT ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txb) ||
+       nir_tex_instr_src_index(tex, nir_tex_src_min_lod) < 0)
+      return false;
+   if (nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0)
+      return tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_shadow &&
+             agx_apple9_texture_native_offset(tex, NULL);
+   const bool cube_as_array = !!(tex->backend_flags & AGX_APPLE9_TEXTURE_CUBE_AS_ARRAY);
+   const bool bindless_sampler =
+      nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle) >= 0;
+   if (tex->is_shadow) {
+      if (tex->sampler_dim != GLSL_SAMPLER_DIM_2D)
+         return false;
+      return !tex->is_array || (tex->op == nir_texop_tex && bindless_sampler);
+   }
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
+       tex->sampler_dim == GLSL_SAMPLER_DIM_3D || cube_as_array)
+      return true;
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
+      return !tex->is_array || (tex->op == nir_texop_tex && bindless_sampler);
+   return false;
 }
 
-/* Route linear compute sampling, implicit array-shadow sampling,
- * and implicit 2D sampling with a minimum LOD through explicit gradients.
- * Only spatial coordinates contribute derivatives, excluding the layer and
- * comparator. An instruction bias scales gradients so the minimum LOD clamps
- * the biased LOD, while the sampler's bias is applied afterwards. */
 /* Whether a texture operation's final form, after the remaining backend
  * rewrites (implicit 3D and comparison samples become bias-0 samples), has a
  * measured offset encoding. Mirrors selection (see the texture emitters). */
@@ -9488,9 +9676,15 @@ apple9_offset_form_encodable(const nir_tex_instr *tex)
    /* 2D arrays pack the layer with the LOD (dimension 2). */
    if (tex->is_array)
       dimension = 2;
-   /* Minimum-LOD samples keep the offset lowering (see the shape check). */
-   if (nir_tex_instr_src_index(tex, nir_tex_src_min_lod) >= 0)
-      return false;
+   bool min_lod = nir_tex_instr_src_index(tex, nir_tex_src_min_lod) >= 0 ||
+                  nir_tex_instr_src_index(tex, nir_tex_src_backend2) >= 0;
+   if (min_lod) {
+      if (tex->is_shadow || tex->sampler_dim != GLSL_SAMPLER_DIM_2D)
+         return false;
+      /* 2D-array bias+min_lod+offset uses explicit mode 0x67db. */
+      if (dimension == 2)
+         return tex->op == nir_texop_tex || tex->op == nir_texop_txb;
+   }
    bool explicit_lod = false, bias = false, gradient = false;
    switch (tex->op) {
    case nir_texop_tg4:
@@ -9510,13 +9704,13 @@ apple9_offset_form_encodable(const nir_tex_instr *tex)
       explicit_lod = bias = true;
       break;
    case nir_texop_tex:
-      explicit_lod = bias = volume;
+      explicit_lod = bias = volume || min_lod;
       break;
    default:
       return false;
    }
    uint16_t mode = agx_apple9_texture_mode(explicit_lod, gradient, bias,
-                                           dimension, tex->is_shadow, false);
+                                           dimension, tex->is_shadow, min_lod);
    return agx_apple9_texture_offset_mode(mode, NULL);
 }
 
@@ -9544,9 +9738,10 @@ apple9_lower_implicit_gradients(nir_builder *b, nir_instr *instr, void *data)
    if (!compute && b->shader->info.stage != MESA_SHADER_FRAGMENT)
       return false;
    nir_tex_instr *tex = nir_instr_as_tex(instr);
-   if (!compute && !(tex->is_array && tex->is_shadow &&
-                    tex->sampler_dim == GLSL_SAMPLER_DIM_2D) &&
-       (!apple9_native_min_lod(tex) || apple9_native_biased_min_lod(tex)))
+   if (!compute &&
+       !(tex->is_array && tex->is_shadow &&
+         tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
+         !apple9_native_min_lod_sample(tex, b->shader->info.stage)))
       return false;
    if (tex->op != nir_texop_tex && tex->op != nir_texop_txb)
       return false;
@@ -9794,7 +9989,8 @@ apple9_lower_implicit_volume_tex(nir_builder *b, nir_instr *instr,
       return false;
    nir_tex_instr *tex = nir_instr_as_tex(instr);
    if (tex->op != nir_texop_tex ||
-       (tex->coord_components < 3 && !tex->is_array && !tex->is_shadow))
+       (tex->coord_components < 3 && !tex->is_array && !tex->is_shadow) ||
+       nir_tex_instr_src_index(tex, nir_tex_src_backend2) >= 0)
       return false;
    b->cursor = nir_before_instr(instr);
    tex->op = nir_texop_txb;
@@ -11008,12 +11204,10 @@ apple9_lower_fetch_min_lod(nir_builder *b, nir_instr *instr, UNUSED void *data)
    return true;
 }
 
-/* Gradient samples of 2D textures clamp the LOD in hardware to a minimum
- * given as signed Q6 in bits 16..27 of coordinate word 3. Pack it separately
- * from the array layer, which occupies the low half. Other samples take no
- * minimum LOD: select the LOD explicitly for implicit and biased sampling,
- * and let nir_lower_tex handle the remaining gradients.
- */
+/* Hardware min_lod_clamp encodes signed Q6 in either the low 12 bits of word 3
+ * (2D/3D/Cube/Depth2D biased or implicit, 3D grad) or bits 16..27 alongside
+ * an array layer / cube-array index (2D/2D-array grad, 2D-array, Cube-array,
+ * Depth2D-array). Unsupported combinations fall back to explicit LOD. */
 static bool
 apple9_lower_min_lod(nir_builder *b, nir_instr *instr, UNUSED void *data)
 {
@@ -11024,10 +11218,16 @@ apple9_lower_min_lod(nir_builder *b, nir_instr *instr, UNUSED void *data)
       return false;
 
    b->cursor = nir_before_instr(instr);
-   const bool biased = b->shader->info.stage == MESA_SHADER_FRAGMENT &&
-                       apple9_native_biased_min_lod(tex);
-   if ((tex->op == nir_texop_txd && apple9_native_min_lod(tex)) || biased) {
-      if (tex->op == nir_texop_tex) {
+   const bool native_grad = apple9_native_min_lod_grad(tex);
+   const bool native_sample = apple9_native_min_lod_sample(tex, b->shader->info.stage);
+   if (native_grad || native_sample) {
+      const bool cube_as_array =
+         !!(tex->backend_flags & AGX_APPLE9_TEXTURE_CUBE_AS_ARRAY);
+      /* 2D (0x0804 / 0x02c1) and 2D-array (0x040c / 0x67db) use the biased
+       * form for implicit samples; 3D, Cube, Cube-array, Depth2D, and
+       * Depth2D-array have dedicated implicit min_lod encodings. */
+      if (native_sample && tex->op == nir_texop_tex && !tex->is_shadow &&
+          (tex->sampler_dim == GLSL_SAMPLER_DIM_2D || cube_as_array)) {
          nir_tex_instr_add_src(tex, nir_tex_src_bias, nir_imm_float(b, 0.0f));
          tex->op = nir_texop_txb;
       }
@@ -11038,10 +11238,11 @@ apple9_lower_min_lod(nir_builder *b, nir_instr *instr, UNUSED void *data)
                                   nir_imm_float(b, 2047.0f / 64.0f));
       nir_def *fixed = nir_f2u32(b, nir_ffloor(b, nir_fmul_imm(b, clamped, 64.0f)));
       b->fp_math_ctrl = fp_math_ctrl;
-      /* Signed Q6: in bits 16..27 of its word for gradients and arrays,
-       * in the low 12 bits beside the bias for biased 2D samples. */
+      bool shift_high =
+         (native_grad && tex->sampler_dim == GLSL_SAMPLER_DIM_2D) ||
+         (native_sample && (tex->is_array || cube_as_array));
       nir_tex_instr_add_src(tex, nir_tex_src_backend2,
-                            biased && !tex->is_array ? fixed : nir_ishl_imm(b, fixed, 16));
+                            shift_high ? nir_ishl_imm(b, fixed, 16) : fixed);
       return true;
    }
    if (tex->op != nir_texop_tex && tex->op != nir_texop_txb)

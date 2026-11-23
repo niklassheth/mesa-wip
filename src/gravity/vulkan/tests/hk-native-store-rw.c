@@ -56,6 +56,7 @@ struct nir_stats {
    unsigned ifs;
    unsigned native_stores;
    unsigned native_store_array;
+   unsigned native_store_16bit;
    unsigned fence_image_write;
    unsigned fence_tex_invalidate;
    unsigned txf_2d;
@@ -81,6 +82,8 @@ collect_cf_stats(struct exec_list *cf_list, unsigned if_depth,
                   st->native_stores++;
                   if (nir_intrinsic_image_array(intr))
                      st->native_store_array++;
+                  if (intr->src[2].ssa->bit_size == 16)
+                     st->native_store_16bit++;
                   break;
                case nir_intrinsic_fence_image_write_apple9_agx:
                   st->fence_image_write++;
@@ -219,10 +222,58 @@ compile_lowered_vertex(nir_shader *nir)
    return 0;
 }
 
+static int
+compile_lowered_fragment(nir_shader *nir, bool use_epilog)
+{
+   CHECK(hk_apple9_texture_bindings(nir));
+   const char *reason = NULL;
+   CHECK(agx_nir_lower_apple9_runtime_sampler_state(nir, &reason));
+   nir_shader_intrinsics_pass(nir, hk_apple9_lower_roots,
+                              nir_metadata_control_flow, NULL);
+   struct agx_apple9_blend blend = {
+      .use_epilog = use_epilog,
+      .dynamic_samples = use_epilog,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .samples = 1,
+      .colormask = 0xf,
+      .rgb_src = PIPE_BLENDFACTOR_ONE,
+      .rgb_dst = PIPE_BLENDFACTOR_ZERO,
+      .alpha_src = PIPE_BLENDFACTOR_ONE,
+      .alpha_dst = PIPE_BLENDFACTOR_ZERO,
+      .rgb_func = PIPE_BLEND_ADD,
+      .alpha_func = PIPE_BLEND_ADD,
+   };
+   struct agx_shader_part out = {0};
+   bool ok = agx_compile_apple9_fragment_mrt(nir, NULL, &blend, 1, &out, &reason);
+   if (!ok)
+      fprintf(stderr, "fragment compile failed: %s\n", reason ?: "unknown");
+   if (ok) {
+      const uint8_t *bytes = out.binary;
+      const uint8_t fs_fence[] = {0x07, 0x14, 0x64, 0x50, 0x06, 0x00};
+      const uint8_t tex_inv[] = {0x07, 0x04, 0x54, 0xd0, 0x06, 0x00};
+      const uint8_t tile_600[] = {0x87, 0x02, 0x54, 0x00, 0x06, 0x00};
+      bool has_fs_fence = false, has_tex_inv = false, has_600 = false;
+      for (size_t i = 0; i + 6 <= out.info.binary_size; i += 2) {
+         if (!memcmp(bytes + i, fs_fence, 6))
+            has_fs_fence = true;
+         if (!memcmp(bytes + i, tex_inv, 6))
+            has_tex_inv = true;
+         if (!memcmp(bytes + i, tile_600, 6))
+            has_600 = true;
+      }
+      CHECK(has_fs_fence && has_tex_inv && has_600);
+      if (use_epilog)
+         CHECK(out.info.apple9_fs_epilog.has_tile_preamble);
+   }
+   free(out.binary);
+   CHECK(ok);
+   return 0;
+}
+
 static nir_shader *
-build_storage_shader(mesa_shader_stage stage, enum glsl_sampler_dim dim,
-                     bool array, enum pipe_format format,
-                     bool do_store, bool do_load)
+build_storage_shader_bits(mesa_shader_stage stage, enum glsl_sampler_dim dim,
+                          bool array, enum pipe_format format,
+                          nir_alu_type src_type, bool do_store, bool do_load)
 {
    nir_builder b = nir_builder_init_simple_shader(stage, &agx_nir_options,
                                                   "storage_test");
@@ -233,19 +284,34 @@ build_storage_shader(mesa_shader_stage stage, enum glsl_sampler_dim dim,
    }
    nir_def *gid = stage == MESA_SHADER_COMPUTE
       ? nir_load_global_invocation_id(&b, 32)
-      : nir_vec3(&b, nir_load_vertex_id(&b), nir_load_instance_id(&b),
-                 nir_imm_int(&b, 0));
+      : stage == MESA_SHADER_VERTEX
+         ? nir_vec3(&b, nir_load_vertex_id(&b), nir_load_instance_id(&b),
+                    nir_imm_int(&b, 0))
+         : nir_vec3(&b, nir_u2u32(&b, nir_channel(&b, nir_load_pixel_coord(&b), 0)),
+                    nir_u2u32(&b, nir_channel(&b, nir_load_pixel_coord(&b), 1)),
+                    nir_imm_int(&b, 0));
    nir_def *coord = nir_vec4(&b, nir_channel(&b, gid, 0),
                              nir_channel(&b, gid, 1),
                              nir_channel(&b, gid, 2), nir_imm_int(&b, 0));
    nir_def *sample = nir_iand_imm(&b, nir_channel(&b, gid, 0), 3);
    nir_def *handle = nir_bindless_image_agx(&b, nir_imm_int(&b, 0), .desc_set = 0);
-   nir_def *val = nir_imm_vec4(&b, 1.0f, 2.0f, 3.0f, 4.0f);
+   unsigned bits = nir_alu_type_get_type_size(src_type);
+   nir_alu_type base = nir_alu_type_get_base_type(src_type);
+   nir_def *val;
+   if (bits == 16) {
+      val = base == nir_type_float
+         ? nir_vec4(&b, nir_imm_float16(&b, 1.0f), nir_imm_float16(&b, 2.0f),
+                    nir_imm_float16(&b, 3.0f), nir_imm_float16(&b, 4.0f))
+         : nir_vec4(&b, nir_imm_intN_t(&b, 1, 16), nir_imm_intN_t(&b, 2, 16),
+                    nir_imm_intN_t(&b, 3, 16), nir_imm_intN_t(&b, 4, 16));
+   } else {
+      val = nir_imm_vec4(&b, 1.0f, 2.0f, 3.0f, 4.0f);
+   }
 
    if (do_store) {
       nir_bindless_image_store(&b, handle, coord, sample, val, nir_imm_int(&b, 0),
                                .image_dim = dim, .image_array = array,
-                               .format = format, .src_type = nir_type_float32);
+                               .format = format, .src_type = src_type);
       b.shader->info.writes_memory = true;
    }
    if (do_load) {
@@ -273,10 +339,24 @@ build_storage_shader(mesa_shader_stage stage, enum glsl_sampler_dim dim,
       nir_variable *pos = nir_variable_create(b.shader, nir_var_shader_out,
                                               glsl_vec4_type(), "pos");
       pos->data.location = VARYING_SLOT_POS;
-      nir_store_var(&b, pos, val, 0xf);
+      nir_store_var(&b, pos, nir_imm_vec4(&b, 0, 0, 0, 1), 0xf);
+   } else if (stage == MESA_SHADER_FRAGMENT) {
+      nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                              glsl_vec4_type(), "color");
+      out->data.location = FRAG_RESULT_DATA0;
+      nir_store_var(&b, out, nir_imm_vec4(&b, 0, 1, 0, 1), 0xf);
    }
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
    return b.shader;
+}
+
+static nir_shader *
+build_storage_shader(mesa_shader_stage stage, enum glsl_sampler_dim dim,
+                     bool array, enum pipe_format format,
+                     bool do_store, bool do_load)
+{
+   return build_storage_shader_bits(stage, dim, array, format, nir_type_float32,
+                                    do_store, do_load);
 }
 
 static int
@@ -454,14 +534,45 @@ test_branchless_storage_and_tbuf(void)
       ralloc_free(nir);
    }
 
-   /* 9. Fragment stage RW keeps SW converter until Wave 2 FS fenced encoding. */
-   {
+   /* 9. Fragment stage fenced RW (store -> load): native FS IMAGE_WRITE +
+    *    AGX_APPLE9_FENCE_IMAGE_WRITE_FS (0x64 50 06) + 0x06d0 + TEXTURE_LOAD +
+    *    lazy TILE_ACCESS 0x600 (both monolithic and epilog). */
+   for (unsigned ep = 0; ep < 2; ++ep) {
       nir_shader *nir = build_storage_shader(MESA_SHADER_FRAGMENT,
                                              GLSL_SAMPLER_DIM_2D, false,
                                              PIPE_FORMAT_NONE, true, true);
       hk_lower_nir(dev, nir, &rs, false, 1, img_sets, 0);
       struct nir_stats st = gather_stats(nir);
-      CHECK(st.native_stores == 0 && st.fence_image_write == 0);
+      CHECK(st.native_stores == 1);
+      CHECK(st.fence_image_write == 1 && st.fence_tex_invalidate == 1);
+      CHECK(st.txf_2d == 1 && st.txf_inside_nested_if == 0);
+      CHECK(compile_lowered_fragment(nir, ep != 0) == 0);
+      ralloc_free(nir);
+   }
+
+   /* 10. Native 16-bit (f16, u16, i16) IMAGE_WRITE stays 16-bit in NIR and
+    *     compiles end-to-end across 2D, 2D-array, and texel buffers. */
+   static const struct {
+      enum glsl_sampler_dim dim;
+      bool array;
+      nir_alu_type type;
+   } cases_16[] = {
+      {GLSL_SAMPLER_DIM_2D, false, nir_type_float16},
+      {GLSL_SAMPLER_DIM_2D, false, nir_type_uint16},
+      {GLSL_SAMPLER_DIM_2D, false, nir_type_int16},
+      {GLSL_SAMPLER_DIM_2D, true, nir_type_float16},
+      {GLSL_SAMPLER_DIM_BUF, false, nir_type_float16},
+      {GLSL_SAMPLER_DIM_BUF, false, nir_type_uint16},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(cases_16); ++i) {
+      nir_shader *nir = build_storage_shader_bits(
+         MESA_SHADER_COMPUTE, cases_16[i].dim, cases_16[i].array,
+         PIPE_FORMAT_NONE, cases_16[i].type, true, false);
+      hk_lower_nir(dev, nir, &rs, false, 1, img_sets, 0);
+      struct nir_stats st = gather_stats(nir);
+      CHECK(st.native_stores == 1 && st.native_store_16bit == 1);
+      CHECK(st.ifs == 0);
+      CHECK(compile_lowered_compute(nir) == 0);
       ralloc_free(nir);
    }
 

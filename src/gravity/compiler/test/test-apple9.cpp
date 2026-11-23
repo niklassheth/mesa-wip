@@ -16721,3 +16721,306 @@ TEST(Apple9Compiler, EarlyTestAlphaToCoverageMasksAllTargetsBeforeRemapping)
       free(ep_ref.binary);
    }
 }
+
+TEST(Apple9Compiler, VectorizedSharedLoadAndStoreEmitNativeUint2AndUint4)
+{
+   auto count_shared_width = [](const agx_shader_part &out, bool load,
+                                uint8_t width_tag) {
+      const uint8_t *bytes = static_cast<const uint8_t *>(out.binary);
+      uint8_t op = load ? 0x67 : 0xe7;
+      unsigned n = 0;
+      for (size_t i = 0; i + 14 <= out.info.binary_size; i += 2) {
+         if (bytes[i] == op && bytes[i + 1] == 0x02 && bytes[i + 2] == 0x54 &&
+             bytes[i + 7] == 0x00 && bytes[i + 8] == width_tag &&
+             bytes[i + 10] == 0x00 && bytes[i + 13] == 0x00) {
+            ++n;
+         }
+      }
+      return n;
+   };
+
+   struct {
+      unsigned comps;
+      unsigned align_mul;
+      unsigned expect_u4;
+      unsigned expect_u2;
+      unsigned expect_u1;
+   } cases[] = {
+      {2, 8,  0, 1, 0}, /* aligned vec2 -> single uint2 */
+      {4, 16, 1, 0, 0}, /* aligned vec4 -> single uint4 */
+      {3, 16, 0, 1, 1}, /* aligned vec3 -> uint2 + scalar u32 */
+      {4, 8,  0, 2, 0}, /* 8B-aligned vec4 -> 2x uint2 */
+      {4, 4,  0, 0, 4}, /* 4B-aligned vec4 -> 4x scalar u32 */
+   };
+
+   for (const auto &c : cases) {
+      SCOPED_TRACE(c.comps * 100 + c.align_mul);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "vec_shared");
+      b.shader->info.workgroup_size[0] = 64;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.shared_size = 4096;
+      b.shader->info.num_ssbos = 1;
+      nir_def *lid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *addr = nir_imul_imm(&b, lid, c.align_mul);
+      nir_def *in = nir_load_ssbo(&b, c.comps, 32, nir_imm_int(&b, 0), addr,
+                                  .align_mul = c.align_mul);
+      nir_store_shared(&b, in, addr, .write_mask = BITFIELD_MASK(c.comps),
+                       .align_mul = c.align_mul);
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_shared);
+      nir_def *out_v = nir_load_shared(&b, c.comps, 32, addr,
+                                       .align_mul = c.align_mul);
+      nir_store_ssbo(&b, out_v, nir_imm_int(&b, 0), addr,
+                     .write_mask = BITFIELD_MASK(c.comps),
+                     .align_mul = c.align_mul);
+
+      agx_shader_part compiled = {};
+      agx_apple9_compute_profile profile = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason))
+         << (reason ?: "");
+      EXPECT_EQ(count_shared_width(compiled, true, 0x5c), c.expect_u4);
+      EXPECT_EQ(count_shared_width(compiled, true, 0x64), c.expect_u2);
+      EXPECT_EQ(count_shared_width(compiled, true, 0x44), c.expect_u1);
+      EXPECT_EQ(count_shared_width(compiled, false, 0x5c), c.expect_u4);
+      EXPECT_EQ(count_shared_width(compiled, false, 0x64), c.expect_u2);
+      EXPECT_EQ(count_shared_width(compiled, false, 0x44), c.expect_u1);
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* Adjacent aligned scalar 32-bit shared loads/stores auto-vectorize to uint4. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "vec_shared_auto");
+      b.shader->info.workgroup_size[0] = 64;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.shared_size = 4096;
+      b.shader->info.num_ssbos = 1;
+      nir_def *lid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *base = nir_imul_imm(&b, lid, 16);
+      for (unsigned i = 0; i < 4; ++i) {
+         nir_def *v = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0),
+                                    nir_iadd_imm(&b, base, 4 * i),
+                                    .align_mul = 16, .align_offset = 4 * i);
+         nir_store_shared(&b, v, nir_iadd_imm(&b, base, 4 * i),
+                          .write_mask = 1, .align_mul = 16, .align_offset = 4 * i);
+      }
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_shared);
+      for (unsigned i = 0; i < 4; ++i) {
+         nir_def *v = nir_load_shared(&b, 1, 32, nir_iadd_imm(&b, base, 4 * i),
+                                      .align_mul = 16, .align_offset = 4 * i);
+         nir_store_ssbo(&b, v, nir_imm_int(&b, 0),
+                        nir_iadd_imm(&b, base, 4 * i),
+                        .write_mask = 1, .align_mul = 16, .align_offset = 4 * i);
+      }
+      agx_shader_part compiled = {};
+      agx_apple9_compute_profile profile = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason))
+         << (reason ?: "");
+      EXPECT_EQ(count_shared_width(compiled, true, 0x5c), 1u);
+      EXPECT_EQ(count_shared_width(compiled, false, 0x5c), 1u);
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(Apple9Compiler, FullDimNativeMinLodClampEndToEnd)
+{
+   auto has_tex_mode = [](const agx_shader_part &out, uint16_t mode) {
+      const uint8_t *bytes = static_cast<const uint8_t *>(out.binary);
+      uint8_t lo = mode & 0xff, hi = mode >> 8;
+      for (size_t i = 0; i + 14 <= out.info.binary_size; i += 2) {
+         if ((bytes[i] & 0x07) == 0x05 && (bytes[i + 1] & 0x80) == 0x80 &&
+             (bytes[i + 2] & 0x3f) == 0x0c && bytes[i + 6] == lo &&
+             bytes[i + 7] == hi)
+            return true;
+      }
+      return false;
+   };
+
+   struct {
+      const char *name;
+      nir_texop op;
+      glsl_sampler_dim dim;
+      bool array;
+      bool shadow;
+      bool offset;
+      bool bindless;
+      uint16_t expected_mode;
+   } cases[] = {
+      {"3d_imp",         nir_texop_tex, GLSL_SAMPLER_DIM_3D,   false, false, false, true,  0x2180},
+      {"3d_bias",        nir_texop_txb, GLSL_SAMPLER_DIM_3D,   false, false, false, true,  0x2190},
+      {"3d_grad",        nir_texop_txd, GLSL_SAMPLER_DIM_3D,   false, false, false, false, 0x219c},
+      {"cube_imp",       nir_texop_tex, GLSL_SAMPLER_DIM_CUBE, false, false, false, true,  0x0810},
+      {"cube_bias",      nir_texop_txb, GLSL_SAMPLER_DIM_CUBE, false, false, false, true,  0x0814},
+      {"cube_arr_imp",   nir_texop_tex, GLSL_SAMPLER_DIM_CUBE, true,  false, false, true,  0x6553},
+      {"cmp2d_imp",      nir_texop_tex, GLSL_SAMPLER_DIM_2D,   false, true,  false, true,  0x0820},
+      {"cmp2d_bias",     nir_texop_txb, GLSL_SAMPLER_DIM_2D,   false, true,  false, true,  0x0824},
+      {"cmp2da_imp",     nir_texop_tex, GLSL_SAMPLER_DIM_2D,   true,  true,  false, true,  0x64ad},
+      {"2d_bias_ofs",    nir_texop_txb, GLSL_SAMPLER_DIM_2D,   false, false, true,  false, 0x02c1},
+      {"2d_grad_ofs",    nir_texop_txd, GLSL_SAMPLER_DIM_2D,   false, false, true,  false, 0x0249},
+      {"2da_bias_ofs",   nir_texop_txb, GLSL_SAMPLER_DIM_2D,   true,  false, true,  false, 0x67db},
+   };
+
+   for (const auto &c : cases) {
+      SCOPED_TRACE(c.name);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "%s", c.name);
+      b.shader->info.num_ubos = 1;
+      nir_def *u = nir_load_ubo(&b, 4, 32, nir_imm_int(&b, 0),
+                                nir_imm_int(&b, 0), .align_mul = 16, .range = 16);
+      unsigned coord_comps = (c.dim == GLSL_SAMPLER_DIM_CUBE && c.array) ? 4
+                           : (c.dim == GLSL_SAMPLER_DIM_3D ||
+                              c.dim == GLSL_SAMPLER_DIM_CUBE || c.array) ? 3 : 2;
+      nir_tex_src srcs[8];
+      unsigned n = 0;
+      srcs[n++] = nir_tex_src_for_ssa(nir_tex_src_coord,
+                                      nir_trim_vector(&b, u, coord_comps));
+      srcs[n++] = nir_tex_src_for_ssa(nir_tex_src_min_lod, nir_imm_float(&b, 1.5f));
+      if (c.op == nir_texop_txb)
+         srcs[n++] = nir_tex_src_for_ssa(nir_tex_src_bias, nir_imm_float(&b, 0.5f));
+      if (c.op == nir_texop_txd) {
+         unsigned grad_comps = c.dim == GLSL_SAMPLER_DIM_3D ? 3 : 2;
+         nir_def *d = nir_imm_vec4(&b, 0.01f, 0.02f, 0.03f, 0.0f);
+         srcs[n++] = nir_tex_src_for_ssa(nir_tex_src_ddx, nir_trim_vector(&b, d, grad_comps));
+         srcs[n++] = nir_tex_src_for_ssa(nir_tex_src_ddy, nir_trim_vector(&b, d, grad_comps));
+      }
+      if (c.shadow)
+         srcs[n++] = nir_tex_src_for_ssa(nir_tex_src_comparator, nir_imm_float(&b, 0.5f));
+      if (c.offset)
+         srcs[n++] = nir_tex_src_for_ssa(nir_tex_src_offset, nir_imm_ivec2(&b, 1, -2));
+      if (c.bindless) {
+         srcs[n++] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, nir_imm_int(&b, 0));
+         srcs[n++] = nir_tex_src_for_ssa(nir_tex_src_sampler_handle, nir_imm_int(&b, 0));
+      }
+
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader, n);
+      tex->op = c.op;
+      tex->sampler_dim = c.dim;
+      tex->is_array = c.array;
+      tex->is_shadow = c.shadow;
+      tex->is_new_style_shadow = c.shadow;
+      tex->dest_type = nir_type_float32;
+      tex->coord_components = coord_comps;
+      tex->texture_index = 0;
+      tex->sampler_index = 0;
+      for (unsigned i = 0; i < n; ++i)
+         tex->src[i] = srcs[i];
+      nir_def_init(&tex->instr, &tex->def, nir_tex_instr_dest_size(tex), 32);
+      nir_builder_instr_insert(&b, &tex->instr);
+      nir_store_output(&b, nir_pad_vector(&b, &tex->def, 4), nir_imm_int(&b, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0, .num_slots = 1});
+      b.shader->info.io_lowered = true;
+
+      agx_shader_part compiled = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment(b.shader, &compiled, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(has_tex_mode(compiled, c.expected_mode));
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(Apple9Compiler, Native16BitAndFragmentFencedImageStoreEndToEnd)
+{
+   auto has_img_write = [](const agx_shader_part &out, uint8_t b13, uint8_t b14) {
+      const uint8_t *bytes = static_cast<const uint8_t *>(out.binary);
+      for (size_t i = 0; i + 16 <= out.info.binary_size; i += 2) {
+         if (bytes[i] == 0xd7 && bytes[i + 2] == 0x54 &&
+             bytes[i + 13] == b13 && bytes[i + 14] == b14)
+            return true;
+      }
+      return false;
+   };
+
+   struct {
+      bool fragment;
+      bool layered;
+      nir_alu_type type;
+      uint8_t expect_b13;
+      uint8_t expect_b14;
+   } cases[] = {
+      {false, false, nir_type_float16, 0x2a, 0x89},
+      {false, false, nir_type_uint16,  0x0a, 0x89},
+      {false, false, nir_type_int16,   0x0a, 0x89},
+      {false, true,  nir_type_float16, 0x2a, 0x89},
+      {false, false, nir_type_float32, 0x3a, 0x89},
+      {false, false, nir_type_uint32,  0x1a, 0x89},
+      {true,  false, nir_type_float16, 0xea, 0x08},
+      {true,  false, nir_type_uint16,  0xca, 0x08},
+      {true,  false, nir_type_float32, 0xfa, 0x08},
+      {true,  true,  nir_type_uint32,  0xda, 0x08},
+   };
+
+   const uint8_t fs_fence[] = {0x07, 0x14, 0x64, 0x50, 0x06, 0x00};
+   const uint8_t cs_fence[] = {0x07, 0x14, 0x54, 0x50, 0x06, 0x00};
+   const uint8_t tex_inv[]  = {0x07, 0x04, 0x54, 0xd0, 0x06, 0x00};
+   const uint8_t tile_600[] = {0x87, 0x02, 0x54, 0x00, 0x06, 0x00};
+
+   for (const auto &c : cases) {
+      SCOPED_TRACE((c.fragment ? 1000 : 0) + (c.layered ? 100 : 0) + (int)c.type);
+      nir_builder b = nir_builder_init_simple_shader(
+         c.fragment ? MESA_SHADER_FRAGMENT : MESA_SHADER_COMPUTE,
+         &agx_nir_options, "native_img_store_ex");
+      if (!c.fragment) {
+         b.shader->info.workgroup_size[0] = 64;
+         b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+         b.shader->info.num_ubos = 1;
+      }
+      nir_def *index = c.fragment
+         ? nir_imm_int(&b, 0)
+         : nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                        .align_mul = 4, .range = 4);
+      nir_def *coord = nir_imm_ivec3(&b, 1, 2, 3);
+      unsigned bits = nir_alu_type_get_type_size(c.type);
+      nir_def *data = bits == 16
+         ? (nir_alu_type_get_base_type(c.type) == nir_type_float
+               ? nir_vec4(&b, nir_imm_float16(&b, 1.0f), nir_imm_float16(&b, 0.5f),
+                          nir_imm_float16(&b, 0.25f), nir_imm_float16(&b, 1.0f))
+               : nir_vec4(&b, nir_imm_intN_t(&b, 1, 16), nir_imm_intN_t(&b, 2, 16),
+                          nir_imm_intN_t(&b, 3, 16), nir_imm_intN_t(&b, 4, 16)))
+         : nir_imm_vec4(&b, 1.0f, 0.5f, 0.25f, 1.0f);
+      nir_image_store_apple9_agx(&b, index, coord, data,
+                                 .src_type = c.type, .image_array = c.layered);
+      nir_fence_image_write_apple9_agx(&b);
+      nir_fence_tex_invalidate_apple9_agx(&b);
+      if (c.fragment) {
+         nir_store_output(&b, nir_imm_vec4(&b, 0, 1, 0, 1), nir_imm_int(&b, 0),
+                          .write_mask = 0xf, .src_type = nir_type_float32,
+                          .io_semantics = {.location = FRAG_RESULT_DATA0, .num_slots = 1});
+         b.shader->info.io_lowered = true;
+      }
+      agx_shader_part compiled = {};
+      const char *reason = nullptr;
+      if (c.fragment) {
+         agx_apple9_blend blend = {};
+         blend.use_epilog = 1;
+         blend.dynamic_samples = 1;
+         ASSERT_TRUE(agx_compile_apple9_fragment_mrt(b.shader, nullptr, &blend, 1,
+                                                     &compiled, &reason))
+            << (reason ?: "");
+         EXPECT_TRUE(compiled.info.apple9_fs_epilog.has_tile_preamble);
+         EXPECT_TRUE(apple9_binary_contains(compiled, tile_600, sizeof(tile_600)));
+         EXPECT_TRUE(apple9_binary_contains(compiled, fs_fence, sizeof(fs_fence)));
+      } else {
+         agx_apple9_compute_profile profile = {};
+         ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason))
+            << (reason ?: "");
+         EXPECT_TRUE(apple9_binary_contains(compiled, cs_fence, sizeof(cs_fence)));
+      }
+      EXPECT_TRUE(apple9_binary_contains(compiled, tex_inv, sizeof(tex_inv)));
+      EXPECT_TRUE(has_img_write(compiled, c.expect_b13, c.expect_b14));
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+}
