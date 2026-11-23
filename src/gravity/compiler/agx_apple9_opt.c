@@ -420,7 +420,8 @@ fold_select_xor(struct agx_apple9_vir_instr *I,
 static void
 select_float_sources(struct agx_apple9_vir_instr *I,
                      struct agx_apple9_vir_instr **definitions,
-                     const bool *constant, const uint32_t *values)
+                     const bool *constant, const uint32_t *values,
+                     const struct agx_apple9_uniform_constants *constants)
 {
    if (I->alu_src_uniform_mask || I->alu_src_immediate_mask)
       return;
@@ -455,16 +456,27 @@ select_float_sources(struct agx_apple9_vir_instr *I,
       while (true) {
          const struct agx_apple9_vir_instr *producer = definitions[I->src[s]];
          if (!producer || !agx_apple9_instr_is_pure_alu(producer) ||
-             producer->nr_srcs != 2 ||
              (producer->op != AGX_APPLE9_VIR_IXOR &&
               producer->op != AGX_APPLE9_VIR_IAND))
             break;
          uint32_t mask = producer->op == AGX_APPLE9_VIR_IXOR
             ? 0x80000000u : 0x7fffffffu;
          int source = -1;
-         for (unsigned c = 0; c < 2; ++c) {
-            if (constant[producer->src[c]] && values[producer->src[c]] == mask)
-               source = 1 - c;
+         if (producer->nr_srcs == 2 && !producer->alu_src_uniform_mask &&
+             !producer->alu_src_immediate_mask) {
+            for (unsigned c = 0; c < 2; ++c) {
+               if (constant[producer->src[c]] && values[producer->src[c]] == mask)
+                  source = 1 - c;
+            }
+         } else if (producer->nr_srcs == 1 && !producer->alu_src_immediate_mask &&
+                    util_bitcount(producer->alu_src_uniform_mask) == 1 &&
+                    constants) {
+            unsigned slot = ffs(producer->alu_src_uniform_mask) - 1;
+            unsigned word = producer->alu_src_value[slot];
+            if (word >= constants->base &&
+                word < constants->base + constants->count &&
+                constants->values[word - constants->base] == mask)
+               source = 0;
          }
          if (source < 0)
             break;
@@ -1504,7 +1516,8 @@ agx_apple9_optimize_vir_with_constants(
          fold_integer(I, constant, values);
          fold_iadd_shift(I, definitions);
          fold_select_xor(I, definitions, constant, values, uniform_writes);
-         select_float_sources(I, definitions, constant, values);
+         select_float_sources(I, definitions, constant, values,
+                              uniform_writes ? NULL : constants);
          inline_integer_immediates(I, constant, values);
          inline_compare_literal(I, constant, values);
          inline_alu_sources(I, uniform_read, constant, values);

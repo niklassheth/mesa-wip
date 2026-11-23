@@ -47,22 +47,23 @@ static bool
 apple9_emit_packed(struct apple9_emitter *emitter,
                    const struct agx_apple9_packed_instruction *packed);
 
-static void
+static bool
 apple9_emit(struct apple9_emitter *emitter, unsigned length,
             const uint8_t *encoded)
 {
    void *dst = util_dynarray_grow_bytes(&emitter->bytes, 1, length);
    if (!dst)
-      return;
+      return false;
    memcpy(dst, encoded, length);
    emitter->instructions++;
+   return true;
 }
 
-static void
+static bool
 apple9_emit_stop(struct apple9_emitter *emitter)
 {
    const uint8_t encoded[4] = {0x0e, 0, 0, 0};
-   apple9_emit(emitter, sizeof(encoded), encoded);
+   return apple9_emit(emitter, sizeof(encoded), encoded);
 }
 
 /*
@@ -4376,8 +4377,7 @@ apple9_emit_packed(struct apple9_emitter *emitter,
 {
    if (packed->length == 0 || packed->length > sizeof(packed->bytes))
       return false;
-   apple9_emit(emitter, packed->length, packed->bytes);
-   return true;
+   return apple9_emit(emitter, packed->length, packed->bytes);
 }
 
 struct apple9_buffer_resource {
@@ -8523,8 +8523,12 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
          fprintf(apple9_log(), "%02x", binary[i]);
       fputc('\n', apple9_log());
    }
-   if (!lower.object_calls && !lower.has_abi_return)
-      apple9_emit_stop(&emitter);
+   if (!lower.object_calls && !lower.has_abi_return &&
+       !apple9_emit_stop(&emitter)) {
+      *reason = "out of memory emitting Apple9 shader stop";
+      util_dynarray_fini(&emitter.bytes);
+      goto fail;
+   }
    if (cost) {
       *cost = (struct apple9_dag_cost){
          .instructions = lower.program.instruction_count,
@@ -14875,14 +14879,18 @@ agx_apple9_patch_vs_varyings(
       memcpy(dst_bin, src_bin, size);
 
    for (unsigned r = 0; r < info->apple9_vary_reloc_count; ++r) {
+      for (unsigned j = 0; j < r; ++j) {
+         if (info->apple9_vary_relocs[j] == info->apple9_vary_relocs[r])
+            return false;
+      }
       size_t off = (size_t)info->apple9_vary_relocs[r] * 2;
       if (off + 8 > info->main_size)
          return false;
-      if (dst_bin[off] != 0x57 || (dst_bin[off + 1] & 0x0f) != 0x06 ||
-          (dst_bin[off + 2] & 0xfc) != 0x54)
+      if (src_bin[off] != 0x57 || (src_bin[off + 1] & 0x0f) != 0x06 ||
+          (src_bin[off + 2] & 0xfc) != 0x54)
          return false;
       unsigned old_slot =
-         ((dst_bin[off + 4] >> 5) & 7u) | ((dst_bin[off + 5] & 0x3fu) << 3);
+         ((src_bin[off + 4] >> 5) & 7u) | ((src_bin[off + 5] & 0x3fu) << 3);
       if (old_slot < 4 || old_slot >= 4 + count)
          return false;
       unsigned new_slot = 4 + remap[old_slot - 4];

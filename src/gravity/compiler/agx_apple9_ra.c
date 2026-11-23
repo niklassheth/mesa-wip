@@ -386,17 +386,28 @@ apple9_can_fold_pending(const struct agx_apple9_vir_instr *ins,
 {
    if (p->unknown || !p->count)
       return false;
-   /* Hardware ilogic folded waits bind to source A only; non-commutative
-    * IANDN cannot swap src[1] into A, and an inline-uniform A cannot swap. */
+   /* Hardware ilogic folded waits bind to source A only. Across all merged
+    * producers on this slot, non-commutative IANDN cannot swap src[1] into A,
+    * commutative ops cannot satisfy both an A-only producer and a B-only
+    * producer in the same slot, and an inline-uniform A cannot swap. */
    if (ins->encoding == AGX_APPLE9_ENC_LOGIC_EXTENDED ||
        ins->encoding == AGX_APPLE9_ENC_LOGIC_EXPORT) {
-      if (ins->nr_srcs == 2 &&
-          ins->op != AGX_APPLE9_VIR_IAND &&
-          ins->op != AGX_APPLE9_VIR_IOR &&
-          ins->op != AGX_APPLE9_VIR_IXOR &&
-          !apple9_pending_result(p, ins->src[0]) &&
-          apple9_pending_result(p, ins->src[1]))
-         return false;
+      if (ins->nr_srcs == 2) {
+         const bool commutative = ins->op == AGX_APPLE9_VIR_IAND ||
+                                  ins->op == AGX_APPLE9_VIR_IOR ||
+                                  ins->op == AGX_APPLE9_VIR_IXOR;
+         bool any_only_a = false, any_only_b = false;
+         for (unsigned i = 0; i < p->count; ++i) {
+            bool def_a = apple9_producer_result(&p->producer[i], ins->src[0]);
+            bool def_b = apple9_producer_result(&p->producer[i], ins->src[1]);
+            if (def_a && !def_b)
+               any_only_a = true;
+            else if (def_b && !def_a)
+               any_only_b = true;
+         }
+         if (any_only_b && (!commutative || any_only_a))
+            return false;
+      }
       if ((ins->alu_src_uniform_mask & 1u) && ins->nr_srcs == 1 &&
           apple9_pending_result(p, ins->src[0]))
          return false;
@@ -1131,19 +1142,30 @@ agx_apple9_schedule_physical(struct agx_apple9_vir_program *program,
          if (fold && !apple9_pending_active(&pending[fold]))
             fold = 0;
          if (fold) {
-            /* Logic's pending-result source is A. Commutative ops may swap. */
+            /* Logic's pending-result source is A. Commutative ops may swap
+             * when a producer on the folded slot targets src[1] alone
+             * (apple9_can_fold_pending already ensured no producer targets
+             * src[0] alone in that case). */
             if ((ins.encoding == AGX_APPLE9_ENC_LOGIC_EXTENDED ||
                  ins.encoding == AGX_APPLE9_ENC_LOGIC_EXPORT) && ins.nr_srcs == 2 &&
                 (ins.op == AGX_APPLE9_VIR_IAND ||
                  ins.op == AGX_APPLE9_VIR_IOR ||
-                 ins.op == AGX_APPLE9_VIR_IXOR) &&
-                !apple9_pending_result(&pending[fold], ins.src[0]) &&
-                apple9_pending_result(&pending[fold], ins.src[1])) {
-               unsigned src = ins.src[0];
-               ins.src[0] = ins.src[1];
-               ins.src[1] = src;
-               ins.live_after_mask = ((ins.live_after_mask & 1) << 1) |
-                                     ((ins.live_after_mask & 2) >> 1);
+                 ins.op == AGX_APPLE9_VIR_IXOR)) {
+               bool swap = false;
+               for (unsigned k = 0; k < pending[fold].count; ++k) {
+                  if (!apple9_producer_result(&pending[fold].producer[k], ins.src[0]) &&
+                      apple9_producer_result(&pending[fold].producer[k], ins.src[1])) {
+                     swap = true;
+                     break;
+                  }
+               }
+               if (swap) {
+                  unsigned src = ins.src[0];
+                  ins.src[0] = ins.src[1];
+                  ins.src[1] = src;
+                  ins.live_after_mask = ((ins.live_after_mask & 1) << 1) |
+                                        ((ins.live_after_mask & 2) >> 1);
+               }
             }
             ins.scoreboard_slot = fold;
             apple9_complete(&state, BITFIELD_BIT(fold - 1));

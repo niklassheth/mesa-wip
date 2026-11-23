@@ -733,6 +733,8 @@ compute_loop_ends(struct agx_apple9_block **cfg_blocks, unsigned num_blocks,
                   void *memctx)
 {
    unsigned *loop_end = ralloc_array(memctx, unsigned, MAX2(num_blocks, 1u));
+   if (!loop_end)
+      return NULL;
    for (unsigned i = 0; i < MAX2(num_blocks, 1u); ++i)
       loop_end[i] = UINT_MAX;
 
@@ -2406,13 +2408,17 @@ apple9_ra_spill(struct agx_apple9_vir_program *program,
    }
 
    BITSET_WORD *is_pub = build_pub_bitset(program, memctx, n);
+   if (!is_pub) {
+      ralloc_free(memctx);
+      return false;
+   }
    BITSET_WORD *direct_lanes = build_direct_lanes_bitset(program, is_pub, memctx, n);
    uint8_t *widths = rzalloc_array(memctx, uint8_t, MAX2(n, 1u));
    dist_t *next_uses = rzalloc_array(memctx, dist_t, MAX2(n, 1u));
    struct agx_apple9_vir_instr **remat =
       rzalloc_array(memctx, struct agx_apple9_vir_instr *, MAX2(n, 1u));
 
-   if (!is_pub || !direct_lanes || !widths || !next_uses || !remat) {
+   if (!direct_lanes || !widths || !next_uses || !remat) {
       ralloc_free(memctx);
       return false;
    }
@@ -2503,6 +2509,10 @@ apple9_ra_spill(struct agx_apple9_vir_program *program,
    struct spill_block *blocks =
       rzalloc_array(memctx, struct spill_block, num_blocks);
    unsigned *loop_end = compute_loop_ends(cfg_blocks, num_blocks, memctx);
+   if (!blocks || !loop_end) {
+      ralloc_free(memctx);
+      return false;
+   }
    global_next_use_distances(program, cfg_blocks, num_blocks, is_pub,
                              direct_lanes, has_abi_ret, memctx, blocks, loop_end);
    validate_next_use_info(cfg_blocks, num_blocks, n, blocks);

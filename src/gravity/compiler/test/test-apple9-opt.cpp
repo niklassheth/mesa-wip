@@ -1604,3 +1604,32 @@ TEST_F(Apple9Optimization, SinglePassConstantsPreferMinifloatAndCommuteFma)
    EXPECT_EQ(fma->nr_srcs, 1u);
    EXPECT_EQ(fma->src[0], acc);
 }
+
+TEST_F(Apple9Optimization, SinglePassUniformSignMaskStillFoldsToNegate)
+{
+   /* When 0x80000000 is in the constant table, single-pass optimization turns
+    * IXOR(x, 0x80000000) into a 1-src uniform IXOR before visiting FADD;
+    * select_float_sources must still fold it into FADD's negate modifier. */
+   auto x = agx_apple9_vir_input(&p, 0);
+   auto y = agx_apple9_vir_input(&p, 1);
+   auto sign_bit = imm(0x80000000u);
+   uint32_t xor_srcs[] = {x, sign_bit};
+   auto neg_x = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IXOR,
+                                    AGX_APPLE9_ENC_LOGIC_EXTENDED, xor_srcs, 2, 0);
+   uint32_t add_srcs[] = {neg_x, y};
+   p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FADD,
+                                  AGX_APPLE9_ENC_FLOAT2_COMPACT, add_srcs, 2, 0);
+
+   struct agx_apple9_uniform_constants constants = {};
+   constants.base = 10;
+   constants.count = 1;
+   constants.values[0] = 0x80000000u;
+   ASSERT_TRUE(agx_apple9_optimize_vir_with_constants(&p, &constants));
+
+   const auto *fadd = agx_apple9_definition(&p, p.output);
+   ASSERT_NE(fadd, nullptr);
+   EXPECT_EQ(fadd->src_neg_mask, 1u);
+   EXPECT_EQ(fadd->nr_srcs, 2u);
+   EXPECT_EQ(fadd->src[0], x);
+   EXPECT_EQ(fadd->src[1], y);
+}

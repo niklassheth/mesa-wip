@@ -19841,6 +19841,23 @@ TEST(Apple9CompilerP0, VaryingPatcherRejectsOutOfBoundsCounts)
    ASSERT_EQ(info.apple9_varyings.count, 128u);
    EXPECT_FALSE(agx_apple9_patch_vs_varyings(src, sizeof(src), &info, 0, 0, dst,
                                              &layout));
+
+   /* 3. Duplicate relocation offsets must be rejected rather than remapped twice */
+   agx_shader_info dup_info = {};
+   dup_info.apple9_vary_relocs_valid = true;
+   dup_info.main_size = sizeof(src);
+   dup_info.apple9_varyings.mask[0] = 0x3;
+   dup_info.apple9_varyings.count = 2;
+   dup_info.apple9_vary_reloc_count = 2;
+   dup_info.apple9_vary_relocs[0] = 0;
+   dup_info.apple9_vary_relocs[1] = 0;
+   src[0] = 0x57;
+   src[1] = 0x06;
+   src[2] = 0x54;
+   src[4] = (4u & 7u) << 5;
+   src[5] = 0x40u | (4u >> 3);
+   EXPECT_FALSE(agx_apple9_patch_vs_varyings(src, sizeof(src), &dup_info, 0, 0,
+                                             dst, &layout));
 }
 
 TEST(Apple9CompilerP0, Fp16UnormBlendClampsDstLoad)

@@ -492,32 +492,8 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
       }
    }
 
-   /* Rewrite instruction operands and program outputs. */
-   for (struct agx_apple9_block *b = program->blocks; b; b = b->next) {
-      for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(b); I;
-           I = agx_apple9_instr_next(I)) {
-         if (I->dest < old_count && I->dest_components > 0)
-            I->dest = remap[I->dest];
-         unsigned ns = agx_apple9_vir_nr_srcs(I);
-         for (unsigned s = 0; s < ns; ++s) {
-            uint32_t *sp = agx_apple9_vir_src_ptr(I, s);
-            if (*sp < old_count) {
-               assert(remap[*sp] != AGX_APPLE9_VREG_INVALID);
-               *sp = remap[*sp];
-            }
-         }
-      }
-   }
-
-   if (program->output < old_count && remap[program->output] != AGX_APPLE9_VREG_INVALID)
-      program->output = remap[program->output];
-   for (unsigned k = 0; k < program->live_out_count; ++k) {
-      if (program->live_out[k] < old_count &&
-          remap[program->live_out[k]] != AGX_APPLE9_VREG_INVALID)
-         program->live_out[k] = remap[program->live_out[k]];
-   }
-
-   /* Rebuild per-value metadata arrays. */
+   /* Allocate replacement metadata before mutating any IR IDs so OOM leaves
+    * the program untouched. */
    unsigned alloc_count = MAX2(new_count, 1u);
    uint8_t *new_fixed = malloc(alloc_count);
    uint8_t *new_max = malloc(alloc_count);
@@ -582,6 +558,31 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
          return false;
       }
       memset(new_width, 1, alloc_count * sizeof(uint8_t));
+   }
+
+   /* Rewrite instruction operands and program outputs. */
+   for (struct agx_apple9_block *b = program->blocks; b; b = b->next) {
+      for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(b); I;
+           I = agx_apple9_instr_next(I)) {
+         if (I->dest < old_count && I->dest_components > 0)
+            I->dest = remap[I->dest];
+         unsigned ns = agx_apple9_vir_nr_srcs(I);
+         for (unsigned s = 0; s < ns; ++s) {
+            uint32_t *sp = agx_apple9_vir_src_ptr(I, s);
+            if (*sp < old_count) {
+               assert(remap[*sp] != AGX_APPLE9_VREG_INVALID);
+               *sp = remap[*sp];
+            }
+         }
+      }
+   }
+
+   if (program->output < old_count && remap[program->output] != AGX_APPLE9_VREG_INVALID)
+      program->output = remap[program->output];
+   for (unsigned k = 0; k < program->live_out_count; ++k) {
+      if (program->live_out[k] < old_count &&
+          remap[program->live_out[k]] != AGX_APPLE9_VREG_INVALID)
+         program->live_out[k] = remap[program->live_out[k]];
    }
 
    for (unsigned v = 0; v < old_count; ++v) {
@@ -675,15 +676,23 @@ apple9_ra_repair_ssa(struct agx_apple9_vir_program *program,
    void *memctx = ralloc_context(NULL);
    struct agx_apple9_block **cfg_blocks =
       rzalloc_array(memctx, struct agx_apple9_block *, num_blocks);
+   struct repair_block *blocks =
+      rzalloc_array(memctx, struct repair_block, num_blocks);
+   if (!cfg_blocks || !blocks) {
+      ralloc_free(memctx);
+      return false;
+   }
    for (struct agx_apple9_block *b = program->blocks; b; b = b->next) {
       if (b->cfg_active && b->cfg_index < num_blocks)
          cfg_blocks[b->cfg_index] = b;
    }
 
-   struct repair_block *blocks =
-      rzalloc_array(memctx, struct repair_block, num_blocks);
    for (unsigned bi = 0; bi < num_blocks; ++bi) {
       blocks[bi].defs = _mesa_hash_table_u64_create(memctx);
+      if (!blocks[bi].defs) {
+         ralloc_free(memctx);
+         return false;
+      }
       util_dynarray_init(&blocks[bi].incomplete_phis, memctx);
    }
 
@@ -695,7 +704,8 @@ apple9_ra_repair_ssa(struct agx_apple9_vir_program *program,
    BITSET_WORD *direct_lanes =
       rzalloc_array(memctx, BITSET_WORD, BITSET_WORDS(MAX2(n, 1u)));
    uint32_t *def_base = malloc(MAX2(n, 1u) * sizeof(uint32_t));
-   if (!blocks || !created_phis || !direct_lanes || !def_base) {
+   if (!created_phis || !direct_lanes || !def_base ||
+       (track_spill_homes && state && !homes)) {
       free(def_base);
       ralloc_free(memctx);
       return false;

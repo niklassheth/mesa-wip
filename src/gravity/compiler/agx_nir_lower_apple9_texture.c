@@ -704,10 +704,15 @@ agx_nir_lower_apple9_texture_offsets(nir_shader *nir,
                tex->src[nir_tex_instr_src_index(tex, nir_tex_src_coord)].src.ssa,
             .offset = offset >= 0 ? tex->src[offset].src.ssa : NULL};
          b.cursor = nir_before_instr(instr);
-         if (tex->is_shadow)
+         if (tex->is_shadow) {
             s.comparator =
                tex->src[nir_tex_instr_src_index(tex, nir_tex_src_comparator)]
                   .src.ssa;
+            if (key && tex->texture_index < 32 &&
+                (key[tex->texture_index].flags &
+                 AGX_APPLE9_CLAMP_SHADOW_REFERENCE))
+               s.comparator = nir_fsat(&b, s.comparator);
+         }
          if (s.state) {
             for (unsigned c = 0; c < s.dims; ++c)
                s.wrap[c] = nir_imm_int(&b, s.state->wrap[c]);
