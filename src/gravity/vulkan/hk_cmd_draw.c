@@ -1766,6 +1766,7 @@ hk_apple9_use_native_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    }
    const struct hk_shader *main = hk_native_producer_main(gs);
    const struct agx_apple9_mesh_body_info *body = &main->info.apple9_native;
+   const uint32_t gs_groups = hk_apple9_native_gs_groups(cmd, draw);
    return main->info.apple9_native_stage == HK_APPLE9_NATIVE_MESH &&
           hk_native_producer_object(gs)->info.apple9_native_stage ==
              HK_APPLE9_NATIVE_OBJECT &&
@@ -1780,7 +1781,9 @@ hk_apple9_use_native_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
              body->layout.max_vertices, body->layout.max_primitives) &&
           /* GS invocations multiply the groups beyond the draw-only bound. */
           hk_apple9_native_mesh_grid_valid(
-             (const uint32_t[]){hk_apple9_native_gs_groups(cmd, draw), draw.b.count[1], 1});
+             (const uint32_t[]){gs_groups, draw.b.count[1], 1}) &&
+          agx_apple9_mesh_ring_fits(&body->layout,
+                                    (uint64_t)gs_groups * draw.b.count[1]);
 }
 
 DEBUG_GET_ONCE_BOOL_OPTION(gs_route_log, "HK_APPLE9_GS_ROUTE_LOG", false)
@@ -2175,9 +2178,12 @@ hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
    }
    /* A single native draw whose declared geometry could reach the TVB cap
     * would lose work in its mesh-mode render; emulate it instead (ordinary
-    * renders recover through a partial render). */
-   if (direct && groups * main->info.apple9_native.layout.max_primitives >
-          hk_apple9_native_render_primitives())
+    * renders recover through a partial render). Likewise fall back when the
+    * draw's vertex planes can wrap the 64 KiB hardware mesh output ring. */
+   if (direct &&
+       (groups * main->info.apple9_native.layout.max_primitives >
+           hk_apple9_native_render_primitives() ||
+        !agx_apple9_mesh_ring_fits(&main->info.apple9_native.layout, groups)))
       return false;
    return hk_apple9_native_mesh_state_eligible(
       cmd, direct, count_addr,

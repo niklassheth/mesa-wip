@@ -33,6 +33,15 @@ bool
 agx_apple9_mesh_state_build(uint32_t out[AGX_APPLE9_MESH_STATE_WORDS],
                             const struct agx_apple9_mesh_state_parameters *p);
 
+/* Apple9 (T8132) mesh vertex output ring capacity in 16-byte rows (64 KiB).
+ * Each workgroup consumes ceil(V / 4) * ALIGN_POT(n, 4) + 8 rows. */
+#define AGX_APPLE9_MESH_RING_ROWS 4096u
+#define AGX_APPLE9_MESH_RING_HEADER_ROWS 8u
+#define AGX_APPLE9_MESH_RING_CONCURRENT_SAFE_ROWS 64u
+
+bool agx_apple9_mesh_ring_fits(const struct agx_apple9_mesh_layout *layout,
+                               uint64_t groups);
+
 /* Ten pointer-sized argument slots. The first six keep the graphics ABI;
  * local output/grid roots are explicit values, not pointers or GPR numbers.
  * The launch builder publishes the padded twenty-word window unchanged. */

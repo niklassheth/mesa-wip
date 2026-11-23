@@ -110,6 +110,21 @@ routes(struct hk_cmd_buffer *cmd)
             VK_CONSERVATIVE_RASTERIZATION_MODE_UNDERESTIMATE_EXT);
    gfx->shaders[MESA_SHADER_FRAGMENT] = NULL;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   /* Hardware 64 KiB mesh output ring gate: V=128, n=8 (264 rows/WG) admits up
+    * to 15 workgroups (e.g. draw_count_{1,2}) and falls back at 16/32/64. */
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_vertices = 128;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.vertex_components = 8;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_primitives = 32;
+   const uint32_t ring_fit[] = {15, 1, 1}, ring_wrap[] = {16, 1, 1},
+                  ring_32[] = {32, 1, 1}, ring_64[] = {64, 1, 1};
+   CHECK(hk_apple9_use_native_mesh(cmd, ring_fit, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, ring_wrap, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, ring_32, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, ring_64, 0));
+   /* Multi-axis product crossing the same threshold falls back too. */
+   const uint32_t ring_2d_fit[] = {3, 5, 1}, ring_2d_wrap[] = {4, 4, 1};
+   CHECK(hk_apple9_use_native_mesh(cmd, ring_2d_fit, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, ring_2d_wrap, 0));
 #undef FALLBACK
    memset(gfx->shaders, 0, sizeof(gfx->shaders));
    free(mesh);
@@ -240,6 +255,14 @@ gs_routes(struct hk_cmd_buffer *cmd)
       main->info.apple9_native.layout.max_vertices = 4;
       main->info.apple9_native.layout.max_primitives = 2;
       CHECK(hk_apple9_use_native_gs(cmd, draw));
+      /* Hardware 64 KiB mesh output ring gate also protects native GS. */
+      main->info.apple9_native.layout.vertex_components = 128; /* 136 rows/WG -> 30 groups */
+      draw.b.count[0] = 3 * 30;
+      CHECK(hk_apple9_use_native_gs(cmd, draw));
+      draw.b.count[0] = 3 * 31;
+      CHECK(!hk_apple9_use_native_gs(cmd, draw));
+      draw.b.count[0] = 3;
+      main->info.apple9_native.layout.vertex_components = 0;
       gfx->shaders[MESA_SHADER_GEOMETRY] = ng;
       gfx->shaders[MESA_SHADER_VERTEX] = nv;
       gfx->shaders[MESA_SHADER_FRAGMENT] = nf;
@@ -296,6 +319,14 @@ task_routes(struct hk_cmd_buffer *cmd)
    CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
    direct[0] = 2;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   /* Task bridge multiplies parent grid by max_mesh_groups before checking the
+    * 64 KiB mesh output ring (V=128, n=8 -> 15 safe groups). */
+   m->info.apple9_native.layout.max_vertices = 128;
+   m->info.apple9_native.layout.vertex_components = 8;
+   direct[0] = 5; direct[1] = direct[2] = 1; /* 5 * 3 = 15 groups */
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   direct[0] = 6; /* 6 * 3 = 18 groups > 15 */
+   CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
    gfx->shaders[MESA_SHADER_TASK] = gfx->shaders[MESA_SHADER_MESH] = NULL;
    free(mesh); free(task);
 }

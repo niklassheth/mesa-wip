@@ -308,6 +308,69 @@ check_child_grids(void)
       CHECK(!hk_apple9_native_mesh_grid_valid(invalid[i]));
 }
 
+static void
+check_mesh_ring_fits(void)
+{
+   CHECK(!agx_apple9_mesh_ring_fits(NULL, 1));
+
+   /* Qualified native-index classes and small footprints (<= 64 rows) stay
+    * within the 64 KiB ring at any grid size. */
+   const struct agx_apple9_mesh_layout small_cases[] = {
+      {.max_vertices = 0, .vertex_components = 0},
+      {.max_vertices = 3, .vertex_components = 4},   /* 12 rows */
+      {.max_vertices = 32, .vertex_components = 4},  /* 40 rows (T32V32P42) */
+      {.max_vertices = 28, .vertex_components = 8},  /* 64 rows (exact safe cap) */
+      {.max_vertices = 4, .vertex_components = 56},  /* 64 rows */
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(small_cases); ++i) {
+      CHECK(agx_apple9_mesh_ring_fits(&small_cases[i], 0));
+      CHECK(agx_apple9_mesh_ring_fits(&small_cases[i], 65535));
+      CHECK(agx_apple9_mesh_ring_fits(&small_cases[i],
+                                      HK_APPLE9_NATIVE_MAX_GROUP_TOTAL));
+   }
+
+   /* Larger footprints are admitted only when groups * wg_rows <= 4096.
+    * Planes align up to multiples of 4 (e.g. n=10 -> 12). */
+   const struct {
+      unsigned max_vertices, vertex_components;
+      uint64_t max_safe_groups;
+   } ring_cases[] = {
+      {32,  8, 56},  /* wg_rows = 8*8 + 8 = 72; 4096 / 72 = 56 */
+      {128, 8, 15},  /* draw_count_{32,64}: 32*8 + 8 = 264; 4096 / 264 = 15 */
+      {124, 8, 16},  /* 31*8 + 8 = 256; 4096 / 256 = 16 */
+      {256, 8, 7},   /* 64*8 + 8 = 520; 4096 / 520 = 7 */
+      {96, 10, 13},  /* ALIGN_POT(10,4)=12: 24*12 + 8 = 296; 4096 / 296 = 13 */
+      {100, 10, 13}, /* 25*12 + 8 = 308; 4096 / 308 = 13 */
+      {96, 12, 13},  /* 24*12 + 8 = 296; 4096 / 296 = 13 */
+      {48, 20, 16},  /* 12*20 + 8 = 248; 4096 / 248 = 16 */
+      {52, 20, 15},  /* 13*20 + 8 = 268; 4096 / 268 = 15 */
+      {6, 128, 15},  /* in_out.with_i16 max varyings: 2*128 + 8 = 264 */
+      {256, 60, 1},  /* 64*60 + 8 = 3848 <= 4096: single WG fits */
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(ring_cases); ++i) {
+      struct agx_apple9_mesh_layout l = {
+         .max_vertices = ring_cases[i].max_vertices,
+         .vertex_components = ring_cases[i].vertex_components,
+      };
+      CHECK(agx_apple9_mesh_ring_fits(&l, 0));
+      CHECK(agx_apple9_mesh_ring_fits(&l, 1));
+      CHECK(agx_apple9_mesh_ring_fits(&l, ring_cases[i].max_safe_groups));
+      CHECK(!agx_apple9_mesh_ring_fits(&l, ring_cases[i].max_safe_groups + 1));
+   }
+
+   /* Impossible / overflowing layouts (> 64 KiB for a single workgroup). */
+   const struct agx_apple9_mesh_layout huge_cases[] = {
+      {.max_vertices = 256, .vertex_components = 64},
+      {.max_vertices = UINT32_MAX, .vertex_components = 4},
+      {.max_vertices = 4, .vertex_components = UINT32_MAX},
+      {.max_vertices = UINT32_MAX, .vertex_components = UINT32_MAX},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(huge_cases); ++i) {
+      CHECK(!agx_apple9_mesh_ring_fits(&huge_cases[i], 0));
+      CHECK(!agx_apple9_mesh_ring_fits(&huge_cases[i], 1));
+   }
+}
+
 /* A native block continuing a render updates the header block plus only the
  * PPP blocks whose bytes changed; without a previous record it is the full
  * chain, word for word. */
@@ -384,6 +447,7 @@ main(int argc, char **argv)
    CHECK(argc == 1);
    check_ppp_delta();
    check_child_grids();
+   check_mesh_ring_fits();
    check_contract(false, 0);
    check_contract(false, 1);
    check_contract(false, 5);

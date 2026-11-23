@@ -56,6 +56,34 @@ agx_apple9_mesh_state_build(uint32_t out[AGX_APPLE9_MESH_STATE_WORDS],
    return true;
 }
 
+/* T8132's mesh output ring holds 4,096 16-byte rows (64 KiB). Each workgroup
+ * occupies ceil(V / 4) * ALIGN_POT(n, 4) + 8 rows (4-vertex quads times
+ * 4-plane-aligned vertex components plus an 8-row per-workgroup header).
+ * When a draw's total ring usage exceeds 4,096 rows, hardware can admit one
+ * extra workgroup before draining earlier ones, wrapping onto live workgroup
+ * data. Footprints <= 64 rows (covering all 31 qualified native-index classes)
+ * fit up to 64 concurrent workgroups without wrapping; larger footprints are
+ * admitted only when the entire draw fits in 4,096 rows. Because the bound is
+ * monotone in max_vertices, any smaller runtime SetMeshOutputsEXT count is
+ * also safe. */
+bool
+agx_apple9_mesh_ring_fits(const struct agx_apple9_mesh_layout *layout,
+                          uint64_t groups)
+{
+   if (!layout)
+      return false;
+   uint64_t quads = ((uint64_t)layout->max_vertices + 3) / 4;
+   uint64_t planes = ((uint64_t)layout->vertex_components + 3) & ~UINT64_C(3);
+   if (quads &&
+       planes > (AGX_APPLE9_MESH_RING_ROWS - AGX_APPLE9_MESH_RING_HEADER_ROWS) /
+                   quads)
+      return false;
+   uint64_t wg_rows = quads * planes + AGX_APPLE9_MESH_RING_HEADER_ROWS;
+   if (wg_rows <= AGX_APPLE9_MESH_RING_CONCURRENT_SAFE_ROWS)
+      return true;
+   return groups <= AGX_APPLE9_MESH_RING_ROWS / wg_rows;
+}
+
 bool
 agx_apple9_mesh_arguments_build(uint64_t out[AGX_APPLE9_MESH_ARGUMENT_WORDS / 2],
                                 const struct agx_apple9_mesh_arguments *p)
