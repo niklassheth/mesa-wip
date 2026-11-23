@@ -165,6 +165,10 @@ struct hk_device {
    } apple9_stipple_prologs;
    struct {
       simple_mtx_t lock;
+      struct hk_apple9_stats_prolog *prolog;
+   } apple9_stats_prolog;
+   struct {
+      simple_mtx_t lock;
       struct hash_table *ht;
    } apple9_sw_vs_prologs;
    struct {

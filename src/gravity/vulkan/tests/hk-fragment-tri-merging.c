@@ -271,6 +271,121 @@ main(void)
          out[i]->ops->destroy(&dev->vk, out[i], NULL);
    }
 
+   /* Linked FS pipeline-statistics prolog: verify standalone prolog ABI
+    * (no preamble, slot 0 = sysvals, slot 1 = root) and that normal epilog FS
+    * omit the inline counter even with pipelineStatisticsQuery enabled, while
+    * early_fragment_tests and sample_shading keep it inline (and persist the
+    * inline_statistics flag across serialization). */
+   {
+      nir_shader *prolog_nir = hk_apple9_build_fs_stats_prolog_nir();
+      struct agx_apple9_blend pblend = {
+         .use_epilog = true,
+         .dynamic_samples = true,
+         .writes_memory_stats_only = true,
+      };
+      struct agx_shader_part part = {0};
+      const char *reason = NULL;
+      CHECK(agx_compile_apple9_fragment_mrt(prolog_nir, NULL, &pblend, 0,
+                                            &part, &reason));
+      CHECK(part.info.apple9_preamble_size == 0);
+      CHECK(part.info.apple9_resource_count == 2);
+      CHECK(part.info.apple9_resource_binding[0] ==
+            AGX_APPLE9_GRAPHICS_SYSVAL_BINDING);
+      CHECK(part.info.apple9_resource_binding[1] == 0);
+      free(part.binary);
+      ralloc_free(prolog_nir);
+
+      dev->vk.enabled_features.pipelineStatisticsQuery = true;
+      const struct vk_render_pass_state rp = {
+         .color_attachment_count = 1,
+         .color_attachment_formats = {VK_FORMAT_R8G8B8A8_UNORM},
+      };
+      const struct vk_color_blend_state cb = {
+         .attachment_count = 1, .color_write_enables = 1,
+         .attachments = {{.write_mask = 15}},
+      };
+
+      /* Normal epilog FS: no inline statistics counter. */
+      struct vk_shader_compile_info infos_normal[] = {
+         {.stage = MESA_SHADER_MESH, .nir = mesh_source(),
+          .robustness = &vk_robustness_disabled},
+         {.stage = MESA_SHADER_FRAGMENT, .nir = fragment_source(false),
+          .robustness = &vk_robustness_disabled},
+      };
+      struct vk_shader *out_normal[2] = {0};
+      const struct vk_graphics_pipeline_state st_normal = {.rp = &rp, .cb = &cb};
+      CHECK(hk_apple9_compile_graphics(dev, 2, infos_normal, &st_normal, NULL,
+                                       NULL, NULL, out_normal) == VK_SUCCESS);
+      struct hk_api_shader *fs_normal =
+         container_of(out_normal[1], struct hk_api_shader, vk);
+      CHECK(!fs_normal->variants[0].info.fs.inline_statistics);
+      size_t normal_size = fs_normal->variants[0].code_size;
+
+      /* early_fragment_tests FS: keeps inline statistics counter. */
+      nir_shader *early_nir = fragment_source(false);
+      early_nir->info.fs.early_fragment_tests = true;
+      struct vk_shader_compile_info infos_early[] = {
+         {.stage = MESA_SHADER_MESH, .nir = mesh_source(),
+          .robustness = &vk_robustness_disabled},
+         {.stage = MESA_SHADER_FRAGMENT, .nir = early_nir,
+          .robustness = &vk_robustness_disabled},
+      };
+      struct vk_shader *out_early[2] = {0};
+      CHECK(hk_apple9_compile_graphics(dev, 2, infos_early, &st_normal, NULL,
+                                       NULL, NULL, out_early) == VK_SUCCESS);
+      struct hk_api_shader *fs_early =
+         container_of(out_early[1], struct hk_api_shader, vk);
+      CHECK(fs_early->variants[0].info.fs.inline_statistics);
+      CHECK(fs_early->variants[0].code_size > normal_size + 200);
+
+      /* sample_shading FS: keeps inline statistics counter. */
+      struct vk_shader_compile_info infos_ss[] = {
+         {.stage = MESA_SHADER_MESH, .nir = mesh_source(),
+          .robustness = &vk_robustness_disabled},
+         {.stage = MESA_SHADER_FRAGMENT, .nir = fragment_source(false),
+          .robustness = &vk_robustness_disabled},
+      };
+      struct vk_shader *out_ss[2] = {0};
+      const struct vk_multisample_state ms_ss = {
+         .rasterization_samples = 4,
+         .sample_shading_enable = true,
+         .sample_mask = 0xf,
+      };
+      const struct vk_graphics_pipeline_state st_ss = {
+         .rp = &rp, .cb = &cb, .ms = &ms_ss,
+      };
+      CHECK(hk_apple9_compile_graphics(dev, 2, infos_ss, &st_ss, NULL,
+                                       NULL, NULL, out_ss) == VK_SUCCESS);
+      struct hk_api_shader *fs_ss =
+         container_of(out_ss[1], struct hk_api_shader, vk);
+      CHECK(fs_ss->variants[0].info.fs.inline_statistics);
+
+      /* Serialization preserves inline_statistics (both false and true). */
+      struct hk_api_shader *check_shaders[2] = {fs_normal, fs_early};
+      for (unsigned k = 0; k < 2; ++k) {
+         struct blob blob;
+         blob_init(&blob);
+         CHECK(hk_api_shader_serialize(&dev->vk, &check_shaders[k]->vk, &blob));
+         struct blob_reader reader;
+         blob_reader_init(&reader, blob.data, blob.size);
+         struct vk_shader *deser = NULL;
+         CHECK(hk_deserialize_api_shader(&dev->vk, &reader, 0, NULL, &deser) ==
+               VK_SUCCESS);
+         blob_finish(&blob);
+         struct hk_api_shader *copy =
+            container_of(deser, struct hk_api_shader, vk);
+         CHECK(copy->variants[0].info.fs.inline_statistics == (k == 1));
+         copy->vk.ops->destroy(&dev->vk, &copy->vk, NULL);
+      }
+
+      for (unsigned i = 0; i < 2; ++i) {
+         out_normal[i]->ops->destroy(&dev->vk, out_normal[i], NULL);
+         out_early[i]->ops->destroy(&dev->vk, out_early[i], NULL);
+         out_ss[i]->ops->destroy(&dev->vk, out_ss[i], NULL);
+      }
+      dev->vk.enabled_features.pipelineStatisticsQuery = false;
+   }
+
    simple_mtx_destroy(&pdev->debug_compile_lock);
    simple_mtx_destroy(&dev->apple9_bodies.lock);
    test_reset_usc_heap(dev);

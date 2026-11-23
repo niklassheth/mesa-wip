@@ -2653,19 +2653,32 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
              * merging unless the shader itself requires disabling it. */
             bool tri_merging = true;
             bool real_writes_memory = false;
+            bool inline_statistics = false;
             if (!nir->info.internal) {
                if (key.zs_self_dep && !key.fs_use_epilog)
                   hk_apple9_late_zs(nir);
                nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
                real_writes_memory = nir->info.writes_memory;
+               const bool per_sample =
+                  key.sample_shading || nir->info.fs.uses_sample_shading;
                tri_merging = !nir->info.uses_wide_subgroup_intrinsics &&
                              !nir->info.fs.needs_coarse_quad_helper_invocations &&
                              !nir->info.writes_memory &&
-                             !key.sample_shading &&
-                             !nir->info.fs.uses_sample_shading &&
+                             !per_sample &&
                              !hk_apple9_interpolates_off_center(nir);
-               if (dev->vk.enabled_features.pipelineStatisticsQuery)
+               /* Normal epilog fragment shaders count invocations via a
+                * draw-time linked stats prolog only when queried. Keep the
+                * counter inline for early_fragment_tests (must execute after
+                * fs_main's early Z/S test), per-sample shaders (must count per
+                * covered sample inside the trampoline loop), and non-epilog
+                * shaders. */
+               if (dev->vk.enabled_features.pipelineStatisticsQuery &&
+                   !key.no_fs_statistics &&
+                   (!key.fs_use_epilog || nir->info.fs.early_fragment_tests ||
+                    per_sample)) {
                   hk_apple9_lower_fs_statistics(nir);
+                  inline_statistics = true;
+               }
                NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                         hk_apple9_clamp_depth_export,
                         nir_metadata_control_flow, NULL);
@@ -2676,6 +2689,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             shader->info.fs.writes_memory = real_writes_memory;
             shader->info.fs.early_fragment_tests =
                nir->info.fs.early_fragment_tests;
+            shader->info.fs.inline_statistics = inline_statistics;
             if (key.sample_shading) {
                nir->info.fs.uses_sample_shading = true;
                NIR_PASS(_, nir, nir_shader_intrinsics_pass,

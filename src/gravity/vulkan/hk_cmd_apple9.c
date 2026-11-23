@@ -1,6 +1,7 @@
 /* Copyright 2026 Asahi Linux Contributors
  * SPDX-License-Identifier: MIT
  */
+#include "gravity/compiler/agx_apple9_encoding.h"
 #include "gravity/compiler/agx_compile_apple9.h"
 #include "gravity/compiler/agx_nir.h"
 #include "gravity/lib/agx_apple9.h"
@@ -582,6 +583,97 @@ hk_apple9_stipple_prologs_finish(struct hk_device *dev)
    dev->apple9_stipple_prologs.ht = NULL;
 }
 
+struct hk_apple9_stats_prolog {
+   struct agx_shader_body *body;
+   uint16_t publication_count;
+   uint32_t scratch_size;
+   uint8_t atomic_frame_size;
+};
+
+static struct hk_apple9_stats_prolog *
+hk_apple9_get_stats_prolog(struct hk_device *dev)
+{
+   simple_mtx_lock(&dev->apple9_stats_prolog.lock);
+   if (dev->apple9_stats_prolog.prolog) {
+      struct hk_apple9_stats_prolog *found = dev->apple9_stats_prolog.prolog;
+      simple_mtx_unlock(&dev->apple9_stats_prolog.lock);
+      return found;
+   }
+   simple_mtx_unlock(&dev->apple9_stats_prolog.lock);
+
+   nir_shader *nir = hk_apple9_build_fs_stats_prolog_nir();
+   struct agx_apple9_blend blend = {
+      .use_epilog = true,
+      .dynamic_samples = true,
+      .writes_memory_stats_only = true,
+   };
+   struct agx_shader_part part = {0};
+   const char *reason = NULL;
+   bool ok = agx_compile_apple9_fragment_mrt(nir, NULL, &blend, 0, &part, &reason);
+   ralloc_free(nir);
+   if (!ok) {
+      fprintf(stderr, "Apple9 FS stats prolog: %s\n",
+              reason ?: "compilation failed");
+      free(part.binary);
+      return NULL;
+   }
+   if (part.info.apple9_preamble_size != 0 ||
+       part.info.apple9_resource_count != 2 ||
+       part.info.apple9_resource_binding[0] !=
+          AGX_APPLE9_GRAPHICS_SYSVAL_BINDING ||
+       part.info.apple9_resource_binding[1] != 0) {
+      fprintf(stderr,
+              "Apple9 FS stats prolog ABI mismatch: preamble=%u res=%u (%u, %u)\n",
+              part.info.apple9_preamble_size, part.info.apple9_resource_count,
+              part.info.apple9_resource_binding[0],
+              part.info.apple9_resource_binding[1]);
+      free(part.binary);
+      return NULL;
+   }
+
+   struct hk_shader upload = {
+      .code_ptr = part.binary,
+      .code_size = part.info.binary_size,
+   };
+   struct agx_shader_body *body = hk_apple9_body_upload(dev, &upload);
+   free(part.binary);
+   if (!body)
+      return NULL;
+
+   struct hk_apple9_stats_prolog *created = calloc(1, sizeof(*created));
+   if (!created) {
+      agx_shader_body_unreference(&dev->dev, body);
+      return NULL;
+   }
+   created->body = body;
+   created->publication_count = part.info.apple9_publication_count;
+   created->scratch_size = part.info.scratch_size;
+   created->atomic_frame_size = part.info.apple9_atomic_frame_size;
+
+   simple_mtx_lock(&dev->apple9_stats_prolog.lock);
+   if (dev->apple9_stats_prolog.prolog) {
+      struct hk_apple9_stats_prolog *existing = dev->apple9_stats_prolog.prolog;
+      simple_mtx_unlock(&dev->apple9_stats_prolog.lock);
+      agx_shader_body_unreference(&dev->dev, created->body);
+      free(created);
+      return existing;
+   }
+   dev->apple9_stats_prolog.prolog = created;
+   simple_mtx_unlock(&dev->apple9_stats_prolog.lock);
+   return created;
+}
+
+void
+hk_apple9_stats_prolog_finish(struct hk_device *dev)
+{
+   struct hk_apple9_stats_prolog *prolog = dev->apple9_stats_prolog.prolog;
+   if (!prolog)
+      return;
+   agx_shader_body_unreference(&dev->dev, prolog->body);
+   free(prolog);
+   dev->apple9_stats_prolog.prolog = NULL;
+}
+
 struct hk_apple9_sw_vs_prolog {
    struct agx_apple9_sw_vs_prolog_key key;
    struct agx_shader_body *body;
@@ -683,12 +775,52 @@ hk_apple9_sw_vs_prologs_finish(struct hk_device *dev)
 }
 
 #define HK_APPLE9_LINKED_ENTRY_CACHE_SIZE 4096
+#define HK_APPLE9_LINKED_STUB_5_MAX_BYTES 82
+
+static size_t
+hk_apple9_build_linked_stub_5(uint8_t *out, size_t capacity, uint64_t code_va,
+                              uint64_t s1, uint64_t s2, uint64_t s3,
+                              uint64_t s4, uint64_t s5)
+{
+   if (!out || !s1 || !s2 || !s3 || !s4 || !s5 ||
+       ((code_va | s1 | s2 | s3 | s4 | s5) & 1) ||
+       capacity < HK_APPLE9_LINKED_STUB_5_MAX_BYTES)
+      return 0;
+
+   size_t pos = 0;
+   const uint8_t push[4] = {0x0f, 0x05, 0x54, 0x1a};
+   memcpy(out + pos, push, 4);
+   pos += 4;
+
+   const uint64_t calls[4] = {s1, s2, s3, s4};
+   for (unsigned i = 0; i < 4; ++i) {
+      int64_t disp = (int64_t)calls[i] - (int64_t)(code_va + pos);
+      if (disp < -(int64_t)UINT32_MAX || disp > UINT32_MAX ||
+          !agx_apple9_encode_call(out + pos, 0, disp))
+         return 0;
+      pos += 10;
+      if (!agx_apple9_encode_exec_pop(out + pos, 2))
+         return 0;
+      pos += 6;
+   }
+
+   int64_t jmp_disp = (int64_t)s5 - (int64_t)(code_va + pos);
+   if (jmp_disp < -(int64_t)UINT32_MAX || jmp_disp > UINT32_MAX ||
+       !agx_apple9_encode_branch(out + pos, true, jmp_disp))
+      return 0;
+   pos += 10;
+   const uint32_t stop = 0x0e;
+   memcpy(out + pos, &stop, 4);
+   pos += 4;
+   return pos;
+}
 
 struct hk_apple9_linked_entry_key {
    uint64_t first_addr;
    uint64_t second_addr;
    uint64_t third_addr;
    uint64_t fourth_addr;
+   uint64_t fifth_addr;
    uint64_t preamble_addr;
    uint32_t frame_extent;
    uint16_t publication_count;
@@ -699,6 +831,7 @@ struct hk_apple9_linked_entry {
    struct hk_apple9_linked_entry_key key;
    struct agx_shader_body body;
    struct agx_shader_body *fourth_ref;
+   struct agx_shader_body *fifth_ref;
    struct agx_shader_body *stub_ref;
    uint64_t program_id;
    struct agx_apple9_stage_launch_cache launch_cache;
@@ -727,13 +860,14 @@ hk_apple9_linked_entry_destroy(struct agx_device *dev,
    agx_shader_body_unreference(dev, entry->body.second_ref);
    agx_shader_body_unreference(dev, entry->body.third_ref);
    agx_shader_body_unreference(dev, entry->fourth_ref);
+   agx_shader_body_unreference(dev, entry->fifth_ref);
    agx_shader_body_unreference(dev, entry->stub_ref);
    agx_apple9_stage_launch_cache_finish(&entry->launch_cache);
    free(entry);
 }
 
 /* Returns a referenced linked entry (2-stage when third == NULL, 3-stage when
- * third != NULL and fourth == NULL, or a slab-allocated 4-stage stub when
+ * third != NULL and fourth == NULL, or a slab-allocated 4/5-stage stub when
  * fourth != NULL); caller must unreference &entry->body once pinned or unused. */
 static struct hk_apple9_linked_entry *
 hk_apple9_get_linked_entry(struct hk_device *dev,
@@ -741,6 +875,7 @@ hk_apple9_get_linked_entry(struct hk_device *dev,
                            struct agx_shader_body *second,
                            struct agx_shader_body *third,
                            struct agx_shader_body *fourth,
+                           struct agx_shader_body *fifth,
                            uint64_t preamble_addr, uint32_t frame_extent,
                            uint16_t publication_count, uint8_t stage_kind)
 {
@@ -750,6 +885,7 @@ hk_apple9_get_linked_entry(struct hk_device *dev,
    key.second_addr = second->addr;
    key.third_addr = third ? third->addr : 0;
    key.fourth_addr = fourth ? fourth->addr : 0;
+   key.fifth_addr = fifth ? fifth->addr : 0;
    key.preamble_addr = preamble_addr;
    key.frame_extent = frame_extent;
    key.publication_count = publication_count;
@@ -782,19 +918,25 @@ hk_apple9_get_linked_entry(struct hk_device *dev,
    if (fourth) {
       simple_mtx_unlock(&dev->apple9_linked_entries.lock);
       void *map = NULL;
-      raw_stub = hk_apple9_body_alloc_raw(
-         dev, AGX_APPLE9_LINKED_STUB_4_MAX_BYTES, &map);
+      size_t stub_bytes = fifth ? HK_APPLE9_LINKED_STUB_5_MAX_BYTES
+                                : AGX_APPLE9_LINKED_STUB_4_MAX_BYTES;
+      raw_stub = hk_apple9_body_alloc_raw(dev, stub_bytes, &map);
       if (!raw_stub)
          return NULL;
-      if (!agx_apple9_build_linked_stub_4(
-             map, AGX_APPLE9_LINKED_STUB_4_MAX_BYTES, raw_stub->addr,
-             first->addr, second->addr, third->addr, fourth->addr)) {
+      size_t built = fifth
+         ? hk_apple9_build_linked_stub_5(map, stub_bytes, raw_stub->addr,
+                                         first->addr, second->addr, third->addr,
+                                         fourth->addr, fifth->addr)
+         : agx_apple9_build_linked_stub_4(map, stub_bytes, raw_stub->addr,
+                                          first->addr, second->addr, third->addr,
+                                          fourth->addr);
+      if (!built) {
          agx_shader_body_unreference(&dev->dev, raw_stub);
          return NULL;
       }
       agx_bo_note_cpu_write(raw_stub->bo,
                             raw_stub->addr - raw_stub->bo->va->addr,
-                            AGX_APPLE9_LINKED_STUB_4_MAX_BYTES);
+                            stub_bytes);
       simple_mtx_lock(&dev->apple9_linked_entries.lock);
       ht = dev->apple9_linked_entries.ht;
       he = _mesa_hash_table_search(ht, &key);
@@ -824,7 +966,10 @@ hk_apple9_get_linked_entry(struct hk_device *dev,
       agx_shader_body_reference(third);
    if (fourth)
       agx_shader_body_reference(fourth);
+   if (fifth)
+      agx_shader_body_reference(fifth);
    result->fourth_ref = fourth;
+   result->fifth_ref = fifth;
    result->stub_ref = raw_stub;
    result->body = (struct agx_shader_body){
       .bo = raw_stub ? raw_stub->bo : first->bo,
@@ -1121,7 +1266,7 @@ hk_apple9_dispatch_sw_vs_prolog(
    uint64_t preamble_addr =
       merged.preamble_size ? s->apple9_body->addr + merged.preamble_offset : 0;
    struct hk_apple9_linked_entry *linked = hk_apple9_get_linked_entry(
-      dev, prolog->body, s->apple9_body, NULL, NULL, preamble_addr,
+      dev, prolog->body, s->apple9_body, NULL, NULL, NULL, preamble_addr,
       MAX2(merged.scratch_size, merged.atomic_frame_size),
       merged.publication_count, 2 /* compute */);
    if (!linked) {
@@ -2361,7 +2506,7 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
             ? vs_main_body->addr + vertex->preamble_offset
             : 0;
       linked_vs_entry = hk_apple9_get_linked_entry(
-         dev, prolog->body, vs_main_body, NULL, NULL, preamble_addr,
+         dev, prolog->body, vs_main_body, NULL, NULL, NULL, preamble_addr,
          MAX2(scratch_size, atomic_frame), pub_count, 0);
       if (!linked_vs_entry)
          UNSUPPORTED();
@@ -2396,6 +2541,11 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       (vertex->varyings.mask[VARYING_SLOT_TEX7] & 0x3) == 0x3 &&
       !shaders[1]->info.fs.line_stipple_start &&
       !shaders[1]->b.info.apple9_varyings.mask[VARYING_SLOT_TEX6];
+   const bool need_stats_prolog =
+      !null_fs &&
+      !shaders[1]->info.fs.inline_statistics &&
+      (gfx->descriptors.root.draw.pipeline_stats_flags &
+       VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT);
    unsigned next_cf =
       (null_fs ? 0 : fragment->varying_components) + 1 +
       (null_fs ? 0 : fragment->reads_primitive_id +
@@ -2545,7 +2695,7 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
             }
          }
          linked_fs_entry = hk_apple9_get_linked_entry(
-            dev, s1, s2, s3, NULL, 0, MAX2(scratch_size, atomic_frame),
+            dev, s1, s2, s3, NULL, NULL, 0, MAX2(scratch_size, atomic_frame),
             pub_count, 1);
          if (!linked_fs_entry)
             UNSUPPORTED();
@@ -2565,6 +2715,7 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          UNSUPPORTED();
       struct hk_apple9_cull_prolog *cull_p = NULL;
       struct hk_apple9_stipple_prolog *stipple_p = NULL;
+      struct hk_apple9_stats_prolog *stats_p = NULL;
       if (need_cull_prolog) {
          struct agx_apple9_cull_prolog_key ckey;
          memset(&ckey, 0, sizeof(ckey));
@@ -2583,6 +2734,13 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          skey.standalone = false;
          stipple_p = hk_apple9_get_stipple_prolog(dev, &skey);
          if (!stipple_p)
+            UNSUPPORTED();
+      }
+      if (need_stats_prolog) {
+         if (shaders[1]->b.info.apple9_fs_epilog.per_sample)
+            UNSUPPORTED();
+         stats_p = hk_apple9_get_stats_prolog(dev);
+         if (!stats_p)
             UNSUPPORTED();
       }
       struct agx_shader_body *prolog1 =
@@ -2678,6 +2836,11 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          scratch_size = MAX2(scratch_size, stipple_p->scratch_size);
          atomic_frame = MAX2(atomic_frame, stipple_p->atomic_frame_size);
       }
+      if (stats_p) {
+         pub_count = MAX2(pub_count, stats_p->publication_count);
+         scratch_size = MAX2(scratch_size, stats_p->scratch_size);
+         atomic_frame = MAX2(atomic_frame, stats_p->atomic_frame_size);
+      }
       uint64_t preamble_addr =
          fragment->preamble_size
             ? shaders[1]->apple9_body->addr + fragment->preamble_offset
@@ -2690,6 +2853,22 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                AGX_APPLE9_GRAPHICS_SYSVAL_BINDING;
          } else if (cmd->apple9_linked_fs.resource_binding[0] !=
                     AGX_APPLE9_GRAPHICS_SYSVAL_BINDING) {
+            UNSUPPORTED();
+         }
+      }
+      if (need_stats_prolog) {
+         if (cmd->apple9_linked_fs.resource_count == 0) {
+            cmd->apple9_linked_fs.resource_binding[0] =
+               AGX_APPLE9_GRAPHICS_SYSVAL_BINDING;
+            cmd->apple9_linked_fs.resource_binding[1] = 0;
+            cmd->apple9_linked_fs.resource_count = 2;
+         } else if (cmd->apple9_linked_fs.resource_binding[0] !=
+                    AGX_APPLE9_GRAPHICS_SYSVAL_BINDING) {
+            UNSUPPORTED();
+         } else if (cmd->apple9_linked_fs.resource_count == 1) {
+            cmd->apple9_linked_fs.resource_binding[1] = 0;
+            cmd->apple9_linked_fs.resource_count = 2;
+         } else if (cmd->apple9_linked_fs.resource_binding[1] != 0) {
             UNSUPPORTED();
          }
       }
@@ -2713,15 +2892,19 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          cmd->apple9_linked_fs.bo = tramp_fs_entry->body.bo;
          cmd->apple9_linked_fs.launch_cache = &tramp_fs_entry->launch_cache;
       } else {
-         struct agx_shader_body *s1 = prolog1 ? prolog1 : shaders[1]->apple9_body;
-         struct agx_shader_body *s2 =
-            prolog2 ? prolog2 : (prolog1 ? shaders[1]->apple9_body : epilog->body);
-         struct agx_shader_body *s3 =
-            prolog2 ? shaders[1]->apple9_body : (prolog1 ? epilog->body : NULL);
-         struct agx_shader_body *s4 = prolog2 ? epilog->body : NULL;
+         struct agx_shader_body *stages[5] = {NULL};
+         unsigned nstages = 0;
+         if (cull_p)
+            stages[nstages++] = cull_p->body;
+         if (stipple_p)
+            stages[nstages++] = stipple_p->body;
+         if (stats_p)
+            stages[nstages++] = stats_p->body;
+         stages[nstages++] = shaders[1]->apple9_body;
+         stages[nstages++] = epilog->body;
          linked_fs_entry = hk_apple9_get_linked_entry(
-            dev, s1, s2, s3, s4, preamble_addr,
-            MAX2(scratch_size, atomic_frame), pub_count, 1);
+            dev, stages[0], stages[1], stages[2], stages[3], stages[4],
+            preamble_addr, MAX2(scratch_size, atomic_frame), pub_count, 1);
          if (!linked_fs_entry)
             UNSUPPORTED();
          cmd->apple9_linked_fs.program_id = linked_fs_entry->program_id;
@@ -2804,7 +2987,7 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       linked_fs_entry = hk_apple9_get_linked_entry(
          dev, cull_p ? cull_p->body : stipple_p->body,
          (cull_p && stipple_p) ? stipple_p->body : shaders[1]->apple9_body,
-         (cull_p && stipple_p) ? shaders[1]->apple9_body : NULL, NULL,
+         (cull_p && stipple_p) ? shaders[1]->apple9_body : NULL, NULL, NULL,
          preamble_addr, MAX2(scratch_size, atomic_frame), pub_count, 1);
       if (!linked_fs_entry)
          UNSUPPORTED();

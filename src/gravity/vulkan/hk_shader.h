@@ -233,6 +233,10 @@ struct hk_shader_info {
          bool uses_sample_shading;
          bool early_fragment_tests;
          bool writes_memory;
+         /* Fragment-invocation statistics counter was lowered inline
+          * (early_fragment_tests, per-sample, or non-epilog FS). Otherwise the
+          * draw-time linked stats prolog counts invocations while queried. */
+         bool inline_statistics;
 
          /* Per-vertex inputs and barycentrics written by the passthrough
           * GS, as in struct hk_per_vertex_copies. */
@@ -771,3 +775,5 @@ struct hk_api_shader *hk_meta_shader(struct hk_device *dev,
 VkResult hk_apple9_create_null_fs(struct hk_device *dev,
    const VkAllocationCallbacks *alloc, bool sample_mask,
    struct hk_api_shader **out);
+
+nir_shader *hk_apple9_build_fs_stats_prolog_nir(void);

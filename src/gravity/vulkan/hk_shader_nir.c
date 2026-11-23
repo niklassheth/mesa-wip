@@ -4388,6 +4388,48 @@ hk_apple9_lower_fs_statistics(nir_shader *nir)
             nir_metadata_control_flow, NULL);
 }
 
+/* Standalone linked fragment prolog that counts active non-helper invocations
+ * into the active FRAGMENT_SHADER_INVOCATIONS pipeline-statistics slot. Linked
+ * at draw time only while the query is active, keeping the counter out of
+ * normal fragment shaders.
+ *
+ * Reads draw.pipeline_stats and draw.pipeline_stats_flags directly from UBO 0
+ * (gfx->root) inside non-uniform control flow without ACCESS_CAN_SPECULATE so
+ * preamble extraction never hoists them into a preamble.
+ */
+nir_shader *
+hk_apple9_build_fs_stats_prolog_nir(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "apple9_fs_stats_prolog");
+   nir_shader *nir = b.shader;
+   nir->info.internal = true;
+
+   nir_def *helper = nir_load_helper_invocation(&b, 1);
+   nir_def *lanes = nir_ballot(&b, 1, 32, nir_inot(&b, helper));
+   nir_if *counted = nir_push_if(&b, nir_inot(&b, helper));
+   counted->control = nir_selection_control_dont_flatten;
+   nir_push_if(&b, nir_elect(&b, 1));
+   unsigned stats_off = hk_root_descriptor_offset(draw.pipeline_stats);
+   unsigned flags_off = hk_root_descriptor_offset(draw.pipeline_stats_flags);
+   nir_def *base = nir_load_ubo(&b, 1, 64, nir_imm_int(&b, 0),
+                                nir_imm_int(&b, stats_off), .align_mul = 8,
+                                .range_base = stats_off, .range = 8);
+   nir_def *flags = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0),
+                                 nir_imm_int(&b, flags_off), .align_mul = 4,
+                                 .range_base = flags_off, .range = 4);
+   const VkQueryPipelineStatisticFlagBits bit =
+      VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+   nir_def *idx = nir_bit_count(&b, nir_iand_imm(&b, flags, bit - 1));
+   nir_def *addr = nir_iadd(
+      &b, base, nir_amul_imm(&b, nir_u2u64(&b, idx), sizeof(uint64_t)));
+   nir_global_atomic(&b, 32, addr, nir_bit_count(&b, lanes),
+                     .atomic_op = nir_atomic_op_iadd);
+   nir_pop_if(&b, NULL);
+   nir_pop_if(&b, NULL);
+   return nir;
+}
+
 /* Draw parameters come from the Apple9 draw-parameter UBO; the geometry
  * pipeline's poly sysvals live in the root table. Lower the former first so
  * hk_lower_uvs_index only sees the table-backed values.

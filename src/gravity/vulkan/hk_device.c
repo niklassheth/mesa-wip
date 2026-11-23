@@ -505,6 +505,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    list_inithead(&dev->apple9_vs_vary_variants.lru);
    simple_mtx_init(&dev->apple9_cull_prologs.lock, mtx_plain);
    simple_mtx_init(&dev->apple9_stipple_prologs.lock, mtx_plain);
+   simple_mtx_init(&dev->apple9_stats_prolog.lock, mtx_plain);
    simple_mtx_init(&dev->apple9_sw_vs_prologs.lock, mtx_plain);
    simple_mtx_init(&dev->apple9_per_sample_trampolines.lock, mtx_plain);
    list_inithead(&dev->apple9_per_sample_trampolines.lru);
@@ -546,6 +547,7 @@ fail_mem_cache:
    hk_apple9_vs_vary_variants_finish(dev);
    hk_apple9_cull_prologs_finish(dev);
    hk_apple9_stipple_prologs_finish(dev);
+   hk_apple9_stats_prolog_finish(dev);
    hk_apple9_sw_vs_prologs_finish(dev);
    hk_apple9_vs_prologs_finish(dev);
    hk_apple9_fs_epilogs_finish(dev);
@@ -554,6 +556,7 @@ fail_mem_cache:
    assert(list_is_empty(&dev->apple9_bodies.slabs));
    simple_mtx_destroy(&dev->apple9_per_sample_trampolines.lock);
    simple_mtx_destroy(&dev->apple9_sw_vs_prologs.lock);
+   simple_mtx_destroy(&dev->apple9_stats_prolog.lock);
    simple_mtx_destroy(&dev->apple9_stipple_prologs.lock);
    simple_mtx_destroy(&dev->apple9_cull_prologs.lock);
    simple_mtx_destroy(&dev->apple9_vs_vary_variants.lock);
@@ -607,6 +610,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    hk_apple9_vs_vary_variants_finish(dev);
    hk_apple9_cull_prologs_finish(dev);
    hk_apple9_stipple_prologs_finish(dev);
+   hk_apple9_stats_prolog_finish(dev);
    hk_apple9_sw_vs_prologs_finish(dev);
    hk_apple9_vs_prologs_finish(dev);
    hk_apple9_fs_epilogs_finish(dev);
@@ -633,6 +637,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       hk_api_shader_destroy(&dev->vk, &dev->null_fs_trivial->vk, pAllocator);
    simple_mtx_destroy(&dev->apple9_per_sample_trampolines.lock);
    simple_mtx_destroy(&dev->apple9_sw_vs_prologs.lock);
+   simple_mtx_destroy(&dev->apple9_stats_prolog.lock);
    simple_mtx_destroy(&dev->apple9_stipple_prologs.lock);
    simple_mtx_destroy(&dev->apple9_cull_prologs.lock);
    simple_mtx_destroy(&dev->apple9_vs_vary_variants.lock);

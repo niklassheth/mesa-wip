@@ -1651,6 +1651,7 @@ void hk_apple9_vs_prologs_finish(struct hk_device *dev);
 void hk_apple9_fs_epilogs_finish(struct hk_device *dev);
 void hk_apple9_cull_prologs_finish(struct hk_device *dev);
 void hk_apple9_stipple_prologs_finish(struct hk_device *dev);
+void hk_apple9_stats_prolog_finish(struct hk_device *dev);
 void hk_apple9_sw_vs_prologs_finish(struct hk_device *dev);
 void hk_apple9_per_sample_trampolines_finish(struct hk_device *dev);
 void hk_apple9_linked_entries_finish(struct hk_device *dev);
