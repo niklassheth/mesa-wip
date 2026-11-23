@@ -830,6 +830,8 @@ inline_texture_image_uniforms(struct agx_apple9_vir_instr *I,
        I->nr_srcs == 10) {
       struct agx_apple9_vir_instr *cdef = definitions[I->src[8]];
       const bool from_collect = cdef && cdef->op == AGX_APPLE9_VIR_COLLECT &&
+                                cdef->dest == I->src[8] &&
+                                cdef->dest_components == 2 &&
                                 cdef->nr_srcs == 2 &&
                                 I->src[9] == I->src[8] + 1;
       uint32_t lo_v = from_collect ? cdef->src[0] : I->src[8];
@@ -1464,7 +1466,7 @@ agx_apple9_optimize_vir_with_constants(
             inline_alu_sources(I, uniform_read, constant, values);
          }
          inline_texture_image_uniforms(I, definitions, uniform_read, constant,
-                                       values, constants);
+                                       values, uniform_writes ? NULL : constants);
          drop_zero_load_index(I, constant, values);
          continue;
       }

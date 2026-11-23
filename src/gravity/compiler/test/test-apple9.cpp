@@ -19650,3 +19650,140 @@ TEST(Apple9CompactIsa, GoldenAluImmModifiersAndSharedOffsets)
       agx_apple9_vir_finish(&p);
    }
 }
+
+TEST(Apple9CompactIsa, CodexAuditRegressionChecks)
+{
+   struct agx_apple9_packed_instruction packed = {};
+   const char *reason = nullptr;
+
+   /* Codex #1 & #2: IMAGE_STORE must require cdef->dest == src[8] and must not
+    * consult initial constant table in programs that write uniforms. */
+   {
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      uint32_t u8 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+                                        AGX_APPLE9_ENC_UNIFORM_MOVE, NULL, 0, 8);
+      uint32_t u9 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+                                        AGX_APPLE9_ENC_UNIFORM_MOVE, NULL, 0, 9);
+      uint32_t u15 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR_UNIFORM,
+                                         AGX_APPLE9_ENC_UNIFORM_MOVE, NULL, 0, 15);
+      uint32_t pair_in[2] = {u8, u9};
+      uint32_t col = agx_apple9_vir_emit_collect(&p, pair_in, 2);
+      uint32_t data[4] = {u8, u8, u8, u8};
+      uint32_t coord[4] = {u8, u8, u8, u8};
+      ASSERT_TRUE(agx_apple9_vir_emit_image_store_ex(&p, coord, data, col + 1,
+                                                     2, 32, false, false));
+      agx_apple9_vir_instr *st = p.instructions[p.instruction_count - 1];
+      st->src[8] = col + 1;
+      st->src[9] = u15;
+      ASSERT_TRUE(agx_apple9_optimize_vir(&p));
+      EXPECT_FALSE(st->texture_uniform_bindless);
+      agx_apple9_vir_finish(&p);
+
+      /* Mutable uniform program must not trust initial constants table. */
+      agx_apple9_vir_program p2;
+      agx_apple9_vir_init(&p2);
+      uint32_t one = agx_apple9_vir_emit(&p2, AGX_APPLE9_VIR_IMM,
+                                         AGX_APPLE9_ENC_MOV_IMM_COMPACT, NULL, 0, 1);
+      ASSERT_TRUE(agx_apple9_vir_emit_side_effect(&p2, AGX_APPLE9_VIR_STORE_UNIFORM,
+                                                  AGX_APPLE9_ENC_STORE_UNIFORM,
+                                                  &one, 1, 9));
+      uint32_t h8 = agx_apple9_vir_emit(&p2, AGX_APPLE9_VIR_IOR_UNIFORM,
+                                        AGX_APPLE9_ENC_UNIFORM_MOVE, NULL, 0, 8);
+      uint32_t d2[4] = {h8, h8, h8, h8};
+      uint32_t c2[4] = {h8, h8, h8, h8};
+      ASSERT_TRUE(agx_apple9_vir_emit_image_store_ex(&p2, c2, d2, h8, 2, 32, false, false));
+      agx_apple9_vir_instr *st2 = p2.instructions[p2.instruction_count - 1];
+      agx_apple9_uniform_constants consts = {.base = 8, .count = 2, .values = {0, 0}};
+      ASSERT_TRUE(agx_apple9_optimize_vir_with_constants(&p2, &consts));
+      EXPECT_FALSE(st2->texture_uniform_bindless);
+      agx_apple9_vir_finish(&p2);
+   }
+
+   /* Codex #6: Validator accepts IMUL_WIDE (2-word dest) and rejects non-adjacent SHARED_LOAD. */
+   {
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      uint32_t idx = agx_apple9_vir_input(&p, 4);
+      uint32_t srcs[2] = {idx, idx};
+      uint32_t prod = agx_apple9_vir_emit_mul_wide(&p, srcs, false);
+      agx_apple9_vir_instr *mi = p.instructions[p.instruction_count - 1];
+      mi->nr_srcs = 1;
+      mi->alu_src_immediate_mask = 2;
+      mi->alu_src_value[1] = 8;
+      ASSERT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << (reason ?: "");
+      p.phys[idx] = 4;
+      p.phys[prod] = 8;
+      p.phys[prod + 1] = 9;
+      p.physical = true;
+      p.dependencies_finalized = true;
+      EXPECT_TRUE(agx_apple9_validate_vir_allocation(&p, &reason)) << (reason ?: "");
+      agx_apple9_vir_finish(&p);
+
+      /* Codex #3: Physical-VIR publication validation must not abort on reused GPR IDs. */
+      agx_apple9_vir_program pphys;
+      agx_apple9_vir_init(&pphys);
+      uint32_t w0 = agx_apple9_vir_emit(&pphys, AGX_APPLE9_VIR_IMM,
+                                        AGX_APPLE9_ENC_MOV_IMM32, NULL, 0, 0x3f000000u);
+      uint32_t w1 = agx_apple9_vir_emit(&pphys, AGX_APPLE9_VIR_IMM,
+                                        AGX_APPLE9_ENC_MOV_IMM32, NULL, 0, 0x3f000000u);
+      uint32_t coords[2] = {w0, w1};
+      uint32_t tex = agx_apple9_vir_emit_texture_sample_mov(&pphys, coords, 0, 0);
+      ASSERT_NE(tex, AGX_APPLE9_VREG_INVALID);
+      ASSERT_TRUE(agx_apple9_allocate_publications(&pphys, &reason)) << (reason ?: "");
+      pphys.phys[w0] = 0;
+      pphys.phys[w1] = 0;
+      for (unsigned c = 0; c < 4; ++c)
+         pphys.phys[tex + c] = 4 + c;
+      /* Reuse physical register ID 0 across both IMMs as native SSA RA does. */
+      pphys.instructions[0]->dest = 0;
+      pphys.instructions[1]->dest = 0;
+      for (unsigned i = 2; i < pphys.instruction_count; ++i) {
+         agx_apple9_vir_instr *ins = pphys.instructions[i];
+         for (unsigned s = 0; s < ins->nr_srcs; ++s) {
+            if (ins->src[s] == w0 || ins->src[s] == w1)
+               ins->src[s] = 0;
+         }
+      }
+      pphys.physical = true;
+      pphys.dependencies_finalized = true;
+      EXPECT_TRUE(agx_apple9_validate_vir_allocation(&pphys, &reason)) << (reason ?: "");
+      agx_apple9_vir_finish(&pphys);
+
+      agx_apple9_vir_program psh;
+      agx_apple9_vir_init(&psh);
+      uint32_t sidx = agx_apple9_vir_input(&psh, 3);
+      uint32_t dst = agx_apple9_vir_emit_shared_load_typed(&psh, sidx, 0, 2, 32);
+      agx_apple9_vir_instr *ld = psh.instructions[psh.instruction_count - 1];
+      ld->producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1;
+      ASSERT_TRUE(agx_apple9_allocate_publications(&psh, &reason)) << (reason ?: "");
+      psh.phys[sidx] = 3;
+      psh.phys[dst] = 4;
+      psh.phys[dst + 1] = 17; /* non-adjacent! */
+      psh.physical = true;
+      psh.dependencies_finalized = true;
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(ld, psh.phys, &packed, &reason));
+      EXPECT_FALSE(agx_apple9_validate_vir_allocation(&psh, &reason));
+      psh.phys[dst + 1] = 5; /* adjacent! */
+      EXPECT_TRUE(agx_apple9_pack_vir_instruction(ld, psh.phys, &packed, &reason)) << (reason ?: "");
+      EXPECT_TRUE(agx_apple9_validate_vir_allocation(&psh, &reason)) << (reason ?: "");
+      agx_apple9_vir_finish(&psh);
+   }
+
+   /* Codex #8: Reject out-of-range GPRs (>= 96) in agx_apple9_pack_mov and pack_iadd. */
+   {
+      EXPECT_FALSE(agx_apple9_pack_mov(0, 96, &packed));
+      EXPECT_FALSE(agx_apple9_pack_mov(0, 127, &packed));
+      uint8_t phys_bad[] = {96, 0, 1};
+      agx_apple9_vir_instr iadd_bad = {
+         .op = AGX_APPLE9_VIR_IADD,
+         .encoding = AGX_APPLE9_ENC_INT_ADD_EXTENDED,
+         .dest = 0,
+         .dest_components = 1,
+         .src = {1, 2},
+         .immediate = 1,
+         .nr_srcs = 2,
+      };
+      EXPECT_FALSE(agx_apple9_pack_vir_instruction(&iadd_bad, phys_bad, &packed, &reason));
+   }
+}
