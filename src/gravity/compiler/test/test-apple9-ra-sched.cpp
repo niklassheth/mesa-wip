@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "compiler/nir/nir.h"
+#include "apple9_ra_pcopy.h"
 #include "apple9_ra_sched.h"
 
 namespace {
@@ -1209,5 +1210,144 @@ TEST(Apple9RaPressureSchedule, RematLongSpanDerivedAluDropsHighBlockPressure)
    EXPECT_EQ(agx_apple9_vir_src(unif_late_use, 1), unif_derived);
 
    verify_ssa_def_before_use_in_block(&p, b0);
+   agx_apple9_vir_finish(&p);
+}
+
+TEST(Apple9RaPressureSchedule, AutoTierSlackCompressesPast52EvenWithCallerSlack)
+{
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   ASSERT_NE(b0, nullptr);
+   agx_apple9_block_begin(&p, b0);
+
+   /* Build a block with 45 live values plus 12 independent early DEVICE_LOADs
+    * whose original order peaks at >52 GPRs, even though sinking/serializing
+    * the loads keeps the entire block at <= 52 GPRs. Even if the caller passes
+    * a nonzero pressure_slack (from unscheduled peak), auto_tier_slack must
+    * compress the block back into the <= 52 GPR (1024-thread) occupancy tier. */
+   uint32_t base = agx_apple9_vir_input(&p, 0);
+   std::vector<uint32_t> keep;
+   for (unsigned i = 0; i < 44; ++i) {
+      uint32_t v = agx_apple9_vir_input(&p, i + 1);
+      keep.push_back(v);
+      ASSERT_TRUE(agx_apple9_vir_add_live_out(&p, v));
+   }
+
+   std::vector<uint32_t> loads;
+   for (unsigned i = 0; i < 12; ++i)
+      loads.push_back(emit_dev_load(&p, i % 4, base, 1));
+
+   uint32_t acc = emit_iadd(&p, keep[0], loads[0]);
+   for (unsigned i = 1; i < 12; ++i)
+      acc = emit_iadd(&p, acc, loads[i]);
+   ASSERT_TRUE(emit_dev_store(&p, 0, base, acc));
+
+   apple9_ra_liveness_info before;
+   ASSERT_TRUE(apple9_ra_liveness(&p, &before));
+   ASSERT_GT(p.peak_live_gprs, 52u);
+   apple9_ra_liveness_finish(&before);
+
+   apple9_ra_sched_options opts = {
+      .latency = true,
+      .pressure_slack = 10,
+      .auto_tier_slack = true,
+      .rejected_pressure_increase = 0,
+   };
+   ASSERT_TRUE(apple9_ra_pressure_schedule_opts(&p, &opts));
+   EXPECT_LE(p.peak_live_gprs, 52u);
+
+   verify_ssa_def_before_use_in_block(&p, b0);
+   agx_apple9_vir_finish(&p);
+}
+
+TEST(Apple9RaPressureSchedule, CrossBlockRematPreservesPhiOperands)
+{
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+
+   /* Build diamond CFG: b0 -> {b1, b2} -> b3. */
+   nir_block n0 = {}, n1 = {}, n2 = {}, n3 = {};
+   n0.successors[0] = &n1;
+   n0.successors[1] = &n2;
+   n1.successors[0] = &n3;
+   n2.successors[0] = &n3;
+
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block *b1 = agx_apple9_block_create(&p);
+   agx_apple9_block *b2 = agx_apple9_block_create(&p);
+   agx_apple9_block *b3 = agx_apple9_block_create(&p);
+   ASSERT_TRUE(b0 && b1 && b2 && b3);
+   b0->nir = &n0;
+   b1->nir = &n1;
+   b2->nir = &n2;
+   b3->nir = &n3;
+
+   agx_apple9_block_begin(&p, b0);
+   uint32_t base = agx_apple9_vir_input(&p, 0);
+   std::vector<uint32_t> carry;
+   for (unsigned i = 0; i < 42; ++i)
+      carry.push_back(agx_apple9_vir_input(&p, i + 1));
+
+   /* Emit 10 derived 1-source integer offsets in b0 used only in b1, plus a
+    * small compact immediate used as a VIR_PHI operand in b3 (which MUST NOT
+    * be deleted or invalidated by cross-block remat). */
+   std::vector<uint32_t> derived;
+   for (unsigned k = 0; k < 10; ++k) {
+      uint32_t v = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IADD,
+                                       AGX_APPLE9_ENC_INT_ADD_EXTENDED, &base,
+                                       1, k + 1);
+      p.instructions[p.instruction_count - 1]->alu_src_immediate_mask = 1u << 1;
+      p.instructions[p.instruction_count - 1]->alu_src_value[1] = k + 1;
+      derived.push_back(v);
+   }
+   uint32_t phi_zero = emit_imm(&p, 0, AGX_APPLE9_ENC_MOV_IMM_COMPACT);
+
+   agx_apple9_block_begin(&p, b1);
+   uint32_t left = base;
+   for (uint32_t v : derived)
+      left = emit_iadd(&p, left, v);
+
+   agx_apple9_block_begin(&p, b2);
+   uint32_t right = emit_imm(&p, 7, AGX_APPLE9_ENC_MOV_IMM_COMPACT);
+
+   agx_apple9_block_begin(&p, b3);
+   uint32_t merged = agx_apple9_vir_emit_phi_canonical(&p, b3, 2);
+   agx_apple9_vir_instr *phi = p.instructions[p.instruction_count - 1];
+   uint32_t sum = emit_iadd(&p, merged, right);
+   for (uint32_t v : carry)
+      sum = emit_iadd(&p, sum, v);
+   ASSERT_TRUE(emit_dev_store(&p, 0, base, sum));
+
+   ASSERT_TRUE(agx_apple9_vir_build_logical_cfg(&p));
+   unsigned p1 = agx_apple9_block_pred_index(b3, b1);
+   unsigned p2 = agx_apple9_block_pred_index(b3, b2);
+   ASSERT_NE(p1, UINT_MAX);
+   ASSERT_NE(p2, UINT_MAX);
+   *agx_apple9_vir_src_ptr(phi, p1) = left;
+   *agx_apple9_vir_src_ptr(phi, p2) = phi_zero;
+
+   apple9_ra_liveness_info before;
+   ASSERT_TRUE(apple9_ra_liveness(&p, &before));
+   unsigned peak_before = p.peak_live_gprs;
+   apple9_ra_liveness_finish(&before);
+   ASSERT_GT(peak_before, 52u);
+
+   apple9_ra_sched_options opts = {
+      .latency = true,
+      .pressure_slack = 0,
+      .auto_tier_slack = true,
+      .rejected_pressure_increase = 0,
+   };
+   ASSERT_TRUE(apple9_ra_pressure_schedule_opts(&p, &opts));
+
+   /* Cross-block remat must compress peak live GPRs across b0 while keeping
+    * phi_zero alive and valid for the VIR_PHI in b3. */
+   EXPECT_LT(p.peak_live_gprs, peak_before);
+   EXPECT_EQ(agx_apple9_vir_src(phi, p2), phi_zero);
+   apple9_ra_validate_error verr = {};
+   EXPECT_TRUE(apple9_ra_validate_ssa(&p, &verr)) << verr.message;
+
    agx_apple9_vir_finish(&p);
 }

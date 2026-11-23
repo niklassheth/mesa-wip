@@ -960,6 +960,7 @@ struct vir_resource_reader {
 
 struct vir_pressure_delta {
    int32_t all;
+   int32_t peak_all;
    int32_t bank64;
    int32_t bank16;
 };
@@ -1034,21 +1035,26 @@ calc_pressure_delta(const struct agx_apple9_vir_program *p,
                     const struct agx_apple9_vir_instr *ins,
                     struct u_sparse_bitset *live)
 {
-   struct vir_pressure_delta d = {0, 0, 0};
+   struct vir_pressure_delta d = {0, 0, 0, 0};
 
    if (ins->op == AGX_APPLE9_VIR_PHI ||
        ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC_RESULT)
       return d;
 
+   int32_t dest_dead = 0;
    if (ins->dest != AGX_APPLE9_VREG_INVALID && ins->dest_components > 0) {
       for (unsigned c = 0; c < ins->dest_components; ++c) {
          uint32_t v = ins->dest + c;
-         if (is_valid_gpr(p, pub_defs, v) && u_sparse_bitset_test(live, v)) {
+         if (!is_valid_gpr(p, pub_defs, v))
+            continue;
+         if (u_sparse_bitset_test(live, v)) {
             d.all -= 1;
             if (val_max_gpr[v] <= 63)
                d.bank64 -= 1;
             if (val_max_gpr[v] <= 15)
                d.bank16 -= 1;
+         } else {
+            dest_dead += 1;
          }
       }
    }
@@ -1068,9 +1074,11 @@ calc_pressure_delta(const struct agx_apple9_vir_program *p,
             }
          }
       }
+      d.peak_all = MAX2(0, d.all);
       return d;
    }
 
+   int32_t src_new = 0;
    const unsigned nr_srcs = agx_apple9_vir_nr_srcs(ins);
    for (unsigned s = 0; s < nr_srcs; ++s) {
       uint32_t v = agx_apple9_vir_src(ins, s);
@@ -1085,6 +1093,7 @@ calc_pressure_delta(const struct agx_apple9_vir_program *p,
       }
       if (!dupe && !u_sparse_bitset_test(live, v)) {
          d.all += 1;
+         src_new += 1;
          if (val_max_gpr[v] <= 63)
             d.bank64 += 1;
          if (val_max_gpr[v] <= 15)
@@ -1092,6 +1101,9 @@ calc_pressure_delta(const struct agx_apple9_vir_program *p,
       }
    }
 
+   /* Simultaneous interference at this instruction: live_before + dest_total
+    * == live_after + dest_dead + src_new. Matches a9_calc_gpr_demand(). */
+   d.peak_all = dest_dead + src_new;
    return d;
 }
 
@@ -1202,7 +1214,7 @@ choose_vir_instr(struct vir_sched_state *s)
    bool best_over_budget = true;
    unsigned best_dependency = 0;
    int32_t best_score = INT32_MAX;
-   struct vir_pressure_delta best_delta = {INT32_MAX, INT32_MAX, INT32_MAX};
+   struct vir_pressure_delta best_delta = {INT32_MAX, INT32_MAX, INT32_MAX, INT32_MAX};
 
    if (s->latency) {
       unsigned earliest = UINT_MAX;
@@ -1227,8 +1239,10 @@ choose_vir_instr(struct vir_sched_state *s)
          score += 2 * delta.bank64;
 
       bool over_budget = s->latency && s->max_all_budget < INT32_MAX &&
-                         delta.all > 0 &&
-                         s->cur_all + delta.all > s->max_all_budget;
+                         ((delta.all > 0 &&
+                           s->cur_all + delta.all > s->max_all_budget) ||
+                          (delta.peak_all > 0 &&
+                           s->cur_all + delta.peak_all > s->max_all_budget));
 
       unsigned dependency = 0;
       if (s->latency && !over_budget) {
@@ -1266,6 +1280,54 @@ choose_vir_instr(struct vir_sched_state *s)
          best_score = score;
          best_delta = delta;
       }
+   }
+
+   /* If every ready node would push pressure past the occupancy-tier budget,
+    * scan non-ready heads for a node that either fits within budget or
+    * strictly closes live registers (e.g. an in-flight vector load) rather
+    * than crossing the tier cliff. Pick the earliest-ready such node to
+    * minimize extra stall cycles. */
+   if (s->latency && s->max_all_budget < INT32_MAX && best && best_over_budget) {
+      struct vir_sched_node *fallback = NULL;
+      bool fb_fits = false;
+      unsigned fb_ready = UINT_MAX;
+      int32_t fb_score = INT32_MAX;
+      int32_t fb_delta_all = INT32_MAX;
+
+      list_for_each_entry(struct vir_sched_node, n, &s->dag->heads, dag.link) {
+         if (n->ready <= s->position)
+            continue;
+         struct vir_pressure_delta delta = calc_pressure_delta(
+            s->p, s->defs, s->pub_defs, s->val_max_gpr, n->instr, &s->live);
+         bool fits = (delta.all <= 0 ||
+                      s->cur_all + delta.all <= s->max_all_budget) &&
+                     (delta.peak_all <= 0 ||
+                      s->cur_all + delta.peak_all <= s->max_all_budget);
+         if (!fits && !(delta.all < 0 && delta.all < best_delta.all))
+            continue;
+
+         int32_t score = delta.all;
+         if (s->cur_16 >= 12 || s->cur_16 + delta.bank16 > 16)
+            score += 4 * delta.bank16;
+         if (s->cur_64 >= 56 || s->cur_64 + delta.bank64 > 64)
+            score += 2 * delta.bank64;
+
+         if (!fallback ||
+             (fits != fb_fits && fits) ||
+             (fits == fb_fits &&
+              (n->ready < fb_ready ||
+               (n->ready == fb_ready && score < fb_score) ||
+               (n->ready == fb_ready && score == fb_score &&
+                delta.all < fb_delta_all)))) {
+            fallback = n;
+            fb_fits = fits;
+            fb_ready = n->ready;
+            fb_score = score;
+            fb_delta_all = delta.all;
+         }
+      }
+      if (fallback)
+         return fallback;
    }
 
    return best;
@@ -1397,6 +1459,7 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
 
       struct vir_pressure_delta delta = calc_pressure_delta(
          p, defs, pub_defs, val_max_gpr, node->instr, &s.live);
+      res.max_all = MAX2(res.max_all, s.cur_all + delta.peak_all);
       s.cur_all += delta.all;
       s.cur_64 += delta.bank64;
       s.cur_16 += delta.bank16;
@@ -1405,6 +1468,7 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
       res.max_16 = MAX2(res.max_16, s.cur_16);
 
       if (latency) {
+         s.position = MAX2(s.position, node->ready);
          util_dynarray_foreach(&node->dag.edges, struct dag_edge, edge) {
             struct vir_sched_node *producer =
                (struct vir_sched_node *)edge->child;
@@ -1428,6 +1492,190 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
    if (latency)
       res.stalls = compute_schedule_stalls(sched_nodes, count, true, dep_pool,
                                            dep_start);
+   res.valid = true;
+   return res;
+}
+
+static bool
+is_sink_load_instr(const struct agx_apple9_vir_instr *ins)
+{
+   if (ins->dest == AGX_APPLE9_VREG_INVALID || ins->dest_components == 0 ||
+       ins->memory_volatile)
+      return false;
+   switch (ins->op) {
+   case AGX_APPLE9_VIR_DEVICE_LOAD:
+   case AGX_APPLE9_VIR_PRIVATE_LOAD:
+   case AGX_APPLE9_VIR_SHARED_LOAD:
+   case AGX_APPLE9_VIR_TILE_LOAD:
+   case AGX_APPLE9_VIR_TEXTURE_SAMPLE:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+is_sink_helper_alu(const struct vir_sched_node *node,
+                   const BITSET_WORD *pub_defs)
+{
+   const struct agx_apple9_vir_instr *ins = node->instr;
+   if (ins->op == AGX_APPLE9_VIR_SPLIT)
+      return true;
+   if (ins->dest == AGX_APPLE9_VREG_INVALID || ins->dest_components != 1)
+      return false;
+   if (BITSET_TEST(pub_defs, ins->dest))
+      return false;
+   if (!agx_apple9_instr_is_pure_alu(ins))
+      return false;
+   if (agx_apple9_vir_nr_srcs(ins) <= 1)
+      return true;
+   /* Sink bounds-check SELECTs (and 2-src pure ALU) that consume a load so
+    * the load itself can sink closer to its first real consumer. */
+   if (ins->op == AGX_APPLE9_VIR_SELECT || agx_apple9_vir_nr_srcs(ins) == 2) {
+      util_dynarray_foreach(&node->dag.edges, struct dag_edge, edge) {
+         if (!edge->data)
+            continue;
+         const struct vir_sched_node *child =
+            (const struct vir_sched_node *)edge->child;
+         if (is_sink_load_instr(child->instr) ||
+             child->instr->op == AGX_APPLE9_VIR_SPLIT)
+            return true;
+      }
+   }
+   return false;
+}
+
+/* Order-preserving intra-block load sinking: on high-pressure blocks where
+ * greedy bottom-up pressure scheduling scrambles independent chains and fails
+ * to beat original order, sink loads (and their bounds-check selects / cheap
+ * 0-1 source helpers) down to right before their earliest dependent in the
+ * exact DAG, preserving every data and resource hazard. */
+static struct vir_sched_result
+run_block_sink_loads(const struct agx_apple9_vir_program *p,
+                     struct agx_apple9_vir_instr *const *defs,
+                     const BITSET_WORD *pub_defs, const uint8_t *val_max_gpr,
+                     struct agx_apple9_vir_instr *first_body,
+                     struct agx_apple9_vir_instr *first_tail,
+                     struct u_sparse_bitset *live_after_body, int32_t base_all,
+                     int32_t base_64, int32_t base_16,
+                     struct vir_sched_node **last_write, void *attempt_ctx)
+{
+   struct vir_sched_result res = {0};
+   struct util_dynarray orig_order = UTIL_DYNARRAY_INIT;
+   util_dynarray_init(&orig_order, attempt_ctx);
+
+   struct dag *dag = create_vir_dag(p, defs, first_body, first_tail,
+                                    attempt_ctx, last_write, &orig_order);
+   if (!dag)
+      return res;
+
+   struct vir_sched_node *const *orig =
+      (struct vir_sched_node *const *)orig_order.data;
+   const unsigned count =
+      util_dynarray_num_elements(&orig_order, struct vir_sched_node *);
+   if (count <= 1)
+      return res;
+
+   unsigned *parent_count = rzalloc_array(attempt_ctx, unsigned, count);
+   unsigned *parent_start = rzalloc_array(attempt_ctx, unsigned, count + 1);
+   struct vir_sched_node **work =
+      ralloc_array(attempt_ctx, struct vir_sched_node *, count);
+   unsigned *pos = ralloc_array(attempt_ctx, unsigned, count);
+   res.order = ralloc_array(attempt_ctx, struct agx_apple9_vir_instr *, count);
+   if (!parent_count || !parent_start || !work || !pos || !res.order)
+      return res;
+
+   unsigned total_edges = 0;
+   for (unsigned i = 0; i < count; ++i) {
+      orig[i]->orig_idx = i;
+      work[i] = orig[i];
+      pos[i] = i;
+      util_dynarray_foreach(&orig[i]->dag.edges, struct dag_edge, edge) {
+         if (edge->child) {
+            struct vir_sched_node *c = (struct vir_sched_node *)edge->child;
+            parent_count[c->orig_idx]++;
+            total_edges++;
+         }
+      }
+   }
+
+   unsigned *parent_pool =
+      ralloc_array(attempt_ctx, unsigned, MAX2(total_edges, 1u));
+   unsigned *parent_cursor = rzalloc_array(attempt_ctx, unsigned, count);
+   if (!parent_pool || !parent_cursor)
+      return res;
+
+   unsigned off = 0;
+   for (unsigned i = 0; i < count; ++i) {
+      parent_start[i] = off;
+      parent_cursor[i] = off;
+      off += parent_count[i];
+   }
+   parent_start[count] = off;
+
+   for (unsigned i = 0; i < count; ++i) {
+      util_dynarray_foreach(&orig[i]->dag.edges, struct dag_edge, edge) {
+         if (edge->child) {
+            struct vir_sched_node *c = (struct vir_sched_node *)edge->child;
+            parent_pool[parent_cursor[c->orig_idx]++] = i;
+         }
+      }
+   }
+
+   bool moved = false;
+   for (unsigned k = count; k-- > 0;) {
+      struct vir_sched_node *u = orig[k];
+      const bool load = is_sink_load_instr(u->instr);
+      if (!load && !is_sink_helper_alu(u, pub_defs))
+         continue;
+
+      unsigned min_p = count;
+      for (unsigned e = parent_start[k]; e < parent_start[k + 1]; ++e) {
+         unsigned p_idx = parent_pool[e];
+         if (pos[p_idx] < min_p)
+            min_p = pos[p_idx];
+      }
+      unsigned cur = pos[k];
+      if (min_p <= cur + 1)
+         continue;
+
+      unsigned target = min_p - 1;
+      for (unsigned j = cur; j < target; ++j) {
+         work[j] = work[j + 1];
+         pos[work[j]->orig_idx] = j;
+      }
+      work[target] = u;
+      pos[k] = target;
+      moved = true;
+   }
+
+   if (!moved)
+      return res;
+
+   /* Measure exact peak pressure of the sunken schedule. */
+   struct u_sparse_bitset live;
+   u_sparse_bitset_dup_with_ctx(&live, live_after_body, attempt_ctx);
+   int32_t cur_all = base_all, cur_64 = base_64, cur_16 = base_16;
+   res.max_all = base_all;
+   res.max_64 = base_64;
+   res.max_16 = base_16;
+
+   for (unsigned i = 0; i < count; ++i) {
+      struct agx_apple9_vir_instr *ins = work[count - 1 - i]->instr;
+      struct vir_pressure_delta delta = calc_pressure_delta(
+         p, defs, pub_defs, val_max_gpr, ins, &live);
+      res.max_all = MAX2(res.max_all, cur_all + delta.peak_all);
+      cur_all += delta.all;
+      cur_64 += delta.bank64;
+      cur_16 += delta.bank16;
+      res.max_all = MAX2(res.max_all, cur_all);
+      res.max_64 = MAX2(res.max_64, cur_64);
+      res.max_16 = MAX2(res.max_16, cur_16);
+      liveness_ins_update_internal(p, defs, pub_defs, &live, ins, false, NULL);
+      res.order[i] = ins;
+   }
+
+   res.count = count;
    res.valid = true;
    return res;
 }
@@ -1538,7 +1786,7 @@ apple9_ra_remat_long_spans(struct agx_apple9_vir_program *p,
 
    bool any_high_pressure = false;
    for (unsigned b = 0; b < liveness->num_cfg_blocks; ++b) {
-      if (liveness->block_peak_gprs[b] > 52) {
+      if (liveness->block_peak_gprs[b] > 46) {
          any_high_pressure = true;
          break;
       }
@@ -1575,7 +1823,7 @@ apple9_ra_remat_long_spans(struct agx_apple9_vir_program *p,
       if (!blk->cfg_active)
          continue;
       const unsigned b = blk->cfg_index;
-      if (liveness->block_peak_gprs[b] <= 52)
+      if (liveness->block_peak_gprs[b] <= 46)
          continue;
 
       struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(blk);
@@ -1862,6 +2110,357 @@ apple9_ra_remat_long_spans(struct agx_apple9_vir_program *p,
    return any_changed;
 }
 
+/* On high-pressure blocks (> 46 live GPRs), rematerialize cheap pure 0/1-GPR-src
+ * integer derivations (e.g. CSE'd buffer-size bounds limits or offset IMADs)
+ * into dominated sibling/child blocks at the same or lower loop depth when their
+ * base GPR is already live-out (or is a cloneable IMM). This removes them from
+ * live_out of the high-pressure block without cloning into deeper loops. */
+static bool
+apple9_ra_remat_cross_block(struct agx_apple9_vir_program *p,
+                            const struct apple9_ra_liveness_info *liveness)
+{
+   const unsigned vcount = p->value_count;
+   const unsigned nblks = liveness->num_cfg_blocks;
+   if (vcount == 0 || nblks <= 1)
+      return false;
+
+   bool any_high_pressure = false;
+   for (unsigned b = 0; b < nblks; ++b) {
+      if (liveness->block_peak_gprs[b] > 46) {
+         any_high_pressure = true;
+         break;
+      }
+   }
+   if (!any_high_pressure)
+      return false;
+
+   void *mem_ctx = ralloc_context(NULL);
+   if (!mem_ctx)
+      return false;
+
+   struct agx_apple9_vir_instr **defs = NULL;
+   BITSET_WORD *pub_defs = NULL;
+   if (!build_defs_and_pub_mask(p, mem_ctx, &defs, &pub_defs)) {
+      ralloc_free(mem_ctx);
+      return false;
+   }
+
+   unsigned *blk_loop_depth = rzalloc_array(mem_ctx, unsigned, nblks);
+   struct agx_apple9_block **def_blk =
+      rzalloc_array(mem_ctx, struct agx_apple9_block *, vcount);
+   unsigned *ext_use_blks = rzalloc_array(mem_ctx, unsigned, vcount);
+   unsigned *in_blk_uses = rzalloc_array(mem_ctx, unsigned, vcount);
+   BITSET_WORD *disqualify = BITSET_RZALLOC(mem_ctx, vcount);
+   BITSET_WORD *pinned_src = BITSET_RZALLOC(mem_ctx, vcount);
+   if (!blk_loop_depth || !def_blk || !ext_use_blks || !in_blk_uses ||
+       !disqualify || !pinned_src) {
+      ralloc_free(mem_ctx);
+      return false;
+   }
+
+   if (p->output < vcount)
+      BITSET_SET(disqualify, p->output);
+   for (unsigned k = 0; k < p->live_out_count; ++k) {
+      if (p->live_out[k] < vcount)
+         BITSET_SET(disqualify, p->live_out[k]);
+   }
+
+   bool has_store_uniform = false;
+   for (struct agx_apple9_block *blk = p->blocks; blk; blk = blk->next) {
+      if (!blk->cfg_active)
+         continue;
+      const unsigned b = blk->cfg_index;
+      for (unsigned si = 0; si < 2; ++si) {
+         struct agx_apple9_block *succ = blk->cfg_succs[si];
+         if (succ && succ->cfg_active && succ->cfg_index <= b) {
+            for (unsigned lb = succ->cfg_index; lb <= b; ++lb)
+               blk_loop_depth[lb]++;
+         }
+      }
+      for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(blk);
+           I; I = agx_apple9_instr_next(I)) {
+         if (I->op == AGX_APPLE9_VIR_STORE_UNIFORM)
+            has_store_uniform = true;
+         if (I->dest != AGX_APPLE9_VREG_INVALID && I->dest_components == 1 &&
+             I->dest < vcount)
+            def_blk[I->dest] = blk;
+      }
+   }
+
+   /* Scan all uses across the program to find disqualifiers and external-block
+    * use counts. */
+   for (struct agx_apple9_block *blk = p->blocks; blk; blk = blk->next) {
+      const bool active = blk->cfg_active;
+      const unsigned b = active ? blk->cfg_index : 0;
+      BITSET_WORD *seen_in_blk = active ? BITSET_RZALLOC(mem_ctx, vcount) : NULL;
+      if (active && !seen_in_blk) {
+         ralloc_free(mem_ctx);
+         return false;
+      }
+      for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(blk);
+           I; I = agx_apple9_instr_next(I)) {
+         if (I->op == AGX_APPLE9_VIR_DEVICE_ATOMIC_RESULT)
+            continue;
+         if (I->op == AGX_APPLE9_VIR_PHI) {
+            const unsigned nr_phi = agx_apple9_vir_nr_srcs(I);
+            for (unsigned k = 0; k < nr_phi; ++k) {
+               uint32_t pv = agx_apple9_vir_src(I, k);
+               if (pv < vcount)
+                  BITSET_SET(disqualify, pv);
+            }
+            continue;
+         }
+         bool bad_user = (!active ||
+                          I->op == AGX_APPLE9_VIR_SPLIT ||
+                          I->op == AGX_APPLE9_VIR_PHI_SRC ||
+                          I->op == AGX_APPLE9_VIR_ABI_RETURN ||
+                          is_pinned_entry(I));
+         const unsigned nr_srcs = agx_apple9_vir_nr_srcs(I);
+         for (unsigned s = 0; s < nr_srcs; ++s) {
+            uint32_t v = agx_apple9_vir_src(I, s);
+            if (v >= vcount)
+               continue;
+            if (bad_user) {
+               BITSET_SET(disqualify, v);
+               continue;
+            }
+            if (!def_blk[v]) {
+               BITSET_SET(disqualify, v);
+               continue;
+            }
+            if (def_blk[v] == blk) {
+               in_blk_uses[v]++;
+            } else {
+               bool small_imm = defs[v] && defs[v]->op == AGX_APPLE9_VIR_IMM &&
+                                defs[v]->dest_components == 1 &&
+                                !defs[v]->local_control &&
+                                agx_apple9_vir_nr_srcs(defs[v]) == 0 &&
+                                defs[v]->immediate <= 0x7fu;
+               if (!small_imm &&
+                   blk_loop_depth[b] > blk_loop_depth[def_blk[v]->cfg_index])
+                  BITSET_SET(disqualify, v);
+               if (!BITSET_TEST(seen_in_blk, v)) {
+                  BITSET_SET(seen_in_blk, v);
+                  ext_use_blks[v]++;
+               }
+            }
+         }
+      }
+      if (seen_in_blk)
+         ralloc_free(seen_in_blk);
+   }
+
+   bool any_changed = false;
+   for (struct agx_apple9_block *blk = p->blocks; blk; blk = blk->next) {
+      if (!blk->cfg_active)
+         continue;
+      const unsigned b = blk->cfg_index;
+      const bool high_blk = liveness->block_peak_gprs[b] > 46;
+
+      /* Collect candidates in blk in reverse order (leaves first). */
+      unsigned blk_len = 0;
+      for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(blk);
+           I; I = agx_apple9_instr_next(I))
+         blk_len++;
+      if (blk_len == 0)
+         continue;
+
+      struct agx_apple9_vir_instr **cands =
+         ralloc_array(mem_ctx, struct agx_apple9_vir_instr *, blk_len);
+      struct agx_apple9_vir_instr **to_remove =
+         ralloc_array(mem_ctx, struct agx_apple9_vir_instr *, blk_len);
+      if (!cands || !to_remove)
+         break;
+
+      unsigned cand_count = 0;
+      for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(blk);
+           I; I = agx_apple9_instr_next(I)) {
+         if (I->dest == AGX_APPLE9_VREG_INVALID || I->dest_components != 1 ||
+             I->dest >= vcount || BITSET_TEST(pub_defs, I->dest))
+            continue;
+         uint32_t v = I->dest;
+         if (BITSET_TEST(disqualify, v) || ext_use_blks[v] == 0 ||
+             !u_sparse_bitset_test(&liveness->live_out[b], v))
+            continue;
+         if (I->alu_src_uniform_mask && has_store_uniform)
+            continue;
+         bool is_imm = (I->op == AGX_APPLE9_VIR_IMM && !I->local_control &&
+                        agx_apple9_vir_nr_srcs(I) == 0);
+         bool small_imm = is_imm && I->immediate <= 0x7fu;
+         if (!high_blk && !small_imm)
+            continue;
+         if (!is_imm && !is_remat_long_span_alu(p, pub_defs, I))
+            continue;
+         cands[cand_count++] = I;
+      }
+
+      unsigned remove_count = 0;
+      for (unsigned ci = cand_count; ci-- > 0;) {
+         struct agx_apple9_vir_instr *orig = cands[ci];
+         uint32_t v = orig->dest;
+         if (BITSET_TEST(pinned_src, v))
+            continue;
+
+         const bool is_imm = (orig->op == AGX_APPLE9_VIR_IMM);
+         uint32_t s0 = AGX_APPLE9_VREG_INVALID;
+         struct agx_apple9_vir_instr *s0_imm = NULL;
+         if (!is_imm) {
+            s0 = agx_apple9_vir_src(orig, 0);
+            if (s0 >= vcount)
+               continue;
+            bool s0_live_out = u_sparse_bitset_test(&liveness->live_out[b], s0);
+            if (!s0_live_out) {
+               if (defs[s0] && defs[s0]->op == AGX_APPLE9_VIR_IMM &&
+                   defs[s0]->dest_components == 1 && !defs[s0]->local_control &&
+                   agx_apple9_vir_nr_srcs(defs[s0]) == 0 &&
+                   !BITSET_TEST(pub_defs, s0)) {
+                  s0_imm = defs[s0];
+               } else {
+                  continue;
+               }
+            }
+         }
+
+         /* Clone orig (and s0_imm if needed) into every other block that uses v. */
+         bool failed = false;
+         bool cloned_any = false;
+         for (struct agx_apple9_block *ub = p->blocks; ub; ub = ub->next) {
+            if (!ub->cfg_active || ub == blk)
+               continue;
+            struct agx_apple9_vir_instr *first_u = NULL;
+            for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(ub);
+                 I; I = agx_apple9_instr_next(I)) {
+               if (I->op == AGX_APPLE9_VIR_DEVICE_ATOMIC_RESULT ||
+                   I->op == AGX_APPLE9_VIR_PHI)
+                  continue;
+               const unsigned nr_srcs = agx_apple9_vir_nr_srcs(I);
+               for (unsigned s = 0; s < nr_srcs; ++s) {
+                  if (agx_apple9_vir_src(I, s) == v) {
+                     first_u = I;
+                     break;
+                  }
+               }
+               if (first_u)
+                  break;
+            }
+            if (!first_u)
+               continue;
+
+            uint32_t clone_src = s0;
+            if (s0_imm) {
+               uint32_t new_imm_v = AGX_APPLE9_VREG_INVALID;
+               if (!apple9_ra_vir_grow_values(p, NULL, 1, &new_imm_v)) {
+                  failed = true;
+                  break;
+               }
+               if (p->max_phys && s0 < p->value_count &&
+                   p->max_phys[s0] != AGX_APPLE9_PHYS_INVALID)
+                  p->max_phys[new_imm_v] = p->max_phys[s0];
+               struct agx_apple9_block *saved_blk = p->current_block;
+               p->current_block = ub;
+               bool ok = agx_apple9_vir_emit_side_effect(
+                  p, s0_imm->op, s0_imm->encoding, NULL, 0, s0_imm->immediate);
+               p->current_block = saved_blk;
+               if (!ok) {
+                  failed = true;
+                  break;
+               }
+               struct agx_apple9_vir_instr *imm_copy =
+                  p->instructions[p->instruction_count - 1];
+               *imm_copy = *s0_imm;
+               imm_copy->dest = new_imm_v;
+               imm_copy->dest_components = 1;
+               imm_copy->phi_block = NULL;
+               imm_copy->phi_edge = NULL;
+               imm_copy->phi_srcs = NULL;
+               imm_copy->phi_src_count = 0;
+               imm_copy->completion_consumer = NULL;
+               imm_copy->kill_mask = 0;
+               imm_copy->retain_mask = 0;
+               imm_copy->live_after_mask = 0;
+               imm_copy->dead_dest_mask = 0;
+               imm_copy->nr_srcs = 0;
+               agx_apple9_vir_move_before(p, imm_copy, first_u);
+               clone_src = new_imm_v;
+            }
+
+            uint32_t new_v = AGX_APPLE9_VREG_INVALID;
+            if (!apple9_ra_vir_grow_values(p, NULL, 1, &new_v)) {
+               failed = true;
+               break;
+            }
+            if (p->max_phys && v < p->value_count &&
+                p->max_phys[v] != AGX_APPLE9_PHYS_INVALID)
+               p->max_phys[new_v] = p->max_phys[v];
+
+            struct agx_apple9_block *saved_blk = p->current_block;
+            p->current_block = ub;
+            bool ok = agx_apple9_vir_emit_side_effect(
+               p, orig->op, orig->encoding, is_imm ? NULL : &clone_src,
+               is_imm ? 0 : 1, orig->immediate);
+            p->current_block = saved_blk;
+            if (!ok) {
+               failed = true;
+               break;
+            }
+            struct agx_apple9_vir_instr *copy =
+               p->instructions[p->instruction_count - 1];
+            *copy = *orig;
+            copy->dest = new_v;
+            copy->dest_components = 1;
+            copy->phi_block = NULL;
+            copy->phi_edge = NULL;
+            copy->phi_srcs = NULL;
+            copy->phi_src_count = 0;
+            copy->completion_consumer = NULL;
+            copy->kill_mask = 0;
+            copy->retain_mask = 0;
+            copy->live_after_mask = 0;
+            copy->dead_dest_mask = 0;
+            copy->nr_srcs = is_imm ? 0 : 1;
+            if (!is_imm)
+               copy->src[0] = clone_src;
+            agx_apple9_vir_move_before(p, copy, first_u);
+
+            for (struct agx_apple9_vir_instr *I = first_u; I;
+                 I = agx_apple9_instr_next(I)) {
+               if (I->op == AGX_APPLE9_VIR_DEVICE_ATOMIC_RESULT ||
+                   I->op == AGX_APPLE9_VIR_PHI)
+                  continue;
+               const unsigned nr_srcs = agx_apple9_vir_nr_srcs(I);
+               for (unsigned s = 0; s < nr_srcs; ++s) {
+                  uint32_t *sp = agx_apple9_vir_src_ptr(I, s);
+                  if (*sp == v)
+                     *sp = new_v;
+               }
+            }
+            cloned_any = true;
+         }
+
+         if (failed) {
+            if (cloned_any)
+               any_changed = true;
+            break;
+         }
+         if (cloned_any) {
+            if (!is_imm && !s0_imm)
+               BITSET_SET(pinned_src, s0);
+            if (in_blk_uses[v] == 0)
+               to_remove[remove_count++] = orig;
+            any_changed = true;
+         }
+      }
+
+      if (remove_count > 0)
+         agx_apple9_vir_remove_many(p, to_remove, remove_count);
+      ralloc_free(cands);
+      ralloc_free(to_remove);
+   }
+
+   ralloc_free(mem_ctx);
+   return any_changed;
+}
+
 bool
 apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                                  struct apple9_ra_sched_options *opts)
@@ -1886,11 +2485,20 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
    }
 
    for (unsigned pass = 0; pass < 2; ++pass) {
-      if (!apple9_ra_remat_long_spans(p, &liveness))
+      bool changed = apple9_ra_remat_cross_block(p, &liveness);
+      if (changed) {
+         apple9_ra_liveness_finish(&liveness);
+         if (!apple9_ra_liveness(p, &liveness))
+            return false;
+      }
+      bool long_changed = apple9_ra_remat_long_spans(p, &liveness);
+      if (long_changed) {
+         apple9_ra_liveness_finish(&liveness);
+         if (!apple9_ra_liveness(p, &liveness))
+            return false;
+      }
+      if (!changed && !long_changed)
          break;
-      apple9_ra_liveness_finish(&liveness);
-      if (!apple9_ra_liveness(p, &liveness))
-         return false;
    }
 
    void *mem_ctx = ralloc_context(NULL);
@@ -1995,6 +2603,7 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
            B = agx_apple9_instr_prev(B)) {
          struct vir_pressure_delta delta = calc_pressure_delta(
             p, defs, pub_defs, val_max_gpr, B, &orig_live);
+         orig_all = MAX2(orig_all, cur_all + delta.peak_all);
          cur_all += delta.all;
          cur_64 += delta.bank64;
          cur_16 += delta.bank16;
@@ -2018,7 +2627,7 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
          struct vir_sched_result pres = {0};
          bool have_pres = false;
          int32_t min_all = orig_all;
-         if (orig_all > 48) {
+         if (orig_all > 42) {
             pres_ctx = ralloc_context(blk_ctx);
             pres = run_block_schedule_attempt(
                p, defs, pub_defs, val_max_gpr, first_body, first_tail,
@@ -2032,6 +2641,32 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                have_pres = true;
                min_all = pres.max_all;
             }
+            /* When greedy bottom-up pressure scheduling fails to bring a
+             * high-pressure block comfortably below the 52-GPR cliff, try
+             * order-preserving load sinking. */
+            if (min_all > 46) {
+               void *sink_ctx = ralloc_context(blk_ctx);
+               struct vir_sched_result sink = run_block_sink_loads(
+                  p, defs, pub_defs, val_max_gpr, first_body, first_tail,
+                  &live_after_body, base_all, base_64, base_16, last_write,
+                  sink_ctx);
+               if (sink.valid &&
+                   bank_limits_respected(sink.max_64, sink.max_16, orig_64,
+                                         orig_16) &&
+                   pressure_strictly_better(
+                      sink.max_all, sink.max_64, sink.max_16,
+                      have_pres ? pres.max_all : orig_all,
+                      have_pres ? pres.max_64 : orig_64,
+                      have_pres ? pres.max_16 : orig_16)) {
+                  ralloc_free(pres_ctx);
+                  pres_ctx = sink_ctx;
+                  pres = sink;
+                  have_pres = true;
+                  min_all = sink.max_all;
+               } else {
+                  ralloc_free(sink_ctx);
+               }
+            }
          }
 
          unsigned clamped_min =
@@ -2041,14 +2676,15 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
             MIN2(agx_occupancy_for_register_count(2u * clamped_min)
                     .max_registers / 2u,
                  (unsigned)AGX_APPLE9_GPR_COUNT);
-         /* Leave 4 GPRs of alignment/RA headroom below each tier ceiling
-          * (48 for 52, 60 for 64, 76 for 80, 92 for 96). */
-         int32_t safe_tier = (int32_t)(tier_gprs > 4u ? tier_gprs - 4u : tier_gprs);
+         /* Leave alignment/RA headroom below each occupancy tier ceiling:
+          * 6 GPRs for the critical 52-GPR (1024-thread) tier so vec4-aligned
+          * loads don't spill over 52, and 4 GPRs for higher tiers. */
+         unsigned headroom = tier_gprs <= 52u ? 6u : 4u;
+         int32_t safe_tier =
+            (int32_t)(tier_gprs > headroom ? tier_gprs - headroom : tier_gprs);
          int32_t lat_limit = min_all;
          if (min_all < safe_tier)
             lat_limit = MIN2(safe_tier, min_all + 12);
-         if (cfg->pressure_slack > 0 && orig_all + (int32_t)cfg->pressure_slack > lat_limit)
-            lat_limit = orig_all + (int32_t)cfg->pressure_slack;
 
          void *lat_ctx = ralloc_context(blk_ctx);
          unsigned orig_stalls = 0;

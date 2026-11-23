@@ -1246,6 +1246,14 @@ struct apple9_dag_lower {
    nir_block *active_nir_block;
    unsigned active_load_instruction_count;
    unsigned active_emitted_load_count;
+   /* Small FIFO of exported varying publications waiting for VARY_STORE so
+    * back-to-back exports separate producer and consumer without interleaving
+    * GPR writes that could clobber borrowed export sources. */
+   struct {
+      uint32_t publication;
+      unsigned slot;
+   } pending_vary_stores[4];
+   unsigned pending_vary_store_count;
    bool structured_cf;
    unsigned mask_depth;
    struct apple9_loop_context *loop;
@@ -5238,6 +5246,49 @@ apple9_emit_coverage(struct apple9_dag_lower *lower, uint32_t affected,
 }
 
 static bool
+apple9_dag_scalar_cached(const struct apple9_dag_lower *lower,
+                         nir_scalar scalar)
+{
+   scalar = apple9_chase_trivial(scalar);
+   if (scalar.def->bit_size == 1 || scalar.comp >= APPLE9_SSA_COMPONENTS)
+      return false;
+   unsigned key = scalar.def->index * APPLE9_SSA_COMPONENTS + scalar.comp;
+   return key < lower->ssa_map_count &&
+          lower->ssa_to_vreg[key] != AGX_APPLE9_VREG_INVALID;
+}
+
+static bool
+apple9_flush_vary_stores(struct apple9_dag_lower *lower)
+{
+   for (unsigned i = 0; i < lower->pending_vary_store_count; ++i) {
+      uint32_t pub = lower->pending_vary_stores[i].publication;
+      if (!agx_apple9_vir_emit_side_effect(
+             &lower->program, AGX_APPLE9_VIR_VARY_STORE,
+             AGX_APPLE9_ENC_VARY_STORE, &pub, 1,
+             lower->pending_vary_stores[i].slot))
+         return false;
+   }
+   lower->pending_vary_store_count = 0;
+   return true;
+}
+
+static bool
+apple9_pop_oldest_vary_store(struct apple9_dag_lower *lower)
+{
+   assert(lower->pending_vary_store_count > 0);
+   uint32_t pub = lower->pending_vary_stores[0].publication;
+   if (!agx_apple9_vir_emit_side_effect(
+          &lower->program, AGX_APPLE9_VIR_VARY_STORE,
+          AGX_APPLE9_ENC_VARY_STORE, &pub, 1,
+          lower->pending_vary_stores[0].slot))
+      return false;
+   lower->pending_vary_store_count--;
+   for (unsigned i = 0; i < lower->pending_vary_store_count; ++i)
+      lower->pending_vary_stores[i] = lower->pending_vary_stores[i + 1];
+   return true;
+}
+
+static bool
 apple9_emit_graphics_output(struct apple9_dag_lower *lower,
                             nir_intrinsic_instr *intr)
 {
@@ -5294,6 +5345,16 @@ apple9_emit_graphics_output(struct apple9_dag_lower *lower,
     */
    if (location == VARYING_SLOT_POS || location == VARYING_SLOT_PSIZ)
       integer = false;
+   /* Mesa may erase user-varying types while lowering IO. Publish their
+    * bits without FP arithmetic: multiplying an integer payload by float
+    * one would quiet NaNs and flush subnormals. The UVS transport is untyped. */
+   const bool raw =
+      integer || (location != VARYING_SLOT_POS && location != VARYING_SLOT_PSIZ);
+
+   unsigned count = 0;
+   unsigned slots[4];
+   unsigned comps[4];
+   nir_scalar scalars[4];
    for (unsigned c = 0; c < intr->num_components; ++c) {
       if (!uvs && !(nir_intrinsic_write_mask(intr) & BITFIELD_BIT(c)))
          continue;
@@ -5313,53 +5374,137 @@ apple9_emit_graphics_output(struct apple9_dag_lower *lower,
             return false;
          slot = 4 + index;
       }
-      uint32_t value =
-         apple9_lower_dag_scalar(lower, nir_get_scalar(intr->src[0].ssa, c));
-      /* Mesa may erase user-varying types while lowering IO. Publish their
-       * bits without FP arithmetic: multiplying an integer payload by float
-       * one would quiet NaNs and flush subnormals. The UVS transport is untyped. */
-      bool raw = integer || (location != VARYING_SLOT_POS && location != VARYING_SLOT_PSIZ);
-      if (value == AGX_APPLE9_VREG_INVALID)
+      slots[count] = slot;
+      comps[count] = component;
+      scalars[count] = nir_get_scalar(intr->src[0].ssa, c);
+      count++;
+   }
+   if (!count)
+      return true;
+
+   /* Keep pending export publications isolated from GPR-writing ALU so their
+    * borrowed source registers are never clobbered before VARY_STORE retires.
+    * Flush before lowering any source or scale literal not already in a GPR. */
+   if (lower->pending_vary_store_count > 0) {
+      bool all_ready = raw;
+      for (unsigned k = 0; all_ready && k < count; ++k) {
+         if (!apple9_dag_scalar_cached(lower, scalars[k]))
+            all_ready = false;
+      }
+      if (!all_ready && !apple9_flush_vary_stores(lower))
          return false;
+   }
+
+   uint32_t values[4];
+   for (unsigned k = 0; k < count; ++k) {
+      values[k] = apple9_lower_dag_scalar(lower, scalars[k]);
+      if (values[k] == AGX_APPLE9_VREG_INVALID)
+         return false;
+   }
+
+   if (lower->share_exports &&
+       lower->cache.export_memo_block != lower->active_nir_block) {
+      lower->cache.export_memo_block = lower->active_nir_block;
+      lower->cache.export_memo_count = 0;
+   }
+
+   /* Materialize the float 1.0 scale once before the export batch so no IMM
+    * write lands between an EXPORT and its queued VARY_STORE. */
+   uint32_t scale = AGX_APPLE9_VREG_INVALID;
+   if (!raw) {
+      bool need_scale = false;
+      for (unsigned k = 0; k < count && !need_scale; ++k) {
+         bool hit = false;
+         for (unsigned m = 0; lower->share_exports && m < lower->cache.export_memo_count; ++m) {
+            if (lower->cache.export_memo[m].value == values[k] &&
+                lower->cache.export_memo[m].raw == raw)
+               hit = true;
+         }
+         if (!hit)
+            need_scale = true;
+      }
+      if (need_scale) {
+         scale = apple9_dag_imm(lower, fui(1.0f));
+         if (scale == AGX_APPLE9_VREG_INVALID)
+            return false;
+      }
+   }
+
+   for (unsigned k = 0; k < count; ++k) {
       /* Export publications stay live until completion, so a value stored to
        * several UVS slots (a clip distance's varying and rasterizer copies)
        * publishes once. */
-      if (lower->share_exports &&
-          lower->cache.export_memo_block != lower->active_nir_block) {
-         lower->cache.export_memo_block = lower->active_nir_block;
-         lower->cache.export_memo_count = 0;
-      }
       uint32_t exported = AGX_APPLE9_VREG_INVALID;
       for (unsigned m = 0; lower->share_exports && m < lower->cache.export_memo_count; ++m) {
-         if (lower->cache.export_memo[m].value == value && lower->cache.export_memo[m].raw == raw)
+         if (lower->cache.export_memo[m].value == values[k] &&
+             lower->cache.export_memo[m].raw == raw)
             exported = lower->cache.export_memo[m].publication;
       }
       if (exported == AGX_APPLE9_VREG_INVALID) {
-         uint32_t scale = apple9_dag_imm(lower, raw ? 0 : fui(1.0f));
-         uint32_t sources[] = {value, scale};
-         if (scale == AGX_APPLE9_VREG_INVALID)
-            return false;
-         exported = apple9_dag_emit(
-            lower, raw ? AGX_APPLE9_VIR_IXOR : AGX_APPLE9_VIR_FMUL,
-            raw ? AGX_APPLE9_ENC_LOGIC_EXPORT : AGX_APPLE9_ENC_FLOAT2_EXPORT,
-            sources, 2, 0);
+         if (raw) {
+            /* IOR(v, v) avoids a zero-literal GPR and packs to 4B MOV cr, r
+             * when assigned scoreboard slot 1 on cr0..cr63. */
+            uint32_t sources[] = {values[k], values[k]};
+            exported = apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR,
+                                       AGX_APPLE9_ENC_LOGIC_EXPORT, sources, 2, 0);
+         } else {
+            uint32_t sources[] = {values[k], scale};
+            exported = apple9_dag_emit(lower, AGX_APPLE9_VIR_FMUL,
+                                       AGX_APPLE9_ENC_FLOAT2_EXPORT, sources, 2, 0);
+         }
          if (lower->share_exports && exported != AGX_APPLE9_VREG_INVALID &&
              lower->cache.export_memo_count < AGX_APPLE9_PUBLICATION_COUNT) {
             lower->cache.export_memo[lower->cache.export_memo_count++] =
-               (struct agx_apple9_export_memo){value, exported, raw};
+               (struct agx_apple9_export_memo){values[k], exported, raw};
          }
       }
-      value = exported;
-      /* The allocator retains this publication independently of GPR liveness. */
-      if (value == AGX_APPLE9_VREG_INVALID ||
-          !agx_apple9_vir_emit_side_effect(
-             &lower->program, AGX_APPLE9_VIR_VARY_STORE,
-             AGX_APPLE9_ENC_VARY_STORE, &value, 1, slot))
+      if (exported == AGX_APPLE9_VREG_INVALID)
          return false;
+      /* Queue VARY_STORE in a 4-deep FIFO so back-to-back exports hide their
+       * completion latency without starving in-flight load scoreboard slots. */
+      if (lower->pending_vary_store_count == ARRAY_SIZE(lower->pending_vary_stores) &&
+          !apple9_pop_oldest_vary_store(lower))
+         return false;
+      lower->pending_vary_stores[lower->pending_vary_store_count].publication = exported;
+      lower->pending_vary_stores[lower->pending_vary_store_count].slot = slots[k];
+      lower->pending_vary_store_count++;
       if (location == VARYING_SLOT_POS)
-         lower->position_mask |= BITFIELD_BIT(component);
+         lower->position_mask |= BITFIELD_BIT(comps[k]);
    }
    return true;
+}
+
+static bool
+apple9_instr_preserves_vary_batch(const struct apple9_dag_lower *lower,
+                                  nir_instr *instr)
+{
+   if (instr->type == nir_instr_type_phi)
+      return true;
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+      if (op == nir_intrinsic_load_barycentric_pixel ||
+          op == nir_intrinsic_load_preamble ||
+          op == nir_intrinsic_load_native_pointer_apple9_agx)
+         return true;
+      if ((op == nir_intrinsic_store_output ||
+           op == nir_intrinsic_store_uvs_agx) &&
+          lower->nir->info.stage != MESA_SHADER_FRAGMENT)
+         return true;
+      return false;
+   }
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (!nir_op_is_vec_or_mov(alu->op) || alu->def.bit_size == 1)
+         return false;
+      const nir_component_mask_t read = nir_def_components_read(&alu->def);
+      for (unsigned c = 0; c < alu->def.num_components; ++c) {
+         if ((read & BITFIELD_BIT(c)) &&
+             !apple9_dag_scalar_cached(lower, nir_get_scalar(&alu->def, c)))
+            return false;
+      }
+      return true;
+   }
+   return false;
 }
 
 /* Emit one NIR block in its original instruction order. Pure SSA expressions
@@ -5377,6 +5522,12 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
    lower->active_emitted_load_count = 0;
 
    nir_foreach_instr(instr, block) {
+      if (lower->pending_vary_store_count > 0 &&
+          !apple9_instr_preserves_vary_batch(lower, instr)) {
+         if (!apple9_flush_vary_stores(lower))
+            return false;
+      }
+
       if (instr->type == nir_instr_type_phi) {
          nir_phi_instr *phi = nir_instr_as_phi(instr);
          for (unsigned c = 0; c < phi->def.num_components; ++c) {
@@ -6319,6 +6470,9 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
          }
       }
    }
+
+   if (!apple9_flush_vary_stores(lower))
+      return false;
 
    if (lower->active_emitted_load_count !=
        lower->active_load_instruction_count) {
@@ -8063,6 +8217,435 @@ agx_apple9_dump_info(const struct agx_shader_info *info)
    fputc('\n', f);
 }
 
+static nir_loop *
+apple9_sink_innermost_loop(nir_cf_node *node)
+{
+   for (; node != NULL; node = node->parent) {
+      if (node->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         if (nir_loop_has_back_edge(loop))
+            return loop;
+      }
+   }
+   return NULL;
+}
+
+static bool
+apple9_sink_loop_contains_block(nir_loop *loop, nir_block *block)
+{
+   assert(!nir_loop_has_continue_construct(loop));
+   nir_block *before = nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
+   nir_block *after = nir_cf_node_as_block(nir_cf_node_next(&loop->cf_node));
+   return block->index > before->index && block->index < after->index;
+}
+
+static nir_block *
+apple9_sink_adjust_for_loops(nir_block *use_block, nir_block *def_block,
+                             bool sink_out_of_loops)
+{
+   nir_loop *def_loop = NULL;
+   if (!sink_out_of_loops) {
+      def_loop = apple9_sink_innermost_loop(&def_block->cf_node);
+      if (def_loop && nir_loop_has_continue_construct(def_loop))
+         return def_block;
+   }
+
+   for (nir_block *cur_block = use_block; cur_block != def_block->imm_dom;
+        cur_block = cur_block->imm_dom) {
+      if (!sink_out_of_loops && def_loop &&
+          !apple9_sink_loop_contains_block(def_loop, use_block)) {
+         use_block = cur_block;
+         continue;
+      }
+
+      nir_cf_node *next = nir_cf_node_next(&cur_block->cf_node);
+      if (next && next->type == nir_cf_node_loop) {
+         nir_loop *following_loop = nir_cf_node_as_loop(next);
+         if (nir_loop_has_continue_construct(following_loop))
+            return def_block;
+         if (nir_loop_has_back_edge(following_loop) &&
+             apple9_sink_loop_contains_block(following_loop, use_block)) {
+            use_block = cur_block;
+            continue;
+         }
+      }
+   }
+
+   return use_block;
+}
+
+static nir_block *
+apple9_sink_preferred_block(nir_def *def, bool sink_out_of_loops)
+{
+   nir_block *lca = NULL;
+   nir_foreach_use_including_if(use, def) {
+      lca = nir_dominance_lca(lca, nir_src_get_block(use));
+   }
+   if (!lca)
+      return NULL;
+
+   lca = apple9_sink_adjust_for_loops(lca, nir_def_block(def),
+                                      sink_out_of_loops);
+   assert(nir_block_dominates(nir_def_block(def), lca));
+   return lca;
+}
+
+static bool
+apple9_is_sinkable_load(nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   if (nir_intrinsic_has_access(intr) &&
+       (nir_intrinsic_access(intr) & ACCESS_VOLATILE))
+      return false;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_global_2x32:
+   case nir_intrinsic_load_global:
+      return (nir_intrinsic_access(intr) & ACCESS_CAN_REORDER) != 0;
+   case nir_intrinsic_load_global_constant:
+      return true;
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_load_constant_agx:
+      return nir_intrinsic_can_reorder(intr);
+   default:
+      return false;
+   }
+}
+
+static bool
+apple9_alu_uses_ballot_true(const nir_alu_instr *alu)
+{
+   unsigned inputs = nir_op_infos[alu->op].num_inputs;
+   for (unsigned i = 0; i < inputs; ++i) {
+      nir_intrinsic_instr *intr = nir_src_as_intrinsic(alu->src[i].src);
+      if (intr && intr->intrinsic == nir_intrinsic_ballot &&
+          nir_src_is_const(intr->src[0]))
+         return true;
+   }
+   return false;
+}
+
+static bool
+apple9_bcsel_unlocks_load_sink(nir_alu_instr *alu, nir_block *target_block)
+{
+   if (alu->op != nir_op_bcsel || apple9_alu_uses_ballot_true(alu))
+      return false;
+
+   nir_block *def_block = alu->instr.block;
+   for (unsigned s = 1; s <= 2; ++s) {
+      nir_instr *src_instr = nir_def_instr(alu->src[s].src.ssa);
+      if (src_instr->block != def_block || !apple9_is_sinkable_load(src_instr))
+         continue;
+
+      nir_def *load_def = nir_instr_def(src_instr);
+      nir_block *lca = NULL;
+      bool can_sink_load = true;
+      nir_foreach_use_including_if(use, load_def) {
+         nir_block *ub = nir_src_get_block(use);
+         if (ub != def_block) {
+            lca = nir_dominance_lca(lca, ub);
+            continue;
+         }
+         if (nir_src_is_if(use)) {
+            can_sink_load = false;
+            break;
+         }
+         nir_instr *ui = nir_src_use_instr(use);
+         if (ui->type != nir_instr_type_alu) {
+            can_sink_load = false;
+            break;
+         }
+         nir_alu_instr *ualu = nir_instr_as_alu(ui);
+         if ((ualu->op != nir_op_bcsel && !nir_op_is_vec_or_mov(ualu->op)) ||
+             apple9_alu_uses_ballot_true(ualu)) {
+            can_sink_load = false;
+            break;
+         }
+         nir_foreach_use_including_if(u2, &ualu->def) {
+            lca = nir_dominance_lca(lca, nir_src_get_block(u2));
+         }
+      }
+      if (!can_sink_load || !lca)
+         continue;
+
+      nir_block *load_target =
+         apple9_sink_adjust_for_loops(lca, def_block, false);
+      if (load_target && load_target != def_block &&
+          nir_block_dominates(load_target, target_block))
+         return true;
+   }
+   return false;
+}
+
+static bool
+apple9_src_is_const_like(const nir_src *src)
+{
+   if (nir_src_is_const(*src) || nir_src_is_undef(*src))
+      return true;
+   nir_instr *parent = nir_def_instr(src->ssa);
+   if (parent->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(parent);
+      if (alu->op == nir_op_unpack_64_2x32_split_x ||
+          alu->op == nir_op_unpack_64_2x32_split_y ||
+          alu->op == nir_op_mov)
+         return apple9_src_is_const_like(&alu->src[0].src);
+      if (alu->op == nir_op_pack_64_2x32_split || nir_op_is_vec(alu->op)) {
+         unsigned n = nir_op_infos[alu->op].num_inputs;
+         for (unsigned i = 0; i < n; ++i) {
+            if (!apple9_src_is_const_like(&alu->src[i].src))
+               return false;
+         }
+         return true;
+      }
+      return false;
+   }
+   if (parent->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_op op = nir_instr_as_intrinsic(parent)->intrinsic;
+   return op == nir_intrinsic_load_preamble ||
+          op == nir_intrinsic_load_uniform ||
+          op == nir_intrinsic_load_ro_sink_address_poly;
+}
+
+static bool
+apple9_def_live_at_block(nir_def *s, nir_instr *ignore_user,
+                         nir_block *target_block)
+{
+   nir_foreach_use_including_if(u, s) {
+      if (!nir_src_is_if(u) && nir_src_use_instr(u) == ignore_user)
+         continue;
+      if (nir_block_dominates(target_block, nir_src_get_block(u)))
+         return true;
+   }
+   return false;
+}
+
+/* Sinking a pure ALU op (such as a 64-bit bounds-check address bcsel or
+ * multi-source arithmetic whose other operands are already live at target_block)
+ * is guaranteed not to increase live GPR pressure across intervening CF/loops
+ * whenever the total 32-bit word width of sources not already live at
+ * target_block does not exceed the destination's word width. */
+static bool
+apple9_alu_sink_pressure_safe(nir_alu_instr *alu, nir_block *target_block)
+{
+   if (apple9_alu_uses_ballot_true(alu))
+      return false;
+
+   unsigned def_words =
+      DIV_ROUND_UP((unsigned)alu->def.num_components * alu->def.bit_size, 32u);
+   unsigned new_words = 0;
+   unsigned inputs = nir_op_infos[alu->op].num_inputs;
+
+   for (unsigned i = 0; i < inputs; ++i) {
+      if (apple9_src_is_const_like(&alu->src[i].src))
+         continue;
+      nir_def *s = alu->src[i].src.ssa;
+      bool dup = false;
+      for (unsigned prev = 0; prev < i; ++prev) {
+         if (alu->src[prev].src.ssa == s) {
+            dup = true;
+            break;
+         }
+      }
+      if (dup)
+         continue;
+
+      if (apple9_def_live_at_block(s, &alu->instr, target_block))
+         continue;
+
+      /* Unwrap zero-cost pack_64_2x32_split / vecN to check whether their
+       * component sources are already live at target_block. */
+      nir_instr *sp = nir_def_instr(s);
+      if (sp->type == nir_instr_type_alu) {
+         nir_alu_instr *pack = nir_instr_as_alu(sp);
+         if (pack->op == nir_op_pack_64_2x32_split || nir_op_is_vec(pack->op)) {
+            unsigned n = nir_op_infos[pack->op].num_inputs;
+            for (unsigned c = 0; c < n; ++c) {
+               if (apple9_src_is_const_like(&pack->src[c].src))
+                  continue;
+               nir_def *cs = pack->src[c].src.ssa;
+               bool cdup = false;
+               for (unsigned prev = 0; prev < c; ++prev) {
+                  if (pack->src[prev].src.ssa == cs) {
+                     cdup = true;
+                     break;
+                  }
+               }
+               if (cdup)
+                  continue;
+               if (!apple9_def_live_at_block(cs, sp, target_block))
+                  new_words += DIV_ROUND_UP((unsigned)cs->bit_size, 32u);
+            }
+            continue;
+         }
+      }
+
+      new_words += DIV_ROUND_UP((unsigned)s->num_components * s->bit_size, 32u);
+   }
+
+   return new_words <= def_words;
+}
+
+/* Recognize the high-word half of a lowered 64-bit constant-offset add:
+ *   lo_add = iadd(lo, const_like)
+ *   carry  = b2i32(ult(lo_add, lo))
+ *   hi_out = iadd(carry, hi)
+ * Considered alone, hi_out looks like a 2-source 1-word add, stranding the
+ * entire 64-bit pointer calculation above downstream branches/loops. When
+ * lo_add's other uses are also dominated by target_block, sinking hi_out lets
+ * all four instructions sink together with 2 inputs <= 2 outputs (zero net
+ * pressure increase) and unlocks sinking of the underlying base address. */
+static bool
+apple9_alu_is_sinkable_carry_hi(nir_alu_instr *alu, nir_block *target_block)
+{
+   if (alu->op != nir_op_iadd || alu->def.num_components != 1 ||
+       alu->def.bit_size != 32)
+      return false;
+
+   for (unsigned ci = 0; ci < 2; ++ci) {
+      nir_instr *c_ins = nir_def_instr(alu->src[ci].src.ssa);
+      if (c_ins->block != alu->instr.block || c_ins->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *b2i = nir_instr_as_alu(c_ins);
+      if (b2i->op != nir_op_b2i32)
+         continue;
+      nir_instr *u_ins = nir_def_instr(b2i->src[0].src.ssa);
+      if (u_ins->block != alu->instr.block || u_ins->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *ult = nir_instr_as_alu(u_ins);
+      if (ult->op != nir_op_ult)
+         continue;
+
+      nir_instr *l_ins = nir_def_instr(ult->src[0].src.ssa);
+      if (l_ins->block != alu->instr.block || l_ins->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *lo_add = nir_instr_as_alu(l_ins);
+      if (lo_add->op != nir_op_iadd)
+         continue;
+
+      nir_def *cmp_rhs = ult->src[1].src.ssa;
+      bool matches_lo =
+         (lo_add->src[0].src.ssa == cmp_rhs &&
+          apple9_src_is_const_like(&lo_add->src[1].src)) ||
+         (lo_add->src[1].src.ssa == cmp_rhs &&
+          apple9_src_is_const_like(&lo_add->src[0].src));
+      if (!matches_lo)
+         continue;
+
+      /* Verify all other uses of lo_add, ult, and b2i are dominated by
+       * target_block so the full 4-op chain sinks together. */
+      bool all_dominated = true;
+      nir_foreach_use_including_if(u, &b2i->def) {
+         if (!nir_src_is_if(u) && nir_src_use_instr(u) == &alu->instr)
+            continue;
+         if (!nir_block_dominates(target_block, nir_src_get_block(u))) {
+            all_dominated = false;
+            break;
+         }
+      }
+      if (!all_dominated)
+         continue;
+      nir_foreach_use_including_if(u, &ult->def) {
+         if (!nir_src_is_if(u) && nir_src_use_instr(u) == &b2i->instr)
+            continue;
+         if (!nir_block_dominates(target_block, nir_src_get_block(u))) {
+            all_dominated = false;
+            break;
+         }
+      }
+      if (!all_dominated)
+         continue;
+      nir_foreach_use_including_if(u, &lo_add->def) {
+         if (!nir_src_is_if(u) && nir_src_use_instr(u) == &ult->instr)
+            continue;
+         if (!nir_block_dominates(target_block, nir_src_get_block(u))) {
+            all_dominated = false;
+            break;
+         }
+      }
+      if (all_dominated)
+         return true;
+   }
+   return false;
+}
+
+/* nir_opt_sink does not recognize Apple9's lowered load_global_2x32 nor
+ * multi-source bcsel/ALU wrappers around reorderable loads, leaving multi-vec4
+ * loads and 64-bit bounds-checked pointers live across downstream branches and
+ * loops. Sink reorderable loads and pressure-neutral ALU/bcsel chains to the
+ * LCA of their uses without moving into or out of loops. */
+static bool
+apple9_nir_sink_loads(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_metadata_require(impl, nir_metadata_block_index |
+                                 nir_metadata_dominance |
+                                 nir_metadata_dominance_lca);
+      bool impl_progress = false;
+      for (unsigned iter = 0; iter < 4; ++iter) {
+         bool iter_progress = false;
+         nir_foreach_block_reverse(block, impl) {
+            nir_foreach_instr_reverse_safe(instr, block) {
+               if (instr->type == nir_instr_type_load_const) {
+                  /* Sink small scalar literals (2B MOV_IMM_COMPACT) to their
+                   * dominance LCA even inside loops so constants like 3/7/11/15
+                   * don't occupy GPRs across an entire loop body. */
+                  nir_load_const_instr *lc = nir_instr_as_load_const(instr);
+                  if (lc->def.num_components != 1 || lc->def.bit_size > 32 ||
+                      nir_const_value_as_uint(lc->value[0], lc->def.bit_size) > 0x7fu)
+                     continue;
+                  nir_block *lca = NULL;
+                  nir_foreach_use_including_if(use, &lc->def) {
+                     lca = nir_dominance_lca(lca, nir_src_get_block(use));
+                  }
+                  if (!lca || lca == instr->block ||
+                      !nir_block_dominates(instr->block, lca))
+                     continue;
+                  nir_instr_remove(instr);
+                  nir_instr_insert(nir_after_phis(lca), instr);
+                  iter_progress = true;
+                  continue;
+               }
+               if (instr->type == nir_instr_type_alu) {
+                  nir_alu_instr *alu = nir_instr_as_alu(instr);
+                  nir_block *use_block =
+                     apple9_sink_preferred_block(&alu->def, false);
+                  if (!use_block || use_block == instr->block)
+                     continue;
+                  if (!apple9_alu_sink_pressure_safe(alu, use_block) &&
+                      !apple9_alu_is_sinkable_carry_hi(alu, use_block) &&
+                      !apple9_bcsel_unlocks_load_sink(alu, use_block))
+                     continue;
+                  nir_instr_remove(instr);
+                  nir_instr_insert(nir_after_phis(use_block), instr);
+                  iter_progress = true;
+                  continue;
+               }
+               if (!apple9_is_sinkable_load(instr))
+                  continue;
+               nir_block *use_block =
+                  apple9_sink_preferred_block(nir_instr_def(instr), false);
+               if (!use_block || use_block == instr->block)
+                  continue;
+               nir_instr_remove(instr);
+               nir_instr_insert(nir_after_phis(use_block), instr);
+               iter_progress = true;
+            }
+         }
+         impl_progress |= iter_progress;
+         if (!iter_progress)
+            break;
+      }
+      nir_progress(impl_progress, impl, nir_metadata_control_flow);
+      progress |= impl_progress;
+   }
+   return progress;
+}
+
 struct apple9_dag_cost {
    uint64_t weighted_spills;
    unsigned spills, instructions, gprs;
@@ -8105,6 +8688,8 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
                            nir_move_comparisons | nir_move_copies |
                            nir_move_load_ssbo | nir_move_alu;
    nir_opt_sink(nir, move);
+   if (apple9_nir_sink_loads(nir))
+      nir_opt_sink(nir, move);
    nir_opt_move(nir, move);
    agx_nir_hoist_apple9_derivative_sources(nir);
    if (hoist)

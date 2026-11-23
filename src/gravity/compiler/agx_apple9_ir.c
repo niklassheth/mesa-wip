@@ -7768,6 +7768,9 @@ pack_logic_extended(const struct agx_apple9_vir_instr *instruction,
     * six-bit one-hot pending-result mask split across bits 45..47 and
     * 61..63.
     */
+   if (!(instruction->alu_src_uniform_mask | instruction->alu_src_immediate_mask) &&
+       source[0] == source[1] && (live & 3u))
+      live |= 3u;
    if (live & (1u << 0)) {
       set_bits(bytes, 15, 1, 1);
       set_bits(bytes, 19, 1, 0);

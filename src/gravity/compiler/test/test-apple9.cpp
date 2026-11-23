@@ -20369,3 +20369,160 @@ TEST(Apple9Compiler, VertexInputUnprovenAlignmentStaysNativeWidth)
    ralloc_free(b.shader);
 }
 
+TEST(Apple9Vir, LogicExportLiveMaskNormalization)
+{
+   /* Identical-source IOR(r, r) LOGIC_EXPORT on non-compact slot (>= 2) must
+    * normalize live_after_mask bit 0 / bit 1 identically to 4B MOV. */
+   uint8_t phys[] = {10, 5};
+   agx_apple9_vir_instr ins_bit0 = {
+      .op = AGX_APPLE9_VIR_IOR,
+      .encoding = AGX_APPLE9_ENC_LOGIC_EXPORT,
+      .dest = 0,
+      .src = {1, 1},
+      .nr_srcs = 2,
+      .producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_2,
+      .live_after_mask = 1u,
+   };
+   agx_apple9_vir_instr ins_both = ins_bit0;
+   ins_both.live_after_mask = 3u;
+
+   agx_apple9_packed_instruction p0 = {}, p1 = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins_bit0, phys, &p0, &reason))
+      << (reason ?: "");
+   ASSERT_TRUE(agx_apple9_pack_vir_instruction(&ins_both, phys, &p1, &reason))
+      << (reason ?: "");
+   ASSERT_EQ(p0.length, 10u);
+   ASSERT_EQ(p1.length, 10u);
+   EXPECT_EQ(memcmp(p0.bytes, p1.bytes, 10u), 0);
+}
+
+TEST(Apple9Compiler, VertexVaryingExportBatchesAndFlushesCleanly)
+{
+   /* Compile a VS with POS (vec4, float-scaled) + VAR0 (vec4, raw) + an
+    * intervening ALU op + VAR1 (vec4, raw). Verify compilation succeeds,
+    * raw exports batch consecutive VARY_STORE instructions (eliminating dist=1
+    * EXPORT->VARY_STORE stalls), and intervening ALU flushes prior exports. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "vary_batch_test");
+   nir_def *vid = nir_u2f32(&b, nir_load_vertex_id(&b));
+   nir_def *zero = nir_imm_int(&b, 0);
+
+   nir_def *pos = nir_vec4(&b, vid, nir_fadd_imm(&b, vid, 1.0f),
+                           nir_fadd_imm(&b, vid, 2.0f), nir_imm_float(&b, 1.0f));
+   nir_def *v0 = nir_vec4(&b, nir_fmul_imm(&b, vid, 2.0f),
+                          nir_fmul_imm(&b, vid, 3.0f),
+                          nir_fmul_imm(&b, vid, 4.0f),
+                          nir_fmul_imm(&b, vid, 5.0f));
+   nir_store_output(&b, pos, zero, .write_mask = 0xf, .src_type = nir_type_float32,
+                    .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   nir_store_output(&b, v0, zero, .write_mask = 0xf, .src_type = nir_type_float32,
+                    .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+
+   /* Intervening ALU between VAR0 and VAR1 forces a clean FIFO flush. */
+   nir_def *mid = nir_fadd(&b, nir_channel(&b, v0, 0), nir_channel(&b, v0, 1));
+   nir_def *v1 = nir_vec4(&b, mid, nir_fadd_imm(&b, mid, 1.0f),
+                          nir_fadd_imm(&b, mid, 2.0f),
+                          nir_fadd_imm(&b, mid, 3.0f));
+   nir_store_output(&b, v1, zero, .write_mask = 0xf, .src_type = nir_type_float32,
+                    .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1});
+   b.shader->info.io_lowered = true;
+
+   agx_shader_part out = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_vertex(b.shader, &out, &reason))
+      << (reason ?: "");
+   ASSERT_NE(out.binary, nullptr);
+   EXPECT_GT(out.info.binary_size, 0u);
+
+   /* Scan for consecutive 8-byte VARY_STORE runs (0x57, 0x*6, 0x54/0x56, ...):
+    * batched vec4 exports must produce at least two back-to-back runs of >= 3
+    * VARY_STORE instructions. */
+   auto is_vary_store_at = [&](size_t off) -> bool {
+      if (off + 8 > out.info.binary_size)
+         return false;
+      const uint8_t *p = static_cast<const uint8_t *>(out.binary) + off;
+      return p[0] == 0x57 && (p[1] & 0x0f) == 0x06 &&
+             (p[2] == 0x54 || p[2] == 0x56) && p[6] == 0x00 && p[7] == 0x00;
+   };
+   unsigned batched_runs = 0;
+   for (size_t off = 0; off + 24 <= out.info.binary_size; off += 2) {
+      if (is_vary_store_at(off) && is_vary_store_at(off + 8) &&
+          is_vary_store_at(off + 16)) {
+         batched_runs++;
+         off += 22;
+      }
+   }
+   EXPECT_GE(batched_runs, 2u);
+
+   free(out.binary);
+   ralloc_free(b.shader);
+}
+
+TEST(Apple9Compiler, NirSinkLoadsAndCarry64PastBranch)
+{
+   /* Verify that a reorderable load_global_2x32 fed by a 64-bit constant-offset
+    * carry-add chain defined before an if-branch sinks past the branch without
+    * leaving the 64-bit pointer live across a high-pressure branch body. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "sink_carry64_test");
+   b.shader->info.workgroup_size[0] = 32;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *desc = nir_load_ubo(&b, 4, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                                .align_mul = 16, .range = 16);
+   nir_def *base_lo = nir_iadd(&b, nir_channel(&b, desc, 0), nir_imul_imm(&b, gid, 4));
+   nir_def *base_hi = nir_channel(&b, desc, 1);
+
+   /* Two vec4 load_global_2x32s with 64-bit constant-offset carry-add chains
+    * defined before the branch, but only consumed after the branch. Without
+    * sinking both loads and their carry chains past the branch, 46 branch-live
+    * values + 8 loaded components would exceed the 52-GPR occupancy tier. */
+   nir_def *lo0 = nir_iadd_imm(&b, base_lo, 24);
+   nir_def *hi0 = nir_iadd(&b, nir_b2i32(&b, nir_ult(&b, lo0, base_lo)), base_hi);
+   nir_def *late0 = nir_load_global_2x32(
+      &b, 4, 32, nir_vec2(&b, lo0, hi0),
+      .access = ACCESS_CAN_REORDER, .align_mul = 16);
+
+   nir_def *lo1 = nir_iadd_imm(&b, base_lo, 40);
+   nir_def *hi1 = nir_iadd(&b, nir_b2i32(&b, nir_ult(&b, lo1, base_lo)), base_hi);
+   nir_def *late1 = nir_load_global_2x32(
+      &b, 4, 32, nir_vec2(&b, lo1, hi1),
+      .access = ACCESS_CAN_REORDER, .align_mul = 16);
+
+   nir_def *acc = nir_imm_int(&b, 0);
+   nir_push_if(&b, nir_ine_imm(&b, gid, 0));
+   nir_def *branch_vals[44];
+   for (unsigned i = 0; i < 44; ++i) {
+      branch_vals[i] = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0),
+                                     nir_iadd_imm(&b, nir_imul_imm(&b, gid, 4), i * 4),
+                                     .access = ACCESS_VOLATILE, .align_mul = 4);
+   }
+   nir_def *then_sum = nir_imm_int(&b, 0);
+   for (unsigned i = 0; i < 44; ++i)
+      then_sum = nir_iadd(&b, then_sum, branch_vals[i]);
+   nir_pop_if(&b, nullptr);
+   acc = nir_if_phi(&b, then_sum, acc);
+
+   /* Consume late0 + late1 + base_lo/base_hi after the branch. */
+   nir_def *sum = acc;
+   for (unsigned c = 0; c < 4; ++c) {
+      sum = nir_iadd(&b, sum, nir_channel(&b, late0, c));
+      sum = nir_iadd(&b, sum, nir_channel(&b, late1, c));
+   }
+   sum = nir_iadd(&b, sum, nir_iadd(&b, base_lo, base_hi));
+   nir_store_ssbo(&b, sum, nir_imm_int(&b, 1), nir_imul_imm(&b, gid, 4),
+                  .write_mask = 1, .align_mul = 4);
+
+   agx_shader_part compiled = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, nullptr, &reason))
+      << (reason ?: "");
+   EXPECT_EQ(compiled.info.scratch_size, 0u);
+   EXPECT_LE(compiled.info.nr_gprs, 52u);
+
+   free(compiled.binary);
+   ralloc_free(b.shader);
+}

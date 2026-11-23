@@ -1028,12 +1028,16 @@ a9_calc_gpr_demand(const struct agx_apple9_vir_program *program,
 
          if (ins->op == AGX_APPLE9_VIR_SPLIT) {
             unsigned comps = ins->dest_components;
-            if ((ins->kill_mask & 1u) && ins->nr_srcs >= 1) {
+            const bool zero_copy = (ins->kill_mask & 1u) && ins->nr_srcs >= 1;
+            if (zero_copy) {
+               /* Zero-copy coalesced VIR_SPLIT reuses the killed source tuple
+                * GPRs directly without needing simultaneous extra registers. */
                uint32_t s0 = ins->src[0];
                for (unsigned c = 0; c < comps; ++c) {
                   if (!a9_is_pub_val(program, s0 + c) &&
-                      !apple9_ra_value_is_mem(spill, s0 + c))
-                     late_kill += 1;
+                      !apple9_ra_value_is_mem(spill, s0 + c) &&
+                      demand > reserved)
+                     demand -= 1;
                }
             }
             for (unsigned c = 0; c < comps; ++c) {
@@ -1045,7 +1049,7 @@ a9_calc_gpr_demand(const struct agx_apple9_vir_program *program,
                   demand += 1;
             }
             max_demand = MAX2(max_demand, demand);
-            min_single = MAX2(min_single, insn_need + comps);
+            min_single = MAX2(min_single, zero_copy ? insn_need : insn_need + comps);
             continue;
          }
 
