@@ -158,9 +158,15 @@ hk_attachment_init(struct hk_attachment *att,
    }
 
    VK_FROM_HANDLE(hk_image_view, iview, info->imageView);
+   const VkAttachmentFeedbackLoopInfoEXT *loop =
+      vk_find_struct_const(info->pNext, ATTACHMENT_FEEDBACK_LOOP_INFO_EXT);
    *att = (struct hk_attachment){
       .vk_format = iview->vk.format,
       .iview = iview,
+      .image_layout = info->imageLayout,
+      .load_op = info->loadOp,
+      .store_op = info->storeOp,
+      .feedback_loop_enable = loop && loop->feedbackLoopEnable,
    };
 
    if (info->resolveMode != VK_RESOLVE_MODE_NONE) {
@@ -240,16 +246,19 @@ hk_pack_zls_control(struct agx_zls_control_packed *packed,
                     const VkRenderingAttachmentInfo *z,
                     const VkRenderingAttachmentInfo *s,
                     bool incomplete_render_area, bool partial_render, bool last,
-                    const bool *chain_load)
+                    const bool *chain_load, uint8_t no_store_ds_mask)
 {
    struct agx_zls zls = {0};
 
    if (z) {
       zls.z_store = z->storeOp == VK_ATTACHMENT_STORE_OP_STORE ||
                     z->resolveMode != VK_RESOLVE_MODE_NONE || !last;
-      if (last && z->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR &&
-          vk_image_layout_is_read_only(z->imageLayout,
-                                               VK_IMAGE_ASPECT_DEPTH_BIT))
+      if ((no_store_ds_mask & BITFIELD_BIT(0)) ||
+          (z->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR &&
+           z->resolveMode == VK_RESOLVE_MODE_NONE &&
+           z->imageLayout != VK_IMAGE_LAYOUT_UNDEFINED &&
+           vk_image_layout_is_read_only(z->imageLayout,
+                                        VK_IMAGE_ASPECT_DEPTH_BIT)))
          zls.z_store = false;
 
       zls.z_load = z->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD || partial_render ||
@@ -259,9 +268,12 @@ hk_pack_zls_control(struct agx_zls_control_packed *packed,
    if (s) {
       zls.s_store = s->storeOp == VK_ATTACHMENT_STORE_OP_STORE ||
                     s->resolveMode != VK_RESOLVE_MODE_NONE || !last;
-      if (last && s->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR &&
-          vk_image_layout_is_read_only(s->imageLayout,
-                                               VK_IMAGE_ASPECT_STENCIL_BIT))
+      if ((no_store_ds_mask & BITFIELD_BIT(1)) ||
+          (s->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR &&
+           s->resolveMode == VK_RESOLVE_MODE_NONE &&
+           s->imageLayout != VK_IMAGE_LAYOUT_UNDEFINED &&
+           vk_image_layout_is_read_only(s->imageLayout,
+                                        VK_IMAGE_ASPECT_STENCIL_BIT)))
          zls.s_store = false;
 
       zls.s_load = s->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD || partial_render ||
@@ -309,6 +321,119 @@ hk_zls_control_make_raw(struct agx_zls_control_packed *packed)
  * also be sampled in GENERAL. GENERAL alone is not a feedback loop, so
  * renders in GENERAL keep barrier hoisting.
  */
+/* Whether an attachment's image layout allows sampling that aspect as a
+ * texture during the render pass. Attachment-only optimal layouts cannot be
+ * sampled even when dynamic/pipeline feedback loop state is enabled for the
+ * aspect (e.g. an unrelated MRT alongside a feedback target).
+ */
+static bool
+hk_layout_allows_sampling(VkImageLayout layout, VkImageAspectFlagBits aspect)
+{
+   switch (layout) {
+   case VK_IMAGE_LAYOUT_GENERAL:
+   case VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT:
+   case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+   case VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL:
+   case VK_IMAGE_LAYOUT_SHARED_PRESENT_KHR:
+   case VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ:
+      return true;
+   case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+      return aspect == VK_IMAGE_ASPECT_DEPTH_BIT ||
+             aspect == VK_IMAGE_ASPECT_STENCIL_BIT;
+   case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL:
+   case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL:
+      return aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
+   case VK_IMAGE_LAYOUT_STENCIL_READ_ONLY_OPTIMAL:
+   case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL:
+      return aspect == VK_IMAGE_ASPECT_STENCIL_BIT;
+   default:
+      return false;
+   }
+}
+
+static bool
+hk_attachment_is_clear(const VkRenderingInfo *info,
+                       const VkRenderingAttachmentInfo *att)
+{
+   return !(info->flags & VK_RENDERING_RESUMING_BIT) &&
+          att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+}
+
+static bool
+hk_attachment_is_read_only_layout(const VkRenderingInfo *info,
+                                  const VkRenderingAttachmentInfo *att,
+                                  VkImageAspectFlagBits aspect)
+{
+   return att && att->imageView &&
+          !hk_attachment_is_clear(info, att) &&
+          att->resolveMode == VK_RESOLVE_MODE_NONE &&
+          att->imageLayout != VK_IMAGE_LAYOUT_UNDEFINED &&
+          vk_image_layout_is_read_only(att->imageLayout, aspect);
+}
+
+static bool
+hk_attachment_is_deferred_store_none(const VkRenderingInfo *info,
+                                     const VkRenderingAttachmentInfo *att)
+{
+   /* Secondary command buffers replay into the primary command buffer via
+    * vk_cmd_enqueue, so their draws and CmdClearAttachments promote deferred
+    * attachments on demand just like primary draws. On SUSPENDING passes
+    * Vulkan ignores storeOp (the final resuming pass decides whether it is
+    * STORE_OP_NONE), so defer non-cleared attachments until actually written;
+    * if unwritten, leaving memory untouched preserves the prior contents for
+    * the resuming pass without emitting compressed suspend/partial stores.
+    */
+   return att && att->imageView &&
+          !hk_attachment_is_clear(info, att) &&
+          att->resolveMode == VK_RESOLVE_MODE_NONE &&
+          (att->storeOp == VK_ATTACHMENT_STORE_OP_NONE ||
+           (info->flags & VK_RENDERING_SUSPENDING_BIT));
+}
+
+static void
+hk_compute_no_store_masks(const VkRenderingInfo *info,
+                          uint8_t *no_store_color_out,
+                          uint8_t *store_none_color_out,
+                          uint8_t *no_store_ds_out,
+                          uint8_t *store_none_ds_out)
+{
+   uint8_t no_store_c = 0, store_none_c = 0;
+   uint8_t no_store_ds = 0, store_none_ds = 0;
+
+   for (unsigned i = 0; i < MIN2(info->colorAttachmentCount, HK_MAX_RTS); ++i) {
+      const VkRenderingAttachmentInfo *a = &info->pColorAttachments[i];
+      if (!a->imageView)
+         continue;
+      if (hk_attachment_is_read_only_layout(info, a,
+                                            VK_IMAGE_ASPECT_COLOR_BIT)) {
+         no_store_c |= BITFIELD_BIT(i);
+      } else if (hk_attachment_is_deferred_store_none(info, a)) {
+         no_store_c |= BITFIELD_BIT(i);
+         store_none_c |= BITFIELD_BIT(i);
+      }
+   }
+
+   const VkRenderingAttachmentInfo *ds[2] = {info->pDepthAttachment,
+                                             info->pStencilAttachment};
+   for (unsigned i = 0; i < 2; ++i) {
+      if (!ds[i] || !ds[i]->imageView)
+         continue;
+      VkImageAspectFlagBits aspect =
+         i ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+      if (hk_attachment_is_read_only_layout(info, ds[i], aspect)) {
+         no_store_ds |= BITFIELD_BIT(i);
+      } else if (hk_attachment_is_deferred_store_none(info, ds[i])) {
+         no_store_ds |= BITFIELD_BIT(i);
+         store_none_ds |= BITFIELD_BIT(i);
+      }
+   }
+
+   *no_store_color_out = no_store_c;
+   *store_none_color_out = store_none_c;
+   *no_store_ds_out = no_store_ds;
+   *store_none_ds_out = store_none_ds;
+}
+
 static bool
 hk_attachment_may_be_sampled(const VkRenderingAttachmentInfo *att)
 {
@@ -378,7 +503,9 @@ hk_render_merge_key_init(struct hk_render_merge_key *key, VkRenderingFlags flags
 
 static bool
 hk_render_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
-                      uint8_t raw_mask, bool raw_zs)
+                      uint8_t raw_mask, bool raw_zs,
+                      uint8_t no_store_color_mask, uint8_t store_none_color_mask,
+                      uint8_t no_store_ds_mask, uint8_t store_none_ds_mask)
 {
    struct hk_image_view *views[HK_MAX_RTS] = {NULL};
    struct hk_render_merge_key key;
@@ -410,7 +537,7 @@ hk_render_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
       if (vk_image_layout_is_read_only(ds[i]->imageLayout,
             i ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT))
          ds_read_only |= BITFIELD_BIT(i);
-      if (is_attachment_stored(ds[i]))
+      if (!(no_store_ds_mask & BITFIELD_BIT(i)) && is_attachment_stored(ds[i]))
          ds_store_mask |= BITFIELD_BIT(i);
    }
    if (cmd->merge_ds_store_mask & ~ds_store_mask)
@@ -432,7 +559,8 @@ hk_render_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
            hk_attachment_may_be_sampled(att) ||
            (cmd->vk.dynamic_graphics_state.feedback_loops & VK_IMAGE_ASPECT_COLOR_BIT)))
          return false;
-      if (att->imageView && is_attachment_stored(att))
+      if (att->imageView && !(no_store_color_mask & BITFIELD_BIT(i)) &&
+          is_attachment_stored(att))
          store_mask |= BITFIELD_BIT(i);
    }
    /* The merged render ends with this pass's store operations. An attachment
@@ -446,6 +574,10 @@ hk_render_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
    return !cmd->merge_feedback && hk_render_merge_enabled(cmd) &&
           raw_mask == cmd->merge_raw_color_mask &&
           raw_zs == cmd->merge_raw_zs &&
+          no_store_color_mask == cmd->merge_no_store_color_mask &&
+          store_none_color_mask == cmd->merge_store_none_color_mask &&
+          no_store_ds_mask == cmd->merge_no_store_ds_mask &&
+          store_none_ds_mask == cmd->merge_store_none_ds_mask &&
           hk_render_merge_key_init(&key,
                               info->flags & ~(empty ? VK_RENDERING_SUSPENDING_BIT : 0),
                               info->layerCount,
@@ -526,18 +658,22 @@ hk_render_inherit_empty_clears(struct hk_cmd_buffer *cmd)
 
 /* A compressed attachment must use raw stores as soon as feedback is possible,
  * or once the image latched prefer_raw to avoid compressed <-> raw thrashing.
- * GENERAL alone does not imply sampling, but the layout/enable bit or explicit
- * dynamic feedback state does. Keep raw stores sticky within the render.
+ * Attachments in no_store_color_mask emit neither main nor partial EOT stores
+ * and therefore cannot race compressed writeback with texture sampling.
+ * Attachment-only optimal layouts cannot be sampled even when dynamic color
+ * feedback is enabled for another MRT.
  */
 static uint8_t
 hk_feedback_color_mask(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
-                       uint8_t *feedback_mask_out)
+                       uint8_t *feedback_mask_out, uint8_t no_store_color_mask)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    uint8_t mask = 0, fb_mask = 0;
-   for (unsigned i = 0; i < info->colorAttachmentCount; i++) {
+   for (unsigned i = 0; i < MIN2(info->colorAttachmentCount, HK_MAX_RTS); i++) {
       const VkRenderingAttachmentInfo *a = &info->pColorAttachments[i];
       if (!a->imageView)
+         continue;
+      if (!cmd->feedback_decompress && (no_store_color_mask & BITFIELD_BIT(i)))
          continue;
       const struct hk_image_view *view = hk_image_view_from_handle(a->imageView);
       const struct hk_image *image = container_of(view->vk.image, struct hk_image, vk);
@@ -548,9 +684,11 @@ hk_feedback_color_mask(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
                                     image->vk.format, image->vk.samples) ||
           !ail_is_level_logically_compressed(layout, view->vk.base_mip_level))
          continue;
-      bool is_feedback =
-         hk_attachment_may_be_sampled(a) ||
-         (cmd->vk.dynamic_graphics_state.feedback_loops & VK_IMAGE_ASPECT_COLOR_BIT);
+      bool dyn_fb =
+         (cmd->vk.dynamic_graphics_state.feedback_loops &
+          VK_IMAGE_ASPECT_COLOR_BIT) &&
+         hk_layout_allows_sampling(a->imageLayout, VK_IMAGE_ASPECT_COLOR_BIT);
+      bool is_feedback = hk_attachment_may_be_sampled(a) || dyn_fb;
       bool prefer_raw = !cmd->in_meta && hk_feedback_image_prefers_raw(image);
       if (cmd->feedback_decompress || is_feedback || prefer_raw)
          mask |= BITFIELD_BIT(i);
@@ -563,12 +701,12 @@ hk_feedback_color_mask(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
 }
 
 /* The depth/stencil view whose compressed planes must be raw in this render,
- * if any. Sampling either aspect in a feedback loop makes the whole image raw:
- * its raw state is tracked per image, not per plane.
+ * if any. Read-only / unwritten STORE_OP_NONE aspects (no_store_ds_mask) emit
+ * neither main nor partial ZLS stores and cannot race compressed writeback.
  */
 static const struct hk_image_view *
 hk_feedback_zs_view(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
-                    bool *is_feedback_out)
+                    bool *is_feedback_out, uint8_t no_store_ds_mask)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (is_feedback_out)
@@ -579,13 +717,19 @@ hk_feedback_zs_view(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
    const VkRenderingAttachmentInfo *ds[2] = {info->pDepthAttachment,
                                              info->pStencilAttachment};
    const struct hk_image_view *view = NULL;
-   bool sampled = cmd->vk.dynamic_graphics_state.feedback_loops &
-                  (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+   bool sampled = false;
    for (unsigned i = 0; i < ARRAY_SIZE(ds); ++i) {
-      if (ds[i] && ds[i]->imageView) {
-         view = hk_image_view_from_handle(ds[i]->imageView);
-         sampled |= hk_attachment_may_be_sampled(ds[i]);
-      }
+      if (!ds[i] || !ds[i]->imageView)
+         continue;
+      if (no_store_ds_mask & BITFIELD_BIT(i))
+         continue;
+      VkImageAspectFlagBits aspect =
+         i ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+      view = hk_image_view_from_handle(ds[i]->imageView);
+      bool dyn_fb =
+         (cmd->vk.dynamic_graphics_state.feedback_loops & aspect) &&
+         hk_layout_allows_sampling(ds[i]->imageLayout, aspect);
+      sampled |= hk_attachment_may_be_sampled(ds[i]) || dyn_fb;
    }
    if (!view)
       return NULL;
@@ -604,6 +748,69 @@ hk_feedback_zs_view(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
       }
    }
    return NULL;
+}
+
+static bool
+hk_feedback_area_covers_level(const VkRenderingInfo *info,
+                              const struct hk_image *image, unsigned level)
+{
+   return info->renderArea.offset.x == 0 && info->renderArea.offset.y == 0 &&
+          info->renderArea.extent.width ==
+             u_minify(image->vk.extent.width, level) &&
+          info->renderArea.extent.height ==
+             u_minify(image->vk.extent.height, level);
+}
+
+static bool
+hk_feedback_load_discards(VkAttachmentLoadOp op)
+{
+   return op == VK_ATTACHMENT_LOAD_OP_CLEAR ||
+          op == VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+}
+
+static bool
+hk_feedback_color_discards(const VkRenderingInfo *info,
+                           const VkRenderingAttachmentInfo *a,
+                           const struct hk_image_view *view,
+                           bool allow_discard)
+{
+   if (!allow_discard || (info->flags & VK_RENDERING_RESUMING_BIT))
+      return false;
+   if (!hk_feedback_load_discards(a->loadOp))
+      return false;
+   const struct hk_image *image =
+      container_of(view->vk.image, struct hk_image, vk);
+   return hk_feedback_area_covers_level(info, image, view->vk.base_mip_level);
+}
+
+static bool
+hk_feedback_zs_discards(const VkRenderingInfo *info,
+                        const struct hk_image_view *view,
+                        bool allow_discard)
+{
+   if (!allow_discard || (info->flags & VK_RENDERING_RESUMING_BIT))
+      return false;
+   const struct hk_image *image =
+      container_of(view->vk.image, struct hk_image, vk);
+   unsigned level = view->vk.base_mip_level;
+   if (!hk_feedback_area_covers_level(info, image, level))
+      return false;
+   if (image->vk.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+      if (ail_is_level_logically_compressed(&image->planes[0].layout, level)) {
+         if (!info->pDepthAttachment || !info->pDepthAttachment->imageView ||
+             !hk_feedback_load_discards(info->pDepthAttachment->loadOp))
+            return false;
+      }
+   }
+   if (image->vk.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
+      unsigned sp = image->plane_count - 1;
+      if (ail_is_level_logically_compressed(&image->planes[sp].layout, level)) {
+         if (!info->pStencilAttachment || !info->pStencilAttachment->imageView ||
+             !hk_feedback_load_discards(info->pStencilAttachment->loadOp))
+            return false;
+      }
+   }
+   return true;
 }
 
 static bool
@@ -644,12 +851,12 @@ hk_feedback_all_raw(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
 static bool
 hk_feedback_decompress_one(struct hk_cmd_buffer *cmd,
                            const struct hk_image_view *view, unsigned layer,
-                           bool is_feedback)
+                           bool is_feedback, bool discard_contents)
 {
    struct hk_image *image = container_of(view->vk.image, struct hk_image, vk);
    unsigned level = view->vk.base_mip_level;
    if (hk_feedback_is_raw(cmd, image, level, layer))
-      return hk_meta_decompress_view(cmd, view, layer);
+      return hk_meta_decompress_view(cmd, view, layer, discard_contents);
 
    uint32_t event_start =
       util_dynarray_num_elements(&cmd->sync_events, struct hk_sync_event);
@@ -657,32 +864,33 @@ hk_feedback_decompress_one(struct hk_cmd_buffer *cmd,
       list_is_empty(&cmd->control_streams)
          ? NULL
          : list_last_entry(&cmd->control_streams, struct hk_cs, node);
-   if (!hk_meta_decompress_view(cmd, view, layer))
+   if (!hk_meta_decompress_view(cmd, view, layer, discard_contents))
       return false;
    uint32_t event_end =
       util_dynarray_num_elements(&cmd->sync_events, struct hk_sync_event);
    return hk_feedback_record_decompress(cmd, image, level, layer, event_start,
-                                        event_end, prev_tail, is_feedback);
+                                        event_end, prev_tail, is_feedback,
+                                        discard_contents);
 }
 
 static bool
 hk_feedback_decompress_layers(struct hk_cmd_buffer *cmd,
                               const VkRenderingInfo *info,
                               const struct hk_image_view *view,
-                              bool is_feedback)
+                              bool is_feedback, bool discard_contents)
 {
    if (info->viewMask) {
       u_foreach_bit(v, info->viewMask) {
          if (!hk_feedback_decompress_one(cmd, view,
                                          view->vk.base_array_layer + v,
-                                         is_feedback))
+                                         is_feedback, discard_contents))
             return false;
       }
    } else {
       for (unsigned v = 0; v < info->layerCount; v++) {
          if (!hk_feedback_decompress_one(cmd, view,
                                          view->vk.base_array_layer + v,
-                                         is_feedback))
+                                         is_feedback, discard_contents))
             return false;
       }
    }
@@ -692,18 +900,26 @@ hk_feedback_decompress_layers(struct hk_cmd_buffer *cmd,
 static bool
 hk_feedback_decompress(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
                        uint8_t mask, uint8_t feedback_mask,
-                       const struct hk_image_view *zs, bool feedback_zs)
+                       const struct hk_image_view *zs, bool feedback_zs,
+                       bool allow_discard)
 {
    if (cmd->feedback_decompress)
       return true;
    u_foreach_bit(i, mask) {
+      const VkRenderingAttachmentInfo *a = &info->pColorAttachments[i];
       const struct hk_image_view *view =
-         hk_image_view_from_handle(info->pColorAttachments[i].imageView);
+         hk_image_view_from_handle(a->imageView);
+      bool discard = hk_feedback_color_discards(info, a, view, allow_discard);
       if (!hk_feedback_decompress_layers(cmd, info, view,
-                                         (feedback_mask & BITFIELD_BIT(i)) != 0))
+                                         (feedback_mask & BITFIELD_BIT(i)) != 0,
+                                         discard))
          return false;
    }
-   return !zs || hk_feedback_decompress_layers(cmd, info, zs, feedback_zs);
+   if (zs) {
+      bool discard = hk_feedback_zs_discards(info, zs, allow_discard);
+      return hk_feedback_decompress_layers(cmd, info, zs, feedback_zs, discard);
+   }
+   return true;
 }
 
 static void
@@ -716,43 +932,114 @@ hk_feedback_make_zs_raw(struct hk_rendering_state *render)
    hk_zls_control_make_raw(&render->zls_partial_last);
 }
 
-/* Splitting a live render keeps the partial EOT's stores and the partial BG's
- * loads. Rebuild only its final/partial colour stores with the new raw mask.
- * This also handles feedback enabled by binding a static-state pipeline.
+static void
+hk_feedback_rebuild_zls(struct hk_rendering_state *render,
+                        const VkRenderingInfo *info,
+                        bool incomplete_render_area)
+{
+   struct ail_layout *z_layout = NULL, *s_layout = NULL;
+   if (render->depth_att.iview) {
+      struct hk_image *image =
+         container_of(render->depth_att.iview->vk.image, struct hk_image, vk);
+      z_layout = &image->planes[0].layout;
+   }
+   if (render->stencil_att.iview) {
+      struct hk_image *image =
+         container_of(render->stencil_att.iview->vk.image, struct hk_image, vk);
+      s_layout = &image->planes[image->plane_count - 1].layout;
+   }
+   const VkRenderingAttachmentInfo *attach_z =
+      render->depth_att.iview ? info->pDepthAttachment : NULL;
+   const VkRenderingAttachmentInfo *attach_s =
+      render->stencil_att.iview ? info->pStencilAttachment : NULL;
+   const bool drop_stores = !(render->flags & VK_RENDERING_SUSPENDING_BIT);
+   const bool chained = render->resumed || render->merge_reach != 0;
+
+   hk_pack_zls_control(&render->cr.zls_control, z_layout, s_layout, attach_z,
+                       attach_s, incomplete_render_area, false, false,
+                       chained ? render->chain_load : NULL,
+                       render->no_store_ds_mask);
+   hk_pack_zls_control(&render->cr.zls_control_partial, z_layout, s_layout,
+                       attach_z, attach_s, incomplete_render_area, true, false,
+                       NULL, render->no_store_ds_mask);
+   hk_pack_zls_control(&render->zls_last, z_layout, s_layout, attach_z,
+                       attach_s, incomplete_render_area, false, drop_stores,
+                       chained ? render->chain_load : NULL,
+                       render->no_store_ds_mask);
+   hk_pack_zls_control(&render->zls_partial_last, z_layout, s_layout, attach_z,
+                       attach_s, incomplete_render_area, true, drop_stores,
+                       chained ? render->chain_load : NULL,
+                       render->no_store_ds_mask);
+}
+
+/* Reconstruct the active render pass's VkRenderingInfo from saved real
+ * per-attachment layouts, loadOps, storeOps, and feedback-loop enables, then:
+ * 1) Promote any deferred STORE_OP_NONE attachments that this draw/clear
+ *    actually writes (rebuilding partial EOT/ZLS stores and invalidating raw
+ *    state if not kept raw).
+ * 2) Split and decompress only attachments that are genuinely writable and
+ *    sampleable under dynamic/pipeline feedback loops (or prefer_raw after
+ *    promotion).
  */
-bool
-hk_feedback_prepare_draw(struct hk_cmd_buffer *cmd)
+static bool
+hk_feedback_prepare_write(struct hk_cmd_buffer *cmd, uint8_t write_color_mask,
+                          uint8_t write_ds_mask)
 {
    if (vk_command_buffer_has_error(&cmd->vk))
       return false;
 
    struct hk_rendering_state *render = &cmd->state.gfx.render;
-   if (!cmd->rendering || cmd->in_meta ||
-       !cmd->vk.dynamic_graphics_state.feedback_loops)
+   if (!cmd->rendering || cmd->in_meta)
       return true;
+
+   const uint8_t promote_c = render->store_none_color_mask & write_color_mask;
+   const uint8_t promote_ds = render->store_none_ds_mask & write_ds_mask;
+   const bool dyn_fb = cmd->vk.dynamic_graphics_state.feedback_loops != 0;
+   if (!dyn_fb && !promote_c && !promote_ds)
+      return true;
+
    VkRenderingAttachmentInfo attachments[HK_MAX_RTS];
+   VkAttachmentFeedbackLoopInfoEXT color_loop[HK_MAX_RTS];
    for (unsigned i = 0; i < render->color_att_count; i++) {
+      color_loop[i] = (VkAttachmentFeedbackLoopInfoEXT){
+         .sType = VK_STRUCTURE_TYPE_ATTACHMENT_FEEDBACK_LOOP_INFO_EXT,
+         .feedbackLoopEnable = render->color_att[i].feedback_loop_enable,
+      };
       attachments[i] = (VkRenderingAttachmentInfo){
          .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+         .pNext = render->color_att[i].feedback_loop_enable ? &color_loop[i] : NULL,
          .imageView = hk_image_view_to_handle(render->color_att[i].iview),
-         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-         .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-         .storeOp = render->store_mask & BITFIELD_BIT(i)
-                       ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         .imageLayout = render->color_att[i].image_layout,
+         .resolveMode = render->color_att[i].resolve_mode,
+         .resolveImageView =
+            hk_image_view_to_handle(render->color_att[i].resolve_iview),
+         .loadOp = render->color_att[i].load_op,
+         .storeOp = render->color_att[i].store_op,
       };
    }
    VkRenderingAttachmentInfo zs[2];
+   VkAttachmentFeedbackLoopInfoEXT zs_loop[2];
    for (unsigned i = 0; i < 2; i++) {
+      const struct hk_attachment *att =
+         i ? &render->stencil_att : &render->depth_att;
+      zs_loop[i] = (VkAttachmentFeedbackLoopInfoEXT){
+         .sType = VK_STRUCTURE_TYPE_ATTACHMENT_FEEDBACK_LOOP_INFO_EXT,
+         .feedbackLoopEnable = att->feedback_loop_enable,
+      };
       zs[i] = (VkRenderingAttachmentInfo){
          .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-         .imageView = hk_image_view_to_handle(
-            i ? render->stencil_att.iview : render->depth_att.iview),
-         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-         .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+         .pNext = att->feedback_loop_enable ? &zs_loop[i] : NULL,
+         .imageView = hk_image_view_to_handle(att->iview),
+         .imageLayout = att->image_layout,
+         .resolveMode = att->resolve_mode,
+         .resolveImageView = hk_image_view_to_handle(att->resolve_iview),
+         .loadOp = att->load_op,
+         .storeOp = att->store_op,
       };
    }
    const VkRenderingInfo info = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .flags = render->flags,
       .renderArea = render->area,
       .layerCount = render->layer_count,
       .viewMask = render->view_mask,
@@ -761,41 +1048,196 @@ hk_feedback_prepare_draw(struct hk_cmd_buffer *cmd)
       .pDepthAttachment = &zs[0],
       .pStencilAttachment = &zs[1],
    };
+
+   const uint8_t next_no_store_c = render->no_store_color_mask & ~promote_c;
+   const uint8_t next_no_store_ds = render->no_store_ds_mask & ~promote_ds;
    uint8_t feedback_mask = 0;
    bool feedback_zs = false;
-   uint8_t mask = hk_feedback_color_mask(cmd, &info, &feedback_mask) &
+   uint8_t mask = hk_feedback_color_mask(cmd, &info, &feedback_mask,
+                                         next_no_store_c) &
                   ~render->raw_color_mask;
    const struct hk_image_view *zs_view =
-      render->raw_zs ? NULL : hk_feedback_zs_view(cmd, &info, &feedback_zs);
-   /* Feedback was enabled mid-render (dynamic or static pipeline). Even if
-    * attachments were already raw via prefer_raw, mark render->feedback so
-    * barrier hoisting and merge end treat this render as a feedback pass. */
-   render->feedback = true;
-   if (!mask && !zs_view)
-      return true;
+      render->raw_zs ? NULL
+                     : hk_feedback_zs_view(cmd, &info, &feedback_zs,
+                                           next_no_store_ds);
+
+   if (dyn_fb)
+      render->feedback = true;
+
+   const bool incomplete_render_area =
+      render->area.offset.x > 0 || render->area.offset.y > 0 ||
+      render->area.extent.width < render->cr.width ||
+      render->area.extent.height < render->cr.height ||
+      (render->view_mask &&
+       render->view_mask != BITFIELD64_MASK(render->cr.layers));
+
+   if (!mask && !zs_view) {
+      if (!promote_c && !promote_ds)
+         return true;
+      render->no_store_color_mask = next_no_store_c;
+      render->store_none_color_mask &= ~promote_c;
+      render->no_store_ds_mask = next_no_store_ds;
+      render->store_none_ds_mask &= ~promote_ds;
+
+      struct hk_cs *cs = cmd->current_cs.gfx;
+      u_foreach_bit(i, promote_c) {
+         if (is_attachment_stored(&attachments[i]))
+            render->store_mask |= BITFIELD_BIT(i);
+         struct hk_image_view *view = render->color_att[i].iview;
+         if (view) {
+            struct hk_image *image =
+               container_of(view->vk.image, struct hk_image, vk);
+            if (image->planes[view->planes[0].image_plane].layout.tiling ==
+                AIL_TILING_LINEAR) {
+               render->linear_store = true;
+               if (cs)
+                  cs->linear_store = true;
+            }
+         }
+         if (!(render->raw_color_mask & BITFIELD_BIT(i)))
+            hk_feedback_invalidate_view(cmd, view);
+      }
+      u_foreach_bit(i, promote_ds) {
+         if (is_attachment_stored(&zs[i]))
+            render->ds_store_mask |= BITFIELD_BIT(i);
+      }
+      if (promote_ds && !render->raw_zs) {
+         hk_feedback_invalidate_view(
+            cmd, render->depth_att.iview ?: render->stencil_att.iview);
+      }
+      if (promote_c) {
+         render->cr.eot.partial =
+            hk_build_bg_eot(cmd, &info, true, true, incomplete_render_area);
+         if (cs) {
+            cs->cr.eot.partial = render->cr.eot.partial;
+            cs->cr.eot.main = render->cr.eot.partial;
+         }
+      }
+      if (promote_ds) {
+         hk_feedback_rebuild_zls(render, &info, incomplete_render_area);
+         if (render->raw_zs)
+            hk_feedback_make_zs_raw(render);
+         if (cs) {
+            cs->cr.zls_control_partial = render->cr.zls_control_partial;
+            cs->cr.zls_control = cs == render->first_cs
+                                    ? render->cr.zls_control
+                                    : render->cr.zls_control_partial;
+         }
+      }
+      return !vk_command_buffer_has_error(&cmd->vk);
+   }
 
    hk_cs_end_hint(cmd, HK_CS_END_RENDER_SPLIT);
    hk_cmd_buffer_end_graphics(cmd);
    hk_cmd_buffer_end_compute(cmd);
    struct hk_rendering_state saved = *render;
    if (!hk_feedback_decompress(cmd, &info, mask, feedback_mask & mask, zs_view,
-                               feedback_zs))
+                               feedback_zs, false /* allow_discard */))
       return false;
    *render = saved;
    cmd->rendering = true;
-   render->feedback = true;
+   if (dyn_fb || feedback_mask || feedback_zs)
+      render->feedback = true;
+   render->no_store_color_mask = next_no_store_c;
+   render->store_none_color_mask &= ~promote_c;
+   render->no_store_ds_mask = next_no_store_ds;
+   render->store_none_ds_mask &= ~promote_ds;
    render->raw_color_mask |= mask;
-   if (zs_view)
+   u_foreach_bit(i, promote_c) {
+      if (is_attachment_stored(&attachments[i]))
+         render->store_mask |= BITFIELD_BIT(i);
+      struct hk_image_view *view = render->color_att[i].iview;
+      if (view) {
+         struct hk_image *image =
+            container_of(view->vk.image, struct hk_image, vk);
+         if (image->planes[view->planes[0].image_plane].layout.tiling ==
+             AIL_TILING_LINEAR)
+            render->linear_store = true;
+      }
+   }
+   u_foreach_bit(i, promote_ds) {
+      if (is_attachment_stored(&zs[i]))
+         render->ds_store_mask |= BITFIELD_BIT(i);
+   }
+   u_foreach_bit(i, promote_c & ~render->raw_color_mask)
+      hk_feedback_invalidate_view(cmd, render->color_att[i].iview);
+   if (promote_ds)
+      hk_feedback_rebuild_zls(render, &info, incomplete_render_area);
+   if (zs_view || render->raw_zs) {
       hk_feedback_make_zs_raw(render);
+   } else if (promote_ds) {
+      hk_feedback_invalidate_view(
+         cmd, render->depth_att.iview ?: render->stencil_att.iview);
+   }
    render->cr.bg.main = render->cr.bg.partial;
    for (unsigned i = 0; i < render->color_att_count; i++)
       render->color_att[i].clear = false;
-   render->cr.eot.main = hk_build_bg_eot(cmd, &info, true, false, true);
-   render->cr.eot.partial = hk_build_bg_eot(cmd, &info, true, true, true);
+   render->depth_att.clear = false;
+   render->stencil_att.clear = false;
+   render->cr.eot.main =
+      hk_build_bg_eot(cmd, &info, true, false, incomplete_render_area);
+   render->cr.eot.partial =
+      hk_build_bg_eot(cmd, &info, true, true, incomplete_render_area);
    cmd->sync_render_continuation = false;
    cmd->state.gfx.render_gen++;
    hk_cmd_buffer_dirty_all(cmd);
    return !vk_command_buffer_has_error(&cmd->vk);
+}
+
+bool
+hk_feedback_prepare_draw(struct hk_cmd_buffer *cmd)
+{
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
+   if (!cmd->rendering || cmd->in_meta)
+      return true;
+
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+   if (!dyn->feedback_loops && !render->store_none_color_mask &&
+       !render->store_none_ds_mask)
+      return true;
+
+   uint8_t write_c = 0, write_ds = 0;
+   if (!dyn->rs.rasterizer_discard_enable) {
+      u_foreach_bit(i, render->store_none_color_mask) {
+         if ((dyn->cb.color_write_enables & BITFIELD_BIT(i)) &&
+             dyn->cb.attachments[i].write_mask != 0)
+            write_c |= BITFIELD_BIT(i);
+      }
+      if ((render->store_none_ds_mask & BITFIELD_BIT(0)) &&
+          hk_apple9_zs_writes(&dyn->ds, VK_IMAGE_ASPECT_DEPTH_BIT))
+         write_ds |= BITFIELD_BIT(0);
+      if ((render->store_none_ds_mask & BITFIELD_BIT(1)) &&
+          hk_apple9_zs_writes(&dyn->ds, VK_IMAGE_ASPECT_STENCIL_BIT))
+         write_ds |= BITFIELD_BIT(1);
+   }
+   return hk_feedback_prepare_write(cmd, write_c, write_ds);
+}
+
+bool
+hk_feedback_prepare_clear_attachments(struct hk_cmd_buffer *cmd,
+                                      uint32_t attachment_count,
+                                      const VkClearAttachment *attachments)
+{
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
+   if (!cmd->rendering || cmd->in_meta)
+      return true;
+   if (!render->store_none_color_mask && !render->store_none_ds_mask &&
+       !cmd->vk.dynamic_graphics_state.feedback_loops)
+      return true;
+
+   uint8_t write_c = 0, write_ds = 0;
+   for (uint32_t i = 0; i < attachment_count; ++i) {
+      VkImageAspectFlags aspects = attachments[i].aspectMask;
+      if ((aspects & VK_IMAGE_ASPECT_COLOR_BIT) &&
+          attachments[i].colorAttachment < HK_MAX_RTS)
+         write_c |= BITFIELD_BIT(attachments[i].colorAttachment);
+      if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
+         write_ds |= BITFIELD_BIT(0);
+      if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT)
+         write_ds |= BITFIELD_BIT(1);
+   }
+   return hk_feedback_prepare_write(cmd, write_c, write_ds);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -812,7 +1254,6 @@ hk_CmdSetAttachmentFeedbackLoopEnableEXT(VkCommandBuffer commandBuffer,
    }
    if (cmd->rendering && aspectMask)
       cmd->state.gfx.render.feedback = true;
-   hk_feedback_prepare_draw(cmd);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -823,12 +1264,21 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
 
+   uint8_t no_store_color_mask = 0, store_none_color_mask = 0;
+   uint8_t no_store_ds_mask = 0, store_none_ds_mask = 0;
+   if (!cmd->in_meta) {
+      hk_compute_no_store_masks(pRenderingInfo, &no_store_color_mask,
+                                &store_none_color_mask, &no_store_ds_mask,
+                                &store_none_ds_mask);
+   }
+
    uint8_t feedback_color_mask = 0;
    bool feedback_zs = false;
-   uint8_t raw_mask =
-      hk_feedback_color_mask(cmd, pRenderingInfo, &feedback_color_mask);
+   uint8_t raw_mask = hk_feedback_color_mask(cmd, pRenderingInfo,
+                                             &feedback_color_mask,
+                                             no_store_color_mask);
    const struct hk_image_view *raw_zs =
-      hk_feedback_zs_view(cmd, pRenderingInfo, &feedback_zs);
+      hk_feedback_zs_view(cmd, pRenderingInfo, &feedback_zs, no_store_ds_mask);
    bool need_decompress =
       (raw_mask || raw_zs) &&
       !hk_feedback_all_raw(cmd, pRenderingInfo, raw_mask, raw_zs);
@@ -837,8 +1287,10 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       hk_cmd_buffer_end_compute(cmd);
    }
    if ((raw_mask || raw_zs) &&
-       !hk_feedback_decompress(cmd, pRenderingInfo, raw_mask,
-                               feedback_color_mask, raw_zs, feedback_zs))
+       !hk_feedback_decompress(
+          cmd, pRenderingInfo, raw_mask, feedback_color_mask, raw_zs,
+          feedback_zs,
+          !(pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT)))
       return;
    if (!cmd->feedback_decompress && need_decompress)
       cmd->sync_render_continuation = false;
@@ -848,13 +1300,19 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    if (cmd->merge_cs && cmd->merge_suspended) {
       resume = (pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT) &&
                !cmd->in_meta && raw_mask == cmd->merge_raw_color_mask &&
-               (raw_zs != NULL) == cmd->merge_raw_zs;
+               (raw_zs != NULL) == cmd->merge_raw_zs &&
+               no_store_color_mask == cmd->merge_no_store_color_mask &&
+               store_none_color_mask == cmd->merge_store_none_color_mask &&
+               no_store_ds_mask == cmd->merge_no_store_ds_mask &&
+               store_none_ds_mask == cmd->merge_store_none_ds_mask;
       if (!resume)
          hk_cmd_render_merge_flush(cmd);
    }
    if (cmd->merge_cs && !resume) {
       merge = hk_render_merge_begin(cmd, pRenderingInfo, raw_mask,
-                                    raw_zs != NULL);
+                                    raw_zs != NULL, no_store_color_mask,
+                                    store_none_color_mask, no_store_ds_mask,
+                                    store_none_ds_mask);
       if (merge)
          hk_cmd_empty_barriers_flush(cmd, true);
       if (!merge) {
@@ -877,12 +1335,17 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    memset(render, 0, sizeof(*render));
    cmd->rendering = true;
    render->raw_color_mask = raw_mask;
+   render->no_store_color_mask = no_store_color_mask;
+   render->store_none_color_mask = store_none_color_mask;
+   render->no_store_ds_mask = no_store_ds_mask;
+   render->store_none_ds_mask = store_none_ds_mask;
    render->feedback = cmd->vk.dynamic_graphics_state.feedback_loops != 0;
 
    render->flags = pRenderingInfo->flags;
    render->area = pRenderingInfo->renderArea;
    for (uint32_t i = 0; i < MIN2(pRenderingInfo->colorAttachmentCount, 32); i++) {
       if (pRenderingInfo->pColorAttachments[i].imageView &&
+          !(no_store_color_mask & BITFIELD_BIT(i)) &&
           is_attachment_stored(&pRenderingInfo->pColorAttachments[i]))
          render->store_mask |= BITFIELD_BIT(i);
    }
@@ -890,7 +1353,8 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       pRenderingInfo->pDepthAttachment, pRenderingInfo->pStencilAttachment};
    for (unsigned i = 0; i < 2; ++i) {
       if (ds[i] && ds[i]->imageView) {
-         if (is_attachment_stored(ds[i]))
+         if (!(no_store_ds_mask & BITFIELD_BIT(i)) &&
+             is_attachment_stored(ds[i]))
             render->ds_store_mask |= BITFIELD_BIT(i);
          if (vk_image_layout_is_read_only(ds[i]->imageLayout,
                i ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT))
@@ -906,13 +1370,15 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          render->feedback = true;
    }
    for (unsigned i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
-      if (!(raw_mask & BITFIELD_BIT(i)))
+      if (!(raw_mask & BITFIELD_BIT(i)) &&
+          !(no_store_color_mask & BITFIELD_BIT(i)))
          hk_feedback_invalidate_view(cmd,
             hk_image_view_from_handle(pRenderingInfo->pColorAttachments[i].imageView));
    }
    /* Compressed ZLS stores re-encode the planes' tiles. */
    for (unsigned i = 0; i < 2 && !raw_zs; i++) {
-      if (ds[i] && ds[i]->imageView)
+      if (ds[i] && ds[i]->imageView &&
+          !(no_store_ds_mask & BITFIELD_BIT(i)))
          hk_feedback_invalidate_view(cmd, hk_image_view_from_handle(ds[i]->imageView));
    }
    render->view_mask = pRenderingInfo->viewMask;
@@ -1128,11 +1594,12 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    }
 
    hk_pack_zls_control(&render->cr.zls_control, z_layout, s_layout, attach_z,
-                       attach_s, incomplete_render_area, false, false, NULL);
+                       attach_s, incomplete_render_area, false, false, NULL,
+                       no_store_ds_mask);
 
    hk_pack_zls_control(&render->cr.zls_control_partial, z_layout, s_layout,
                        attach_z, attach_s, incomplete_render_area, true, false,
-                       NULL);
+                       NULL, no_store_ds_mask);
 
    const bool drop_stores = !(render->flags & VK_RENDERING_SUSPENDING_BIT);
    /* The first render pass of a chain decides its loads. */
@@ -1148,10 +1615,12 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    }
    hk_pack_zls_control(&render->zls_last, z_layout, s_layout, attach_z,
                        attach_s, incomplete_render_area, false, drop_stores,
-                       (resume || merge) ? render->chain_load : NULL);
+                       (resume || merge) ? render->chain_load : NULL,
+                       no_store_ds_mask);
    hk_pack_zls_control(&render->zls_partial_last, z_layout, s_layout, attach_z,
                        attach_s, incomplete_render_area, true, drop_stores,
-                       (resume || merge) ? render->chain_load : NULL);
+                       (resume || merge) ? render->chain_load : NULL,
+                       no_store_ds_mask);
    if (raw_zs)
       hk_feedback_make_zs_raw(render);
 
@@ -1226,6 +1695,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    uint32_t clear_count = 0;
    VkClearAttachment clear_att[HK_MAX_RTS + 1];
    bool resolved_clear = false;
+   const bool suspending = (render->flags & VK_RENDERING_SUSPENDING_BIT) != 0;
 
    for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
       const VkRenderingAttachmentInfo *att_info =
@@ -1247,7 +1717,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       memcpy(render->color_att[i].clear_colour, &att_info->clearValue,
              sizeof(att_info->clearValue));
 
-      resolved_clear |= is_attachment_stored(att_info);
+      resolved_clear |= suspending || is_attachment_stored(att_info);
    }
 
    clear_att[clear_count] = (VkClearAttachment){
@@ -1264,7 +1734,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       render->depth_att.clear_colour[0] =
          fui(attach_z->clearValue.depthStencil.depth);
 
-      resolved_clear |= is_attachment_stored(attach_z);
+      resolved_clear |= suspending || is_attachment_stored(attach_z);
    }
 
    if (attach_s != NULL && attach_s->imageView != VK_NULL_HANDLE &&
@@ -1277,7 +1747,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       render->stencil_att.clear_colour[1] =
          attach_s->clearValue.depthStencil.stencil;
 
-      resolved_clear |= is_attachment_stored(attach_s);
+      resolved_clear |= suspending || is_attachment_stored(attach_s);
    }
 
    if (clear_att[clear_count].aspectMask != 0)
@@ -1340,6 +1810,10 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       cmd->merge_ds_store_mask = render->ds_store_mask;
       cmd->merge_raw_color_mask = render->raw_color_mask;
       cmd->merge_raw_zs = render->raw_zs;
+      cmd->merge_no_store_color_mask = render->no_store_color_mask;
+      cmd->merge_store_none_color_mask = render->store_none_color_mask;
+      cmd->merge_no_store_ds_mask = render->no_store_ds_mask;
+      cmd->merge_store_none_ds_mask = render->store_none_ds_mask;
       cmd->merge_feedback = render->feedback;
       cmd->merge_reach = hk_merge_graphics_stages() | render->merge_reach;
       cmd->merge_cs = cs;

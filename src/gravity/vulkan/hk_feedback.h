@@ -62,7 +62,9 @@ bool hk_feedback_record_decompress(struct hk_cmd_buffer *cmd,
                                    struct hk_image *image, unsigned level,
                                    unsigned layer, uint32_t event_start,
                                    uint32_t event_end, struct hk_cs *prev_tail,
-                                   bool is_feedback);
+                                   bool is_feedback, bool discard_contents);
+uint64_t hk_feedback_decompress_bytes(const struct hk_image *image,
+                                      unsigned level, bool discard_contents);
 void hk_feedback_record_invalidate_all(struct hk_cmd_buffer *cmd);
 void hk_feedback_shift_events(struct hk_cmd_buffer *cmd, uint32_t pos,
                               uint32_t delta);
@@ -74,7 +76,11 @@ void hk_feedback_invalidate_range(struct hk_cmd_buffer *cmd,
 void hk_feedback_invalidate_view(struct hk_cmd_buffer *cmd,
                                  const struct hk_image_view *view);
 bool hk_meta_decompress_view(struct hk_cmd_buffer *cmd,
-                             const struct hk_image_view *view, unsigned layer);
+                             const struct hk_image_view *view, unsigned layer,
+                             bool discard_contents);
+bool hk_feedback_prepare_clear_attachments(struct hk_cmd_buffer *cmd,
+                                           uint32_t attachment_count,
+                                           const VkClearAttachment *attachments);
 
 VkResult hk_feedback_plan_submit(struct hk_device *dev,
                                  struct vk_command_buffer *const *cmdbufs,

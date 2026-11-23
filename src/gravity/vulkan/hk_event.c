@@ -200,12 +200,32 @@ hk_event_dep_src_scope(const VkDependencyInfo *info,
    *src_access = access;
 }
 
+static void
+hk_event_invalidate_undefined_barriers(struct hk_cmd_buffer *cmd,
+                                       const VkDependencyInfo *info)
+{
+   for (unsigned i = 0; i < info->imageMemoryBarrierCount; ++i) {
+      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+      if (b->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+         VK_FROM_HANDLE(hk_image, image, b->image);
+         const VkImageSubresourceRange *r = &b->subresourceRange;
+         hk_feedback_invalidate_range(
+            cmd, image, r->baseMipLevel,
+            vk_image_subresource_level_count(&image->vk, r),
+            r->baseArrayLayer,
+            vk_image_subresource_layer_count(&image->vk, r));
+      }
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
                 const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(hk_event, event, _event);
+
+   hk_event_invalidate_undefined_barriers(cmd, pDependencyInfo);
 
    /* Device-only events are never queried by the host, and hk_CmdWaitEvents2
     * enforces the matching VkDependencyInfo via pipeline barriers.
@@ -269,6 +289,26 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
 
    if (!cmd->in_meta)
       hk_feedback_invalidate(cmd);
+
+   /* A host-visible event may synchronize CPU writes to aliased memory via
+    * vkSetEvent; device-only events only require invalidating any UNDEFINED
+    * image layout transitions carried in pDependencyInfos.
+    */
+   bool any_host_event = false;
+   for (uint32_t e = 0; e < eventCount; ++e) {
+      VK_FROM_HANDLE(hk_event, event, pEvents[e]);
+      if (!event->device_only) {
+         any_host_event = true;
+         break;
+      }
+   }
+   if (any_host_event) {
+      hk_feedback_record_invalidate_all(cmd);
+   } else {
+      for (uint32_t e = 0; e < eventCount; ++e)
+         hk_event_invalidate_undefined_barriers(cmd, &pDependencyInfos[e]);
+   }
+
    hk_apple9_end_native_batch(cmd);
 
    if (HK_PERF(dev, NOBARRIER))

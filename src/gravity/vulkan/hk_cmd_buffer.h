@@ -221,6 +221,11 @@ struct hk_attachment {
    VkFormat vk_format;
    struct hk_image_view *iview;
 
+   VkImageLayout image_layout;
+   VkAttachmentLoadOp load_op;
+   VkAttachmentStoreOp store_op;
+   bool feedback_loop_enable;
+
    VkResolveModeFlagBits resolve_mode;
    struct hk_image_view *resolve_iview;
    VkRenderingAttachmentFlagsKHR flags;
@@ -289,6 +294,14 @@ struct hk_rendering_state {
    uint8_t raw_color_mask;
    /* The depth/stencil planes are raw: ZLS loads and stores uncompressed. */
    bool raw_zs;
+   /* Attachments that currently emit neither main nor partial stores (read-only
+    * layout without clear, or unwritten STORE_OP_NONE). store_none_* tracks the
+    * subset that must be promoted if a draw or CmdClearAttachments writes them.
+    */
+   uint8_t no_store_color_mask;
+   uint8_t store_none_color_mask;
+   uint8_t no_store_ds_mask;
+   uint8_t store_none_ds_mask;
 
    VkRenderingFlagBits flags;
 
@@ -892,6 +905,10 @@ struct hk_cmd_buffer {
    uint8_t merge_ds_store_mask;
    uint8_t merge_raw_color_mask;
    bool merge_raw_zs;
+   uint8_t merge_no_store_color_mask;
+   uint8_t merge_store_none_color_mask;
+   uint8_t merge_no_store_ds_mask;
+   uint8_t merge_store_none_ds_mask;
    bool merge_feedback;
    /* The open render is a suspended render pass, which only its resuming
     * render pass may continue. */
@@ -1378,14 +1395,10 @@ void hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 void hk_tess_batch_flush(struct hk_cmd_buffer *cmd);
 bool hk_tess_fold_enabled(void);
 
-void hk_feedback_record_invalidate_all(struct hk_cmd_buffer *cmd);
-
 /* Record why the next stream end happens, unless a caller already did. */
 static inline void
 hk_cs_end_hint(struct hk_cmd_buffer *cmd, enum hk_cs_end reason)
 {
-   if (reason == HK_CS_END_EVENT)
-      hk_feedback_record_invalidate_all(cmd);
    if (!cmd->end_hint)
       cmd->end_hint = reason;
 }

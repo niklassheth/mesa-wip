@@ -254,14 +254,28 @@ hk_feedback_mark_raw(struct hk_cmd_buffer *cmd, const struct hk_image *image,
    return true;
 }
 
-static uint64_t
-hk_feedback_level_bytes(const struct hk_image *image, unsigned level)
+uint64_t
+hk_feedback_decompress_bytes(const struct hk_image *image, unsigned level,
+                             bool discard_contents)
 {
    uint64_t bytes = 0;
    for (unsigned p = 0; p < image->plane_count; ++p) {
-      bytes += (uint64_t)u_minify(image->vk.extent.width, level) *
-               u_minify(image->vk.extent.height, level) *
-               util_format_get_blocksize(image->planes[p].layout.format);
+      const struct ail_layout *layout = &image->planes[p].layout;
+      if (discard_contents) {
+         if (!ail_is_level_logically_compressed(layout, level))
+            continue;
+         uint64_t start = layout->level_offsets_compressed_B[level];
+         uint64_t end = level + 1 < layout->levels &&
+                          ail_is_level_allocated_compressed(layout, level + 1)
+                           ? layout->level_offsets_compressed_B[level + 1]
+                           : layout->compression_layer_stride_B;
+         if (end > start)
+            bytes += end - start;
+      } else {
+         bytes += (uint64_t)u_minify(image->vk.extent.width, level) *
+                  u_minify(image->vk.extent.height, level) *
+                  util_format_get_blocksize(layout->format);
+      }
    }
    return bytes;
 }
@@ -270,7 +284,8 @@ bool
 hk_feedback_record_decompress(struct hk_cmd_buffer *cmd, struct hk_image *image,
                               unsigned level, unsigned layer,
                               uint32_t event_start, uint32_t event_end,
-                              struct hk_cs *prev_tail, bool is_feedback)
+                              struct hk_cs *prev_tail, bool is_feedback,
+                              bool discard_contents)
 {
    assert(event_start <= event_end);
    struct hk_feedback_op *op =
@@ -288,7 +303,7 @@ hk_feedback_record_decompress(struct hk_cmd_buffer *cmd, struct hk_image *image,
       .layers = 1,
       .event_start = event_start,
       .event_end = event_end,
-      .bytes = hk_feedback_level_bytes(image, level),
+      .bytes = hk_feedback_decompress_bytes(image, level, discard_contents),
       .is_feedback = is_feedback,
    };
    uint32_t op_idx =

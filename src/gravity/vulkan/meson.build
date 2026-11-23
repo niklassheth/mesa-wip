@@ -243,7 +243,7 @@ if with_tests
                              inc_src, inc_gravity],
       dependencies : [gravity_vk_deps],
       link_with : [libgravity_vk],
-      link_args : t in ['hk-heap-addresses', 'hk-heap-resubmit'] ? ['-Wl,--wrap=hk_dispatch_precomp'] : [],
+      link_args : t in ['hk-feedback', 'hk-heap-addresses', 'hk-heap-resubmit'] ? ['-Wl,--wrap=hk_dispatch_precomp'] : [],
     )
     test(
       'gravity-' + t,

@@ -1477,8 +1477,10 @@ hk_apple9_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
       bool load =
          partial || incomplete || att->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
       bool clear = !load && att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
-      bool write = partial || att->storeOp == VK_ATTACHMENT_STORE_OP_STORE ||
-                   att->resolveMode != VK_RESOLVE_MODE_NONE;
+      bool write =
+         !(render->no_store_color_mask & BITFIELD_BIT(rt)) &&
+         (partial || att->storeOp == VK_ATTACHMENT_STORE_OP_STORE ||
+          att->resolveMode != VK_RESOLVE_MODE_NONE);
       if (store ? write : (load || clear))
          key.mask |= BITFIELD_BIT(rt);
       if (clear)

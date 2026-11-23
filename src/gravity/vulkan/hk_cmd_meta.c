@@ -242,7 +242,7 @@ hk_meta_copy_get_image_properties(struct hk_image *img);
 
 static bool
 hk_meta_decompress_hit(struct hk_cmd_buffer *cmd, const struct hk_image *image,
-                       unsigned level, unsigned layer)
+                       unsigned level, unsigned layer, bool discard_contents)
 {
    bool hit = hk_feedback_is_raw(cmd, image, level, layer);
    if (unlikely(hk_cpu_level)) {
@@ -251,12 +251,8 @@ hk_meta_decompress_hit(struct hk_cmd_buffer *cmd, const struct hk_image *image,
          cmd->feedback_stats.hits++;
       } else {
          cmd->feedback_stats.misses++;
-         for (unsigned p = 0; p < image->plane_count; ++p) {
-            cmd->feedback_stats.bytes +=
-               (uint64_t)u_minify(image->vk.extent.width, level) *
-               u_minify(image->vk.extent.height, level) *
-               util_format_get_blocksize(image->planes[p].layout.format);
-         }
+         cmd->feedback_stats.bytes +=
+            hk_feedback_decompress_bytes(image, level, discard_contents);
       }
    }
    return hit;
@@ -267,60 +263,71 @@ hk_meta_decompress_hit(struct hk_cmd_buffer *cmd, const struct hk_image *image,
  * tile. Integer channel aliases avoid sRGB, SNORM or floating-point
  * conversion; depth and stencil planes are copied through their R32/R16/R8
  * colour aliases, so all their stores go through the raw PBE path too.
+ *
+ * When discard_contents is true (complete-area LOAD_OP_CLEAR / DONT_CARE on
+ * all compressed planes of the image), previous pixel values are discarded,
+ * so skip the graphics self-blit and only reset compression metadata to raw.
  */
 static bool
 hk_meta_decompress(struct hk_cmd_buffer *cmd, struct hk_image *image,
-                   unsigned level, unsigned layer)
+                   unsigned level, unsigned layer, bool discard_contents)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const VkExtent3D extent = {u_minify(image->vk.extent.width, level),
                               u_minify(image->vk.extent.height, level), 1};
    hk_cmd_render_merge_flush(cmd);
-   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
-      VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
-   struct hk_meta_save save;
-   cmd->feedback_decompress = true;
-   hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
-   if (image->vk.aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
-      VkFormat raw = hk_feedback_raw_format(image->vk.format);
-      assert(raw != VK_FORMAT_UNDEFINED);
-      const VkImageBlit2 region = {
-         .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
-         .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
-         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
-         .srcOffsets[1] = {extent.width, extent.height, 1},
-         .dstOffsets[1] = {extent.width, extent.height, 1},
-      };
-      vk_meta_blit_image(&cmd->vk, &dev->meta,
-         &image->vk, raw, VK_IMAGE_LAYOUT_GENERAL,
-         &image->vk, raw, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
+   if (!discard_contents) {
+      hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+         VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+      struct hk_meta_save save;
+      cmd->feedback_decompress = true;
+      hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      if (image->vk.aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+         VkFormat raw = hk_feedback_raw_format(image->vk.format);
+         assert(raw != VK_FORMAT_UNDEFINED);
+         const VkImageBlit2 region = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
+            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
+            .srcOffsets[1] = {extent.width, extent.height, 1},
+            .dstOffsets[1] = {extent.width, extent.height, 1},
+         };
+         vk_meta_blit_image(&cmd->vk, &dev->meta,
+            &image->vk, raw, VK_IMAGE_LAYOUT_GENERAL,
+            &image->vk, raw, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
+      } else {
+         const VkImageCopy2 region = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2,
+            .srcSubresource = {image->vk.aspects, level, layer, 1},
+            .dstSubresource = {image->vk.aspects, level, layer, 1},
+            .extent = extent,
+         };
+         const VkCopyImageInfo2 info = {
+            .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2,
+            .srcImage = hk_image_to_handle(image),
+            .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .dstImage = hk_image_to_handle(image),
+            .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .regionCount = 1,
+            .pRegions = &region,
+         };
+         struct vk_meta_copy_image_properties props =
+            hk_meta_copy_get_image_properties(image);
+         vk_meta_copy_image(&cmd->vk, &dev->meta, &info, &props, &props,
+                            VK_PIPELINE_BIND_POINT_GRAPHICS);
+      }
+      hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      cmd->feedback_decompress = false;
+      hk_cmd_buffer_end_graphics(cmd);
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return false;
    } else {
-      const VkImageCopy2 region = {
-         .sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2,
-         .srcSubresource = {image->vk.aspects, level, layer, 1},
-         .dstSubresource = {image->vk.aspects, level, layer, 1},
-         .extent = extent,
-      };
-      const VkCopyImageInfo2 info = {
-         .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2,
-         .srcImage = hk_image_to_handle(image),
-         .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
-         .dstImage = hk_image_to_handle(image),
-         .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
-         .regionCount = 1,
-         .pRegions = &region,
-      };
-      struct vk_meta_copy_image_properties props =
-         hk_meta_copy_get_image_properties(image);
-      vk_meta_copy_image(&cmd->vk, &dev->meta, &info, &props, &props,
-                         VK_PIPELINE_BIND_POINT_GRAPHICS);
+      hk_cmd_buffer_end_compute(cmd);
+      hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
    }
-   hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
-   cmd->feedback_decompress = false;
-   hk_cmd_buffer_end_graphics(cmd);
-   if (vk_command_buffer_has_error(&cmd->vk))
-      return false;
 
    /* A raw PBE store leaves compression metadata untouched. Publish its new
     * interpretation only once the copy completed, before any feedback read.
@@ -344,8 +351,13 @@ hk_meta_decompress(struct hk_cmd_buffer *cmd, struct hk_image *image,
                         address, 0, mode, mode >> 32, mode, mode >> 32);
    }
    hk_cmd_buffer_end_compute(cmd);
-   hk_cmd_sync_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-      VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+   hk_cmd_sync_barrier(
+      cmd,
+      discard_contents ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                       : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+      VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+      discard_contents ? VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+                       : VK_ACCESS_2_MEMORY_WRITE_BIT,
       VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
    return !vk_command_buffer_has_error(&cmd->vk) &&
           hk_feedback_mark_raw(cmd, image, level, layer);
@@ -356,13 +368,14 @@ hk_meta_decompress(struct hk_cmd_buffer *cmd, struct hk_image *image,
  */
 bool
 hk_meta_decompress_view(struct hk_cmd_buffer *cmd,
-                        const struct hk_image_view *view, unsigned layer)
+                        const struct hk_image_view *view, unsigned layer,
+                        bool discard_contents)
 {
    struct hk_image *image = container_of(view->vk.image, struct hk_image, vk);
    unsigned level = view->vk.base_mip_level;
-   if (hk_meta_decompress_hit(cmd, image, level, layer))
+   if (hk_meta_decompress_hit(cmd, image, level, layer, discard_contents))
       return true;
-   return hk_meta_decompress(cmd, image, level, layer);
+   return hk_meta_decompress(cmd, image, level, layer, discard_contents);
 }
 
 #define BINDING_OUTPUT 0
@@ -1738,6 +1751,10 @@ hk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (!cmd->in_meta &&
+       !hk_feedback_prepare_clear_attachments(cmd, attachmentCount, pAttachments))
+      return;
 
    struct vk_meta_rendering_info render_info;
    hk_meta_init_render(cmd, &render_info);
