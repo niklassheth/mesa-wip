@@ -58,11 +58,36 @@ struct apple9_ra_sched_options {
 void apple9_ra_liveness_init(struct apple9_ra_liveness_info *info);
 void apple9_ra_liveness_finish(struct apple9_ra_liveness_info *info);
 
-/* Shared VIR RA classification helpers. */
+/* Resolved register-bank and contiguity contract for a VIR operand group
+ * (one destination tuple or one contiguous source group starting at
+ * `source`). Shared across RA scheduling, assignment, and validation. */
+struct apple9_ra_operand_group {
+   uint8_t width;      /* Contiguous 32-bit GPR count (1 for scalar). */
+   uint8_t min_gpr;    /* Inclusive minimum base 32-bit GPR. */
+   uint8_t max_gpr;    /* Inclusive maximum base 32-bit GPR (<= 96 - width). */
+   uint8_t align_gprs; /* Power-of-two base GPR alignment (>= 1). */
+   bool clobber;       /* Hardware overwrites this source group at issue. */
+   bool reuse_killed;  /* Destination may reuse a killed non-clobber source GPR. */
+   const struct agx_apple9_operand_constraint *constraint;
+};
+
+/* Shared VIR RA classification, operand-group, and latency helpers. */
 bool apple9_ra_after_logical_end(const struct agx_apple9_vir_instr *ins);
 bool apple9_ra_is_publication_instr(const struct agx_apple9_vir_instr *ins);
 bool apple9_ra_is_publication_val(const struct agx_apple9_vir_program *p,
                                   uint32_t value);
+bool apple9_ra_async(const struct agx_apple9_vir_instr *ins);
+bool apple9_ra_reads_sources_at_issue(const struct agx_apple9_vir_instr *ins);
+unsigned apple9_ra_source_width(const struct agx_apple9_vir_instr *ins,
+                                unsigned source);
+const struct agx_apple9_operand_constraint *
+apple9_ra_source_constraint(const struct agx_apple9_vir_instr *ins,
+                            unsigned source);
+struct apple9_ra_operand_group
+apple9_ra_source_group(const struct agx_apple9_vir_instr *ins,
+                       unsigned source);
+struct apple9_ra_operand_group
+apple9_ra_dest_group(const struct agx_apple9_vir_instr *ins);
 void apple9_ra_schedule_resources(const struct agx_apple9_vir_instr *ins,
                                   uint32_t *reads, uint32_t *writes);
 unsigned apple9_ra_dependency_delay(const struct agx_apple9_vir_instr *ins);

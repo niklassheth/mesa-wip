@@ -15,37 +15,6 @@
 #include "util/hash_table.h"
 #include "util/macros.h"
 
-static unsigned
-apple9_dependency_delay(const struct agx_apple9_vir_instr *I)
-{
-   /* Scheduling priorities, not measured T8132 cycle counts. Memory receives
-    * the largest separation; transcendental pipelines come next. Candidate
-    * selection also accounts for the completed allocation's copies/spills. */
-   switch (I->op) {
-   case AGX_APPLE9_VIR_DEVICE_LOAD:
-   case AGX_APPLE9_VIR_PRIVATE_LOAD:
-   case AGX_APPLE9_VIR_SHARED_LOAD:
-   case AGX_APPLE9_VIR_TEXTURE_SAMPLE:
-   case AGX_APPLE9_VIR_DEVICE_ATOMIC:
-   case AGX_APPLE9_VIR_SPILL_LOAD:
-      return 16;
-   case AGX_APPLE9_VIR_FRCP:
-   case AGX_APPLE9_VIR_FRSQ:
-   case AGX_APPLE9_VIR_FSQRT_FACTOR:
-   case AGX_APPLE9_VIR_FSIN_FACTOR:
-   case AGX_APPLE9_VIR_FEXP2:
-   case AGX_APPLE9_VIR_FLOG2:
-   case AGX_APPLE9_VIR_SUBGROUP_REDUCE:
-   case AGX_APPLE9_VIR_SUBGROUP_SHUFFLE:
-   case AGX_APPLE9_VIR_SUBGROUP_ROTATE:
-   case AGX_APPLE9_VIR_MMA:
-      return 4;
-   default:
-      return 1;
-   }
-}
-
-
 static bool
 apple9_identity(const struct agx_apple9_vir_instr *ins)
 {
@@ -447,26 +416,6 @@ apple9_completion_barrier(const struct agx_apple9_vir_instr *ins, bool drain)
           agx_apple9_encoding_info(ins->encoding)->requires_prior_completion;
 }
 
-/* Memory operations read their address, index and data registers at issue.
- * Native Metal overwrites a pending device load's address or index 3,744
- * times in 4,000 public pipelines without waiting. Overwriting atomic,
- * private-load and shared-load inputs right after issue passed the CTS
- * atomic, indexing and shared-memory groups. */
-static bool
-apple9_reads_sources_at_issue(const struct agx_apple9_vir_instr *ins)
-{
-   switch (ins->op) {
-   case AGX_APPLE9_VIR_DEVICE_LOAD:
-   case AGX_APPLE9_VIR_DEVICE_ATOMIC:
-   case AGX_APPLE9_VIR_PRIVATE_LOAD:
-   case AGX_APPLE9_VIR_SHARED_LOAD:
-   case AGX_APPLE9_VIR_MESH_CONTROL:
-      return true;
-   default:
-      return false;
-   }
-}
-
 /* Hazards on shared execution resources rather than on a lane's registers or
  * memory: they hold however the producer's and consumer's lanes relate. */
 static bool
@@ -507,7 +456,7 @@ apple9_lane_hazard(const struct agx_apple9_vir_instr *ins,
        * Bindless index GPRs (< PUB_BASE) for image stores and texture samples
        * are read at issue, like device-load address/index GPRs. */
       for (unsigned s = 0;
-           !apple9_reads_sources_at_issue(producer) && s < producer->nr_srcs;
+           !apple9_ra_reads_sources_at_issue(producer) && s < producer->nr_srcs;
            ++s) {
          if ((producer->op == AGX_APPLE9_VIR_IMAGE_STORE ||
               producer->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE) &&
@@ -1401,7 +1350,7 @@ apple9_allocation_cost(const struct agx_apple9_vir_program *p)
       cost.dependency_gaps += weight * (earliest - issue);
       for (unsigned c = 0; c < I->dest_components; ++c) {
          if (I->dest + c < ARRAY_SIZE(ready))
-            ready[I->dest + c] = earliest + apple9_dependency_delay(I);
+            ready[I->dest + c] = earliest + apple9_ra_dependency_delay(I);
       }
       issue = earliest + 1;
       cost.spills += weight * (I->op == AGX_APPLE9_VIR_SPILL_STORE ||
@@ -1631,7 +1580,7 @@ apple9_allocate_native_driver(struct agx_apple9_vir_program *program,
    const unsigned peak_gprs = apple9_estimate_vir_pressure(program);
    unsigned long_dependencies = 0;
    for (unsigned i = 0; i < program->instruction_count; ++i)
-      long_dependencies += apple9_dependency_delay(program->instructions[i]) > 1;
+      long_dependencies += apple9_ra_dependency_delay(program->instructions[i]) > 1;
 
    const bool high_pressure = peak_gprs > 104;
    const bool first_banks = high_pressure;

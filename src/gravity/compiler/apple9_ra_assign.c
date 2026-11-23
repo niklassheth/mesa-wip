@@ -120,287 +120,50 @@ a9_is_pub_val(const struct agx_apple9_vir_program *p, uint32_t v)
    return p->publication && v < p->publication_capacity && p->publication[v];
 }
 
-static inline bool
-a9_scalar_publication(const struct agx_apple9_vir_instr *ins)
-{
-   return ins->encoding == AGX_APPLE9_ENC_FLOAT2_EXPORT ||
-          ins->encoding == AGX_APPLE9_ENC_LOGIC_EXPORT;
-}
-
-static inline unsigned
-a9_fixed_producer_slot(const struct agx_apple9_vir_instr *ins)
-{
-   if (ins->encoding == AGX_APPLE9_ENC_PSEUDO ||
-       ins->encoding >= AGX_APPLE9_ENC_COUNT)
-      return AGX_APPLE9_SCOREBOARD_SLOT_NONE;
-   return agx_apple9_encoding_info(ins->encoding)->fixed_producer_slot;
-}
-
-static bool
-a9_async(const struct agx_apple9_vir_instr *ins)
-{
-   if (a9_scalar_publication(ins) || a9_fixed_producer_slot(ins))
-      return true;
-   switch (ins->op) {
-   case AGX_APPLE9_VIR_DEVICE_LOAD:
-   case AGX_APPLE9_VIR_PRIVATE_LOAD:
-   case AGX_APPLE9_VIR_SHARED_LOAD:
-   case AGX_APPLE9_VIR_SHARED_ATOMIC:
-   case AGX_APPLE9_VIR_TEXTURE_SAMPLE:
-   case AGX_APPLE9_VIR_TILE_LOAD:
-   case AGX_APPLE9_VIR_ITER_FLAT:
-   case AGX_APPLE9_VIR_SPILL_LOAD:
-   case AGX_APPLE9_VIR_SPILL_STORE:
-   case AGX_APPLE9_VIR_IMAGE_STORE:
-      return true;
-   case AGX_APPLE9_VIR_GET_SR:
-      return ins->encoding == AGX_APPLE9_ENC_GET_SR_EXTENDED ||
-             ins->producer_scoreboard_slot != AGX_APPLE9_SCOREBOARD_SLOT_NONE;
-   case AGX_APPLE9_VIR_DEVICE_ATOMIC:
-      return !ins->atomic_discard;
-   default:
-      return false;
-   }
-}
-
-static bool
-a9_reads_sources_at_issue(const struct agx_apple9_vir_instr *ins)
-{
-   switch (ins->op) {
-   case AGX_APPLE9_VIR_DEVICE_LOAD:
-   case AGX_APPLE9_VIR_DEVICE_ATOMIC:
-   case AGX_APPLE9_VIR_PRIVATE_LOAD:
-   case AGX_APPLE9_VIR_SHARED_LOAD:
-   case AGX_APPLE9_VIR_MESH_CONTROL:
-      return true;
-   default:
-      return false;
-   }
-}
-
-static unsigned
-a9_source_width(const struct agx_apple9_vir_instr *ins, unsigned source)
-{
-   if ((ins->op == AGX_APPLE9_VIR_MESH_SUBMIT_CHANNEL ||
-        ins->op == AGX_APPLE9_VIR_MESH_SUBMIT_SCALAR) &&
-       source == 0)
-      return 2;
-   if ((ins->op == AGX_APPLE9_VIR_DEVICE_STORE ||
-        ins->encoding == AGX_APPLE9_ENC_SHARED_STORE ||
-        ins->op == AGX_APPLE9_VIR_PRIVATE_STORE) &&
-       source == 0)
-      return agx_apple9_mem_data_gprs(ins);
-   if ((ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
-        ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC) &&
-       source == 0)
-      return MAX2(ins->memory_components, 1u);
-   if (ins->encoding == AGX_APPLE9_ENC_DEVICE_STORE_INDIRECT &&
-       source == agx_apple9_mem_data_gprs(ins) + 1)
-      return 2;
-   if (ins->encoding == AGX_APPLE9_ENC_DEVICE_ATOMIC_INDIRECT &&
-       source == ins->memory_components + 1)
-      return 2;
-   if ((ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT && source == 1) ||
-       (ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_POINTER && source == 0))
-      return 2;
-   if (ins->op == AGX_APPLE9_VIR_MMA)
-      return agx_apple9_mma_source_width(ins, source);
-   if (ins->op == AGX_APPLE9_VIR_IMAGE_STORE && source == 8)
-      return 2;
-   return 1;
-}
-
-static const struct agx_apple9_operand_constraint a9_table_index[2] = {
-   {
-      .role = AGX_APPLE9_OPERAND_SRC4,
-      .files = AGX_APPLE9_FILE_GPR,
-      .widths = AGX_APPLE9_WIDTH_32,
-      .min_index = 0,
-      .max_index = AGX_APPLE9_GPR_COUNT - 1,
-      .alignment_halves = 2,
-      .flags = AGX_APPLE9_OPERAND_ALLOCATABLE,
-   },
-   {
-      .role = AGX_APPLE9_OPERAND_SRC5,
-      .files = AGX_APPLE9_FILE_GPR,
-      .widths = AGX_APPLE9_WIDTH_32,
-      .min_index = 0,
-      .max_index = AGX_APPLE9_GPR_COUNT - 1,
-      .alignment_halves = 2,
-      .flags = AGX_APPLE9_OPERAND_ALLOCATABLE,
-   },
-};
-
-static const struct agx_apple9_operand_constraint *
-a9_find_source_constraint(const struct agx_apple9_vir_instr *ins,
-                          unsigned source)
-{
-   if (ins->encoding == AGX_APPLE9_ENC_PSEUDO ||
-       ins->encoding >= AGX_APPLE9_ENC_COUNT)
-      return NULL;
-
-   if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE &&
-       source + ins->texture_bindless + ins->sampler_bindless >= ins->nr_srcs)
-      return &a9_table_index[ins->sampler_bindless &&
-                             source + 1 == ins->nr_srcs];
-
-   if (ins->encoding == AGX_APPLE9_ENC_SHARED_STORE ||
-       ins->op == AGX_APPLE9_VIR_PRIVATE_STORE) {
-      return agx_apple9_find_operand(ins->encoding,
-                                     source ? AGX_APPLE9_OPERAND_SRC1
-                                            : AGX_APPLE9_OPERAND_SRC0);
-   }
-
-   if (ins->op == AGX_APPLE9_VIR_DEVICE_STORE ||
-       ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
-       ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC) {
-      unsigned data_gprs = ins->op == AGX_APPLE9_VIR_DEVICE_STORE
-                              ? agx_apple9_mem_data_gprs(ins)
-                              : MAX2(ins->memory_components, 1u);
-      if ((ins->encoding == AGX_APPLE9_ENC_DEVICE_STORE_INDIRECT ||
-           ins->encoding == AGX_APPLE9_ENC_DEVICE_ATOMIC_INDIRECT) &&
-          source > data_gprs)
-         return agx_apple9_find_operand(ins->encoding,
-                                        source == data_gprs + 1
-                                           ? AGX_APPLE9_OPERAND_SRC1
-                                           : AGX_APPLE9_OPERAND_SRC2);
-      enum agx_apple9_operand_role role =
-         source                                     ? AGX_APPLE9_OPERAND_INDEX
-         : ins->op == AGX_APPLE9_VIR_DEVICE_STORE   ? AGX_APPLE9_OPERAND_STORE_DATA
-                                                    : AGX_APPLE9_OPERAND_ATOMIC_DATA;
-      return agx_apple9_find_operand(ins->encoding, role);
-   }
-
-   if (ins->op == AGX_APPLE9_VIR_MMA)
-      return agx_apple9_find_operand(ins->encoding,
-                                     agx_apple9_mma_source_role(ins, source));
-
-   const struct agx_apple9_encoding_info *info =
-      agx_apple9_encoding_info(ins->encoding);
-   for (unsigned o = 0, s = 0; o < info->operand_count; ++o) {
-      const struct agx_apple9_operand_constraint *c = &info->operands[o];
-      if (!(c->files & AGX_APPLE9_FILE_GPR) ||
-          agx_apple9_inline_source_file(ins, c->role) ||
-          c->role == AGX_APPLE9_OPERAND_DEST)
-         continue;
-      if (s++ == source)
-         return c;
-   }
-   return NULL;
-}
-
 static struct a9_gpr_constraint
 a9_dest_constraint(const struct agx_apple9_vir_program *program,
                    const struct agx_apple9_vir_instr *ins)
 {
-   unsigned comps = ins->dest_components ? ins->dest_components : 1u;
+   struct apple9_ra_operand_group g = apple9_ra_dest_group(ins);
    struct a9_gpr_constraint c = {
-      .min = 0,
-      .max = (uint8_t)(AGX_APPLE9_GPR_COUNT - comps),
-      .align = 1,
+      .min = g.min_gpr,
+      .max = g.max_gpr,
+      .align = g.align_gprs,
       .clobber = false,
-      .reuse_killed = false,
+      .reuse_killed = g.reuse_killed,
    };
 
-   if (ins->encoding == AGX_APPLE9_ENC_PSEUDO ||
-       ins->encoding >= AGX_APPLE9_ENC_COUNT) {
-      c.reuse_killed = (comps == 1);
-      return c;
-   }
-
-   const struct agx_apple9_operand_constraint *dc =
-      ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC
-         ? agx_apple9_find_operand(AGX_APPLE9_ENC_DEVICE_ATOMIC_RESULT,
-                                   AGX_APPLE9_OPERAND_SRC0)
-         : agx_apple9_find_operand(ins->encoding, AGX_APPLE9_OPERAND_DEST);
-
-   unsigned min_gpr = dc ? dc->min_index : 0u;
-   unsigned max_gpr = dc ? dc->max_index : (AGX_APPLE9_GPR_COUNT - 1u);
-   unsigned align_gprs = dc ? MAX2(dc->alignment_halves, 2u) / 2u : 1u;
-
-   if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE) {
-      unsigned limit = (ins->texture_bindless || ins->sampler_bindless ||
-                        ins->texture_uniform_bindless ||
-                        ins->sampler_uniform_bindless)
-                          ? AGX_APPLE9_GPR_COUNT
-                          : 64u;
-      max_gpr = limit - comps;
-   }
-   if ((ins->op == AGX_APPLE9_VIR_SHARED_LOAD ||
-        ins->op == AGX_APPLE9_VIR_DEVICE_LOAD) &&
-       comps > 1)
-      max_gpr = AGX_APPLE9_GPR_COUNT - comps;
-   if (ins->op == AGX_APPLE9_VIR_PRIVATE_LOAD && comps > 1)
-      max_gpr = 64u - comps;
-   if (max_gpr + comps > AGX_APPLE9_GPR_COUNT)
-      max_gpr = AGX_APPLE9_GPR_COUNT - comps;
-
-   if (ins->dest < program->value_count && program->fixed_phys &&
+   if (ins->encoding != AGX_APPLE9_ENC_PSEUDO &&
+       ins->encoding < AGX_APPLE9_ENC_COUNT &&
+       ins->dest < program->value_count && program->fixed_phys &&
        program->fixed_phys[ins->dest] != AGX_APPLE9_PHYS_INVALID &&
        !a9_is_pub_val(program, ins->dest)) {
-      min_gpr = max_gpr = program->fixed_phys[ins->dest];
+      c.min = c.max = program->fixed_phys[ins->dest];
    }
-
-   c.min = (uint8_t)min_gpr;
-   c.max = (uint8_t)max_gpr;
-   c.align = (uint8_t)MAX2(align_gprs, 1u);
-   c.reuse_killed =
-      comps == 1 &&
-      (!a9_async(ins) || (a9_reads_sources_at_issue(ins) &&
-                          ins->op != AGX_APPLE9_VIR_DEVICE_ATOMIC)) &&
-      !apple9_ra_after_logical_end(ins) &&
-      ins->op != AGX_APPLE9_VIR_DEVICE_ATOMIC &&
-      !agx_apple9_encoding_info(ins->encoding)->split_result;
    return c;
 }
 
 static struct a9_gpr_constraint
 a9_src_constraint(const struct agx_apple9_vir_program *program,
-                  const struct agx_apple9_vir_instr *ins, unsigned source,
-                  unsigned width)
+                  const struct agx_apple9_vir_instr *ins, unsigned source)
 {
+   struct apple9_ra_operand_group g = apple9_ra_source_group(ins, source);
    struct a9_gpr_constraint c = {
-      .min = 0,
-      .max = (uint8_t)(AGX_APPLE9_GPR_COUNT - width),
-      .align = 1,
-      .clobber = false,
+      .min = g.min_gpr,
+      .max = g.max_gpr,
+      .align = g.align_gprs,
+      .clobber = g.clobber,
       .reuse_killed = false,
    };
 
-   if (ins->encoding == AGX_APPLE9_ENC_PSEUDO ||
-       ins->encoding >= AGX_APPLE9_ENC_COUNT)
-      return c;
-
-   const struct agx_apple9_operand_constraint *sc =
-      a9_find_source_constraint(ins, source);
-   unsigned min_gpr = sc ? sc->min_index : 0u;
-   unsigned max_gpr = sc ? sc->max_index : (AGX_APPLE9_GPR_COUNT - 1u);
-   unsigned align_gprs = sc ? MAX2(sc->alignment_halves, 2u) / 2u : 1u;
-
-   if (source == 0) {
-      if ((ins->encoding == AGX_APPLE9_ENC_SHARED_STORE ||
-           ins->op == AGX_APPLE9_VIR_DEVICE_STORE) &&
-          width > 1)
-         max_gpr = AGX_APPLE9_GPR_COUNT - width;
-      else if (ins->op == AGX_APPLE9_VIR_PRIVATE_STORE && width > 1)
-         max_gpr = 64u - width;
-      else if (ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC && width > 1)
-         max_gpr = AGX_APPLE9_GPR_COUNT - width;
-   }
-   if (max_gpr + width > AGX_APPLE9_GPR_COUNT)
-      max_gpr = AGX_APPLE9_GPR_COUNT - width;
-
-   if (source < ins->nr_srcs && ins->src[source] < program->value_count &&
+   if (ins->encoding != AGX_APPLE9_ENC_PSEUDO &&
+       ins->encoding < AGX_APPLE9_ENC_COUNT &&
+       source < ins->nr_srcs && ins->src[source] < program->value_count &&
        program->fixed_phys &&
        program->fixed_phys[ins->src[source]] != AGX_APPLE9_PHYS_INVALID &&
        !a9_is_pub_val(program, ins->src[source])) {
-      min_gpr = max_gpr = program->fixed_phys[ins->src[source]];
+      c.min = c.max = program->fixed_phys[ins->src[source]];
    }
-
-   c.min = (uint8_t)min_gpr;
-   c.max = (uint8_t)max_gpr;
-   c.align = (uint8_t)MAX2(align_gprs, 1u);
-   c.clobber = sc && (sc->flags & AGX_APPLE9_OPERAND_CLOBBER);
    return c;
 }
 
@@ -457,7 +220,7 @@ a9_validate_constraint_windows(const struct agx_apple9_vir_program *program,
          }
 
          for (unsigned s = 0; s < ins->nr_srcs; ) {
-            unsigned w = a9_source_width(ins, s);
+            unsigned w = apple9_ra_source_width(ins, s);
             if (s + w > ins->nr_srcs) {
                *error = "Source tuple width exceeds instruction nr_srcs";
                return false;
@@ -466,7 +229,7 @@ a9_validate_constraint_windows(const struct agx_apple9_vir_program *program,
             if (!a9_is_pub_val(program, sv) &&
                 !apple9_ra_value_is_mem(spill, sv)) {
                struct a9_gpr_constraint sc =
-                  a9_src_constraint(program, ins, s, w);
+                  a9_src_constraint(program, ins, s);
                unsigned first, last;
                if (sc.min == sc.max && sc.max < reserved) {
                   if (sc.max + w > bound || (sc.min % sc.align) != 0) {
@@ -717,7 +480,7 @@ a9_prepare_tuples_and_clobbers(struct agx_apple9_vir_program *program,
       }
 
       for (unsigned s = 0; s < ins->nr_srcs; ) {
-         unsigned width = a9_source_width(ins, s);
+         unsigned width = apple9_ra_source_width(ins, s);
          if (s + width > ins->nr_srcs) {
             *error = "source tuple width exceeds nr_srcs";
             ok = false;
@@ -731,7 +494,7 @@ a9_prepare_tuples_and_clobbers(struct agx_apple9_vir_program *program,
          }
 
          const struct agx_apple9_operand_constraint *op_c =
-            a9_find_source_constraint(ins, s);
+            apple9_ra_source_constraint(ins, s);
          const bool is_clobber =
             op_c && (op_c->flags & AGX_APPLE9_OPERAND_CLOBBER);
 
@@ -1001,12 +764,12 @@ a9_calc_gpr_demand(const struct agx_apple9_vir_program *program,
                max_demand = MAX2(max_demand, first + ins->dest_components);
             }
             for (unsigned s = 0; s < ins->nr_srcs; ) {
-               unsigned w = a9_source_width(ins, s);
+               unsigned w = apple9_ra_source_width(ins, s);
                uint32_t sv = ins->src[s];
                if (!a9_is_pub_val(program, sv) &&
                    !apple9_ra_value_is_mem(spill, sv)) {
                   struct a9_gpr_constraint sc =
-                     a9_src_constraint(program, ins, s, w);
+                     a9_src_constraint(program, ins, s);
                   unsigned first = ALIGN_POT(MAX2((unsigned)sc.min, reserved),
                                              (unsigned)sc.align);
                   max_demand = MAX2(max_demand, first + w);
@@ -2072,7 +1835,7 @@ a9_assign_constrained_sources(struct a9_ra_ctx *rctx,
 {
    const unsigned nr_srcs = MIN2((unsigned)ins->nr_srcs, AGX_APPLE9_MAX_VIR_SRCS);
    for (unsigned s = 0; s < nr_srcs; ) {
-      unsigned w = a9_source_width(ins, s);
+      unsigned w = apple9_ra_source_width(ins, s);
       if (w == 0 || w > 4 || s + w > nr_srcs) {
          rctx->error = "source tuple width exceeds instruction nr_srcs";
          return false;
@@ -2084,18 +1847,18 @@ a9_assign_constrained_sources(struct a9_ra_ctx *rctx,
          continue;
       }
 
-      struct a9_gpr_constraint c = a9_src_constraint(rctx->program, ins, s, w);
+      struct a9_gpr_constraint c = a9_src_constraint(rctx->program, ins, s);
 
       if (w == 1) {
          /* Merge constraints across duplicate occurrences of the same value. */
          bool seen_earlier = false;
          for (unsigned t = 0; t < ins->nr_srcs; ) {
-            unsigned tw = a9_source_width(ins, t);
+            unsigned tw = apple9_ra_source_width(ins, t);
             if (tw == 1 && ins->src[t] == s0) {
                if (t < s)
                   seen_earlier = true;
                struct a9_gpr_constraint other =
-                  a9_src_constraint(rctx->program, ins, t, 1);
+                  a9_src_constraint(rctx->program, ins, t);
                c.min = MAX2(c.min, other.min);
                c.max = MIN2(c.max, other.max);
                c.align = MAX2(c.align, other.align);
@@ -2482,7 +2245,7 @@ a9_assign_dest(struct a9_ra_ctx *rctx, struct agx_apple9_vir_instr *ins,
          if ((ins->retain_mask >> s) & 1u)
             continue;
          const struct agx_apple9_operand_constraint *sc =
-            a9_find_source_constraint(ins, s);
+            apple9_ra_source_constraint(ins, s);
          if (sc && (sc->flags & AGX_APPLE9_OPERAND_CLOBBER))
             continue;
          unsigned sr = rctx->phys[sv];
@@ -3055,9 +2818,9 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                   continue;
                }
                for (unsigned s = 0; s < uns && can_bypass; ) {
-                  unsigned sw = a9_source_width(u, s);
+                  unsigned sw = apple9_ra_source_width(u, s);
                   const struct agx_apple9_operand_constraint *op_c =
-                     a9_find_source_constraint(u, s);
+                     apple9_ra_source_constraint(u, s);
                   if (op_c && (op_c->flags & AGX_APPLE9_OPERAND_CLOBBER)) {
                      for (unsigned c = 0; c < sw && s + c < uns; ++c) {
                         uint32_t usv = agx_apple9_vir_src(u, s + c);
@@ -3225,7 +2988,7 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                any_dead = true;
             }
          }
-         if (any_dead && a9_async(ins)) {
+         if (any_dead && apple9_ra_async(ins)) {
             unsigned slot = rctx->async_next++ % ARRAY_SIZE(rctx->async_pending);
             rctx->async_pending[slot].live[0] = live_mask[0];
             rctx->async_pending[slot].live[1] = live_mask[1];
@@ -4381,12 +4144,12 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
             rctx.precolor_hint[ins->dest] = (uint8_t)ins->immediate;
          } else if (ins->encoding != AGX_APPLE9_ENC_PSEUDO) {
             for (unsigned s = 0; s < ins->nr_srcs; ) {
-               unsigned w = a9_source_width(ins, s);
+               unsigned w = apple9_ra_source_width(ins, s);
                uint32_t sv = ins->src[s];
                if (w == 1 && sv < orig_vcount && !a9_is_pub_val(program, sv) &&
                    !apple9_ra_value_is_mem(&spill_state, sv)) {
                   struct a9_gpr_constraint sc =
-                     a9_src_constraint(program, ins, s, 1);
+                     a9_src_constraint(program, ins, s);
                   if (sc.min == sc.max && sc.min < max_gprs &&
                       rctx.precolor_hint[sv] == AGX_APPLE9_PHYS_INVALID)
                      rctx.precolor_hint[sv] = sc.min;
@@ -4674,12 +4437,12 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
             }
 
             for (unsigned s = 0; s < ins->nr_srcs; ) {
-               unsigned w = a9_source_width(ins, s);
+               unsigned w = apple9_ra_source_width(ins, s);
                uint32_t sv = ins->src[s];
                if (sv < orig_vcount && !a9_is_pub_val(program, sv) &&
                    !apple9_ra_value_is_mem(&spill_state, sv)) {
                   struct a9_gpr_constraint sc =
-                     a9_src_constraint(program, ins, s, w);
+                     a9_src_constraint(program, ins, s);
                   if (!(sc.min == sc.max && sc.max < reserved)) {
                      struct a9_gpr_constraint *p = &rctx.preferred[sv];
                      p->min = MAX2(p->min, sc.min);

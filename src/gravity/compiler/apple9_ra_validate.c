@@ -4,6 +4,7 @@
  */
 
 #include "apple9_ra_pcopy.h"
+#include "apple9_ra_sched.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -653,165 +654,6 @@ fail:
    return false;
 }
 
-/* --- Encoding / Apple9 constraint helpers (mirrors agx_apple9_ra.c) --- */
-
-static unsigned
-val_source_width(const struct agx_apple9_vir_instr *ins, unsigned source)
-{
-   if ((ins->op == AGX_APPLE9_VIR_MESH_SUBMIT_CHANNEL ||
-        ins->op == AGX_APPLE9_VIR_MESH_SUBMIT_SCALAR) &&
-       source == 0)
-      return 2;
-   if ((ins->op == AGX_APPLE9_VIR_DEVICE_STORE ||
-        ins->encoding == AGX_APPLE9_ENC_SHARED_STORE ||
-        ins->op == AGX_APPLE9_VIR_PRIVATE_STORE) &&
-       source == 0)
-      return agx_apple9_mem_data_gprs(ins);
-   if ((ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
-        ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC) &&
-       source == 0)
-      return MAX2(ins->memory_components, 1u);
-   if (ins->encoding == AGX_APPLE9_ENC_DEVICE_STORE_INDIRECT &&
-       source == agx_apple9_mem_data_gprs(ins) + 1)
-      return 2;
-   if (ins->encoding == AGX_APPLE9_ENC_DEVICE_ATOMIC_INDIRECT &&
-       source == ins->memory_components + 1)
-      return 2;
-   if ((ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT && source == 1) ||
-       (ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_POINTER && source == 0))
-      return 2;
-   if (ins->op == AGX_APPLE9_VIR_MMA)
-      return agx_apple9_mma_source_width(ins, source);
-   if (ins->op == AGX_APPLE9_VIR_IMAGE_STORE && source == 8)
-      return 2;
-   return 1;
-}
-
-static const struct agx_apple9_operand_constraint val_table_index[2] = {
-   {
-      .role = AGX_APPLE9_OPERAND_SRC4,
-      .files = AGX_APPLE9_FILE_GPR,
-      .widths = AGX_APPLE9_WIDTH_32,
-      .min_index = 0,
-      .max_index = AGX_APPLE9_GPR_COUNT - 1,
-      .alignment_halves = 2,
-      .flags = AGX_APPLE9_OPERAND_ALLOCATABLE,
-   },
-   {
-      .role = AGX_APPLE9_OPERAND_SRC5,
-      .files = AGX_APPLE9_FILE_GPR,
-      .widths = AGX_APPLE9_WIDTH_32,
-      .min_index = 0,
-      .max_index = AGX_APPLE9_GPR_COUNT - 1,
-      .alignment_halves = 2,
-      .flags = AGX_APPLE9_OPERAND_ALLOCATABLE,
-   },
-};
-
-static const struct agx_apple9_operand_constraint *
-val_source_constraint(const struct agx_apple9_vir_instr *ins, unsigned source)
-{
-   if (ins->encoding == AGX_APPLE9_ENC_PSEUDO ||
-       ins->encoding >= AGX_APPLE9_ENC_COUNT)
-      return NULL;
-
-   if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE &&
-       source + ins->texture_bindless + ins->sampler_bindless >= ins->nr_srcs)
-      return &val_table_index[ins->sampler_bindless &&
-                              source + 1 == ins->nr_srcs];
-
-   if (ins->encoding == AGX_APPLE9_ENC_SHARED_STORE ||
-       ins->op == AGX_APPLE9_VIR_PRIVATE_STORE) {
-      return agx_apple9_find_operand(ins->encoding,
-                                     source ? AGX_APPLE9_OPERAND_SRC1
-                                            : AGX_APPLE9_OPERAND_SRC0);
-   }
-
-   if (ins->op == AGX_APPLE9_VIR_DEVICE_STORE ||
-       ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC ||
-       ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC) {
-      unsigned data_gprs = ins->op == AGX_APPLE9_VIR_DEVICE_STORE
-                              ? agx_apple9_mem_data_gprs(ins)
-                              : MAX2(ins->memory_components, 1u);
-      if ((ins->encoding == AGX_APPLE9_ENC_DEVICE_STORE_INDIRECT ||
-           ins->encoding == AGX_APPLE9_ENC_DEVICE_ATOMIC_INDIRECT) &&
-          source > data_gprs)
-         return agx_apple9_find_operand(ins->encoding,
-                                        source == data_gprs + 1
-                                           ? AGX_APPLE9_OPERAND_SRC1
-                                           : AGX_APPLE9_OPERAND_SRC2);
-      enum agx_apple9_operand_role role =
-         source                                     ? AGX_APPLE9_OPERAND_INDEX
-         : ins->op == AGX_APPLE9_VIR_DEVICE_STORE   ? AGX_APPLE9_OPERAND_STORE_DATA
-                                                    : AGX_APPLE9_OPERAND_ATOMIC_DATA;
-      return agx_apple9_find_operand(ins->encoding, role);
-   }
-
-   if (ins->op == AGX_APPLE9_VIR_MMA)
-      return agx_apple9_find_operand(ins->encoding,
-                                     agx_apple9_mma_source_role(ins, source));
-
-   const struct agx_apple9_encoding_info *info =
-      agx_apple9_encoding_info(ins->encoding);
-   for (unsigned o = 0, s = 0; o < info->operand_count; ++o) {
-      const struct agx_apple9_operand_constraint *c = &info->operands[o];
-      if (!(c->files & AGX_APPLE9_FILE_GPR) ||
-          agx_apple9_inline_source_file(ins, c->role) ||
-          c->role == AGX_APPLE9_OPERAND_DEST)
-         continue;
-      if (s++ == source)
-         return c;
-   }
-   return NULL;
-}
-
-static bool
-val_async(const struct agx_apple9_vir_instr *ins)
-{
-   if (ins->encoding == AGX_APPLE9_ENC_FLOAT2_EXPORT ||
-       ins->encoding == AGX_APPLE9_ENC_LOGIC_EXPORT)
-      return true;
-   if (ins->encoding != AGX_APPLE9_ENC_PSEUDO &&
-       ins->encoding < AGX_APPLE9_ENC_COUNT &&
-       agx_apple9_encoding_info(ins->encoding)->fixed_producer_slot != 0)
-      return true;
-   switch (ins->op) {
-   case AGX_APPLE9_VIR_DEVICE_LOAD:
-   case AGX_APPLE9_VIR_PRIVATE_LOAD:
-   case AGX_APPLE9_VIR_SHARED_LOAD:
-   case AGX_APPLE9_VIR_SHARED_ATOMIC:
-   case AGX_APPLE9_VIR_TEXTURE_SAMPLE:
-   case AGX_APPLE9_VIR_TILE_LOAD:
-   case AGX_APPLE9_VIR_ITER_FLAT:
-   case AGX_APPLE9_VIR_SPILL_LOAD:
-   case AGX_APPLE9_VIR_SPILL_STORE:
-   case AGX_APPLE9_VIR_IMAGE_STORE:
-      return true;
-   case AGX_APPLE9_VIR_GET_SR:
-      return ins->encoding == AGX_APPLE9_ENC_GET_SR_EXTENDED ||
-             ins->producer_scoreboard_slot != AGX_APPLE9_SCOREBOARD_SLOT_NONE;
-   case AGX_APPLE9_VIR_DEVICE_ATOMIC:
-      return !ins->atomic_discard;
-   default:
-      return false;
-   }
-}
-
-static bool
-val_reads_sources_at_issue(const struct agx_apple9_vir_instr *ins)
-{
-   switch (ins->op) {
-   case AGX_APPLE9_VIR_DEVICE_LOAD:
-   case AGX_APPLE9_VIR_DEVICE_ATOMIC:
-   case AGX_APPLE9_VIR_PRIVATE_LOAD:
-   case AGX_APPLE9_VIR_SHARED_LOAD:
-   case AGX_APPLE9_VIR_MESH_CONTROL:
-      return true;
-   default:
-      return false;
-   }
-}
-
 static bool
 val_allows_reuse_killed(const struct agx_apple9_vir_instr *ins)
 {
@@ -819,13 +661,7 @@ val_allows_reuse_killed(const struct agx_apple9_vir_instr *ins)
       return true;
    if (ins->encoding >= AGX_APPLE9_ENC_COUNT)
       return false;
-   return vir_dest_components(ins) == 1 &&
-          (!val_async(ins) ||
-           (val_reads_sources_at_issue(ins) &&
-            ins->op != AGX_APPLE9_VIR_DEVICE_ATOMIC)) &&
-          !apple9_ra_after_logical_end(ins) &&
-          ins->op != AGX_APPLE9_VIR_DEVICE_ATOMIC &&
-          !agx_apple9_encoding_info(ins->encoding)->split_result;
+   return apple9_ra_dest_group(ins).reuse_killed;
 }
 
 static bool
@@ -991,31 +827,10 @@ validate_encoding_constraints(const struct agx_apple9_vir_program *program,
             return false;
          }
       } else {
-         const struct agx_apple9_operand_constraint *dc =
-            ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC
-               ? agx_apple9_find_operand(AGX_APPLE9_ENC_DEVICE_ATOMIC_RESULT,
-                                         AGX_APPLE9_OPERAND_SRC0)
-               : agx_apple9_find_operand(ins->encoding, AGX_APPLE9_OPERAND_DEST);
-
-         unsigned min_gpr = dc ? dc->min_index : 0u;
-         unsigned max_gpr = dc ? dc->max_index : (AGX_APPLE9_GPR_COUNT - 1u);
-         unsigned align_gprs =
-            dc ? MAX2(dc->alignment_halves, 2u) / 2u : 1u;
-
-         if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE) {
-            unsigned limit = (ins->texture_bindless || ins->sampler_bindless ||
-                              ins->texture_uniform_bindless ||
-                              ins->sampler_uniform_bindless)
-                                ? AGX_APPLE9_GPR_COUNT
-                                : 64u;
-            max_gpr = limit - comps;
-         }
-         if ((ins->op == AGX_APPLE9_VIR_SHARED_LOAD ||
-              ins->op == AGX_APPLE9_VIR_DEVICE_LOAD) &&
-             comps > 1)
-            max_gpr = AGX_APPLE9_GPR_COUNT - comps;
-         if (ins->op == AGX_APPLE9_VIR_PRIVATE_LOAD && comps > 1)
-            max_gpr = 64u - comps;
+         struct apple9_ra_operand_group dg = apple9_ra_dest_group(ins);
+         unsigned min_gpr = dg.min_gpr;
+         unsigned max_gpr = dg.max_gpr;
+         unsigned align_gprs = dg.align_gprs;
 
          if (dloc.value < min_gpr || dloc.value > max_gpr) {
             set_err(err, block_idx, pos,
@@ -1051,7 +866,8 @@ validate_encoding_constraints(const struct agx_apple9_vir_program *program,
 
    /* Check source encoding constraints & contiguous source tuples. */
    for (unsigned s = 0; s < ins->nr_srcs; ) {
-      unsigned width = val_source_width(ins, s);
+      struct apple9_ra_operand_group sg = apple9_ra_source_group(ins, s);
+      unsigned width = sg.width;
       if (s + width > ins->nr_srcs) {
          set_err(err, block_idx, pos,
                  "encoding %s source tuple at src[%u] width %u exceeds nr_srcs %u",
@@ -1083,22 +899,9 @@ validate_encoding_constraints(const struct agx_apple9_vir_program *program,
          continue;
       }
 
-      const struct agx_apple9_operand_constraint *sc =
-         val_source_constraint(ins, s);
-      unsigned min_gpr = sc ? sc->min_index : 0u;
-      unsigned max_gpr = sc ? sc->max_index : (AGX_APPLE9_GPR_COUNT - 1u);
-      unsigned align_gprs = sc ? MAX2(sc->alignment_halves, 2u) / 2u : 1u;
-
-      if (s == 0) {
-         if ((ins->encoding == AGX_APPLE9_ENC_SHARED_STORE ||
-              ins->op == AGX_APPLE9_VIR_DEVICE_STORE) &&
-             width > 1)
-            max_gpr = AGX_APPLE9_GPR_COUNT - width;
-         else if (ins->op == AGX_APPLE9_VIR_PRIVATE_STORE && width > 1)
-            max_gpr = 64u - width;
-         else if (ins->op == AGX_APPLE9_VIR_SHARED_ATOMIC && width > 1)
-            max_gpr = AGX_APPLE9_GPR_COUNT - width;
-      }
+      unsigned min_gpr = sg.min_gpr;
+      unsigned max_gpr = sg.max_gpr;
+      unsigned align_gprs = sg.align_gprs;
 
       if (program->fixed_phys && ins->src[s] < program->value_count &&
           program->fixed_phys[ins->src[s]] != AGX_APPLE9_PHYS_INVALID &&
@@ -1622,10 +1425,9 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
       /* Check AGX_APPLE9_OPERAND_CLOBBER legality and invalidate clobbered
        * input registers. */
       for (unsigned s = 0; s < ins->nr_srcs; ) {
-         unsigned width = val_source_width(ins, s);
-         const struct agx_apple9_operand_constraint *sc =
-            val_source_constraint(ins, s);
-         if (sc && (sc->flags & AGX_APPLE9_OPERAND_CLOBBER)) {
+         struct apple9_ra_operand_group sg = apple9_ra_source_group(ins, s);
+         unsigned width = sg.width;
+         if (sg.clobber) {
             for (unsigned c = 0; c < width && s + c < ins->nr_srcs; ++c) {
                uint32_t sv = ins->src[s + c];
                if (is_publication_val(program, sv))

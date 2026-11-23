@@ -1351,3 +1351,98 @@ TEST(Apple9RaPressureSchedule, CrossBlockRematPreservesPhiOperands)
 
    agx_apple9_vir_finish(&p);
 }
+
+TEST(Apple9RaSched, UnifiedOperandGroupsAndLatencyTable)
+{
+   /* Latency table: memory/atomic/tile = 16, SFU/FP16-SFU/subgroup/MMA = 4, ALU = 1. */
+   struct agx_apple9_vir_instr ins = {};
+   ins.op = AGX_APPLE9_VIR_DEVICE_LOAD;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 16u);
+   ins.op = AGX_APPLE9_VIR_SHARED_ATOMIC;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 16u);
+   ins.op = AGX_APPLE9_VIR_TILE_LOAD;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 16u);
+   ins.op = AGX_APPLE9_VIR_HRCP;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 4u);
+   ins.op = AGX_APPLE9_VIR_HLOG2;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 4u);
+   ins.op = AGX_APPLE9_VIR_MMA;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 4u);
+   ins.op = AGX_APPLE9_VIR_FADD;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 1u);
+
+   /* Async & reads-sources-at-issue classification. */
+   ins = {};
+   ins.op = AGX_APPLE9_VIR_DEVICE_LOAD;
+   ins.encoding = AGX_APPLE9_ENC_DEVICE_LOAD;
+   ins.dest_components = 1;
+   EXPECT_TRUE(apple9_ra_async(&ins));
+   EXPECT_TRUE(apple9_ra_reads_sources_at_issue(&ins));
+   EXPECT_TRUE(apple9_ra_dest_group(&ins).reuse_killed);
+
+   ins = {};
+   ins.op = AGX_APPLE9_VIR_TEXTURE_SAMPLE;
+   ins.encoding = AGX_APPLE9_ENC_TEXTURE_SAMPLE;
+   ins.dest_components = 4;
+   ins.nr_srcs = 3;
+   ins.texture_bindless = false;
+   ins.sampler_bindless = false;
+   struct apple9_ra_operand_group tex_dst = apple9_ra_dest_group(&ins);
+   EXPECT_EQ(tex_dst.width, 4u);
+   EXPECT_EQ(tex_dst.max_gpr, 60u);
+   EXPECT_FALSE(tex_dst.reuse_killed);
+
+   ins.texture_bindless = true;
+   ins.sampler_bindless = true;
+   ins.nr_srcs = 4;
+   tex_dst = apple9_ra_dest_group(&ins);
+   EXPECT_EQ(tex_dst.max_gpr, AGX_APPLE9_GPR_COUNT - 4u);
+   struct apple9_ra_operand_group bindless_tex = apple9_ra_source_group(&ins, 2);
+   struct apple9_ra_operand_group bindless_smp = apple9_ra_source_group(&ins, 3);
+   ASSERT_NE(bindless_tex.constraint, nullptr);
+   ASSERT_NE(bindless_smp.constraint, nullptr);
+   EXPECT_EQ(bindless_tex.constraint->role, AGX_APPLE9_OPERAND_SRC4);
+   EXPECT_EQ(bindless_smp.constraint->role, AGX_APPLE9_OPERAND_SRC5);
+   EXPECT_EQ(bindless_tex.max_gpr, AGX_APPLE9_GPR_COUNT - 1u);
+
+   /* Indirect device store: data tuple (w=2), index (w=1), pointer pair (w=2). */
+   ins = {};
+   ins.op = AGX_APPLE9_VIR_DEVICE_STORE;
+   ins.encoding = AGX_APPLE9_ENC_DEVICE_STORE_INDIRECT;
+   ins.memory_components = 2;
+   ins.memory_bits = 32;
+   ins.nr_srcs = 5;
+   struct apple9_ra_operand_group data_g = apple9_ra_source_group(&ins, 0);
+   struct apple9_ra_operand_group idx_g = apple9_ra_source_group(&ins, 2);
+   struct apple9_ra_operand_group ptr_g = apple9_ra_source_group(&ins, 3);
+   EXPECT_EQ(data_g.width, 2u);
+   EXPECT_EQ(data_g.max_gpr, AGX_APPLE9_GPR_COUNT - 2u);
+   ASSERT_NE(data_g.constraint, nullptr);
+   EXPECT_EQ(data_g.constraint->role, AGX_APPLE9_OPERAND_STORE_DATA);
+   EXPECT_EQ(idx_g.width, 1u);
+   ASSERT_NE(idx_g.constraint, nullptr);
+   EXPECT_EQ(idx_g.constraint->role, AGX_APPLE9_OPERAND_INDEX);
+   EXPECT_EQ(ptr_g.width, 2u);
+   ASSERT_NE(ptr_g.constraint, nullptr);
+   EXPECT_EQ(ptr_g.constraint->role, AGX_APPLE9_OPERAND_SRC1);
+   EXPECT_EQ(ptr_g.max_gpr, 94u);
+   /* Interior lane of indirect pointer pair resolves to SRC1 as well. */
+   ASSERT_NE(apple9_ra_source_constraint(&ins, 4), nullptr);
+   EXPECT_EQ(apple9_ra_source_constraint(&ins, 4)->role, AGX_APPLE9_OPERAND_SRC1);
+
+   /* Private store multi-word data tuple respects 64-GPR bank ceiling. */
+   ins = {};
+   ins.op = AGX_APPLE9_VIR_PRIVATE_STORE;
+   ins.encoding = AGX_APPLE9_ENC_PRIVATE_STORE;
+   ins.memory_components = 4;
+   ins.memory_bits = 32;
+   ins.nr_srcs = 5;
+   struct apple9_ra_operand_group priv_data = apple9_ra_source_group(&ins, 0);
+   struct apple9_ra_operand_group priv_idx = apple9_ra_source_group(&ins, 4);
+   EXPECT_EQ(priv_data.width, 4u);
+   EXPECT_EQ(priv_data.max_gpr, 60u);
+   EXPECT_TRUE(priv_data.clobber);
+   EXPECT_EQ(priv_idx.width, 1u);
+   EXPECT_EQ(priv_idx.max_gpr, 63u);
+   EXPECT_FALSE(priv_idx.clobber);
+}
