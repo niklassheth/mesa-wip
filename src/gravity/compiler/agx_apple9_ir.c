@@ -3836,6 +3836,63 @@ fail:
    return false;
 }
 
+static uint32_t
+apple9_publication_write_mask(const struct agx_apple9_vir_instr *ins)
+{
+   if (ins->op == AGX_APPLE9_VIR_PUBLICATION_TUPLE) {
+      switch (ins->encoding) {
+      case AGX_APPLE9_ENC_TEXTURE_LOD_PARAMS:
+         /* Writes offsets 0, 1, 3 (offset 2 is reserved). */
+         return 0x0bu;
+      case AGX_APPLE9_ENC_TEXTURE_GRAD_PARAMS:
+         /* Writes offsets 0, 1, 4..7 (offsets 2, 3 are reserved). */
+         return 0xf3u;
+      case AGX_APPLE9_ENC_TEXTURE_GRAD_VOLUME_PARAMS:
+         /* Writes offsets 0..2, 4..9 (offset 3 and 10..15 are reserved). */
+         return 0x3f7u;
+      case AGX_APPLE9_ENC_TEXTURE_GRAD_VOLUME_MIN_LOD_PARAMS:
+         /* Writes offsets 0..9 (offsets 10..15 are reserved). */
+         return 0x3ffu;
+      case AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS_2D:
+         /* Writes offsets 0..3, 6, 7 (offsets 4, 5 are reserved). */
+         return 0xcfu;
+      case AGX_APPLE9_ENC_IMAGE_WRITE_PARAMS_16:
+         /* Writes offsets 0..3 (offsets 4..7 are reserved). */
+         return 0x0fu;
+      case AGX_APPLE9_ENC_BLOCK_STORE_PARAMS:
+         /* Writes offsets 0..2 (offset 3 is reserved). */
+         return 0x07u;
+      default:
+         break;
+      }
+   }
+   unsigned width = apple9_vir_dest_components(ins);
+   return (width >= 32) ? UINT32_MAX : (width ? ((1u << width) - 1u) : 0u);
+}
+
+static uint32_t
+apple9_texture_sample_read_mask(const struct agx_apple9_vir_instr *sample)
+{
+   if (sample->encoding == AGX_APPLE9_ENC_TEXTURE_GRAD) {
+      const bool volume_block = sample->texture_dimension == 3 ||
+                                sample->texture_dimension == 1 ||
+                                sample->texture_dimension == 4;
+      const bool extended = sample->texture_dimension ||
+                            sample->texture_shadow ||
+                            sample->texture_min_lod;
+      if (volume_block)
+         return sample->texture_min_lod ? 0x3ffu : 0x3f7u;
+      return extended ? 0x0ffu : 0x0f3u;
+   }
+   if (sample->encoding == AGX_APPLE9_ENC_TEXTURE_LOD) {
+      if (sample->texture_multisampled || sample->texture_dimension ||
+          sample->texture_shadow || sample->texture_min_lod)
+         return 0x0fu;
+      return 0x0bu;
+   }
+   return 0x03u;
+}
+
 bool
 agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
                                    const char **reason)
@@ -3865,6 +3922,104 @@ agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
       const struct agx_apple9_vir_instr *ins = program->instructions[i];
       if (!apple9_vir_publishes(ins))
          continue;
+      if (ins->op == AGX_APPLE9_VIR_PUBLICATION_TUPLE &&
+          ins->encoding != AGX_APPLE9_ENC_PUBLICATION_PAIR) {
+         /* Apple9 TEXTURE_SAMPLE consumes its parameter publication tuple on
+          * read; sharing one published tuple across multiple samples or across
+          * loop iterations leaves zeroed coordinates for subsequent reads on
+          * T8132 silicon. Enforce the strict single-block, single-consumer IR
+          * invariant (tracking exact written/read physical slot footprints per
+          * word so partial overwrites and reserved tuple holes cannot mask
+          * stale reads of surviving words). */
+         unsigned base = program->phys[ins->dest];
+         unsigned width = apple9_vir_dest_components(ins);
+         uint32_t live_mask = apple9_publication_write_mask(ins);
+         struct agx_apple9_block *pub_blk = agx_apple9_instr_block(ins);
+         unsigned loop_depth = 0;
+         unsigned tex_consumers = 0;
+         for (unsigned pos = i + 1; pos < program->instruction_count && live_mask;
+              ++pos) {
+            const struct agx_apple9_vir_instr *u = program->instructions[pos];
+            if (u->op == AGX_APPLE9_VIR_LOOP_MASK_PUSH)
+               loop_depth++;
+            else if (u->op == AGX_APPLE9_VIR_LOOP_MASK_POP && loop_depth > 0)
+               loop_depth--;
+
+            if (u->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE) {
+               bool reads = false;
+               uint32_t rmask = apple9_texture_sample_read_mask(u);
+               if (program->physical) {
+                  if (u->nr_srcs > 0 && u->src[0] < program->value_count &&
+                      program->publication[u->src[0]]) {
+                     unsigned u_base = program->phys[u->src[0]];
+                     uint32_t m = rmask;
+                     while (m) {
+                        unsigned bit = u_bit_scan(&m);
+                        unsigned slot = u_base + bit;
+                        if (slot >= base && slot < base + width &&
+                            slot - base < 32 &&
+                            (live_mask & (1u << (slot - base)))) {
+                           reads = true;
+                           break;
+                        }
+                     }
+                  }
+                  for (unsigned s = 1; !reads && s < u->nr_srcs; ++s) {
+                     uint32_t v = u->src[s];
+                     if (v >= program->value_count || !program->publication[v])
+                        continue;
+                     if (s < 32 && !(rmask & (1u << s)))
+                        continue;
+                     unsigned slot = program->phys[v];
+                     if (slot >= base && slot < base + width &&
+                         slot - base < 32 &&
+                         (live_mask & (1u << (slot - base)))) {
+                        reads = true;
+                        break;
+                     }
+                  }
+               } else {
+                  for (unsigned s = 0; s < u->nr_srcs; ++s) {
+                     uint32_t v = u->src[s];
+                     if (v >= program->value_count || !program->publication[v])
+                        continue;
+                     if (s < 32 && !(rmask & (1u << s)))
+                        continue;
+                     if (v >= ins->dest && v < ins->dest + width &&
+                         v - ins->dest < 32 &&
+                         (live_mask & (1u << (v - ins->dest)))) {
+                        reads = true;
+                        break;
+                     }
+                  }
+               }
+               if (reads) {
+                  if (agx_apple9_instr_block(u) != pub_blk || loop_depth > 0) {
+                     if (reason)
+                        *reason = "Apple9 texture parameter publication must stay in its consumer's block and loop";
+                     return false;
+                  }
+                  if (++tex_consumers > 1) {
+                     if (reason)
+                        *reason = "Apple9 texture parameter publication cannot be shared across samples";
+                     return false;
+                  }
+               }
+            }
+            if (program->physical && apple9_vir_publishes(u)) {
+               unsigned uw = apple9_vir_dest_components(u);
+               uint32_t wmask = apple9_publication_write_mask(u);
+               while (wmask) {
+                  unsigned uc = u_bit_scan(&wmask);
+                  if (uc >= uw)
+                     break;
+                  unsigned slot = program->phys[u->dest + uc];
+                  if (slot >= base && slot < base + width && slot - base < 32)
+                     live_mask &= ~(1u << (slot - base));
+               }
+            }
+         }
+      }
       unsigned end = apple9_publication_end(program, i);
       for (unsigned c = 0; c < apple9_vir_dest_components(ins); ++c) {
          unsigned index = program->phys[ins->dest + c];
@@ -4882,129 +5037,13 @@ apple9_materialize_pending_result_at(struct agx_apple9_vir_program *program,
                                      unsigned producer_index,
                                      unsigned insertion, const char **reason);
 
-/* Deduplicate identical texture-parameter PUBLICATION_TUPLEs within the same
- * basic block whenever the earlier tuple is still live at the duplicate site.
- * Because the earlier tuple's publication lifetime already spans the duplicate,
- * sharing it strictly reduces live publication words and eliminates redundant
- * publication moves without risking publication-slot exhaustion. */
-static void
-apple9_dedup_publication_tuples(struct agx_apple9_vir_program *program)
-{
-   if (program->physical || program->instruction_count < 2 ||
-       !agx_apple9_analyze_uses(program))
-      return;
-
-   unsigned count = program->instruction_count;
-   unsigned *pub_end = malloc(count * sizeof(unsigned));
-   bool *eligible = calloc(count, sizeof(bool));
-   if (!pub_end || !eligible) {
-      free(pub_end);
-      free(eligible);
-      return;
-   }
-
-   for (unsigned i = 0; i < count; ++i) {
-      const struct agx_apple9_vir_instr *ins = program->instructions[i];
-      if (ins->op != AGX_APPLE9_VIR_PUBLICATION_TUPLE ||
-          ins->encoding == AGX_APPLE9_ENC_PUBLICATION_PAIR ||
-          ins->dest == AGX_APPLE9_VREG_INVALID || ins->dest_components == 0)
-         continue;
-      bool tex_only = true;
-      bool any_use = false;
-      for (unsigned c = 0; c < ins->dest_components && tex_only; ++c) {
-         for (const struct agx_apple9_use *u =
-                 agx_apple9_uses(program, ins->dest + c);
-              u; u = u->next) {
-            any_use = true;
-            if (u->instruction->op != AGX_APPLE9_VIR_TEXTURE_SAMPLE) {
-               tex_only = false;
-               break;
-            }
-         }
-      }
-      if (!any_use || !tex_only)
-         continue;
-      eligible[i] = true;
-      pub_end[i] = apple9_publication_end(program, i);
-   }
-
-   struct util_dynarray to_remove = UTIL_DYNARRAY_INIT;
-   for (unsigned i = 0; i < count; ++i) {
-      if (!eligible[i])
-         continue;
-      struct agx_apple9_vir_instr *cur = program->instructions[i];
-      struct agx_apple9_block *blk = agx_apple9_instr_block(cur);
-      unsigned match = UINT_MAX;
-      for (unsigned j = i; j-- > 0; ) {
-         struct agx_apple9_vir_instr *prev = program->instructions[j];
-         if (agx_apple9_instr_block(prev) != blk)
-            break;
-         if (apple9_vir_is_control_side_effect(prev->op) ||
-             prev->op == AGX_APPLE9_VIR_COVERAGE)
-            break;
-         if (!eligible[j] || pub_end[j] < i)
-            continue;
-         if (prev->encoding != cur->encoding ||
-             prev->dest_components != cur->dest_components ||
-             prev->nr_srcs != cur->nr_srcs ||
-             prev->immediate != cur->immediate)
-            continue;
-         bool same_srcs = true;
-         for (unsigned s = 0; s < cur->nr_srcs; ++s) {
-            if (prev->src[s] != cur->src[s]) {
-               same_srcs = false;
-               break;
-            }
-         }
-         if (!same_srcs)
-            continue;
-         match = j;
-         break;
-      }
-      if (match == UINT_MAX)
-         continue;
-
-      struct agx_apple9_vir_instr *prev = program->instructions[match];
-      for (unsigned c = 0; c < cur->dest_components; ++c) {
-         uint32_t old_v = cur->dest + c;
-         uint32_t new_v = prev->dest + c;
-         for (const struct agx_apple9_use *u = agx_apple9_uses(program, old_v);
-              u; u = u->next) {
-            struct agx_apple9_vir_instr *user =
-               (struct agx_apple9_vir_instr *)u->instruction;
-            for (unsigned s = 0; s < user->nr_srcs; ++s) {
-               if (user->src[s] == old_v)
-                  user->src[s] = new_v;
-            }
-         }
-         if (program->max_phys &&
-             program->max_phys[old_v] != AGX_APPLE9_PHYS_INVALID &&
-             (program->max_phys[new_v] == AGX_APPLE9_PHYS_INVALID ||
-              program->max_phys[old_v] < program->max_phys[new_v]))
-            program->max_phys[new_v] = program->max_phys[old_v];
-      }
-      pub_end[match] = MAX2(pub_end[match], pub_end[i]);
-      eligible[i] = false;
-      util_dynarray_append(&to_remove, cur);
-   }
-
-   unsigned remove_count =
-      util_dynarray_num_elements(&to_remove, struct agx_apple9_vir_instr *);
-   if (remove_count > 0) {
-      agx_apple9_vir_remove_many(program, to_remove.data, remove_count);
-      agx_apple9_invalidate_uses(program);
-   }
-
-   util_dynarray_fini(&to_remove);
-   free(pub_end);
-   free(eligible);
-}
-
 bool
 agx_apple9_allocate_publications(struct agx_apple9_vir_program *program,
                                  const char **reason)
 {
-   apple9_dedup_publication_tuples(program);
+   /* Do not deduplicate texture PUBLICATION_TUPLEs across samples: Apple9
+    * TEXTURE_SAMPLE consumes its p0..pN coordinate publication on read, so a
+    * second sample reading the same published tuple observes zeroed coords. */
 retry:
    free(program->publication);
    free(program->phys);
@@ -5100,6 +5139,7 @@ retry:
                   program->instructions[insert_pos];
                if (agx_apple9_instr_block(k_ins) != victim_blk ||
                    k_ins->op == AGX_APPLE9_VIR_PHI_SRC ||
+                   k_ins->op == AGX_APPLE9_VIR_COVERAGE ||
                    apple9_vir_is_control_side_effect(k_ins->op))
                   break;
                insert_pos++;
@@ -5310,9 +5350,20 @@ apple9_materialize_pending_result_at(struct agx_apple9_vir_program *program,
 
    materialize_instructions[0]->scoreboard_materialize = true;
 
-   if (insertion == earliest_insertion) {
-      /* A return handoff belongs to its producer, even when the next
-       * instruction starts a loop header. Backedges must not repeat it. */
+   const bool attach_to_prev_block =
+      insertion == earliest_insertion ||
+      (insertion < old_count &&
+       agx_apple9_instr_block(program->instructions[insertion]) !=
+          agx_apple9_instr_block(program->instructions[insertion - 1]) &&
+       agx_apple9_instr_block(program->instructions[insertion - 1]) ==
+          agx_apple9_instr_block(program->instructions[producer_index]) &&
+       !apple9_vir_is_control_side_effect(
+          program->instructions[insertion - 1]->op) &&
+       program->instructions[insertion - 1]->op != AGX_APPLE9_VIR_PHI_SRC);
+   if (attach_to_prev_block) {
+      /* A return handoff belongs to its producer's block, even when the next
+       * instruction starts a successor or loop header. Backedges and other
+       * predecessors must not execute it. */
       struct apple9_instruction_node *after =
          apple9_node(program->instructions[insertion - 1]);
       for (unsigned c = 0; c < components; ++c) {

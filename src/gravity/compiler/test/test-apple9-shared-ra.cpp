@@ -1377,10 +1377,12 @@ TEST(Apple9SharedRa, EmptyProgramAllocatesCleanly)
    ralloc_free(nir.shader);
 }
 
-TEST(Apple9SharedRa, PublicationTupleDedupAndLateHandoffPlacement)
+TEST(Apple9SharedRa, PublicationTupleSingleConsumerAndLateHandoffPlacement)
 {
-   /* 1. Four overlapping textures sharing identical (u, v, lod) operands must
-    *    deduplicate into a single 4-word PUBLICATION_TUPLE (4 pub words, not 16). */
+   /* 1. Four overlapping textures with identical (u, v, lod) operands must
+    *    retain distinct PUBLICATION_TUPLEs (16 pub words, 1 consumer each):
+    *    Apple9 TEXTURE_SAMPLE consumes its p0..pN publication on read, so a
+    *    second sample reading the same tuple sees zeroed coordinates. */
    {
       agx_apple9_vir_program p;
       agx_apple9_vir_init(&p);
@@ -1409,12 +1411,63 @@ TEST(Apple9SharedRa, PublicationTupleDedupAndLateHandoffPlacement)
       unsigned pub_tuples = 0;
       for (unsigned i = 0; i < p.instruction_count; ++i)
          pub_tuples += (p.instructions[i]->op == AGX_APPLE9_VIR_PUBLICATION_TUPLE);
-      EXPECT_EQ(pub_tuples, 1u);
-      EXPECT_EQ(p.publication_count, 4u);
+      EXPECT_EQ(pub_tuples, 4u);
+      EXPECT_EQ(p.publication_count, 16u);
       agx_apple9_vir_finish(&p);
    }
 
-   /* 2. Nine distinct overlapping textures exceed the 32-word p0..p31 bank:
+   /* 2. Validator must reject a texture PUBLICATION_TUPLE shared across two
+    *    TEXTURE_SAMPLE consumers. */
+   {
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      auto *blk = agx_apple9_block_create(&p);
+      agx_apple9_block_begin(&p, blk);
+
+      uint32_t u = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                       AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+      uint32_t v = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                       AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+      uint32_t coords[2] = {u, v};
+      uint32_t s0 = agx_apple9_vir_emit_texture_sample_mov(&p, coords, 0, 0);
+      uint32_t s1 = agx_apple9_vir_emit_texture_sample_mov(&p, coords, 1, 0);
+      ASSERT_NE(s0, AGX_APPLE9_VREG_INVALID);
+      ASSERT_NE(s1, AGX_APPLE9_VREG_INVALID);
+
+      /* Manually rewrite the second sample to share the first tuple's dest. */
+      struct agx_apple9_vir_instr *pub0 = nullptr;
+      struct agx_apple9_vir_instr *tex1 = nullptr;
+      unsigned tex_seen = 0;
+      for (unsigned i = 0; i < p.instruction_count; ++i) {
+         auto *ins = p.instructions[i];
+         if (!pub0 && ins->op == AGX_APPLE9_VIR_PUBLICATION_TUPLE)
+            pub0 = ins;
+         if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE && ++tex_seen == 2)
+            tex1 = ins;
+      }
+      ASSERT_NE(pub0, nullptr);
+      ASSERT_NE(tex1, nullptr);
+      tex1->src[0] = pub0->dest;
+      tex1->src[1] = pub0->dest + 1;
+      uint32_t sum_src[2] = {s0, s1};
+      uint32_t sum = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR,
+                                         AGX_APPLE9_ENC_LOGIC_EXTENDED, sum_src, 2, 0);
+      p.output = sum;
+
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << (reason ?: "");
+      for (unsigned val = 0; val < p.value_count; ++val) {
+         if (!p.publication[val])
+            p.phys[val] = val % 16;
+      }
+      p.dependencies_finalized = true;
+      EXPECT_FALSE(agx_apple9_validate_vir_allocation(&p, &reason));
+      ASSERT_NE(reason, nullptr);
+      EXPECT_NE(strstr(reason, "cannot be shared across samples"), nullptr);
+      agx_apple9_vir_finish(&p);
+   }
+
+   /* 3. Nine distinct overlapping textures exceed the 32-word p0..p31 bank:
     *    the publication-relief handoff must be placed right before the 9th
     *    texture's PUBLICATION_TUPLE (AFTER textures 0..7 have all issued),
     *    NOT immediately at t+1 after texture 0! */
@@ -1458,6 +1511,409 @@ TEST(Apple9SharedRa, PublicationTupleDedupAndLateHandoffPlacement)
       }
       EXPECT_TRUE(found_handoff);
       EXPECT_EQ(samples_before_handoff, 8u);
+      agx_apple9_vir_finish(&p);
+   }
+
+   /* 4. Cross-block fall-through with trailing ALU in the producer block:
+    *    late publication-relief handoff must stay at the end of entry and not
+    *    cross into successor (e.g. ahead of successor PHIs or merge code). */
+   {
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      auto *entry = agx_apple9_block_create(&p);
+      agx_apple9_block_begin(&p, entry);
+      uint32_t zero = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                          AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+      uint32_t coords[2] = {zero, zero};
+      uint32_t first = agx_apple9_vir_emit_texture_lod(&p, coords, zero, 0, 0, true);
+      /* Trailing ALU after the victim sample before falling through to successor. */
+      uint32_t trailing_src[2] = {zero, zero};
+      uint32_t trailing = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR,
+                                              AGX_APPLE9_ENC_LOGIC_EXTENDED,
+                                              trailing_src, 2, 0);
+      ASSERT_NE(trailing, AGX_APPLE9_VREG_INVALID);
+
+      auto *successor = agx_apple9_block_create(&p);
+      agx_apple9_block_begin(&p, successor);
+      for (unsigned t = 1; t <= 8; ++t) {
+         uint32_t lod_t = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                              AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0,
+                                              t << 16);
+         agx_apple9_vir_emit_texture_lod(&p, coords, lod_t, t, 0, true);
+      }
+      p.output = first;
+
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << (reason ?: "");
+      unsigned handoffs = 0;
+      for (unsigned i = 0; i < p.instruction_count; ++i) {
+         const auto *ins = p.instructions[i];
+         if (ins->publication_handoff) {
+            EXPECT_EQ(agx_apple9_instr_block(ins), entry);
+            handoffs++;
+         }
+      }
+      EXPECT_EQ(handoffs, 1u);
+      EXPECT_NE(p.output, first);
+      agx_apple9_vir_finish(&p);
+   }
+
+   /* 5. Physical VIR: partial overwrite of p2..p3 must NOT hide a stale read
+    *    of consumed p0..p1, whereas full overwrite of p0..p3 is valid. */
+   {
+      auto run_phys_partial = [](bool full_overwrite) -> bool {
+         agx_apple9_vir_program p;
+         agx_apple9_vir_init(&p);
+         auto *blk = agx_apple9_block_create(&p);
+         agx_apple9_block_begin(&p, blk);
+
+         uint32_t u = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                          AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+         uint32_t v = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                          AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+         uint32_t lod = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                            AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+         uint32_t coords[2] = {u, v};
+         uint32_t s0 = agx_apple9_vir_emit_texture_lod(&p, coords, lod, 0, 0, false);
+         uint32_t h0_src[2] = {s0, s0};
+         uint32_t h0 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR,
+                                           AGX_APPLE9_ENC_LOGIC_EXTENDED, h0_src, 2, 0);
+         p.instructions[p.instruction_count - 1]->scoreboard_slot =
+            AGX_APPLE9_SCOREBOARD_SLOT_1;
+
+         uint32_t s1 = full_overwrite
+                          ? agx_apple9_vir_emit_texture_lod(&p, coords, lod, 1, 0, false)
+                          : agx_apple9_vir_emit_texture_sample_mov(&p, coords, 1, 0);
+         uint32_t h1_src[2] = {s1, s1};
+         uint32_t h1 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR,
+                                           AGX_APPLE9_ENC_LOGIC_EXTENDED, h1_src, 2, 0);
+         p.instructions[p.instruction_count - 1]->scoreboard_slot =
+            AGX_APPLE9_SCOREBOARD_SLOT_1;
+
+         uint32_t s2 = agx_apple9_vir_emit_texture_sample_mov(&p, coords, 2, 0);
+         /* Remove the 3rd sample's own publication so it reads stale p0..p1
+          * in the partial-overwrite case (or overwritten p0..p1 in full). */
+         struct agx_apple9_vir_instr *pub2 = nullptr;
+         struct agx_apple9_vir_instr *pub0 = nullptr;
+         struct agx_apple9_vir_instr *pub1 = nullptr;
+         struct agx_apple9_vir_instr *tex2 = nullptr;
+         unsigned pub_seen = 0, tex_seen = 0;
+         for (unsigned i = 0; i < p.instruction_count; ++i) {
+            auto *ins = p.instructions[i];
+            if (ins->op == AGX_APPLE9_VIR_PUBLICATION_TUPLE) {
+               if (pub_seen == 0) pub0 = ins;
+               else if (pub_seen == 1) pub1 = ins;
+               else if (pub_seen == 2) pub2 = ins;
+               pub_seen++;
+            }
+            if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE && ++tex_seen == 3)
+               tex2 = ins;
+         }
+         EXPECT_NE(pub0, nullptr);
+         EXPECT_NE(pub1, nullptr);
+         EXPECT_NE(pub2, nullptr);
+         EXPECT_NE(tex2, nullptr);
+         if (!full_overwrite) {
+            tex2->src[0] = pub0->dest;
+            tex2->src[1] = pub0->dest + 1;
+            struct agx_apple9_vir_instr *rem[1] = {pub2};
+            agx_apple9_vir_remove_many(&p, rem, 1);
+         }
+
+         uint32_t h2_src[2] = {s2, h0};
+         uint32_t h2 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR,
+                                           AGX_APPLE9_ENC_LOGIC_EXTENDED, h2_src, 2, 0);
+         p.instructions[p.instruction_count - 1]->scoreboard_slot =
+            AGX_APPLE9_SCOREBOARD_SLOT_1;
+         uint32_t out_src[2] = {h2, h1};
+         p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR,
+                                        AGX_APPLE9_ENC_LOGIC_EXTENDED, out_src, 2, 0);
+
+         const char *reason = nullptr;
+         EXPECT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << (reason ?: "");
+         p.physical = true;
+         /* Force physical slots: pub0=p0..p3, pub1=p2..p3 (partial) or p0..p3 (full). */
+         for (unsigned c = 0; c < pub0->dest_components; ++c)
+            p.phys[pub0->dest + c] = c;
+         for (unsigned c = 0; c < pub1->dest_components; ++c)
+            p.phys[pub1->dest + c] = full_overwrite ? c : (2 + c);
+         if (full_overwrite) {
+            for (unsigned c = 0; c < pub2->dest_components; ++c)
+               p.phys[pub2->dest + c] = c;
+         }
+         unsigned gpr = 0;
+         for (unsigned val = 0; val < p.value_count; ++val) {
+            if (!p.publication[val])
+               p.phys[val] = gpr++;
+         }
+         p.dependencies_finalized = true;
+         bool ok = agx_apple9_validate_vir_allocation(&p, &reason);
+         if (!full_overwrite) {
+            EXPECT_FALSE(ok);
+            EXPECT_NE(reason, nullptr);
+            if (reason) {
+               EXPECT_NE(strstr(reason, "cannot be shared across samples"), nullptr)
+                  << reason;
+            }
+         } else {
+            EXPECT_TRUE(ok) << (reason ?: "");
+         }
+         agx_apple9_vir_finish(&p);
+         return ok;
+      };
+      EXPECT_FALSE(run_phys_partial(false));
+      EXPECT_TRUE(run_phys_partial(true));
+   }
+
+   /* 5b. Implicit gradient read footprint: overwriting p0..p1 with a
+    *     PUBLICATION_PAIR after a 2D TEXTURE_GRAD leaves consumed derivatives
+    *     in p4..p7; a second TEXTURE_GRAD at p0 must still be rejected. */
+   {
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      auto *blk = agx_apple9_block_create(&p);
+      agx_apple9_block_begin(&p, blk);
+      uint32_t zero = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                          AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+      uint32_t gsrc[6] = {zero, zero, zero, zero, zero, zero};
+      uint32_t s0 = agx_apple9_vir_emit_texture_grad(&p, gsrc, 0, 0, 0, false, false);
+      uint32_t h0_src[2] = {s0, s0};
+      uint32_t h0 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR,
+                                        AGX_APPLE9_ENC_LOGIC_EXTENDED, h0_src, 2, 0);
+      p.instructions[p.instruction_count - 1]->scoreboard_slot =
+         AGX_APPLE9_SCOREBOARD_SLOT_1;
+
+      uint32_t pair_src[2] = {zero, zero};
+      uint32_t pair = agx_apple9_vir_emit_publication_pair(&p, pair_src, false);
+      ASSERT_NE(pair, AGX_APPLE9_VREG_INVALID);
+
+      uint32_t s1 = agx_apple9_vir_emit_texture_grad(&p, gsrc, 1, 0, 0, false, false);
+      struct agx_apple9_vir_instr *pub0 = nullptr, *pair_ins = nullptr,
+                                  *pub1 = nullptr, *tex1 = nullptr;
+      for (unsigned i = 0; i < p.instruction_count; ++i) {
+         auto *ins = p.instructions[i];
+         if (ins->op == AGX_APPLE9_VIR_PUBLICATION_TUPLE) {
+            if (ins->encoding == AGX_APPLE9_ENC_PUBLICATION_PAIR)
+               pair_ins = ins;
+            else if (!pub0)
+               pub0 = ins;
+            else
+               pub1 = ins;
+         }
+         if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE)
+            tex1 = ins;
+      }
+      ASSERT_NE(pub0, nullptr);
+      ASSERT_NE(pair_ins, nullptr);
+      ASSERT_NE(pub1, nullptr);
+      ASSERT_NE(tex1, nullptr);
+      tex1->src[0] = pub0->dest;
+      struct agx_apple9_vir_instr *rem[1] = {pub1};
+      agx_apple9_vir_remove_many(&p, rem, 1);
+
+      uint32_t h1_src[2] = {s1, h0};
+      p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR,
+                                     AGX_APPLE9_ENC_LOGIC_EXTENDED, h1_src, 2, 0);
+      p.instructions[p.instruction_count - 1]->scoreboard_slot =
+         AGX_APPLE9_SCOREBOARD_SLOT_1;
+
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << (reason ?: "");
+      p.physical = true;
+      for (unsigned c = 0; c < pub0->dest_components; ++c)
+         p.phys[pub0->dest + c] = c;
+      for (unsigned c = 0; c < pair_ins->dest_components; ++c)
+         p.phys[pair_ins->dest + c] = c;
+      unsigned gpr = 0;
+      for (unsigned val = 0; val < p.value_count; ++val) {
+         if (!p.publication[val])
+            p.phys[val] = gpr++;
+      }
+      p.dependencies_finalized = true;
+      EXPECT_FALSE(agx_apple9_validate_vir_allocation(&p, &reason));
+      ASSERT_NE(reason, nullptr);
+      EXPECT_NE(strstr(reason, "cannot be shared across samples"), nullptr) << reason;
+      agx_apple9_vir_finish(&p);
+   }
+
+   /* 5c. Reserved tuple holes are not overwrites: TEXTURE_GRAD_PARAMS at p0..p7
+    *     writes offsets 0,1,4..7 and leaves consumed p3 from an earlier
+    *     TEXTURE_LOD_PARAMS untouched. A following TEXTURE_LOD at p0 must be
+    *     rejected, while a valid 2D TEXTURE_GRAD at p0 must be accepted. */
+   {
+      auto run_grad_hole = [](bool second_is_lod) -> bool {
+         agx_apple9_vir_program p;
+         agx_apple9_vir_init(&p);
+         auto *blk = agx_apple9_block_create(&p);
+         agx_apple9_block_begin(&p, blk);
+         uint32_t zero = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                             AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+         uint32_t coords[2] = {zero, zero};
+         uint32_t s0 = agx_apple9_vir_emit_texture_lod(&p, coords, zero, 0, 0, false);
+         uint32_t h0_src[2] = {s0, s0};
+         uint32_t h0 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR,
+                                           AGX_APPLE9_ENC_LOGIC_EXTENDED, h0_src, 2, 0);
+         p.instructions[p.instruction_count - 1]->scoreboard_slot =
+            AGX_APPLE9_SCOREBOARD_SLOT_1;
+
+         uint32_t gsrc[6] = {zero, zero, zero, zero, zero, zero};
+         uint32_t s1 = agx_apple9_vir_emit_texture_grad(&p, gsrc, 1, 0, 0, false, false);
+         struct agx_apple9_vir_instr *pub_lod = nullptr, *pub_grad = nullptr,
+                                     *tex_grad = nullptr;
+         for (unsigned i = 0; i < p.instruction_count; ++i) {
+            auto *ins = p.instructions[i];
+            if (ins->op == AGX_APPLE9_VIR_PUBLICATION_TUPLE) {
+               if (!pub_lod) pub_lod = ins;
+               else pub_grad = ins;
+            }
+            if (ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE)
+               tex_grad = ins;
+         }
+         EXPECT_NE(pub_lod, nullptr);
+         EXPECT_NE(pub_grad, nullptr);
+         EXPECT_NE(tex_grad, nullptr);
+
+         uint32_t final_res = s1;
+         if (second_is_lod) {
+            /* Replace tex_grad with a second TEXTURE_LOD reading p0..p3 (stale p3!). */
+            struct agx_apple9_vir_instr *rem[1] = {tex_grad};
+            agx_apple9_vir_remove_many(&p, rem, 1);
+            uint32_t s2 = agx_apple9_vir_emit_texture_lod(&p, coords, zero, 2, 0, false);
+            struct agx_apple9_vir_instr *pub2 = p.instructions[p.instruction_count - 2];
+            struct agx_apple9_vir_instr *tex2 = p.instructions[p.instruction_count - 1];
+            for (unsigned c = 0; c < 4; ++c)
+               tex2->src[c] = pub_lod->dest + c;
+            struct agx_apple9_vir_instr *rem2[1] = {pub2};
+            agx_apple9_vir_remove_many(&p, rem2, 1);
+            final_res = s2;
+         }
+         uint32_t h1_src[2] = {final_res, h0};
+         p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR,
+                                        AGX_APPLE9_ENC_LOGIC_EXTENDED, h1_src, 2, 0);
+         p.instructions[p.instruction_count - 1]->scoreboard_slot =
+            AGX_APPLE9_SCOREBOARD_SLOT_1;
+
+         const char *reason = nullptr;
+         EXPECT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << (reason ?: "");
+         p.physical = true;
+         for (unsigned c = 0; c < pub_lod->dest_components; ++c)
+            p.phys[pub_lod->dest + c] = c;
+         for (unsigned c = 0; c < pub_grad->dest_components; ++c)
+            p.phys[pub_grad->dest + c] = c;
+         unsigned gpr = 0;
+         for (unsigned val = 0; val < p.value_count; ++val) {
+            if (!p.publication[val])
+               p.phys[val] = gpr++;
+         }
+         p.dependencies_finalized = true;
+         bool ok = agx_apple9_validate_vir_allocation(&p, &reason);
+         if (second_is_lod) {
+            EXPECT_FALSE(ok);
+            EXPECT_NE(reason, nullptr);
+            if (reason) {
+               EXPECT_NE(strstr(reason, "cannot be shared across samples"), nullptr)
+                  << reason;
+            }
+         } else {
+            EXPECT_TRUE(ok) << (reason ?: "");
+         }
+         agx_apple9_vir_finish(&p);
+         return ok;
+      };
+      EXPECT_FALSE(run_grad_hole(true));
+      EXPECT_TRUE(run_grad_hole(false));
+   }
+
+   /* 6. Cross-block and loop-carried texture publications (published before a
+    *    block boundary or LOOP_MASK_PUSH, sampled inside) must be rejected. */
+   for (int mode = 0; mode < 2; ++mode) {
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      auto *pre = agx_apple9_block_create(&p);
+      agx_apple9_block_begin(&p, pre);
+      uint32_t u = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                       AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+      uint32_t v = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                       AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+      uint32_t coords[2] = {u, v};
+      uint32_t s0 = agx_apple9_vir_emit_texture_sample_mov(&p, coords, 0, 0);
+      struct agx_apple9_vir_instr *tex0 = p.instructions[p.instruction_count - 1];
+      ASSERT_EQ(tex0->op, AGX_APPLE9_VIR_TEXTURE_SAMPLE);
+
+      if (mode == 0) {
+         /* Cross-block: move the sample into a successor block. */
+         auto *body = agx_apple9_block_create(&p);
+         agx_apple9_block_begin(&p, body);
+      } else {
+         /* Same-block loop: push loop mask before the sample. */
+         ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+            &p, AGX_APPLE9_VIR_LOOP_MASK_PUSH, AGX_APPLE9_ENC_LOOP_MASK_PUSH,
+            nullptr, 0, 0));
+      }
+      uint32_t h_src[2] = {s0, s0};
+      uint32_t h = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR,
+                                       AGX_APPLE9_ENC_LOGIC_EXTENDED, h_src, 2, 0);
+      struct agx_apple9_vir_instr *h_ins = p.instructions[p.instruction_count - 1];
+      h_ins->scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1;
+      agx_apple9_vir_move_before(&p, tex0, h_ins);
+      if (mode == 1) {
+         ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+            &p, AGX_APPLE9_VIR_LOOP_MASK_POP, AGX_APPLE9_ENC_LOOP_MASK_POP,
+            nullptr, 0, 0));
+      }
+      p.output = h;
+
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << (reason ?: "");
+      unsigned gpr = 0;
+      for (unsigned val = 0; val < p.value_count; ++val) {
+         if (!p.publication[val])
+            p.phys[val] = gpr++;
+      }
+      p.dependencies_finalized = true;
+      EXPECT_FALSE(agx_apple9_validate_vir_allocation(&p, &reason));
+      ASSERT_NE(reason, nullptr);
+      EXPECT_NE(strstr(reason, "consumer's block and loop"), nullptr) << reason;
+      agx_apple9_vir_finish(&p);
+   }
+
+   /* 7. Publication-relief handoff must stop before AGX_APPLE9_VIR_COVERAGE. */
+   {
+      agx_apple9_vir_program p;
+      agx_apple9_vir_init(&p);
+      auto *blk = agx_apple9_block_create(&p);
+      agx_apple9_block_begin(&p, blk);
+      uint32_t zero = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                          AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 0);
+      uint32_t coords[2] = {zero, zero};
+      uint32_t first = agx_apple9_vir_emit_texture_lod(&p, coords, zero, 0, 0, true);
+      uint32_t publish[2] = {zero, zero};
+      uint32_t cov_ctl = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IOR,
+                                             AGX_APPLE9_ENC_LOGIC_EXPORT,
+                                             publish, 2, 0);
+      ASSERT_NE(cov_ctl, AGX_APPLE9_VREG_INVALID);
+      ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+         &p, AGX_APPLE9_VIR_COVERAGE, AGX_APPLE9_ENC_COVERAGE, &cov_ctl, 1, 0));
+      for (unsigned t = 1; t <= 8; ++t) {
+         uint32_t lod_t = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMM,
+                                              AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0,
+                                              t << 16);
+         agx_apple9_vir_emit_texture_lod(&p, coords, lod_t, t, 0, true);
+      }
+      p.output = first;
+
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_apple9_allocate_publications(&p, &reason)) << (reason ?: "");
+      unsigned handoff_pos = UINT_MAX, cov_pos = UINT_MAX;
+      for (unsigned i = 0; i < p.instruction_count; ++i) {
+         if (p.instructions[i]->publication_handoff)
+            handoff_pos = i;
+         if (p.instructions[i]->op == AGX_APPLE9_VIR_COVERAGE)
+            cov_pos = i;
+      }
+      ASSERT_NE(handoff_pos, UINT_MAX);
+      ASSERT_NE(cov_pos, UINT_MAX);
+      EXPECT_LT(handoff_pos, cov_pos);
       agx_apple9_vir_finish(&p);
    }
 }
