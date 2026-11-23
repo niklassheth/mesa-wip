@@ -818,6 +818,10 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    memcpy(full + key_size, &suffix, sizeof(suffix));
    gs = hk_meta_shader(dev, hk_apple9_passthrough_gs, full,
                        key_size + sizeof(suffix));
+   if (!gs) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
    gs->is_passthrough = true;
    hk_cmd_bind_graphics_shader(cmd, MESA_SHADER_GEOMETRY, gs);
 }

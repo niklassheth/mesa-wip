@@ -38,6 +38,10 @@ enum hk_feature_key {
     * both descriptorBuffer and sparseResidencyBuffer (vkGetDescriptorEXT
     * cannot attach a buffer residency table). */
    HK_FEAT_CHECKED_BUF_STORES = BITFIELD_BIT(4),
+   /* Pipeline statistics queries instrument fragment shaders. */
+   HK_FEAT_PIPELINE_STATS = BITFIELD_BIT(5),
+   /* Primitives-generated queries require SW VS/TES variants for passthrough GS. */
+   HK_FEAT_PRIMS_GENERATED = BITFIELD_BIT(6),
 };
 
 

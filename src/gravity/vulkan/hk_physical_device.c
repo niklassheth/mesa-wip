@@ -1997,6 +1997,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       result = VK_ERROR_INCOMPATIBLE_DRIVER;
       goto fail_pdev_alloc;
    }
+   /* Ownership of fd transferred to pdev->dev (closed by agx_close_device). */
+   fd = -1;
 
    /* This Vulkan driver targets Apple9 (G16/G17) hardware only. */
    if (pdev->dev.params.gpu_generation < 16) {
@@ -2146,7 +2148,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    assert(pdev->queue_family_count <= ARRAY_SIZE(pdev->queue_families));
 
    unsigned st_idx = 0;
-   pdev->syncobj_sync_type = vk_drm_syncobj_get_type(fd);
+   pdev->syncobj_sync_type = vk_drm_syncobj_get_type(pdev->dev.fd);
    pdev->sync_types[st_idx++] = &pdev->syncobj_sync_type;
    pdev->sync_types[st_idx++] = NULL;
    assert(st_idx <= ARRAY_SIZE(pdev->sync_types));
@@ -2167,12 +2169,13 @@ fail_disk_cache:
 fail_agx_device:
    agx_close_device(&pdev->dev);
 fail_pdev_alloc:
-   if (pdev->master_fd)
+   if (pdev->master_fd >= 0)
       close(pdev->master_fd);
 
    vk_free(&instance->vk.alloc, pdev);
 fail_fd:
-   close(fd);
+   if (fd >= 0)
+      close(fd);
    return result;
 }
 

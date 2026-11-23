@@ -726,9 +726,15 @@ struct hk_apple9_graphics_key {
    /* stippledLineEnable: lines measure a stipple counter in the fragment
     * shader, see hk_apple9_lower_line_stipple_fs. */
    bool line_stipple;
+   /* Line stipple may be enabled statically, dynamically, or via GPL/ESO. */
+   bool may_line_stipple;
    /* Polygon mode POINT: triangles may be drawn by the software polygon
     * stage, see hk_apple9_polygon_point_gs. */
    bool polygon_points;
+   /* Polygon mode POINT may be enabled statically, dynamically, or via GPL/ESO. */
+   bool may_polygon_points;
+   /* VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR: independently compiled GPL library. */
+   bool is_library;
    /* A passthrough geometry shader rasterizing for a vertex stage that
     * publishes interpolated cull planes, see hk_apple9_compile_vertex_culls.
     * Otherwise geometry shaders publish one flat primitive cull mask. */

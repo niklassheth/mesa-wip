@@ -177,6 +177,100 @@ main(void)
    CHECK(!disables_merging(dev, false, false));
    CHECK(!disables_merging(dev, false, true));
 
+   /* Cache key distinguishes static vs dynamic polygon mode / line stipple / GPL. */
+   {
+      const struct vk_rasterization_state rs_fill = {
+         .polygon_mode = VK_POLYGON_MODE_FILL,
+      };
+      struct vk_graphics_pipeline_state s_static = {.rs = &rs_fill};
+      struct vk_graphics_pipeline_state s_dyn_poly = s_static;
+      BITSET_SET(s_dyn_poly.dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE);
+      struct vk_graphics_pipeline_state s_dyn_stipple = s_static;
+      BITSET_SET(s_dyn_stipple.dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE);
+      struct vk_graphics_pipeline_state s_gpl = s_static;
+      s_gpl.pipeline_flags = VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR;
+
+      struct hk_apple9_graphics_key k_static, k_dyn_poly, k_dyn_stipple, k_gpl;
+      hk_apple9_graphics_key(&k_static, &s_static);
+      hk_apple9_graphics_key(&k_dyn_poly, &s_dyn_poly);
+      hk_apple9_graphics_key(&k_dyn_stipple, &s_dyn_stipple);
+      hk_apple9_graphics_key(&k_gpl, &s_gpl);
+
+      CHECK(!k_static.may_polygon_points && !k_static.may_line_stipple &&
+            !k_static.is_library);
+      CHECK(k_dyn_poly.may_polygon_points && !k_dyn_poly.polygon_points);
+      CHECK(k_dyn_stipple.may_line_stipple && !k_dyn_stipple.line_stipple);
+      CHECK(k_gpl.is_library);
+      CHECK(memcmp(&k_static, &k_dyn_poly, sizeof(k_static)) != 0);
+      CHECK(memcmp(&k_static, &k_dyn_stipple, sizeof(k_static)) != 0);
+      CHECK(memcmp(&k_static, &k_gpl, sizeof(k_static)) != 0);
+   }
+
+   /* Feature key distinguishes pipelineStatisticsQuery & primitivesGeneratedQuery. */
+   {
+      struct vk_features base = {0};
+      struct vk_features f_stats = {.pipelineStatisticsQuery = true};
+      struct vk_features f_pgq = {.primitivesGeneratedQuery = true};
+      CHECK(hk_make_feature_key(&base) != hk_make_feature_key(&f_stats));
+      CHECK(hk_make_feature_key(&base) != hk_make_feature_key(&f_pgq));
+      CHECK(hk_make_feature_key(&f_stats) != hk_make_feature_key(&f_pgq));
+   }
+
+   /* Application line-strip GS with dynamic line stipple retains TEX6/TEX7
+    * exports while leaving FS unstippled for the draw-time stipple prolog. */
+   {
+      nir_builder gb = nir_builder_init_simple_shader(
+         MESA_SHADER_GEOMETRY, &agx_nir_options, "gs_dyn_stipple");
+      gb.shader->info.internal = false;
+      gb.shader->info.gs.input_primitive = MESA_PRIM_LINES;
+      gb.shader->info.gs.output_primitive = MESA_PRIM_LINE_STRIP;
+      gb.shader->info.gs.vertices_in = 2;
+      gb.shader->info.gs.vertices_out = 2;
+      gb.shader->info.gs.invocations = 1;
+      gb.shader->info.gs.active_stream_mask = 1;
+      for (unsigned v = 0; v < 2; ++v) {
+         nir_store_output(&gb, nir_imm_vec4(&gb, v ? 1.0f : -1.0f, 0, 0, 1),
+                          nir_imm_int(&gb, 0), .write_mask = 0xf,
+                          .src_type = nir_type_float32,
+                          .io_semantics = {.location = VARYING_SLOT_POS,
+                                           .num_slots = 1});
+         nir_emit_vertex(&gb, 0);
+      }
+      nir_end_primitive(&gb, 0);
+      nir_shader_gather_info(gb.shader, nir_shader_get_entrypoint(gb.shader));
+
+      struct vk_shader_compile_info infos[] = {
+         {.stage = MESA_SHADER_GEOMETRY, .nir = gb.shader,
+          .robustness = &vk_robustness_disabled},
+         {.stage = MESA_SHADER_FRAGMENT, .nir = fragment_source(false),
+          .robustness = &vk_robustness_disabled},
+      };
+      struct vk_shader *out[2] = {0};
+      const struct vk_rasterization_state rs_fill = {
+         .polygon_mode = VK_POLYGON_MODE_FILL,
+      };
+      const struct vk_render_pass_state rp = {
+         .color_attachment_count = 1,
+         .color_attachment_formats = {VK_FORMAT_R8G8B8A8_UNORM},
+      };
+      const struct vk_color_blend_state cb = {
+         .attachment_count = 1, .color_write_enables = 1,
+         .attachments = {{.write_mask = 15}},
+      };
+      struct vk_graphics_pipeline_state st = {.rs = &rs_fill, .rp = &rp, .cb = &cb};
+      BITSET_SET(st.dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE);
+      CHECK(hk_apple9_compile_graphics(dev, 2, infos, &st, NULL, NULL, NULL, out) ==
+            VK_SUCCESS);
+      struct hk_api_shader *gs = container_of(out[0], struct hk_api_shader, vk);
+      struct hk_api_shader *fs = container_of(out[1], struct hk_api_shader, vk);
+      struct hk_shader *gs_rast = &gs->variants[HK_GS_VARIANT_RAST];
+      CHECK((gs_rast->b.info.apple9_varyings.mask[VARYING_SLOT_TEX6] & 0x7) == 0x7);
+      CHECK((gs_rast->b.info.apple9_varyings.mask[VARYING_SLOT_TEX7] & 0x3) == 0x3);
+      CHECK(fs->variants[0].info.fs.line_stipple_start == 0);
+      for (unsigned i = 0; i < 2; ++i)
+         out[i]->ops->destroy(&dev->vk, out[i], NULL);
+   }
+
    simple_mtx_destroy(&pdev->debug_compile_lock);
    simple_mtx_destroy(&dev->apple9_bodies.lock);
    test_reset_usc_heap(dev);

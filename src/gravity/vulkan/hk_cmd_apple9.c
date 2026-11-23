@@ -24,6 +24,34 @@ hk_apple9_usc_alloc(void *data, size_t size, size_t alignment)
    return hk_pool_usc_alloc(data, size, alignment);
 }
 
+static void
+hk_apple9_copy_vs_prolog_iface(struct agx_apple9_vs_prolog_iface *dst,
+                               const struct agx_apple9_vs_prolog_iface *src)
+{
+   dst->attribs_read = src->attribs_read;
+   dst->integer_attribs = src->integer_attribs;
+   memcpy(dst->attrib_mask, src->attrib_mask, sizeof(dst->attrib_mask));
+   dst->uses_prolog = src->uses_prolog;
+}
+
+static void
+hk_apple9_copy_fs_epilog_iface(struct agx_apple9_fs_epilog_iface *dst,
+                               const struct agx_apple9_fs_epilog_iface *src)
+{
+   dst->outputs_written = src->outputs_written;
+   dst->writes_src1 = src->writes_src1;
+   dst->writes_frag_color = src->writes_frag_color;
+   dst->writes_depth = src->writes_depth;
+   dst->writes_stencil = src->writes_stencil;
+   dst->has_tile_lock = src->has_tile_lock;
+   dst->has_tile_preamble = src->has_tile_preamble;
+   dst->early_fragment_tests = src->early_fragment_tests;
+   dst->has_killed_mask = src->has_killed_mask;
+   dst->per_sample = src->per_sample;
+   dst->main_defers_zs_test = src->main_defers_zs_test;
+   dst->uses_epilog = src->uses_epilog;
+}
+
 /* A tile helper program depends only on its key. Each render binds its own
  * clear values, reload textures and store images through tables. */
 struct hk_apple9_tile_helper {
@@ -79,7 +107,7 @@ hk_apple9_tile_helper(struct hk_device *dev,
    created = calloc(1, sizeof(*created));
    if (!created)
       goto done;
-   created->key = *key;
+   memcpy(&created->key, key, sizeof(*key));
    created->info = part.info;
    created->bo = agx_bo_create(&dev->dev, part.info.binary_size, 0,
                                AGX_BO_EXEC | AGX_BO_LOW_VA | AGX_BO_WRITEBACK,
@@ -91,7 +119,12 @@ hk_apple9_tile_helper(struct hk_device *dev,
    memcpy(agx_bo_map(created->bo), part.binary, part.info.binary_size);
    agx_bo_note_cpu_write(created->bo, 0, part.info.binary_size);
    agx_apple9_stage_launch_cache_init(&created->launch);
-   _mesa_hash_table_insert(ht, &created->key, created);
+   if (!_mesa_hash_table_insert(ht, &created->key, created)) {
+      agx_apple9_stage_launch_cache_finish(&created->launch);
+      agx_bo_unreference(&dev->dev, created->bo);
+      free(created);
+      goto done;
+   }
    helper = created;
 
 done:
@@ -179,7 +212,7 @@ hk_apple9_get_vs_prolog(struct hk_device *dev,
       agx_shader_body_unreference(&dev->dev, body);
       return NULL;
    }
-   created->key = *key;
+   memcpy(&created->key, key, sizeof(*key));
    created->body = body;
    created->publication_count = part.info.apple9_publication_count;
    created->scratch_size = part.info.scratch_size;
@@ -194,7 +227,13 @@ hk_apple9_get_vs_prolog(struct hk_device *dev,
       free(created);
       return existing;
    }
-   _mesa_hash_table_insert(dev->apple9_vs_prologs.ht, &created->key, created);
+   if (!_mesa_hash_table_insert(dev->apple9_vs_prologs.ht, &created->key,
+                                created)) {
+      simple_mtx_unlock(&dev->apple9_vs_prologs.lock);
+      agx_shader_body_unreference(&dev->dev, created->body);
+      free(created);
+      return NULL;
+   }
    simple_mtx_unlock(&dev->apple9_vs_prologs.lock);
    return created;
 }
@@ -279,7 +318,7 @@ hk_apple9_get_fs_epilog(struct hk_device *dev,
       agx_shader_body_unreference(&dev->dev, body);
       return NULL;
    }
-   created->key = *key;
+   memcpy(&created->key, key, sizeof(*key));
    created->body = body;
    created->publication_count = part.info.apple9_publication_count;
    created->scratch_size = part.info.scratch_size;
@@ -298,7 +337,13 @@ hk_apple9_get_fs_epilog(struct hk_device *dev,
       free(created);
       return existing;
    }
-   _mesa_hash_table_insert(dev->apple9_fs_epilogs.ht, &created->key, created);
+   if (!_mesa_hash_table_insert(dev->apple9_fs_epilogs.ht, &created->key,
+                                created)) {
+      simple_mtx_unlock(&dev->apple9_fs_epilogs.lock);
+      agx_shader_body_unreference(&dev->dev, created->body);
+      free(created);
+      return NULL;
+   }
    simple_mtx_unlock(&dev->apple9_fs_epilogs.lock);
    return created;
 }
@@ -382,7 +427,7 @@ hk_apple9_get_cull_prolog(struct hk_device *dev,
       agx_shader_body_unreference(&dev->dev, body);
       return NULL;
    }
-   created->key = *key;
+   memcpy(&created->key, key, sizeof(*key));
    created->body = body;
    created->program_id = p_atomic_inc_return(&dev->apple9_last_program_id);
    created->publication_count = part.info.apple9_publication_count;
@@ -400,7 +445,14 @@ hk_apple9_get_cull_prolog(struct hk_device *dev,
       free(created);
       return existing;
    }
-   _mesa_hash_table_insert(dev->apple9_cull_prologs.ht, &created->key, created);
+   if (!_mesa_hash_table_insert(dev->apple9_cull_prologs.ht, &created->key,
+                                created)) {
+      simple_mtx_unlock(&dev->apple9_cull_prologs.lock);
+      agx_apple9_stage_launch_cache_finish(&created->launch_cache);
+      agx_shader_body_unreference(&dev->dev, created->body);
+      free(created);
+      return NULL;
+   }
    simple_mtx_unlock(&dev->apple9_cull_prologs.lock);
    return created;
 }
@@ -485,7 +537,7 @@ hk_apple9_get_stipple_prolog(struct hk_device *dev,
       agx_shader_body_unreference(&dev->dev, body);
       return NULL;
    }
-   created->key = *key;
+   memcpy(&created->key, key, sizeof(*key));
    created->body = body;
    created->program_id = p_atomic_inc_return(&dev->apple9_last_program_id);
    created->publication_count = part.info.apple9_publication_count;
@@ -503,8 +555,14 @@ hk_apple9_get_stipple_prolog(struct hk_device *dev,
       free(created);
       return existing;
    }
-   _mesa_hash_table_insert(dev->apple9_stipple_prologs.ht, &created->key,
-                           created);
+   if (!_mesa_hash_table_insert(dev->apple9_stipple_prologs.ht, &created->key,
+                                created)) {
+      simple_mtx_unlock(&dev->apple9_stipple_prologs.lock);
+      agx_apple9_stage_launch_cache_finish(&created->launch_cache);
+      agx_shader_body_unreference(&dev->dev, created->body);
+      free(created);
+      return NULL;
+   }
    simple_mtx_unlock(&dev->apple9_stipple_prologs.lock);
    return created;
 }
@@ -586,7 +644,7 @@ hk_apple9_get_sw_vs_prolog(struct hk_device *dev,
       agx_shader_body_unreference(&dev->dev, body);
       return NULL;
    }
-   created->key = *key;
+   memcpy(&created->key, key, sizeof(*key));
    created->body = body;
    created->profile = profile;
 
@@ -599,8 +657,13 @@ hk_apple9_get_sw_vs_prolog(struct hk_device *dev,
       free(created);
       return existing;
    }
-   _mesa_hash_table_insert(dev->apple9_sw_vs_prologs.ht, &created->key,
-                           created);
+   if (!_mesa_hash_table_insert(dev->apple9_sw_vs_prologs.ht, &created->key,
+                                created)) {
+      simple_mtx_unlock(&dev->apple9_sw_vs_prologs.lock);
+      agx_shader_body_unreference(&dev->dev, created->body);
+      free(created);
+      return NULL;
+   }
    simple_mtx_unlock(&dev->apple9_sw_vs_prologs.lock);
    return created;
 }
@@ -752,7 +815,7 @@ hk_apple9_get_linked_entry(struct hk_device *dev,
          agx_shader_body_unreference(&dev->dev, raw_stub);
       return NULL;
    }
-   result->key = key;
+   memcpy(&result->key, &key, sizeof(key));
    result->program_id = p_atomic_inc_return(&dev->apple9_last_program_id);
    agx_apple9_stage_launch_cache_init(&result->launch_cache);
    agx_shader_body_reference(first);
@@ -774,7 +837,12 @@ hk_apple9_get_linked_entry(struct hk_device *dev,
       .refcnt = 2, /* 1 for cache + 1 for caller */
       .destroy = hk_apple9_linked_entry_destroy,
    };
-   _mesa_hash_table_insert(ht, &result->key, result);
+   if (!_mesa_hash_table_insert(ht, &result->key, result)) {
+      simple_mtx_unlock(&dev->apple9_linked_entries.lock);
+      result->body.refcnt = 1;
+      agx_shader_body_unreference(&dev->dev, &result->body);
+      return NULL;
+   }
    list_add(&result->lru_link, &dev->apple9_linked_entries.lru);
    dev->apple9_linked_entries.count++;
    if (dev->apple9_linked_entries.count > HK_APPLE9_LINKED_ENTRY_CACHE_SIZE) {
@@ -923,7 +991,7 @@ hk_apple9_get_per_sample_trampoline(
       agx_shader_body_unreference(&dev->dev, raw);
       return NULL;
    }
-   created->key = key;
+   memcpy(&created->key, &key, sizeof(key));
    created->program_id = p_atomic_inc_return(&dev->apple9_last_program_id);
    agx_apple9_stage_launch_cache_init(&created->launch_cache);
    agx_shader_body_reference(fs_main);
@@ -957,8 +1025,13 @@ hk_apple9_get_per_sample_trampoline(
       agx_shader_body_unreference(&dev->dev, &created->body);
       return existing;
    }
-   _mesa_hash_table_insert(dev->apple9_per_sample_trampolines.ht, &created->key,
-                           created);
+   if (!_mesa_hash_table_insert(dev->apple9_per_sample_trampolines.ht,
+                                &created->key, created)) {
+      simple_mtx_unlock(&dev->apple9_per_sample_trampolines.lock);
+      created->body.refcnt = 1;
+      agx_shader_body_unreference(&dev->dev, &created->body);
+      return NULL;
+   }
    list_add(&created->lru_link, &dev->apple9_per_sample_trampolines.lru);
    dev->apple9_per_sample_trampolines.count++;
    if (dev->apple9_per_sample_trampolines.count >
@@ -1006,7 +1079,7 @@ hk_apple9_dispatch_sw_vs_prolog(
    }
    struct agx_apple9_sw_vs_prolog_key pkey;
    memset(&pkey, 0, sizeof(pkey));
-   pkey.base.iface = s->b.info.apple9_vs_prolog;
+   hk_apple9_copy_vs_prolog_iface(&pkey.base.iface, &s->b.info.apple9_vs_prolog);
    pkey.base.draw_params_ubo = HK_APPLE9_DRAW_PARAMS_BINDING;
    pkey.base.buffer_descriptor_ubo = HK_APPLE9_VERTEX_BUFFERS_BINDING;
    pkey.base.dynamic_stride = true;
@@ -1159,11 +1232,11 @@ hk_apple9_get_vs_vary_variant(struct hk_device *dev,
       if (vs->b.info.apple9_varyings.mask[s])
          written |= BITFIELD64_BIT(s);
    }
-   struct hk_apple9_vs_vary_key key = {
-      .vs_program_id = vs->apple9_program_id,
-      .flat_mask = fs_flat & written,
-      .linear_mask = fs_linear & written,
-   };
+   struct hk_apple9_vs_vary_key key;
+   memset(&key, 0, sizeof(key));
+   key.vs_program_id = vs->apple9_program_id;
+   key.flat_mask = fs_flat & written;
+   key.linear_mask = fs_linear & written;
 
    simple_mtx_lock(&dev->apple9_vs_vary_variants.lock);
    if (!dev->apple9_vs_vary_variants.ht) {
@@ -1208,7 +1281,7 @@ hk_apple9_get_vs_vary_variant(struct hk_device *dev,
       agx_shader_body_unreference(&dev->dev, body);
       return NULL;
    }
-   created->key = key;
+   memcpy(&created->key, &key, sizeof(key));
    created->body = body;
    created->program_id = p_atomic_inc_return(&dev->apple9_last_program_id);
    created->varyings = new_layout;
@@ -1224,8 +1297,14 @@ hk_apple9_get_vs_vary_variant(struct hk_device *dev,
       free(created);
       return existing;
    }
-   _mesa_hash_table_insert(dev->apple9_vs_vary_variants.ht, &created->key,
-                           created);
+   if (!_mesa_hash_table_insert(dev->apple9_vs_vary_variants.ht, &created->key,
+                                created)) {
+      simple_mtx_unlock(&dev->apple9_vs_vary_variants.lock);
+      agx_apple9_stage_launch_cache_finish(&created->launch_cache);
+      agx_shader_body_unreference(&dev->dev, created->body);
+      free(created);
+      return NULL;
+   }
    simple_mtx_unlock(&dev->apple9_vs_vary_variants.lock);
    return created;
 }
@@ -1391,8 +1470,11 @@ hk_apple9_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
       else
          goto fail;
    }
+   error = VK_ERROR_OUT_OF_HOST_MEMORY;
    uint64_t table = hk_pool_upload(
       cmd, resources, part_info->apple9_resource_count * sizeof(uint64_t), 64);
+   if (part_info->apple9_resource_count && !table)
+      goto fail;
    struct agx_apple9_render_stage shader = {
       .bo = helper->bo,
       .launch_cache = &helper->launch,
@@ -1784,8 +1866,10 @@ hk_apple9_prepare_native_mesh(struct hk_cmd_buffer *cmd,
       simple_mtx_lock(&dev->dev.apple9_entry_lock);
       bool pinned = hk_apple9_pin_entry(cmd, shader->apple9_body);
       simple_mtx_unlock(&dev->dev.apple9_entry_lock);
-      if (!pinned)
+      if (!pinned) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
          return false;
+      }
    }
    struct agx_apple9_mesh_arguments args = {
       .graphics = {draw->texture_table[0], draw->sampler_table[0],
@@ -2047,7 +2131,7 @@ hk_apple9_try_cached_draw(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          if (!agx_apple9_update_draw_tables_alloc(
                 &dev->dev, cmd, hk_apple9_usc_alloc, cmd, hk_apple9_context_alloc,
                 pipeline, record, tables)) {
-            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
             return true;
          }
          pipeline->ppp = record->ppp;
@@ -2240,7 +2324,8 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          UNSUPPORTED();
       struct agx_apple9_vertex_prolog_key pkey;
       memset(&pkey, 0, sizeof(pkey));
-      pkey.iface = shaders[0]->b.info.apple9_vs_prolog;
+      hk_apple9_copy_vs_prolog_iface(&pkey.iface,
+                                     &shaders[0]->b.info.apple9_vs_prolog);
       pkey.draw_params_ubo = HK_APPLE9_DRAW_PARAMS_BINDING;
       pkey.buffer_descriptor_ubo = HK_APPLE9_VERTEX_BUFFERS_BINDING;
       pkey.dynamic_stride = true;
@@ -2332,6 +2417,14 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       stipple_cf_base = (uint8_t)next_cf;
       next_cf += 5;
    }
+   /* Without a depth attachment, the depth test is disabled. Early tests keep
+    * a hardware NEVER: the shader must not run at all. */
+   const bool depth_test =
+      dyn->ds.depth.test_enable && gfx->render.depth_att.iview;
+   const bool force_never_in_shader =
+      depth_test && dyn->ds.depth.compare_op == VK_COMPARE_OP_NEVER &&
+      shaders[1]->info.fs.writes_memory &&
+      !shaders[1]->info.fs.early_fragment_tests;
    if (null_fs && !need_cull_prolog && !need_stipple_prolog) {
       /* The empty fragment program reads no varyings. Retain the producer's
        * layout for the native interface linker, independent of its contents. */
@@ -2502,10 +2595,12 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
             ? dyn->ms.rasterization_samples
             : MAX2(gfx->render.tilebuffer.nr_samples, 1);
       const bool late_zs =
-         hk_apple9_draw_late_zs(dyn, &gfx->render, fragment_api);
+         hk_apple9_draw_late_zs(dyn, &gfx->render, fragment_api) ||
+         force_never_in_shader;
       struct agx_apple9_fs_epilog_key ekey;
       memset(&ekey, 0, sizeof(ekey));
-      ekey.iface = shaders[1]->b.info.apple9_fs_epilog;
+      hk_apple9_copy_fs_epilog_iface(&ekey.iface,
+                                     &shaders[1]->b.info.apple9_fs_epilog);
       ekey.nr_targets = nr_targets;
       ekey.late_zs =
          late_zs && !ekey.iface.writes_depth && !ekey.iface.early_fragment_tests;
@@ -2809,7 +2904,7 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       if (offset >= index_range) {
          struct agx_ptr zero = hk_pool_usc_alloc(cmd, 16, 16);
          if (!zero.cpu)
-            return;
+            goto cleanup;
          memset(zero.cpu, 0, 16);
          index_buffer = zero.gpu;
          index_range = 16;
@@ -2827,10 +2922,10 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    }
    struct hk_cs *cs = hk_cmd_buffer_get_cs(cmd, false);
    if (!cs)
-      return;
+      goto cleanup;
    cs = hk_occlusion_prepare_draw(cmd, cs);
    if (!cs)
-      return;
+      goto cleanup;
    /* Selection and preparation guarantee a leading native state and blocks
     * the profile admits. Keep this backstop before publishing a malformed
     * stream. */
@@ -2948,7 +3043,7 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          effects = gfx->shaders[s] && gfx->shaders[s]->writes_memory;
       effects |= native_grid && mesh && mesh->writes_memory;
       if (!effects)
-         return;
+         goto cleanup;
       bbox[0] = bbox[1] = bbox[2] = bbox[3] = 0;
    }
    record->scissor_min[0] = bbox[0];
@@ -3002,19 +3097,12 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       }
    }
    bool stencil = dyn->ds.stencil.test_enable && gfx->render.stencil_att.iview;
-   /* Without a depth attachment, the depth test is disabled. */
-   bool depth_test = dyn->ds.depth.test_enable && gfx->render.depth_att.iview;
    record->depth_control = 0x200 | (1u << 16) | (bias ? 1u << 17 : 0) |
                           (stencil ? 3u << 18 : 0) |
                           (rasterizer_discard ? 1u << 21 : 0);
    record->occlusion_index = gfx->occlusion.index;
    record->visibility_mode = rasterizer_discard ? 0 : gfx->occlusion.mode;
    record->depth_control |= record->visibility_mode << 14;
-   /* Early tests keep a hardware NEVER: the shader must not run at all. */
-   bool force_never_in_shader =
-      depth_test && dyn->ds.depth.compare_op == VK_COMPARE_OP_NEVER &&
-      shaders[1]->info.fs.writes_memory &&
-      !shaders[1]->info.fs.early_fragment_tests;
    gfx->descriptors.root.draw.force_never_in_shader = force_never_in_shader;
    /* The shader fails a forced NEVER test itself (hk_apple9_clamp_depth_export). */
    VkCompareOp depth_compare = !depth_test ? VK_COMPARE_OP_ALWAYS
@@ -3147,8 +3235,10 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       &dev->dev, cmd, hk_apple9_usc_alloc, cmd, hk_apple9_context_alloc,
       &pipeline, record, previous);
    hk_cpu_sub_end(t_sub, HK_CPU_SUB_PREPARE_ALLOC);
-   if (!prepared)
-      UNSUPPORTED();
+   if (!prepared) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto cleanup;
+   }
    cmd->apple9_draw_current = !cmd->apple9_draw_current;
    cmd->apple9_prev_cs = cs;
    pipeline.ppp = record->ppp;
@@ -3158,8 +3248,11 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    pipeline.pipeline_word = 0x01000000;
    hk_ensure_cs_has_space(cmd, cs, 256);
    if (!hk_apple9_record_draw(cmd, cs, &pipeline, draw, native_grid,
-                               mesh, shaders[0], record))
+                               mesh, shaders[0], record)) {
+      if (vk_command_buffer_has_error(&cmd->vk))
+         goto cleanup;
       UNSUPPORTED();
+   }
    hk_apple9_account_draw(cs, &pipeline, draw, gs || tes || mesh, shaders[1]);
    /* Only ordinary single-view draws reuse prepared state. Other paths
     * still consume dynamic state in their software-stage lowering. */
@@ -3180,6 +3273,7 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       gfx->dirty = 0;
       gfx->descriptors.root_dirty = false;
    }
+cleanup:
    if (linked_vs_entry)
       agx_shader_body_unreference(&dev->dev, &linked_vs_entry->body);
    if (linked_fs_entry)
@@ -3188,12 +3282,6 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       agx_shader_body_unreference(&dev->dev, &tramp_fs_entry->body);
    return;
 unsupported:
-   if (linked_vs_entry)
-      agx_shader_body_unreference(&dev->dev, &linked_vs_entry->body);
-   if (linked_fs_entry)
-      agx_shader_body_unreference(&dev->dev, &linked_fs_entry->body);
-   if (tramp_fs_entry)
-      agx_shader_body_unreference(&dev->dev, &tramp_fs_entry->body);
    fprintf(
       stderr,
       "Apple9 draw unsupported at %u: native=%d shaders=%d/%d indirect=%d vp=%u sc=%u stencil=%d bias=%d topology=%u\n",
@@ -3203,6 +3291,7 @@ unsupported:
       dyn->ia.primitive_topology);
 #undef UNSUPPORTED
    vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+   goto cleanup;
 }
 
 void

@@ -1253,8 +1253,18 @@ hk_apple9_lower_gs_polygon_points(nir_shader *gs, struct hk_pp_info info,
             nir_def *provoking = nir_bcsel(
                &b, last, nir_imm_int(&b, 2),
                nir_bcsel(&b, pp.odd, nir_imm_int(&b, 1), nir_imm_int(&b, 0)));
+            nir_def *prim_id;
+            if (written & VARYING_BIT_PRIMITIVE_ID) {
+               nir_def *first_id = nir_channel(
+                  &b, nir_load_var(&b, pp.v[0][VARYING_SLOT_PRIMITIVE_ID]), 0);
+               nir_def *last_id = nir_channel(
+                  &b, nir_load_var(&b, pp.v[2][VARYING_SLOT_PRIMITIVE_ID]), 0);
+               prim_id = nir_bcsel(&b, last, last_id, first_id);
+            } else {
+               prim_id = nir_load_primitive_id(&b);
+            }
             hk_apple9_pp_emit_triangle(&b, &info, hk_gs_pp_load, &pp,
-                                       provoking, nir_load_primitive_id(&b), NULL);
+                                       provoking, prim_id, NULL);
          }
          nir_pop_if(&b, NULL);
          for (unsigned k = 0; k < VARYING_SLOT_MAX + 8; ++k) {
@@ -1822,6 +1832,8 @@ hk_apple9_graphics_key(struct hk_apple9_graphics_key *key,
        * clip-space depth range, and fragment output/blending. */
       key->vertex.use_prolog = true;
       key->clip_negative_one_to_one_dynamic = true;
+      key->may_line_stipple = true;
+      key->may_polygon_points = true;
       key->blend[0].dynamic_samples = true;
       key->blend[0].sample_mask_single_sample = true;
       key->blend[0].dynamic_sample_positions = true;
@@ -1830,12 +1842,14 @@ hk_apple9_graphics_key(struct hk_apple9_graphics_key *key,
          hk_root_descriptor_offset(draw.depth_clamp);
       return;
    }
+   key->is_library =
+      !!(state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR);
    if (state->cal) {
       for (unsigned rt = 0; rt < ARRAY_SIZE(key->color_map); ++rt)
          key->color_map[rt] = state->cal->color_map[rt];
    }
    if (!state->vp ||
-       (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ||
+       key->is_library ||
        BITSET_TEST(state->dynamic,
                    MESA_VK_DYNAMIC_VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE)) {
       key->clip_negative_one_to_one_dynamic = true;
@@ -1856,14 +1870,22 @@ hk_apple9_graphics_key(struct hk_apple9_graphics_key *key,
    key->line_stipple =
       state->rs && state->rs->line.stipple.enable &&
       !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE);
+   key->may_line_stipple =
+      key->line_stipple || !state->rs ||
+      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE);
    key->polygon_points =
       state->rs && state->rs->polygon_mode == VK_POLYGON_MODE_POINT &&
       !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE);
-   if (state->ia) {
+   if (state->ia &&
+       !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY)) {
       enum mesa_prim prim =
          u_reduced_prim(vk_topology_to_mesa(state->ia->primitive_topology));
       key->polygon_points &= prim != MESA_PRIM_POINTS && prim != MESA_PRIM_LINES;
    }
+   key->may_polygon_points =
+      key->polygon_points || !state->rs ||
+      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE) ||
+      state->rs->polygon_mode == VK_POLYGON_MODE_POINT;
 
    if (state->ia &&
        !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY)) {
@@ -2017,13 +2039,17 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
    struct hk_per_vertex_copies per_vertex = {0};
    bool copies_from_gs = false;
    struct hk_apple9_stipple_slots stipple = {0};
+   bool fs_lowered_stipple = false;
    bool polygon_points = false;
+   bool has_stipple_feature =
+      dev->vk.enabled_features.stippledRectangularLines ||
+      dev->vk.enabled_features.stippledBresenhamLines ||
+      dev->vk.enabled_features.stippledSmoothLines;
+   bool may_line_stipple =
+      key.line_stipple ||
+      (key.may_line_stipple && ((state && state->rs) || has_stipple_feature));
    bool may_polygon_points =
-      key.polygon_points ||
-      !state || !state->rs ||
-      (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ||
-      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE) ||
-      state->rs->polygon_mode == VK_POLYGON_MODE_POINT;
+      key.may_polygon_points || key.is_library || !state;
    unsigned polygon_face_slot = 0;
    bool gs_dynamic_polygon_points = false;
    mesa_shader_stage polygon_stage = MESA_SHADER_NONE;
@@ -2075,6 +2101,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             stipple.axis = VARYING_SLOT_TEX7;
             stipple_stage = last->info.stage;
             hk_apple9_lower_line_stipple_fs(fs_nir, stipple);
+            fs_lowered_stipple = true;
          } else {
             static bool warned;
             if (!warned) {
@@ -2087,6 +2114,19 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                warned = true;
             }
          }
+      } else if (stage_nir[MESA_SHADER_GEOMETRY] &&
+                 !stage_nir[MESA_SHADER_GEOMETRY]->info.internal &&
+                 stage_nir[MESA_SHADER_GEOMETRY]->info.gs.output_primitive ==
+                    MESA_PRIM_LINE_STRIP &&
+                 may_line_stipple &&
+                 hk_apple9_slot_fits(stage_nir[MESA_SHADER_GEOMETRY],
+                                     HK_APPLE9_STIPPLE_COMPONENTS)) {
+         /* Dynamic line stipple or GPL/ESO: retain stipple TEX6/TEX7 exports
+          * on application line-strip GS so the draw-time stipple prolog can
+          * consume them without recompiling the GS. */
+         stipple.start = VARYING_SLOT_TEX6;
+         stipple.axis = VARYING_SLOT_TEX7;
+         stipple_stage = MESA_SHADER_GEOMETRY;
       }
 
       /* Lower FS gl_FrontFacing independently when polygon mode may be POINT
@@ -2318,13 +2358,6 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
              * or enabled device features can actually reach GS/TCS or a
              * passthrough GS — avoiding wasted SW-VS compiles on normal GPL
              * titles (CS2/DXVK). */
-            bool is_library =
-               state &&
-               (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR);
-            bool has_stipple_feature =
-               dev->vk.enabled_features.stippledRectangularLines ||
-               dev->vk.enabled_features.stippledBresenhamLines ||
-               dev->vk.enabled_features.stippledSmoothLines;
             bool static_point_mode =
                state && state->rs &&
                state->rs->polygon_mode == VK_POLYGON_MODE_POINT &&
@@ -2332,19 +2365,16 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                 BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY) ||
                 u_reduced_prim(vk_topology_to_mesa(state->ia->primitive_topology)) ==
                    MESA_PRIM_TRIANGLES);
-            bool may_stipple =
-               key.line_stipple ||
-               (state && BITSET_TEST(state->dynamic,
-                                     MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE)) ||
-               ((!state || !state->rs) && has_stipple_feature);
             bool may_polygon_point_gs =
-               key.polygon_points || static_point_mode ||
-               (state && BITSET_TEST(state->dynamic,
-                                     MESA_VK_DYNAMIC_RS_POLYGON_MODE)) ||
-               ((!state || !state->rs) &&
-                dev->vk.enabled_features.fillModeNonSolid);
+               key.polygon_points ||
+               (key.may_polygon_points &&
+                (state && state->rs
+                    ? (BITSET_TEST(state->dynamic,
+                                   MESA_VK_DYNAMIC_RS_POLYGON_MODE) ||
+                       static_point_mode)
+                    : dev->vk.enabled_features.fillModeNonSolid));
             bool may_link_barycentric =
-               (!state || is_library) && !has_fragment &&
+               (!state || key.is_library) && !has_fragment &&
                dev->vk.enabled_features.fragmentShaderBarycentric;
             bool unknown_next_stage =
                !infos[i].next_stage_mask &&
@@ -2359,7 +2389,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                nir->xfb_info || hk_per_vertex_copies_used(&per_vertex) ||
                stipple_stage == MESA_SHADER_VERTEX ||
                polygon_stage == MESA_SHADER_VERTEX ||
-               !state || may_stipple || may_polygon_point_gs ||
+               !state || may_line_stipple || may_polygon_point_gs ||
                may_link_barycentric ||
                dev->vk.enabled_features.primitivesGeneratedQuery;
             struct hk_shader *sw = &obj->variants[HK_VS_VARIANT_SW];
@@ -2443,29 +2473,13 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                varyings = hk_native_producer_main(obj)->b.info.apple9_varyings;
                continue;
             }
-            bool is_library =
-               state &&
-               (state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR);
-            bool has_stipple_feature =
-               dev->vk.enabled_features.stippledRectangularLines ||
-               dev->vk.enabled_features.stippledBresenhamLines ||
-               dev->vk.enabled_features.stippledSmoothLines;
-            bool static_point_mode =
-               state && state->rs &&
-               state->rs->polygon_mode == VK_POLYGON_MODE_POINT;
-            bool may_stipple =
-               key.line_stipple ||
-               (state && BITSET_TEST(state->dynamic,
-                                     MESA_VK_DYNAMIC_RS_LINE_STIPPLE_ENABLE)) ||
-               ((!state || !state->rs) && has_stipple_feature);
             bool may_polygon_point_gs =
-               key.polygon_points || static_point_mode ||
-               (state && BITSET_TEST(state->dynamic,
-                                     MESA_VK_DYNAMIC_RS_POLYGON_MODE)) ||
-               ((!state || !state->rs) &&
-                dev->vk.enabled_features.fillModeNonSolid);
+               key.polygon_points ||
+               (key.may_polygon_points &&
+                ((state && state->rs) ||
+                 dev->vk.enabled_features.fillModeNonSolid));
             bool may_link_barycentric =
-               (!state || is_library) && !has_fragment &&
+               (!state || key.is_library) && !has_fragment &&
                dev->vk.enabled_features.fragmentShaderBarycentric;
             bool unknown_next_stage =
                !infos[i].next_stage_mask &&
@@ -2475,7 +2489,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                polygon_stage == MESA_SHADER_TESS_EVAL ||
                stipple_stage == MESA_SHADER_TESS_EVAL ||
                copies_from_gs || !state || unknown_next_stage ||
-               may_stipple || may_polygon_point_gs ||
+               may_line_stipple || may_polygon_point_gs ||
                may_link_barycentric ||
                dev->vk.enabled_features.primitivesGeneratedQuery;
             result = hk_apple9_compile_tes(
@@ -2619,7 +2633,8 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                 VK_PIPELINE_CREATE_2_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
             shader->info.fs.interp.linear = key.vertex.outputs_linear;
             shader->info.fs.interp.flat = key.vertex.outputs_flat;
-            shader->info.fs.line_stipple_start = stipple.start;
+            shader->info.fs.line_stipple_start =
+               fs_lowered_stipple ? stipple.start : 0;
             shader->info.fs.polygon_points = may_polygon_points || polygon_points;
             shader->info.fs.polygon_face_slot = polygon_face_slot;
             if (hk_per_vertex_copies_used(&per_vertex)) {
@@ -3147,6 +3162,7 @@ hk_apple9_compile_internal_mesh_rast(struct hk_device *dev, nir_shader *nir,
                       VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_VIEWPORT |
                       VARYING_BIT_FOGC | VARYING_BIT_TEX6,
       .outputs_linear = (fs_interp ? fs_interp[1] : 0) | VARYING_BIT_TEX7,
+      .clip_distance_enable = 0xff,
       .rasterize_points = info->prim == MESA_PRIM_POINTS || polygon_points,
    };
    layout.ignore_point_size = !layout.rasterize_points;

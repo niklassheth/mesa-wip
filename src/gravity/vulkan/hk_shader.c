@@ -418,7 +418,11 @@ hk_make_feature_key(const struct vk_features *feats)
           ((!feats || feats->sparseResidencyImage2D) ? HK_FEAT_SPARSE_IMAGE : 0) |
           ((!feats || feats->sparseResidencyBuffer) ? HK_FEAT_STORE_BUFFER_RESIDENCY : 0) |
           ((!feats || (feats->descriptorBuffer && feats->sparseResidencyBuffer))
-              ? HK_FEAT_CHECKED_BUF_STORES : 0);
+              ? HK_FEAT_CHECKED_BUF_STORES : 0) |
+          ((!feats || feats->pipelineStatisticsQuery)
+              ? HK_FEAT_PIPELINE_STATS : 0) |
+          ((!feats || feats->primitivesGeneratedQuery)
+              ? HK_FEAT_PRIMS_GENERATED : 0);
 }
 
 static void

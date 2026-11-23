@@ -217,6 +217,14 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
 
    mem->implicit_sync = false;
 
+   uint64_t heap_used = p_atomic_add_return(&heap->used, mem->bo->size);
+   p_atomic_add(&hk_process_heap_used[type->heapIndex], mem->bo->size);
+   if (heap_used > heap->size) {
+      hk_FreeMemory(device, hk_device_memory_to_handle(mem), pAllocator);
+      return vk_errorf(device, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "Out of heap memory");
+   }
+
    if (fd_info && fd_info->handleType) {
       /* From the Vulkan spec:
        *
@@ -228,14 +236,6 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
        * If the import fails, we leave the file descriptor open.
        */
       close(fd_info->fd);
-   }
-
-   uint64_t heap_used = p_atomic_add_return(&heap->used, mem->bo->size);
-   p_atomic_add(&hk_process_heap_used[type->heapIndex], mem->bo->size);
-   if (heap_used > heap->size) {
-      hk_FreeMemory(device, hk_device_memory_to_handle(mem), pAllocator);
-      return vk_errorf(device, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                       "Out of heap memory");
    }
 
    *pMem = hk_device_memory_to_handle(mem);

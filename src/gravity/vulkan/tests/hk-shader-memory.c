@@ -147,6 +147,11 @@ alloc_launch(void *priv, size_t size, size_t align)
    CHECK(size <= sizeof(r->launch));
    return (struct agx_ptr){r->launch, 0x80000};
 }
+static bool
+pin_always_fail(void *allocator, struct agx_shader_body *body)
+{
+   return false;
+}
 static void
 launch_body(struct hk_device *dev, struct recording *r,
             struct agx_shader_body *body)
@@ -219,6 +224,23 @@ check_slices_and_entries(struct hk_device *dev)
    struct agx_shader_body *d = hk_apple9_body_upload(dev, &shader);
    CHECK(d->addr == old_b_addr && d->bo == a->bo);
    CHECK(*(uint8_t *)a->bo->_map == 0x42 && a->entry_offset == a_entry);
+   /* Pin-hook OOM must fail prepare without setting entry_fixed (no UAF). */
+   dev->dev.apple9_pin_entry = pin_always_fail;
+   {
+      struct agx_apple9_render_stage stage = {
+         .bo = d->bo,
+         .body = d,
+         .publication_count_valid = true,
+         .publication_count = 4,
+         .binary_size = 64,
+      };
+      uint32_t launch = 0;
+      CHECK(!agx_apple9_prepare_graphics_stage(
+         &dev->dev, &other->cmd, alloc_launch, &stage, false, 0, 0, 0, 0, 1,
+         &launch));
+      CHECK(!d->entry_fixed && !d->entry_offset);
+   }
+   dev->dev.apple9_pin_entry = hk_apple9_pin_entry;
    agx_shader_body_unreference(&dev->dev, a);
    hk_apple9_unpin_entries(&r->cmd);
    agx_shader_body_unreference(&dev->dev, d);

@@ -513,9 +513,14 @@ apple9_shader_entry(struct agx_device *dev, void *allocator,
                     struct agx_shader_body *body, bool compute)
 {
    simple_mtx_lock(&dev->apple9_entry_lock);
-   if (!allocator || !dev->apple9_pin_entry ||
-       !dev->apple9_pin_entry(allocator, body))
+   if (allocator && dev->apple9_pin_entry) {
+      if (!dev->apple9_pin_entry(allocator, body)) {
+         simple_mtx_unlock(&dev->apple9_entry_lock);
+         return 0;
+      }
+   } else {
       body->entry_fixed = true;
+   }
    uint32_t entry = body->entry_offset;
    if (entry) {
       list_move_to(&body->entry_link, &dev->apple9_entry_lru);
