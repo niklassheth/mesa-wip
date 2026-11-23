@@ -63,12 +63,6 @@ void apple9_ra_schedule_resources(const struct agx_apple9_vir_instr *ins,
                                   uint32_t *reads, uint32_t *writes);
 unsigned apple9_ra_dependency_delay(const struct agx_apple9_vir_instr *ins);
 
-/* Single-instruction backwards liveness update (32-bit GPR SSA units),
- * populating ins->kill_mask and updating the live sparse bitset. */
-void apple9_ra_liveness_ins_update(const struct agx_apple9_vir_program *p,
-                                   struct u_sparse_bitset *live,
-                                   struct agx_apple9_vir_instr *ins);
-
 /* Native VIR partial dead code elimination. */
 bool apple9_ra_dce(struct agx_apple9_vir_program *p);
 

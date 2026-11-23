@@ -442,16 +442,6 @@ liveness_ins_update_internal(const struct agx_apple9_vir_program *p,
    return unlive_defs;
 }
 
-void
-apple9_ra_liveness_ins_update(const struct agx_apple9_vir_program *p,
-                              struct u_sparse_bitset *live,
-                              struct agx_apple9_vir_instr *ins)
-{
-   if (!p || !live || !ins)
-      return;
-   liveness_ins_update_internal(p, NULL, NULL, live, ins, true, NULL);
-}
-
 static bool
 build_defs_and_pub_mask(const struct agx_apple9_vir_program *p, void *mem_ctx,
                         struct agx_apple9_vir_instr ***defs_out,

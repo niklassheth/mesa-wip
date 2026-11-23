@@ -612,6 +612,7 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
    free(program->max_phys);
    program->fixed_phys = new_fixed;
    program->max_phys = new_max;
+   program->value_capacity = alloc_count;
    if (new_pub) {
       free(program->publication);
       program->publication = new_pub;

@@ -74,7 +74,6 @@ enum agx_apple9_vir_opcode {
    /* Two normalized components to FP32. Mode plus input half in immediate. */
    AGX_APPLE9_VIR_UNPACK_NORM,
    AGX_APPLE9_VIR_IADD,
-   AGX_APPLE9_VIR_IMUL,
    AGX_APPLE9_VIR_ISUB,
    AGX_APPLE9_VIR_IMAD,
    /* Full 32x32 product, low word followed by high word. immediate is signed. */
@@ -173,9 +172,7 @@ enum agx_apple9_vir_opcode {
    AGX_APPLE9_VIR_DEVICE_STORE,
    AGX_APPLE9_VIR_DEVICE_ATOMIC,
    AGX_APPLE9_VIR_DEVICE_ATOMIC_RESULT,
-   AGX_APPLE9_VIR_SUBGROUP_SCAN_IADD,
    AGX_APPLE9_VIR_SUBGROUP_REDUCE_UMAX,
-   AGX_APPLE9_VIR_SUBGROUP_BROADCAST,
    AGX_APPLE9_VIR_SUBGROUP_BALLOT,
    /* Generalized 1-instruction SIMD & Quad reductions and exclusive scans.
     * immediate encodes enum agx_apple9_subgroup_reduce_op | flags. */
@@ -735,6 +732,7 @@ struct agx_apple9_vir_program {
    unsigned instruction_capacity;
    unsigned num_cfg_blocks;
    unsigned value_count;
+   unsigned value_capacity;
    uint32_t output;
    /* Fragment execution can update depth/stencil without explicit stores. */
    bool fragment_shader;
@@ -783,6 +781,8 @@ void agx_apple9_vir_set_source(struct agx_apple9_vir_program *program,
 
 void agx_apple9_vir_init(struct agx_apple9_vir_program *program);
 void agx_apple9_vir_finish(struct agx_apple9_vir_program *program);
+bool agx_apple9_vir_ensure_value_capacity(
+   struct agx_apple9_vir_program *program, unsigned needed);
 /* Deep copy. Logical NIR block pointers are copied as they are. */
 bool agx_apple9_vir_clone(struct agx_apple9_vir_program *dst,
                           const struct agx_apple9_vir_program *src);
@@ -911,10 +911,6 @@ agx_apple9_wide_float_immediate_slot(enum agx_apple9_encoding encoding,
                          encoding == AGX_APPLE9_ENC_FLOAT3_MODIFIER_EXTENDED ||
                          encoding == AGX_APPLE9_ENC_FLOAT3_SATURATE_EXTENDED));
 }
-
-/* AGX_APPLE9_NO_COMPARE_LITERAL=1 keeps compare operands in registers and
- * uniform words. */
-bool agx_apple9_compare_literals_disabled(void);
 
 /* Compare operand B of a select or predicate takes a literal in the byte
  * that otherwise names a uniform: a minifloat with its sign beside it for
@@ -1333,10 +1329,6 @@ uint32_t agx_apple9_vir_emit_texture_sample_mov(
 uint32_t agx_apple9_vir_emit_texture_lod_imm(
    struct agx_apple9_vir_program *program, const uint32_t coords[2],
    uint8_t lod_uq4_2, unsigned texture, unsigned sampler);
-
-uint32_t agx_apple9_vir_emit_texture_min_lod(
-   struct agx_apple9_vir_program *program, const uint32_t coords[2],
-   uint32_t zero, uint32_t bias_min_lod, unsigned texture, unsigned sampler);
 uint32_t agx_apple9_vir_emit_texture_ms(
    struct agx_apple9_vir_program *program, const uint32_t coords[4],
    unsigned texture, unsigned sampler, bool array);
@@ -1527,12 +1519,6 @@ bool agx_apple9_pack_mov_imm32(unsigned dst, uint32_t value,
                                struct agx_apple9_packed_instruction *packed);
 bool agx_apple9_pack_mov(unsigned dst, unsigned src,
                          struct agx_apple9_packed_instruction *packed);
-
-bool
-agx_apple9_pack_device_load_u32(unsigned dst, unsigned index, unsigned binding,
-                                uint8_t flags,
-                                enum agx_apple9_scoreboard_slot scoreboard_slot,
-                                struct agx_apple9_packed_instruction *packed);
 bool agx_apple9_pack_device_load_u32_raw(
    unsigned dst, unsigned index, unsigned binding,
    enum agx_apple9_device_load_index_kind index_kind, uint8_t flags,

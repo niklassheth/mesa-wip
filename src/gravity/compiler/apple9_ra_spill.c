@@ -144,15 +144,8 @@ apple9_ra_vir_grow_values(struct agx_apple9_vir_program *program,
    unsigned old_count = program->value_count;
    unsigned new_count = old_count + extra_count;
 
-   uint8_t *fixed = realloc(program->fixed_phys, new_count);
-   if (!fixed)
+   if (!agx_apple9_vir_ensure_value_capacity(program, new_count))
       return false;
-   program->fixed_phys = fixed;
-
-   uint8_t *maximum = realloc(program->max_phys, new_count);
-   if (!maximum)
-      return false;
-   program->max_phys = maximum;
 
    memset(&program->fixed_phys[old_count], AGX_APPLE9_PHYS_INVALID, extra_count);
    memset(&program->max_phys[old_count], AGX_APPLE9_PHYS_INVALID, extra_count);

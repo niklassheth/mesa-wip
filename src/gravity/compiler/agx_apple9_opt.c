@@ -5,21 +5,8 @@
 
 #include "agx_apple9_ir.h"
 #include "util/bitscan.h"
-#include "util/u_debug.h"
 #include "util/hash_table.h"
 #include "util/u_memory.h"
-
-DEBUG_GET_ONCE_OPTION(cached_agx_apple9_no_pointer_load,
-                      "AGX_APPLE9_NO_POINTER_LOAD", NULL)
-
-DEBUG_GET_ONCE_OPTION(apple9_no_compare_literal,
-                      "AGX_APPLE9_NO_COMPARE_LITERAL", NULL)
-
-bool
-agx_apple9_compare_literals_disabled(void)
-{
-   return debug_get_option_apple9_no_compare_literal() != NULL;
-}
 
 /* Selection creates address arithmetic and packing which did not exist
  * during NIR optimization. Keep a semantic whitelist: publications, implicit
@@ -78,7 +65,6 @@ agx_apple9_instr_is_pure_alu(const struct agx_apple9_vir_instr *I)
    case AGX_APPLE9_VIR_UNPACK_HALF:
    case AGX_APPLE9_VIR_UNPACK_NORM:
    case AGX_APPLE9_VIR_IADD:
-   case AGX_APPLE9_VIR_IMUL:
    case AGX_APPLE9_VIR_ISUB:
    case AGX_APPLE9_VIR_IMAD:
    case AGX_APPLE9_VIR_IMUL_WIDE:
@@ -243,7 +229,6 @@ fold_integer(struct agx_apple9_vir_instr *I, const bool *constant,
          return false;
       value = c[0] + (c[1] << I->immediate);
       break;
-   case AGX_APPLE9_VIR_IMUL: value = c[0] * c[1]; break;
    case AGX_APPLE9_VIR_ISUB:
       if (I->immediate > 4)
          return false;
@@ -564,8 +549,7 @@ static void
 inline_compare_literal(struct agx_apple9_vir_instr *I, const bool *constant,
                        const uint32_t *values)
 {
-   if (agx_apple9_compare_literals_disabled() ||
-       !agx_apple9_compare_literal_slot(I, 1) || I->nr_srcs < 2 ||
+   if (!agx_apple9_compare_literal_slot(I, 1) || I->nr_srcs < 2 ||
        ((I->alu_src_uniform_mask | I->alu_src_immediate_mask) & 3))
       return;
    const bool is_float = agx_apple9_compare_is_float(I);
@@ -779,12 +763,6 @@ drop_zero_load_index(struct agx_apple9_vir_instr *I, const bool *constant,
        I->encoding != AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT || I->nr_srcs != 3 ||
        !constant[I->src[0]] || values[I->src[0]] != 0)
       return;
-   /* AGX_APPLE9_NO_POINTER_LOAD=1 keeps the materialized zero index. */
-   static int disabled = -1;
-   if (disabled < 0)
-      disabled = debug_get_option_cached_agx_apple9_no_pointer_load() != NULL;
-   if (disabled)
-      return;
    I->encoding = AGX_APPLE9_ENC_DEVICE_LOAD_POINTER;
    I->src[0] = I->src[1];
    I->src[1] = I->src[2];
@@ -911,10 +889,9 @@ inline_alu_sources(struct agx_apple9_vir_instr *I, const uint16_t *uniform_read,
        * half_mask is illegal in Apple9 encodings). */
       if (I->src_half_mask & BITFIELD_BIT(s))
          continue;
-      if (uniform_read[reg[s]]) {
-         file[s] = AGX_APPLE9_FILE_UNIFORM;
-         value[s] = uniform_read[reg[s]] - 1;
-      } else if ((fma || minmax_float) && !filled && constant[reg[s]]) {
+      /* Prefer encodable minifloat literals over constant-table uniforms on
+       * FMA and floating min/max so a single pass matches literal selection. */
+      if ((fma || minmax_float) && !filled && constant[reg[s]]) {
          /* The literal takes this slot's modifiers below. FMA operand B
           * and min/max operand A have no fourth mantissa bit. */
          uint32_t literal = values[reg[s]];
@@ -927,13 +904,19 @@ inline_alu_sources(struct agx_apple9_vir_instr *I, const uint16_t *uniform_read,
                   : agx_apple9_encode_float_immediate(literal, &encoded)) {
             file[s] = AGX_APPLE9_FILE_IMMEDIATE;
             value[s] = values[reg[s]];
+            continue;
          }
+      }
+      if (uniform_read[reg[s]]) {
+         file[s] = AGX_APPLE9_FILE_UNIFORM;
+         value[s] = uniform_read[reg[s]] - 1;
       }
    }
    /* Floating min/max takes a literal only as operand B. They commute for
     * NaN operands (the result is the other value) but not for zeros of
     * opposite sign, where G16 returns operand B: max(+0, -0) is -0. A zero
-    * literal therefore stays in operand A's register. */
+    * literal therefore stays in operand A's register (or a uniform if none is
+    * used in operand B). */
    if (minmax_float && file[0] == AGX_APPLE9_FILE_IMMEDIATE &&
        file[1] != AGX_APPLE9_FILE_IMMEDIATE && !(I->src_neg_mask & 2) &&
        (value[0] & 0x7fffffffu) != 0) {
@@ -944,8 +927,14 @@ inline_alu_sources(struct agx_apple9_vir_instr *I, const uint16_t *uniform_read,
       reg[0] = I->src[0]; reg[1] = I->src[1];
       I->src_neg_mask = ((I->src_neg_mask & 1) << 1) | ((I->src_neg_mask & 2) >> 1);
    }
-   if (minmax_float && file[0] == AGX_APPLE9_FILE_IMMEDIATE)
-      file[0] = 0;
+   if (minmax_float && file[0] == AGX_APPLE9_FILE_IMMEDIATE) {
+      if (!file[1] && uniform_read[reg[0]]) {
+         file[0] = AGX_APPLE9_FILE_UNIFORM;
+         value[0] = uniform_read[reg[0]] - 1;
+      } else {
+         file[0] = 0;
+      }
+   }
    if (filled) {
       /* Only one of the two leading operands of a plain binary operation may
        * leave the register file; keep whichever was already selected. */
@@ -976,12 +965,20 @@ inline_alu_sources(struct agx_apple9_vir_instr *I, const uint16_t *uniform_read,
    }
    /* FMA's second multiplicand has a native alternative file selector.
     * Commuting the product preserves its absolute/negate composition,
-    * provided neither multiplicand carries a half-register selection. */
-   if (fma && file[0] && !file[1] && !(I->src_half_mask & 3)) {
+    * provided neither multiplicand carries a half-register selection.
+    * Extended FMA also takes a uniform in A and an immediate in B, so
+    * commuting (IMMEDIATE, UNIFORM) -> (UNIFORM, IMMEDIATE) avoids
+    * materializing either operand. */
+   if (fma && file[0] &&
+       (!file[1] ||
+        (file[0] == AGX_APPLE9_FILE_IMMEDIATE &&
+         file[1] == AGX_APPLE9_FILE_UNIFORM)) &&
+       !(I->src_half_mask & 3)) {
       uint32_t src = I->src[0];
       I->src[0] = I->src[1]; I->src[1] = src;
-      file[1] = file[0]; value[1] = value[0];
-      file[0] = 0;
+      uint8_t f = file[0]; file[0] = file[1]; file[1] = f;
+      uint32_t v = value[0]; value[0] = value[1]; value[1] = v;
+      reg[0] = I->src[0]; reg[1] = I->src[1];
       I->src_abs_mask = (I->src_abs_mask & 4) |
          ((I->src_abs_mask & 1) << 1) | ((I->src_abs_mask & 2) >> 1);
       I->src_neg_mask = (I->src_neg_mask & 4) |
@@ -989,10 +986,19 @@ inline_alu_sources(struct agx_apple9_vir_instr *I, const uint16_t *uniform_read,
    }
    /* Extended FMA has a uniform selector for A as well. Preserve the
     * compact form when commuting a lone uniform to B; A immediates still
-    * require materialization. Fixed integer operands are independent. */
-   if ((fma && file[0] == AGX_APPLE9_FILE_IMMEDIATE) ||
-       (!shift && !predicate && !select && !fma && !float2 && !integer && file[0] && file[1]))
+    * fall back to a constant-table uniform if available, otherwise
+    * materialization. Fixed integer operands are independent. */
+   if (fma && file[0] == AGX_APPLE9_FILE_IMMEDIATE) {
+      if (uniform_read[reg[0]]) {
+         file[0] = AGX_APPLE9_FILE_UNIFORM;
+         value[0] = uniform_read[reg[0]] - 1;
+      } else {
+         file[0] = 0;
+      }
+   } else if (!shift && !predicate && !select && !fma && !float2 && !integer &&
+              file[0] && file[1]) {
       file[0] = 0;
+   }
 
    unsigned source = 0;
    for (unsigned s = 0; s < arity; ++s) {
@@ -1390,10 +1396,6 @@ agx_apple9_optimize_vir_with_constants(
    const struct agx_apple9_uniform_constants *constants)
 {
    assert(!p->physical && !p->dependencies_finalized);
-   /* Preserve literal operands through folding and modifier selection first.
-    * Only then trade remaining register sources for known uniform words. */
-   if (constants && constants->count && !agx_apple9_optimize_vir(p))
-      return false;
    if (!p->value_count)
       return true;
 

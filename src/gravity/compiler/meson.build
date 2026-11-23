@@ -28,7 +28,6 @@ libgravity_compiler_files = files(
   '../lib/agx_nir_lower_msaa.c',
   '../lib/agx_nir_lower_sample_intrinsics.c',
   'agx_nir_lower_discard_zs_emit.c',
-  'agx_nir_lower_interpolation.c',
   'agx_nir_lower_texture.c',
 )
 

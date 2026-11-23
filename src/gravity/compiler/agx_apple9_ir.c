@@ -558,6 +558,7 @@ agx_apple9_vir_clone(struct agx_apple9_vir_program *dst,
    dst->instruction_capacity = 0;
    dst->fixed_phys = apple9_dup(src->fixed_phys, src->value_count);
    dst->max_phys = apple9_dup(src->max_phys, src->value_count);
+   dst->value_capacity = (dst->fixed_phys && dst->max_phys) ? src->value_count : 0;
    dst->live_out = apple9_dup(src->live_out, src->live_out_count * sizeof(*src->live_out));
    dst->live_out_reg = apple9_dup(src->live_out_reg, src->live_out_count);
    dst->live_out_capacity = src->live_out ? src->live_out_count : 0;
@@ -823,20 +824,42 @@ agx_apple9_vir_key(const struct agx_apple9_vir_program *program,
    return true;
 }
 
+bool
+agx_apple9_vir_ensure_value_capacity(struct agx_apple9_vir_program *program,
+                                     unsigned needed)
+{
+   if (needed <= program->value_capacity)
+      return true;
+   unsigned capacity = program->value_capacity ? program->value_capacity : 64;
+   while (capacity < needed) {
+      if (capacity > UINT32_MAX / 2) {
+         capacity = needed;
+         break;
+      }
+      capacity *= 2;
+   }
+   uint8_t *fixed = realloc(program->fixed_phys, capacity);
+   if (fixed == NULL)
+      return false;
+   program->fixed_phys = fixed;
+   uint8_t *maximum = realloc(program->max_phys, capacity);
+   if (maximum == NULL)
+      return false;
+   program->max_phys = maximum;
+   program->value_capacity = capacity;
+   return true;
+}
+
 static uint32_t
 apple9_vir_new_value(struct agx_apple9_vir_program *program,
                      unsigned fixed_phys)
 {
    agx_apple9_invalidate_uses(program);
+   if (program->value_count == UINT32_MAX)
+      return AGX_APPLE9_VREG_INVALID;
    const unsigned new_count = program->value_count + 1;
-   uint8_t *fixed = realloc(program->fixed_phys, new_count);
-   if (fixed == NULL)
+   if (!agx_apple9_vir_ensure_value_capacity(program, new_count))
       return AGX_APPLE9_VREG_INVALID;
-   program->fixed_phys = fixed;
-   uint8_t *maximum = realloc(program->max_phys, new_count);
-   if (maximum == NULL)
-      return AGX_APPLE9_VREG_INVALID;
-   program->max_phys = maximum;
    uint32_t value = program->value_count++;
    program->fixed_phys[value] = fixed_phys;
    program->max_phys[value] = AGX_APPLE9_PHYS_INVALID;
@@ -855,14 +878,8 @@ apple9_vir_append_values(struct agx_apple9_vir_program *program, unsigned count)
 
    const unsigned old_count = program->value_count;
    const unsigned new_count = program->value_count + count;
-   uint8_t *fixed = realloc(program->fixed_phys, new_count);
-   if (fixed == NULL)
+   if (!agx_apple9_vir_ensure_value_capacity(program, new_count))
       return false;
-   program->fixed_phys = fixed;
-   uint8_t *maximum = realloc(program->max_phys, new_count);
-   if (maximum == NULL)
-      return false;
-   program->max_phys = maximum;
    memset(&program->fixed_phys[old_count], AGX_APPLE9_PHYS_INVALID, count);
    memset(&program->max_phys[old_count], AGX_APPLE9_PHYS_INVALID, count);
    program->value_count += count;
@@ -2305,34 +2322,6 @@ agx_apple9_vir_emit_texture_lod(struct agx_apple9_vir_program *program,
 {
    return apple9_vir_emit_texture(program, coords, packed_lod, texture, sampler,
                                   true, bias);
-}
-
-/* A biased 2D sample clamped to a minimum LOD: four parameter words, the
- * coordinates, a zero word and word 3 = bias Q6 << 16 | minimum LOD Q6
- * (low 12 bits), with mode 0x0804. Measured on G16 against the gradient form
- * (bit exact for implicit and biased samples across nearest and linear
- * mipmapping, fractional minimum LODs and clamps at the base and last levels;
- * artifacts/msl-encodings-20261011, minlod-probe). */
-uint32_t
-agx_apple9_vir_emit_texture_min_lod(struct agx_apple9_vir_program *program,
-                                   const uint32_t coords[2], uint32_t zero,
-                                   uint32_t bias_min_lod, unsigned texture,
-                                   unsigned sampler)
-{
-   if (!program || !coords || zero >= program->value_count ||
-       bias_min_lod >= program->value_count)
-      return AGX_APPLE9_VREG_INVALID;
-   uint32_t result = apple9_vir_emit_texture(program, coords, zero, texture,
-                                             sampler, true, true);
-   if (result == AGX_APPLE9_VREG_INVALID)
-      return result;
-   struct agx_apple9_vir_instr *params = program->instructions[program->instruction_count - 2];
-   params->encoding = AGX_APPLE9_ENC_TEXTURE_VOLUME_PARAMS;
-   params->nr_srcs = 4;
-   params->src[2] = zero;
-   params->src[3] = bias_min_lod;
-   program->instructions[program->instruction_count - 1]->texture_min_lod = true;
-   return result;
 }
 
 uint32_t
@@ -6296,21 +6285,6 @@ agx_apple9_pack_mov(unsigned dst, unsigned src,
 }
 
 bool
-agx_apple9_pack_device_load_u32(unsigned dst, unsigned index, unsigned binding,
-                                uint8_t flags,
-                                enum agx_apple9_scoreboard_slot scoreboard_slot,
-                                struct agx_apple9_packed_instruction *packed)
-{
-   uint16_t raw_token;
-   if (!apple9_scalar_load_token_for_slot(scoreboard_slot, &raw_token))
-      return false;
-
-   return agx_apple9_pack_device_load_u32_raw(
-      dst, index, binding, AGX_APPLE9_DEVICE_LOAD_INDEX_RETAINED_GPR, flags,
-      AGX_APPLE9_SCOREBOARD_SLOT_NONE, raw_token, packed);
-}
-
-bool
 agx_apple9_pack_device_load_u32_raw(
    unsigned dst, unsigned index, unsigned binding,
    enum agx_apple9_device_load_index_kind index_kind, uint8_t flags,
@@ -9175,19 +9149,6 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       packed_init(packed, bytes, sizeof(bytes));
       return true;
    }
-   case AGX_APPLE9_VIR_SUBGROUP_SCAN_IADD: {
-      if (instruction->encoding != AGX_APPLE9_ENC_SUBGROUP_SCAN_IADD ||
-          instruction->nr_srcs != 1 || instruction->immediate ||
-          phys[instruction->dest] >= 64 || phys[instruction->src[0]] >= 64)
-         return false;
-      /* Authored integer scans use an exclusive primitive. Retain the input
-       * so inclusive scans can add it and later SSA uses remain valid. */
-      const uint8_t bytes[] = {0xbf, 0x01, 0x54,
-         phys[instruction->dest] << 1, 0x03,
-         phys[instruction->src[0]] << 2, 0x16, 0x09};
-      packed_init(packed, bytes, sizeof(bytes));
-      return true;
-   }
    case AGX_APPLE9_VIR_SUBGROUP_REDUCE_UMAX: {
       if (instruction->encoding != AGX_APPLE9_ENC_SUBGROUP_REDUCE_UMAX ||
           instruction->nr_srcs != 1 || instruction->immediate ||
@@ -9200,23 +9161,6 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       return agx_apple9_pack_subgroup_reduce_umax(
          2 * phys[instruction->dest], 2 * phys[instruction->src[0]], 32,
          false, false, false, packed);
-   }
-   case AGX_APPLE9_VIR_SUBGROUP_BROADCAST: {
-      if (instruction->encoding != AGX_APPLE9_ENC_SUBGROUP_BROADCAST ||
-          instruction->nr_srcs != 2 || instruction->immediate ||
-          phys[instruction->dest] >= 64 || phys[instruction->src[0]] >= 64 ||
-          phys[instruction->src[1]] >= 64)
-         return false;
-      /* simd_shuffle: each lane reads the data register from the lane named
-       * by the low half of its index register. Byte 8 bits 2 and 3 are the
-       * data and index discard hints; leave both clear so the sources stay
-       * live. */
-      const uint8_t bytes[] = {0x47, 0x04, 0x54,
-         phys[instruction->dest] << 1, 0x03,
-         phys[instruction->src[0]] << 2, phys[instruction->src[1]] << 2,
-         0x2c, 0x10, 0};
-      packed_init(packed, bytes, sizeof(bytes));
-      return true;
    }
    case AGX_APPLE9_VIR_SUBGROUP_BALLOT: {
       if (instruction->encoding != AGX_APPLE9_ENC_SUBGROUP_BALLOT ||
@@ -10365,8 +10309,6 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       return pack_shift(instruction, phys, packed);
    case AGX_APPLE9_VIR_EXTR:
       return pack_extr(instruction, phys, packed);
-   case AGX_APPLE9_VIR_IMUL:
-      break;
    case AGX_APPLE9_VIR_IADD:
    case AGX_APPLE9_VIR_ISUB:
       return pack_iadd(instruction, phys, packed);

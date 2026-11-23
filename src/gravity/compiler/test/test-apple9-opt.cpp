@@ -1574,3 +1574,33 @@ TEST_F(Apple9Optimization, FoldUniformStoresRejectsHalfAndHiMasks)
    EXPECT_EQ(store->encoding, AGX_APPLE9_ENC_STORE_UNIFORM);
    EXPECT_EQ(store->nr_srcs, 1u);
 }
+
+TEST_F(Apple9Optimization, SinglePassConstantsPreferMinifloatAndCommuteFma)
+{
+   /* P1-6: single-pass agx_apple9_optimize_vir_with_constants prefers
+    * encodable minifloat literals over constant-table uniforms and commutes
+    * FMA(minifloat_imm, uniform_const, acc) -> FMA(uniform_const, minifloat_imm, acc). */
+   auto acc = agx_apple9_vir_input(&p, 0);
+   auto lit_one = imm(0x3f800000u);      /* 1.0f: encodable minifloat */
+   auto non_lit = imm(0x40490fdbu);      /* pi: only in constant table */
+   uint32_t srcs[] = {lit_one, non_lit, acc};
+   p.output = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FMA,
+                                  AGX_APPLE9_ENC_FLOAT3_EXTENDED, srcs, 3, 0);
+
+   struct agx_apple9_uniform_constants constants = {};
+   constants.base = 12;
+   constants.count = 2;
+   constants.values[0] = 0x3f800000u; /* 1.0f also present in constant table */
+   constants.values[1] = 0x40490fdbu; /* pi in u13 */
+   ASSERT_TRUE(agx_apple9_optimize_vir_with_constants(&p, &constants));
+
+   const auto *fma = agx_apple9_definition(&p, p.output);
+   ASSERT_NE(fma, nullptr);
+   /* Slot 0 gets u13 (pi), slot 1 gets immediate 1.0f, slot 2 stays GPR acc. */
+   EXPECT_EQ(fma->alu_src_uniform_mask, 1u);
+   EXPECT_EQ(fma->alu_src_value[0], 13u);
+   EXPECT_EQ(fma->alu_src_immediate_mask, 2u);
+   EXPECT_EQ(fma->alu_src_value[1], 0x3f800000u);
+   EXPECT_EQ(fma->nr_srcs, 1u);
+   EXPECT_EQ(fma->src[0], acc);
+}

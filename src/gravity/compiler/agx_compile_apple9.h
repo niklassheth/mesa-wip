@@ -663,11 +663,6 @@ bool agx_nir_lower_apple9_vertex_inputs(
 bool agx_compile_apple9_vertex(nir_shader *nir, struct agx_shader_part *out,
                                const char **reason);
 
-/* Vertex-fetch packaging is not implemented; this entry point rejects. */
-bool agx_compile_apple9_vertex_prolog(nir_shader *nir,
-                                      struct agx_shader_part *out,
-                                      const char **reason);
-
 /* Patch a compiled vertex shader's user-varying VARY_STORE slot immediates to
  * match a new (flat_mask, linear_mask) group ordering without recompilation. */
 bool agx_apple9_patch_vs_varyings(

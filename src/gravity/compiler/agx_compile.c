@@ -81,22 +81,6 @@ agx_occupancy_for_register_count(unsigned halfregs)
    UNREACHABLE("Register count must be less than the maximum");
 }
 
-unsigned
-agx_max_registers_for_occupancy(unsigned occupancy)
-{
-   unsigned max_regs = 0;
-
-   for (unsigned i = 0; i < ARRAY_SIZE(occupancies); ++i) {
-      if (occupancy <= occupancies[i].max_threads)
-         max_regs = occupancies[i].max_registers;
-      else
-         break;
-   }
-
-   assert(max_regs > 0 && "Thread count must be less than the maximum");
-   return max_regs;
-}
-
 static bool
 agx_lower_sincos_filter(const nir_instr *instr, UNUSED const void *_)
 {
@@ -195,41 +179,6 @@ agx_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
       return false;
 
    return true;
-}
-
-/*
- * Varyings that are used as texture coordinates should be kept at fp32, because
- * fp16 does not have enough precision for large textures.
- */
-static bool
-gather_texcoords(nir_builder *b, nir_tex_instr *tex, void *data)
-{
-   nir_def *coord = nir_get_tex_src(tex, nir_tex_src_coord);
-   if (!coord)
-      return false;
-
-   nir_scalar x = nir_scalar_resolved(coord, 0);
-   nir_scalar y = nir_scalar_resolved(coord, 1);
-   nir_intrinsic_instr *intr = nir_scalar_as_intrinsic(x);
-
-   if (x.def == y.def && intr &&
-       intr->intrinsic == nir_intrinsic_load_interpolated_input) {
-
-      uint64_t *mask = data;
-      *mask |= BITFIELD64_BIT(nir_intrinsic_io_semantics(intr).location);
-   }
-
-   return false;
-}
-
-uint64_t
-agx_gather_texcoords(nir_shader *nir)
-{
-   assert(nir->info.stage == MESA_SHADER_FRAGMENT);
-
-   uint64_t mask = 0;
-   nir_shader_tex_pass(nir, gather_texcoords, nir_metadata_all, &mask);
-   return mask;
 }
 
 static bool

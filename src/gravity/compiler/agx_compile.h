@@ -380,41 +380,6 @@ struct agx_shader_info {
    struct agx2_stats stats;
 };
 
-struct agx_precompiled_kernel_info {
-   uint32_t preamble_offset, main_offset;
-   uint32_t main_size, binary_size;
-   struct agx_rodata rodata;
-   uint16_t nr_gprs, nr_preamble_gprs;
-   uint16_t push_count;
-   uint16_t workgroup_size[3];
-   uint16_t local_size;
-   uint16_t imageblock_stride;
-   bool uses_txf;
-};
-
-static inline struct agx_precompiled_kernel_info
-agx_compact_kernel_info(struct agx_shader_info *info)
-{
-   assert(info->has_preamble == (info->nr_preamble_gprs > 0));
-   assert(info->texture_state_count <= 8 && "static maximum, no need to plumb");
-
-   return (struct agx_precompiled_kernel_info){
-      .preamble_offset = info->preamble_offset,
-      .main_offset = info->main_offset,
-      .main_size = info->main_size,
-      .binary_size = info->binary_size,
-      .rodata = info->rodata,
-      .nr_gprs = info->nr_gprs,
-      .nr_preamble_gprs = info->nr_preamble_gprs,
-      .push_count = info->push_count,
-      .workgroup_size = {info->workgroup_size[0], info->workgroup_size[1],
-                         info->workgroup_size[2]},
-      .local_size = info->local_size,
-      .imageblock_stride = info->imageblock_stride,
-      .uses_txf = info->uses_txf,
-   };
-}
-
 struct agx_shader_part {
    struct agx_shader_info info;
    void *binary;
@@ -431,131 +396,12 @@ agx_is_shader_empty(struct agx_shader_part *s)
 
 #define AGX_MAX_RTS (8)
 
-enum agx_format {
-   AGX_FORMAT_I8 = 0,
-   AGX_FORMAT_I16 = 1,
-   AGX_FORMAT_I32 = 2,
-   AGX_FORMAT_F16 = 3,
-   AGX_FORMAT_U8NORM = 4,
-   AGX_FORMAT_S8NORM = 5,
-   AGX_FORMAT_U16NORM = 6,
-   AGX_FORMAT_S16NORM = 7,
-   AGX_FORMAT_RGB10A2 = 8,
-   AGX_FORMAT_SRGBA8 = 10,
-   AGX_FORMAT_RG11B10F = 12,
-   AGX_FORMAT_RGB9E5 = 13,
-
-   /* Keep last */
-   AGX_NUM_FORMATS,
-};
-
-struct agx_fs_shader_key {
-   /* Normally, access to the tilebuffer must be guarded by appropriate fencing
-    * instructions to ensure correct results in the presence of out-of-order
-    * hardware optimizations. However, specially dispatched clear shaders are
-    * not subject to these conditions and can omit the wait instructions.
-    *
-    * Must (only) be set for special clear shaders.
-    *
-    * Must not be used with sample mask writes (including discards) or
-    * tilebuffer loads (including blending).
-    */
-   bool ignore_tib_dependencies;
-
-   /* When dynamic sample shading is used, the fragment shader is wrapped in a
-    * loop external to the API shader. This bit indicates that we are compiling
-    * inside the sample loop, meaning the execution nesting counter is already
-    * zero and must be preserved.
-    */
-   bool inside_sample_loop;
-
-   /* Base coefficient register. 0 for API shaders but nonzero for FS prolog */
-   uint8_t cf_base;
-};
-
-/*
- * Shader instruction-set generation.  The fixed-function GPU generation and
- * the shader ISA are deliberately tracked separately: G16/G17 use the Apple9
- * shader ISA even though their firmware and command interfaces differ.
- *
- * DEFAULT is kept for target-independent internal compiler invocations.  A
- * key gathered from a physical device always selects a concrete ISA.
- */
-enum agx_shader_isa {
-   AGX_SHADER_ISA_DEFAULT = 0,
-   AGX_SHADER_ISA_APPLE8 = 8,
-   AGX_SHADER_ISA_APPLE9 = 9,
-};
-
-struct agx_device_key {
-   enum agx_shader_isa shader_isa;
-
-   /* Does the target GPU need explicit cluster coherency for atomics?
-    * Only used on G13X.
-    */
-   enum u_tristate needs_g13x_coherency;
-
-   /* Is soft fault enabled? This is technically system-wide policy set by the
-    * kernel, but that's functionally a hardware feature.
-    */
-   bool soft_fault;
-};
-
-struct agx_shader_key {
-   /* Device info */
-   struct agx_device_key dev;
-
-   /* Number of reserved preamble slots at the start */
-   unsigned reserved_preamble;
-
-   /* Whether scratch memory is available in the given shader stage */
-   bool has_scratch;
-
-   /* Whether we're compiling the helper program used for scratch allocation.
-    * This has special register allocation requirements.
-    */
-   bool is_helper;
-
-   /* Whether the driver supports uploading constants for this shader. If
-    * false, constants will not be promoted to uniforms.
-    */
-   bool promote_constants;
-
-   /* Similarly whether the driver supports promoting bindless
-    * textures/samplers.  Currently this works only if non-bindless
-    * textures/samplers are not used, but none of our drivers mix bindless /
-    * non-bindless usage.
-    */
-   bool promote_textures;
-
-   /* Set if this is a non-monolithic shader that must be linked with additional
-    * shader parts before the program can be used. This suppresses omission of
-    * `stop` instructions, which the linker must insert instead.
-    */
-   bool no_stop;
-
-   /* Set if this is a secondary shader part (prolog or epilog). This prevents
-    * the compiler from allocating uniform registers. For example, this turns
-    * off preambles.
-    */
-   bool secondary;
-
-   union {
-      struct agx_fs_shader_key fs;
-   };
-};
-
-uint64_t agx_gather_texcoords(nir_shader *nir);
-
 void agx_preprocess_nir(nir_shader *nir);
 bool agx_nir_lower_printf_buffer(nir_shader *nir);
 bool agx_nir_lower_discard_zs_emit(nir_shader *s);
 bool agx_nir_lower_sample_mask(nir_shader *s);
-bool agx_nir_lower_interpolation(nir_shader *s);
 
 bool agx_nir_lower_cull_distance_vs(struct nir_shader *s);
-bool agx_nir_lower_cull_distance_fs(struct nir_shader *s,
-                                    unsigned nr_distances);
 bool agx_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
                           unsigned bit_size, unsigned num_components,
                           int64_t hole_size, nir_intrinsic_instr *low,
@@ -567,13 +413,6 @@ struct agx_occupancy {
 };
 
 struct agx_occupancy agx_occupancy_for_register_count(unsigned halfregs);
-unsigned agx_max_registers_for_occupancy(unsigned occupancy);
-
-static inline unsigned
-agx_round_registers(unsigned halfregs)
-{
-   return agx_occupancy_for_register_count(halfregs).max_registers;
-}
 
 static const nir_shader_compiler_options agx_nir_options = {
    .lower_fdiv = true,

@@ -30,15 +30,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-DEBUG_GET_ONCE_OPTION(cached_agx_apple9_no_descriptor_hoist,
-                      "AGX_APPLE9_NO_DESCRIPTOR_HOIST", NULL)
-DEBUG_GET_ONCE_OPTION(cached_agx_apple9_no_promote,
-                      "AGX_APPLE9_NO_PROMOTE", NULL)
-DEBUG_GET_ONCE_OPTION(cached_agx_apple9_no_sampler_hoist,
-                      "AGX_APPLE9_NO_SAMPLER_HOIST", NULL)
-DEBUG_GET_ONCE_OPTION(cached_agx_apple9_no_uniform_move,
-                      "AGX_APPLE9_NO_UNIFORM_MOVE", NULL)
-
 
 /* Apple9 compute compilation uses one NIR-to-VIR-to-machine pipeline. */
 
@@ -3540,24 +3531,13 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
          if (scalar.def->bit_size != 32 ||
              word >= AGX_APPLE9_UNIFORM_COUNT - lower->preamble_base)
             return AGX_APPLE9_VREG_INVALID;
-         /* A uniform move reads the word without a zero register
-          * (AGX_APPLE9_NO_UNIFORM_MOVE=1 keeps the zero-sourced OR).
+         /* A uniform move reads the word without a zero register.
           * Rematerialize immutable uniform imports at each use so bindless
           * handles do not pin GPRs across the entire shader; in-block CSE
           * and inline uniform folding clean up repeated uses. */
-         static int no_move = -1;
-         if (no_move < 0)
-            no_move = debug_get_option_cached_agx_apple9_no_uniform_move() != NULL;
-         if (no_move) {
-            uint32_t zero = apple9_dag_zero(lower);
-            return apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR_UNIFORM,
-               AGX_APPLE9_ENC_LOGIC_UNIFORM, &zero, 1,
-               lower->preamble_base + word);
-         } else {
-            return apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR_UNIFORM,
-               AGX_APPLE9_ENC_UNIFORM_MOVE, NULL, 0,
-               lower->preamble_base + word);
-         }
+         return apple9_dag_emit(lower, AGX_APPLE9_VIR_IOR_UNIFORM,
+            AGX_APPLE9_ENC_UNIFORM_MOVE, NULL, 0,
+            lower->preamble_base + word);
       } else if (subgroup_size) {
          /* Native Metal materializes the architectural SIMD width. */
          value = apple9_dag_imm(lower, 32);
@@ -8916,7 +8896,7 @@ apple9_uniform_constant_use(nir_alu_instr *alu, unsigned s, uint32_t *value)
    /* So are 8-bit literals of integer add/subtract, logic and selected
     * values; a small negative addend is subtracted. */
    /* Compare operands take a literal as well (either side, by reversal). */
-   if (comparison && !agx_apple9_compare_literals_disabled()) {
+   if (comparison) {
       bool low;
       bool float_compare = alu->op == nir_op_flt || alu->op == nir_op_fge ||
                            alu->op == nir_op_feq || alu->op == nir_op_fneu;
@@ -9409,7 +9389,7 @@ apple9_hoist_uniform_reads(nir_shader *nir, struct hash_table *original_blocks,
       /* Descriptor records read through handles (texture info, runtime
        * sampler state) are hoisted in every stage: unlike buffer reads,
        * leaving them in their branches did not save registers. */
-      .descriptor_reads = !debug_get_option_cached_agx_apple9_no_descriptor_hoist(),
+      .descriptor_reads = true,
       .state = calloc(MAX2(impl->ssa_alloc, 1), 1),
       .cursor = nir_after_block_before_jump(nir_start_block(impl)),
    };
@@ -9422,8 +9402,7 @@ apple9_hoist_uniform_reads(nir_shader *nir, struct hash_table *original_blocks,
     * instructions are restored. Like address hoists, this placement is
     * compared against the original one when it spills or its setup does not
     * fit. */
-   const bool alu_seeds = addresses && original_blocks &&
-                          !debug_get_option_cached_agx_apple9_no_sampler_hoist();
+   const bool alu_seeds = addresses && original_blocks;
    if (alu_seeds) {
       nir_foreach_block(block, impl) {
          if (block == s.entry)
@@ -9695,16 +9674,21 @@ apple9_preamble_trial(nir_shader *nir, struct agx_shader_part *out,
                      char **log, size_t *log_size, unsigned *address_hoists,
                      bool *setup_retried)
 {
-   FILE *stream = open_memstream(log, log_size);
+   const bool capture_log =
+      (agx_apple9_debug_flags() &
+       (AGX_A9_DBG_ASM | AGX_A9_DBG_BINARY | AGX_A9_DBG_STATS |
+        AGX_A9_DBG_TRACE | AGX_A9_DBG_FINAL_NIR)) != 0;
+   FILE *stream = capture_log ? open_memstream(log, log_size) : NULL;
    FILE *previous = apple9_log_stream;
-   apple9_log_stream = stream;
+   if (stream)
+      apple9_log_stream = stream;
    bool ok = false;
    unsigned budget =
       AGX_APPLE9_UNIFORM_COUNT -
       (resources->descriptor_tables
           ? MAX2(AGX_APPLE9_GRAPHICS_ROOT_WORDS, resources->native_root_words)
           : agx_apple9_compute_preamble_base(resources->count));
-   bool promote_constants = !debug_get_option_cached_agx_apple9_no_promote();
+   bool promote_constants = true;
    /* Constant stores must not discard an otherwise useful preamble when
     * they cross the code-size policy bound. Retry without them first.
     * If the extracted expressions alone exceed the bound, reduce their
@@ -9764,7 +9748,6 @@ static bool
 apple9_compile_dag_tail(nir_shader *nir, struct agx_shader_part *out,
                         struct agx_apple9_compute_profile *profile,
                         const struct agx_apple9_varying_layout *varyings,
-                        struct apple9_dag_cost *chosen_cost,
                         const struct agx_apple9_mesh_key *native_key,
                         const struct apple9_buffer_map *reserved_resources,
                         bool allow_preamble, const char **reason);
@@ -9831,8 +9814,7 @@ apple9_compile_dag(nir_shader *nir, struct agx_shader_part *out,
       nir->options = saved;
    }
    apple9_prepare_dag(nir);
-   struct apple9_dag_cost cost = {0};
-   return apple9_compile_dag_tail(nir, out, profile, varyings, &cost,
+   return apple9_compile_dag_tail(nir, out, profile, varyings,
                                   native_key, reserved_resources,
                                   allow_preamble, reason);
 }
@@ -9841,7 +9823,6 @@ static bool
 apple9_compile_dag_tail(nir_shader *nir, struct agx_shader_part *out,
                         struct agx_apple9_compute_profile *profile,
                         const struct agx_apple9_varying_layout *varyings,
-                        struct apple9_dag_cost *chosen_cost,
                         const struct agx_apple9_mesh_key *native_key,
                         const struct apple9_buffer_map *reserved_resources,
                         bool allow_preamble, const char **reason)
@@ -9870,7 +9851,7 @@ apple9_compile_dag_tail(nir_shader *nir, struct agx_shader_part *out,
 
    if (!allow_preamble) {
       return apple9_compile_dag_body(nir, out, profile, varyings, &resources,
-                                     NULL, false, chosen_cost, reason);
+                                     NULL, false, NULL, reason);
    }
 
    struct apple9_dag_cost address_cost = {0}, original_cost = {0};
@@ -9914,7 +9895,6 @@ apple9_compile_dag_tail(nir_shader *nir, struct agx_shader_part *out,
    }
    apple9_prepared_main = NULL;
    ralloc_free(prepared);
-   *chosen_cost = use_original ? original_cost : address_cost;
    const char *log = use_original ? original_log : address_log;
    size_t size = use_original ? original_size : address_size;
    if (log && size)
@@ -14848,16 +14828,6 @@ agx_compile_apple9_vertex_inputs(
 {
    return nir->info.stage == MESA_SHADER_VERTEX &&
           apple9_compile_graphics(nir, out, layout, NULL, NULL, 1, reason);
-}
-
-bool
-agx_compile_apple9_vertex_prolog(nir_shader *nir, struct agx_shader_part *out,
-                                 const char **reason)
-{
-   memset(out, 0, sizeof(*out));
-   if (reason)
-      *reason = "Apple9 vertex-fetch ABI is not implemented";
-   return false;
 }
 
 bool
