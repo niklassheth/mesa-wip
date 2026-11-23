@@ -1254,33 +1254,144 @@ static bool hk_apple9_vectorize_cb(unsigned align_mul, unsigned align_offset,
                                    int64_t hole_size, nir_intrinsic_instr *low,
                                    nir_intrinsic_instr *high, void *data);
 
-/* Peak of live words after vectorizing a copy of the shader with or
- * without the windows. */
-static unsigned
-hk_apple9_vectorized_peak(const nir_shader *nir, bool windowed, bool soft_fault)
-{
-   nir_shader *clone = nir_shader_clone(NULL, nir);
-   struct hk_vectorize_policy policy = {
-      .windowed = windowed,
-      .soft_fault = soft_fault,
-   };
-   nir_opt_load_store_vectorize(clone,
-                                &(const nir_load_store_vectorize_options){
-                                   .modes = nir_var_mem_global,
-                                   .bounds_checked_modes = nir_var_mem_global,
-                                   .callback = hk_apple9_vectorize_cb,
-                                   .cb_data = &policy,
-                                });
-   nir_opt_dce(clone);
-   unsigned peak = hk_apple9_peak_live_words(clone);
-   ralloc_free(clone);
-   return peak;
-}
-
 /* Above this divergent live-word peak, unwindowed merging is only allowed if
  * it does not increase peak live words (e.g. by eliminating CSE'd +4/+8/+12
  * address offsets). */
 #define HK_APPLE9_VECTORIZE_PRESSURE_BUDGET 80
+
+static unsigned
+hk_apple9_count_vectorizable_global_ops(const nir_shader *nir)
+{
+   unsigned count = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_global:
+            case nir_intrinsic_load_global_constant:
+            case nir_intrinsic_load_global_offset:
+            case nir_intrinsic_load_global_constant_offset:
+            case nir_intrinsic_load_global_bounded:
+            case nir_intrinsic_load_global_constant_bounded:
+            case nir_intrinsic_store_global:
+            case nir_intrinsic_store_global_offset:
+               if (++count >= 2)
+                  return count;
+               break;
+            case nir_intrinsic_load_deref:
+            case nir_intrinsic_store_deref:
+               if (nir_src_as_deref(intr->src[0])->modes & nir_var_mem_global) {
+                  if (++count >= 2)
+                     return count;
+               }
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return count;
+}
+
+/* Vectorize global/bounded loads and stores, gating pressure estimation and
+ * trial cloning on the presence of candidate ops and reusing the winning
+ * vectorized function implementation instead of re-running a third time. */
+static void
+hk_apple9_vectorize_global(nir_shader *nir, bool soft_fault)
+{
+   const unsigned global_ops = hk_apple9_count_vectorizable_global_ops(nir);
+   if (global_ops == 0)
+      return;
+
+   struct hk_vectorize_policy policy = {
+      .windowed = true,
+      .soft_fault = soft_fault,
+   };
+   const nir_load_store_vectorize_options vec_opts = {
+      .modes = nir_var_mem_global,
+      .bounds_checked_modes = nir_var_mem_global,
+      .callback = hk_apple9_vectorize_cb,
+      .cb_data = &policy,
+   };
+
+   /* Bounded loads perform their own exact 32-bit non-wrap proof inside
+    * hk_apple9_vectorize_cb (avoiding both false rejects on iand/umin offsets
+    * and false accepts on non-power-of-two gcd strides in check_for_robustness). */
+   if (global_ops == 1) {
+      NIR_PASS(_, nir, nir_opt_load_store_vectorize, &vec_opts);
+      return;
+   }
+
+   /* Below the pressure budget, merge without windows, unless that raises
+    * the shader's peak of live words over windowed merging. */
+   const bool dbg_pressure = agx_apple9_debug_enabled(AGX_A9_DBG_PRESSURE);
+   const unsigned peak = hk_apple9_peak_live_words(nir);
+   policy.windowed = peak > 2 * HK_APPLE9_VECTORIZE_PRESSURE_BUDGET;
+   unsigned peak_windowed = 0, peak_free = 0;
+
+   if (policy.windowed) {
+      NIR_PASS(_, nir, nir_opt_load_store_vectorize, &vec_opts);
+   } else if (exec_list_is_singular(&nir->functions)) {
+      nir_function *func = nir_shader_get_entrypoint(nir)->function;
+      nir_function_impl *orig_impl = func->impl;
+      nir_function_impl *backup_impl =
+         !orig_impl->preamble ? nir_function_impl_clone(nir, orig_impl) : NULL;
+
+      if (!backup_impl) {
+         policy.windowed = true;
+         NIR_PASS(_, nir, nir_opt_load_store_vectorize, &vec_opts);
+      } else {
+         bool free_progress = false;
+         NIR_PASS(free_progress, nir, nir_opt_load_store_vectorize, &vec_opts);
+         if (!free_progress) {
+            /* Windowed mode is strictly more restrictive than unwindowed, so
+             * it would also make no merges. */
+            peak_free = peak_windowed = peak;
+            ralloc_free(backup_impl);
+         } else {
+            NIR_PASS(_, nir, nir_opt_dce);
+            peak_free = hk_apple9_peak_live_words(nir);
+            if (peak_free <= HK_APPLE9_VECTORIZE_PRESSURE_BUDGET && !dbg_pressure) {
+               ralloc_free(backup_impl);
+            } else {
+               nir_function_set_impl(func, backup_impl);
+               policy.windowed = true;
+               NIR_PASS(_, nir, nir_opt_load_store_vectorize, &vec_opts);
+               if (peak_free <= 88u || dbg_pressure) {
+                  NIR_PASS(_, nir, nir_opt_dce);
+                  peak_windowed = hk_apple9_peak_live_words(nir);
+               }
+               /* Keep windowed merging if unwindowed merging still exceeds the
+                * pressure budget (unless it strictly reduces peak live words
+                * below windowed, e.g. by eliminating dozens of CSE'd +4/+8/+12
+                * offsets). */
+               policy.windowed =
+                  peak_free > HK_APPLE9_VECTORIZE_PRESSURE_BUDGET &&
+                  !(peak_free + 8u <= peak_windowed && peak_free <= 88u);
+               if (policy.windowed) {
+                  ralloc_free(orig_impl);
+               } else {
+                  nir_function_set_impl(func, orig_impl);
+                  ralloc_free(backup_impl);
+               }
+            }
+         }
+      }
+   } else {
+      policy.windowed = true;
+      NIR_PASS(_, nir, nir_opt_load_store_vectorize, &vec_opts);
+   }
+
+   if (dbg_pressure)
+      fprintf(stderr,
+              "HK_PRESSURE stage=%u peak=%u windowed=%u merged_peaks=%u/%u\n",
+              nir->info.stage, peak,
+              policy.windowed, peak_windowed, peak_free);
+}
 
 /* Compute the proven power-of-two stride modulo 2^32 and constant remainder of
  * a 32-bit offset expression (returning 0 when the offset is constant). Only
@@ -3361,40 +3472,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    if (agx_apple9_debug_enabled(AGX_A9_DBG_VECTORIZE) &&
        nir->info.stage == MESA_SHADER_FRAGMENT)
       nir_print_shader(nir, stderr);
-   /* Below the pressure budget, merge without windows, unless that
-    * raises the shader's peak of live words over windowed merging.
-    */
-   const bool soft_fault = agx_has_soft_fault(&dev->dev);
-   unsigned peak = hk_apple9_peak_live_words(nir);
-   struct hk_vectorize_policy policy = {
-      .windowed = peak > 2 * HK_APPLE9_VECTORIZE_PRESSURE_BUDGET,
-      .soft_fault = soft_fault,
-   };
-   unsigned peak_windowed = 0, peak_free = 0;
-   if (!policy.windowed) {
-      peak_windowed = hk_apple9_vectorized_peak(nir, true, soft_fault);
-      peak_free = hk_apple9_vectorized_peak(nir, false, soft_fault);
-      /* Keep windowed merging if unwindowed merging still exceeds the pressure
-       * budget (unless it strictly reduces peak live words below windowed, e.g.
-       * by eliminating dozens of CSE'd +4/+8/+12 offsets). */
-      policy.windowed = peak_free > HK_APPLE9_VECTORIZE_PRESSURE_BUDGET &&
-                        !(peak_free + 8u <= peak_windowed && peak_free <= 88u);
-   }
-   if (agx_apple9_debug_enabled(AGX_A9_DBG_PRESSURE))
-      fprintf(stderr,
-              "HK_PRESSURE stage=%u peak=%u windowed=%u merged_peaks=%u/%u\n",
-              nir->info.stage, peak,
-              policy.windowed, peak_windowed, peak_free);
-   /* Bounded loads perform their own exact 32-bit non-wrap proof inside
-    * hk_apple9_vectorize_cb (avoiding both false rejects on iand/umin offsets
-    * and false accepts on non-power-of-two gcd strides in check_for_robustness). */
-   NIR_PASS(_, nir, nir_opt_load_store_vectorize,
-            &(const nir_load_store_vectorize_options){
-               .modes = nir_var_mem_global,
-               .bounds_checked_modes = nir_var_mem_global,
-               .callback = hk_apple9_vectorize_cb,
-               .cb_data = &policy,
-            });
+   hk_apple9_vectorize_global(nir, agx_has_soft_fault(&dev->dev));
 
    nir_move_options opts = nir_move_load_ssbo | nir_move_load_ubo;
    NIR_PASS(progress, nir, nir_opt_sink, opts);

@@ -268,8 +268,8 @@ hk_get_spirv_options(struct vk_physical_device *vk_pdev,
    };
 }
 
-void
-hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
+static void
+hk_preprocess_nir_early(struct vk_physical_device *vk_pdev, nir_shader *nir)
 {
    /* Must lower before io to temps */
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
@@ -348,16 +348,32 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
 
-   /* Extract immutable tables before agx_preprocess_nir lowers large local
-    * arrays to scratch. The analysis requires explicit loads/stores rather
-    * than copies. Keep the data attached to NIR through variant cloning.
+   /* Extract immutable tables before lowering large local arrays to scratch.
+    * The analysis requires explicit loads/stores rather than copies. Keep the
+    * data attached to NIR through variant cloning.
     */
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_large_constants, NULL, 32);
 
-   NIR_PASS(_, nir, agx_nir_lower_apple9_math);
-   agx_preprocess_nir(nir);
+   /* Lower function temporaries to SSA/scratch/if-else early without running
+    * the full late agx_preprocess_nir loop or non-idempotent fragment
+    * helper-write guarding, which run once in hk_lower_nir after all driver
+    * lowering has created its final memory writes.
+    */
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_lower_vars_to_scratch, 256,
+            glsl_get_natural_size_align_bytes,
+            glsl_get_word_size_align_bytes);
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
+            nir_var_function_temp, ~0);
+   NIR_PASS(_, nir, nir_split_var_copies);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_lower_var_copies);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_opt_dead_cf);
 
    /* Constant-offset reads can fold away after extraction. Do not upload
     * or bind an unused blob: besides wasting storage, that would extend
@@ -381,15 +397,24 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
       }
    }
 
+   NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    NIR_PASS(_, nir, nir_lower_var_copies);
+}
+
+void
+hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
+{
+   hk_preprocess_nir_early(vk_pdev, nir);
+   NIR_PASS(_, nir, agx_nir_lower_apple9_math);
+   agx_preprocess_nir(nir);
 }
 
 static void
 hk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
                   UNUSED const struct vk_pipeline_robustness_state *rs)
 {
-   hk_preprocess_nir_internal(vk_pdev, nir);
+   hk_preprocess_nir_early(vk_pdev, nir);
    /* Only compute dispatches have a base workgroup. */
    nir_lower_compute_system_values_options csv_options = {
       .has_base_workgroup_id = nir->info.stage == MESA_SHADER_COMPUTE,
@@ -636,7 +661,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 }
 
 /* Version the container independently of the hardware programs it owns. */
-#define HK_SHADER_CONTAINER_VERSION 0x484b000fu
+#define HK_SHADER_CONTAINER_VERSION 0x484b0010u
 
 static VkResult
 hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *blob,

@@ -14,48 +14,9 @@
 /* Shared by the standalone compiler and the driver's device initialization. */
 bool agx_apple9_trace_enabled(void);
 
-struct agx_cf_binding {
-   /* Base coefficient register */
-   uint8_t cf_base;
-
-   /* Slot being bound */
-   gl_varying_slot slot : 8;
-
-   /* First component bound.
-    *
-    * Must be 2 (Z) or 3 (W) if slot == VARYING_SLOT_POS.
-    */
-   unsigned offset : 2;
-
-   /* Number of components bound */
-   unsigned count : 3;
-
-   /* Is smooth shading enabled? If false, flat shading is used */
-   bool smooth : 1;
-
-   /* Perspective correct interpolation */
-   bool perspective : 1;
-
-   uint8_t pad;
-};
-
-/* Conservative bound, * 4 due to offsets (TODO: maybe worth eliminating
- * coefficient register aliasing?)
- */
-#define AGX_MAX_CF_BINDINGS (VARYING_SLOT_MAX * 4)
-
 struct agx_varyings_fs {
    /* Number of coefficient registers used */
    unsigned nr_cf;
-
-   /* Number of coefficient register bindings */
-   unsigned nr_bindings;
-
-   /* Whether gl_FragCoord.z is read */
-   bool reads_z;
-
-   /* Coefficient register bindings */
-   struct agx_cf_binding bindings[AGX_MAX_CF_BINDINGS];
 };
 
 union agx_varyings {
