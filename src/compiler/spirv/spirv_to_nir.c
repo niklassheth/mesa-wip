@@ -2345,13 +2345,12 @@ vtn_handle_type(struct vtn_builder *b, SpvOp opcode,
 
          val->type->pointed = pointed_type;
 
-         /* Only certain storage classes use ArrayStride. */
+         /* Only certain storage classes use ArrayStride on OpTypePointer.
+          * Workgroup arrays carry ArrayStride on OpTypeArray under
+          * WorkgroupMemoryExplicitLayoutKHR, while ArrayStride on a Workgroup
+          * OpTypePointer is ignored.
+          */
          switch (storage_class) {
-         case SpvStorageClassWorkgroup:
-            if (!b->supported_capabilities.WorkgroupMemoryExplicitLayoutKHR)
-               break;
-            FALLTHROUGH;
-
          case SpvStorageClassUniform:
          case SpvStorageClassPushConstant:
          case SpvStorageClassStorageBuffer:

@@ -1022,10 +1022,12 @@ is_trivial_array_deref_cast(nir_deref_instr *cast)
    nir_deref_instr *parent = nir_src_as_deref(cast->parent);
 
    if (parent->deref_type == nir_deref_type_array) {
-      return cast->cast.ptr_stride ==
+      return cast->cast.ptr_stride == 0 ||
+             cast->cast.ptr_stride ==
              glsl_get_explicit_stride(nir_deref_instr_parent(parent)->type);
    } else if (parent->deref_type == nir_deref_type_ptr_as_array) {
-      return cast->cast.ptr_stride ==
+      return cast->cast.ptr_stride == 0 ||
+             cast->cast.ptr_stride ==
              nir_deref_instr_array_stride(parent);
    } else {
       return false;

@@ -24,6 +24,7 @@
 #include "nir.h"
 #include "nir_builder.h"
 #include "nir_deref.h"
+#include "util/u_dynarray.h"
 
 static nir_intrinsic_op
 ssbo_atomic_for_deref(nir_intrinsic_op deref_op)
@@ -2113,6 +2114,142 @@ nir_calculate_alignment_from_explicit_layout(const glsl_type *type,
    return alignment;
 }
 
+static unsigned
+infer_shared_deref_stride(nir_function_impl *impl, nir_def *root)
+{
+   if (!root || impl->ssa_alloc == 0)
+      return 0;
+
+   BITSET_WORD *visited = calloc(BITSET_WORDS(impl->ssa_alloc), sizeof(*visited));
+   if (!visited)
+      return 0;
+
+   struct util_dynarray stack;
+   util_dynarray_init(&stack, NULL);
+   util_dynarray_append(&stack, root);
+   BITSET_SET(visited, root->index);
+
+   unsigned common = 0;
+   bool conflict = false;
+
+   while (!conflict && util_dynarray_num_elements(&stack, nir_def *) > 0) {
+      nir_def *def = util_dynarray_pop(&stack, nir_def *);
+      nir_instr *instr = nir_def_instr(def);
+      switch (instr->type) {
+      case nir_instr_type_deref: {
+         nir_deref_instr *d = nir_instr_as_deref(instr);
+         unsigned stride = nir_deref_instr_array_stride(d);
+         if (stride > 0) {
+            if (common == 0)
+               common = stride;
+            else if (common != stride)
+               conflict = true;
+         } else if (d->deref_type == nir_deref_type_cast ||
+                    d->deref_type == nir_deref_type_ptr_as_array) {
+            nir_def *next = d->parent.ssa;
+            if (!BITSET_TEST(visited, next->index)) {
+               BITSET_SET(visited, next->index);
+               util_dynarray_append(&stack, next);
+            }
+         }
+         break;
+      }
+      case nir_instr_type_alu: {
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         if (alu->op == nir_op_mov) {
+            nir_def *next = alu->src[0].src.ssa;
+            if (!BITSET_TEST(visited, next->index)) {
+               BITSET_SET(visited, next->index);
+               util_dynarray_append(&stack, next);
+            }
+         } else if (alu->op == nir_op_bcsel) {
+            for (unsigned i = 1; i <= 2; i++) {
+               nir_def *next = alu->src[i].src.ssa;
+               if (!BITSET_TEST(visited, next->index)) {
+                  BITSET_SET(visited, next->index);
+                  util_dynarray_append(&stack, next);
+               }
+            }
+         }
+         break;
+      }
+      case nir_instr_type_phi: {
+         nir_phi_instr *phi = nir_instr_as_phi(instr);
+         nir_foreach_phi_src(src, phi) {
+            nir_def *next = src->src.ssa;
+            if (!BITSET_TEST(visited, next->index)) {
+               BITSET_SET(visited, next->index);
+               util_dynarray_append(&stack, next);
+            }
+         }
+         break;
+      }
+      default:
+         break;
+      }
+   }
+
+   util_dynarray_fini(&stack);
+   free(visited);
+   return conflict ? 0 : common;
+}
+
+/* Under SPV_KHR_workgroup_memory_explicit_layout, Workgroup OpTypePointer
+ * ignores ArrayStride, so variable-pointer casts rooted in OpSelect/OpPhi may
+ * arrive here with ptr_stride == 0. Recover the underlying array's explicit
+ * stride via complete cycle-aware dataflow (or fall back to the pointed type's
+ * natural explicit stride) so OpPtrAccessChain always sees a valid stride.
+ */
+static bool
+assign_missing_shared_cast_strides(nir_shader *shader,
+                                   glsl_type_size_align_func type_info)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, shader) {
+      bool impl_progress = false;
+      bool indexed = false;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+            if (deref->deref_type != nir_deref_type_cast ||
+                !nir_deref_mode_is(deref, nir_var_mem_shared) ||
+                deref->cast.ptr_stride != 0)
+               continue;
+
+            if (!indexed) {
+               nir_index_ssa_defs(impl);
+               indexed = true;
+            }
+            unsigned stride = infer_shared_deref_stride(impl, deref->parent.ssa);
+            if (stride == 0) {
+               unsigned size = glsl_get_explicit_size(deref->type, true);
+               unsigned alignment = glsl_get_explicit_alignment(deref->type);
+               if ((size == 0 || alignment == 0) &&
+                   glsl_type_is_vector_or_scalar(deref->type))
+                  type_info(deref->type, &size, &alignment);
+               stride = alignment ? align(size, alignment) : size;
+            }
+            if (stride > 0) {
+               deref->cast.ptr_stride = stride;
+               impl_progress = true;
+            }
+         }
+      }
+      if (impl_progress) {
+         nir_progress(true, impl,
+                      nir_metadata_control_flow | nir_metadata_live_defs |
+                         nir_metadata_loop_analysis);
+         progress = true;
+      }
+   }
+
+   return progress;
+}
+
 static void
 nir_assign_shared_var_locations(nir_shader *shader, glsl_type_size_align_func type_info)
 {
@@ -2194,6 +2331,7 @@ nir_lower_vars_to_explicit_types(nir_shader *shader,
    if (modes & nir_var_mem_shared) {
       if (shader->info.shared_memory_explicit_layout) {
          nir_assign_shared_var_locations(shader, type_info);
+         progress |= assign_missing_shared_cast_strides(shader, type_info);
          /* Types don't change, so no further lowering is needed. */
          modes &= ~nir_var_mem_shared;
       } else {
