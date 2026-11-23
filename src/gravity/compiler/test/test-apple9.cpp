@@ -18399,6 +18399,8 @@ TEST(Apple9Vir, MmaSharedRaForcedSpill)
    uint32_t fence_idx = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IMM,
                                             AGX_APPLE9_ENC_MOV_IMM32, nullptr, 0, 1);
    ASSERT_TRUE(agx_apple9_vir_emit_device_store(&program, 0, fence_idx, &live[99], 1, 32));
+   uint32_t post_load = agx_apple9_vir_emit_device_load(&program, 0, fence_idx, &contract);
+   ASSERT_NE(post_load, AGX_APPLE9_VREG_INVALID);
 
    uint32_t sa[2] = {live[0], live[1]};
    uint32_t sb[2] = {live[2], live[3]};
@@ -18422,6 +18424,9 @@ TEST(Apple9Vir, MmaSharedRaForcedSpill)
    uint32_t f16_srcs[2] = {acc, d_f16};
    acc = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IADD,
                              AGX_APPLE9_ENC_INT_ADD_EXTENDED, f16_srcs, 2, 0);
+   uint32_t post_srcs[2] = {acc, post_load};
+   acc = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IADD,
+                             AGX_APPLE9_ENC_INT_ADD_EXTENDED, post_srcs, 2, 0);
    for (unsigned i = 0; i < ARRAY_SIZE(live); ++i) {
       uint32_t s[2] = {acc, live[i]};
       acc = agx_apple9_vir_emit(&program, AGX_APPLE9_VIR_IADD,

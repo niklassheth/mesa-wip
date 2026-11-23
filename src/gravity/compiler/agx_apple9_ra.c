@@ -1580,7 +1580,7 @@ apple9_allocate_native_driver(struct agx_apple9_vir_program *program,
    const unsigned peak_gprs = apple9_estimate_vir_pressure(program);
    unsigned long_dependencies = 0;
    for (unsigned i = 0; i < program->instruction_count; ++i)
-      long_dependencies += apple9_ra_dependency_delay(program->instructions[i]) > 1;
+      long_dependencies += apple9_ra_dependency_delay(program->instructions[i]) > 2;
 
    const bool high_pressure = peak_gprs > 104;
    const bool first_banks = high_pressure;

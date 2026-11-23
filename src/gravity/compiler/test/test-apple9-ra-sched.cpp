@@ -1313,6 +1313,203 @@ TEST(Apple9RaPressureSchedule, AutoTierSlackPreservesOverlapInFlat45To96Band)
    agx_apple9_vir_finish(&p);
 }
 
+TEST(Apple9RaPressureSchedule, FivePipeDualIssueInterleavesAluImadSfu)
+{
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   ASSERT_NE(b0, nullptr);
+   agx_apple9_block_begin(&p, b0);
+
+   uint32_t a = agx_apple9_vir_input(&p, 0);
+   uint32_t b = agx_apple9_vir_input(&p, 1);
+   uint32_t c = agx_apple9_vir_input(&p, 2);
+
+   /* Emit clustered independent MAIN (FMA), IMUL (IMAD), and SFU (FRSQ) ops
+    * that all feed independent live outputs. 5-pipe dual-issue scheduling must
+    * interleave distinct pipes instead of keeping all ops of each pipe bunched. */
+   std::vector<uint32_t> outs;
+   for (unsigned i = 0; i < 4; ++i) {
+      uint32_t srcs[3] = {a, b, c};
+      uint32_t v = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FMA,
+                                       AGX_APPLE9_ENC_FLOAT3_EXTENDED, srcs, 3, 0);
+      outs.push_back(v);
+   }
+   for (unsigned i = 0; i < 4; ++i) {
+      uint32_t srcs[3] = {a, b, c};
+      uint32_t v = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IMAD,
+                                       AGX_APPLE9_ENC_INT_MAD_EXTENDED, srcs, 3, 0);
+      outs.push_back(v);
+   }
+   for (unsigned i = 0; i < 4; ++i) {
+      uint32_t v = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FRSQ,
+                                       AGX_APPLE9_ENC_FLOAT_SPECIAL, &a, 1, 0);
+      outs.push_back(v);
+   }
+   for (uint32_t v : outs)
+      ASSERT_TRUE(agx_apple9_vir_add_live_out(&p, v));
+
+   apple9_ra_sched_options opts = {
+      .latency = true,
+      .pressure_slack = 0,
+      .auto_tier_slack = true,
+      .rejected_pressure_increase = 0,
+   };
+   ASSERT_TRUE(apple9_ra_pressure_schedule_opts(&p, &opts));
+
+   unsigned transitions = 0;
+   enum apple9_ra_exec_pipe prev = APPLE9_RA_PIPE_NONE;
+   for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(b0); I;
+        I = agx_apple9_instr_next(I)) {
+      enum apple9_ra_exec_pipe pipe = apple9_ra_exec_pipe(I);
+      if (pipe == APPLE9_RA_PIPE_NONE)
+         continue;
+      if (prev != APPLE9_RA_PIPE_NONE && pipe != prev)
+         transitions++;
+      prev = pipe;
+   }
+   /* Original clustered order had only 2 pipe transitions (MAIN->IMUL->SFU);
+    * interleaved order should switch pipes on nearly every instruction. */
+   EXPECT_GE(transitions, 8u);
+
+   verify_ssa_def_before_use_in_block(&p, b0);
+   agx_apple9_vir_finish(&p);
+}
+
+TEST(Apple9RaPressureSchedule, CapsInFlightDeviceLoadsAtFourWave)
+{
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   ASSERT_NE(b0, nullptr);
+   agx_apple9_block_begin(&p, b0);
+
+   uint32_t base = agx_apple9_vir_input(&p, 0);
+   uint32_t acc = agx_apple9_vir_input(&p, 1);
+
+   /* 8 independent DEVICE_LOAD + consumer pairs in a low-pressure block:
+    * scheduler should overlap loads into N=4 waves rather than bursting all 8
+    * in flight simultaneously (avoiding L2 MSHR thrashing and slot sharing). */
+   std::vector<uint32_t> load_vals;
+   for (unsigned i = 0; i < 8; ++i) {
+      uint32_t ld = emit_dev_load(&p, i % 4, base, 1);
+      load_vals.push_back(ld);
+      acc = emit_iadd(&p, acc, ld);
+   }
+   ASSERT_TRUE(emit_dev_store(&p, 0, base, acc));
+
+   apple9_ra_sched_options opts = {
+      .latency = true,
+      .pressure_slack = 0,
+      .auto_tier_slack = true,
+      .rejected_pressure_increase = 0,
+   };
+   ASSERT_TRUE(apple9_ra_pressure_schedule_opts(&p, &opts));
+
+   unsigned inflight = 0, max_inflight = 0;
+   std::vector<bool> pending(8, false);
+   for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(b0); I;
+        I = agx_apple9_instr_next(I)) {
+      for (unsigned i = 0; i < 8; ++i) {
+         if (I->dest == load_vals[i]) {
+            pending[i] = true;
+            inflight++;
+            max_inflight = std::max(max_inflight, inflight);
+         }
+      }
+      for (unsigned s = 0; s < I->nr_srcs; ++s) {
+         for (unsigned i = 0; i < 8; ++i) {
+            if (pending[i] && I->src[s] == load_vals[i]) {
+               pending[i] = false;
+               inflight--;
+            }
+         }
+      }
+   }
+   EXPECT_GE(max_inflight, 2u);
+   EXPECT_LE(max_inflight, 4u);
+
+   verify_ssa_def_before_use_in_block(&p, b0);
+   agx_apple9_vir_finish(&p);
+}
+
+TEST(Apple9RaPressureSchedule, CapsMultiLoadConsumerAtFourInFlightLoads)
+{
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   ASSERT_NE(b0, nullptr);
+   agx_apple9_block_begin(&p, b0);
+
+   uint32_t base = agx_apple9_vir_input(&p, 0);
+   uint32_t seed = agx_apple9_vir_input(&p, 1);
+
+   /* Two independent 3-load FMA groups (6 DEVICE_LOADs total) emitted
+    * back-to-back with their consumers, followed by independent ALU work so
+    * latency scheduling is accepted. When 3 loads are already in flight,
+    * opening the second 3-load FMA would jump to 6 > 4; projected load count
+    * must enforce max_inflight <= 4. */
+   uint32_t v[6];
+   v[0] = emit_dev_load(&p, 0, base, 1);
+   v[1] = emit_dev_load(&p, 1, base, 1);
+   v[2] = emit_dev_load(&p, 2, base, 1);
+   uint32_t s0[3] = {v[0], v[1], v[2]};
+   uint32_t f0 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FMA,
+                                     AGX_APPLE9_ENC_FLOAT3_EXTENDED, s0, 3, 0);
+
+   v[3] = emit_dev_load(&p, 0, base, 1);
+   v[4] = emit_dev_load(&p, 1, base, 1);
+   v[5] = emit_dev_load(&p, 2, base, 1);
+   uint32_t s1[3] = {v[3], v[4], v[5]};
+   uint32_t f1 = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FMA,
+                                     AGX_APPLE9_ENC_FLOAT3_EXTENDED, s1, 3, 0);
+
+   uint32_t alu = seed;
+   for (unsigned i = 0; i < 6; ++i)
+      alu = emit_iadd(&p, alu, base);
+
+   uint32_t acc = emit_iadd(&p, f0, f1);
+   acc = emit_iadd(&p, acc, alu);
+   ASSERT_TRUE(emit_dev_store(&p, 0, base, acc));
+
+   apple9_ra_sched_options opts = {
+      .latency = true,
+      .pressure_slack = 0,
+      .auto_tier_slack = true,
+      .rejected_pressure_increase = 0,
+   };
+   ASSERT_TRUE(apple9_ra_pressure_schedule_opts(&p, &opts));
+
+   unsigned inflight = 0, max_inflight = 0;
+   bool pending[6] = {};
+   for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(b0); I;
+        I = agx_apple9_instr_next(I)) {
+      for (unsigned i = 0; i < 6; ++i) {
+         if (I->dest == v[i]) {
+            pending[i] = true;
+            inflight++;
+            max_inflight = std::max(max_inflight, inflight);
+         }
+      }
+      for (unsigned s = 0; s < I->nr_srcs; ++s) {
+         for (unsigned i = 0; i < 6; ++i) {
+            if (pending[i] && I->src[s] == v[i]) {
+               pending[i] = false;
+               inflight--;
+            }
+         }
+      }
+   }
+   EXPECT_GE(max_inflight, 3u);
+   EXPECT_LE(max_inflight, 4u);
+
+   verify_ssa_def_before_use_in_block(&p, b0);
+   agx_apple9_vir_finish(&p);
+}
+
 TEST(Apple9RaPressureSchedule, CrossBlockRematPreservesPhiOperands)
 {
    agx_apple9_vir_program p;
@@ -1405,22 +1602,76 @@ TEST(Apple9RaPressureSchedule, CrossBlockRematPreservesPhiOperands)
 
 TEST(Apple9RaSched, UnifiedOperandGroupsAndLatencyTable)
 {
-   /* Latency table: memory/atomic/tile = 16, SFU/FP16-SFU/subgroup/MMA = 4, ALU = 1. */
+   /* Exact G16G (T8132 @ 1470 MHz) calibrated latencies. */
    struct agx_apple9_vir_instr ins = {};
+   ins.encoding = AGX_APPLE9_ENC_TEXTURE_SAMPLE;
+   ins.op = AGX_APPLE9_VIR_TEXTURE_SAMPLE;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 48u);
+   EXPECT_EQ(apple9_ra_exec_pipe(&ins), APPLE9_RA_PIPE_MEM);
+
+   ins.encoding = AGX_APPLE9_ENC_DEVICE_LOAD;
    ins.op = AGX_APPLE9_VIR_DEVICE_LOAD;
-   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 16u);
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 36u);
+   EXPECT_EQ(apple9_ra_exec_pipe(&ins), APPLE9_RA_PIPE_MEM);
+
+   ins.encoding = AGX_APPLE9_ENC_SHARED_ATOMIC;
    ins.op = AGX_APPLE9_VIR_SHARED_ATOMIC;
-   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 16u);
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 24u);
+   EXPECT_EQ(apple9_ra_exec_pipe(&ins), APPLE9_RA_PIPE_MEM);
+
+   ins.encoding = AGX_APPLE9_ENC_TILE_LOAD;
    ins.op = AGX_APPLE9_VIR_TILE_LOAD;
-   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 16u);
-   ins.op = AGX_APPLE9_VIR_HRCP;
-   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 4u);
-   ins.op = AGX_APPLE9_VIR_HLOG2;
-   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 4u);
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 24u);
+
+   ins.encoding = AGX_APPLE9_ENC_MMA_F32;
    ins.op = AGX_APPLE9_VIR_MMA;
-   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 4u);
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 18u);
+   EXPECT_EQ(apple9_ra_exec_pipe(&ins), APPLE9_RA_PIPE_MAIN);
+
+   ins.encoding = AGX_APPLE9_ENC_INT_MUL_WIDE;
+   ins.op = AGX_APPLE9_VIR_IMUL_WIDE;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 7u);
+   EXPECT_EQ(apple9_ra_exec_pipe(&ins), APPLE9_RA_PIPE_IMUL);
+
+   ins.encoding = AGX_APPLE9_ENC_FLOAT_SPECIAL;
+   ins.op = AGX_APPLE9_VIR_HRCP;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 6u);
+   EXPECT_EQ(apple9_ra_exec_pipe(&ins), APPLE9_RA_PIPE_SFU);
+
+   ins.op = AGX_APPLE9_VIR_HLOG2;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 5u);
+   EXPECT_EQ(apple9_ra_exec_pipe(&ins), APPLE9_RA_PIPE_SFU);
+
+   ins.encoding = AGX_APPLE9_ENC_INT_MAD_EXTENDED;
+   ins.op = AGX_APPLE9_VIR_IMAD;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 5u);
+   EXPECT_EQ(apple9_ra_exec_pipe(&ins), APPLE9_RA_PIPE_IMUL);
+
+   ins.encoding = AGX_APPLE9_ENC_SHIFT_EXTENDED;
+   ins.op = AGX_APPLE9_VIR_ISHL;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 5u);
+   EXPECT_EQ(apple9_ra_exec_pipe(&ins), APPLE9_RA_PIPE_SHIFT);
+
+   ins.encoding = AGX_APPLE9_ENC_GET_SR_EXTENDED;
+   ins.op = AGX_APPLE9_VIR_GET_SR;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 5u);
+   ins.encoding = AGX_APPLE9_ENC_GET_SR_ZEXT16;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 2u);
+
+   ins.encoding = AGX_APPLE9_ENC_SELECT_GPR_WIDE;
+   ins.op = AGX_APPLE9_VIR_SELECT;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 3u);
+   EXPECT_EQ(apple9_ra_exec_pipe(&ins), APPLE9_RA_PIPE_MAIN);
+
+   ins.encoding = AGX_APPLE9_ENC_FLOAT2_BASE;
    ins.op = AGX_APPLE9_VIR_FADD;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 2u);
+   EXPECT_EQ(apple9_ra_exec_pipe(&ins), APPLE9_RA_PIPE_MAIN);
+
+   ins.encoding = AGX_APPLE9_ENC_PSEUDO;
+   ins.op = AGX_APPLE9_VIR_SPLIT;
    EXPECT_EQ(apple9_ra_dependency_delay(&ins), 1u);
+   EXPECT_EQ(apple9_ra_exec_pipe(&ins), APPLE9_RA_PIPE_NONE);
 
    /* Async & reads-sources-at-issue classification. */
    ins = {};

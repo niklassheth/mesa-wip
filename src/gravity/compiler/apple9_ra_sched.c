@@ -794,21 +794,94 @@ apple9_ra_schedule_resources(const struct agx_apple9_vir_instr *ins,
    }
 }
 
-/* Single hardware-calibrated latency priority table shared across VIR
- * scheduling, allocation cost evaluation, and RA policy selection. */
+/* Single hardware-calibrated Apple9 (G16G / T8132 @ 1470 MHz) latency table
+ * shared across VIR scheduling, allocation cost evaluation, and RA policy.
+ *
+ * Exact measured cycle latencies:
+ *   - Main ALU (FMA/FADD/FMUL/HFMA/IADD/IAND/IOR/IXOR/MOV): 2
+ *   - SELECT: 3
+ *   - IMAD / ISHL / USHR / ISHR / EXTR / SFU / async GET_SR: 5
+ *   - HRCP / HRCP_F32: 6
+ *   - IMUL_WIDE (32x32->64): 7
+ *   - 0xCF MMA (8x8x8 FP32/FP16): 18 (17..18 measured)
+ *   - SHARED / PRIVATE / SPILL / TILE load: 24 (~75..88 raw cyc)
+ *   - DEVICE_LOAD / DEVICE_ATOMIC: 36 (~72..152 raw cyc)
+ *   - TEXTURE_SAMPLE: 48 (~166..253 raw cyc, highest priority) */
 unsigned
 apple9_ra_dependency_delay(const struct agx_apple9_vir_instr *ins)
 {
+   if (ins->encoding == AGX_APPLE9_ENC_PSEUDO && ins->op != AGX_APPLE9_VIR_MOV)
+      return 1;
+
    switch (ins->op) {
+   case AGX_APPLE9_VIR_TEXTURE_SAMPLE:
+      return 48;
    case AGX_APPLE9_VIR_DEVICE_LOAD:
+   case AGX_APPLE9_VIR_DEVICE_ATOMIC:
+      return 36;
    case AGX_APPLE9_VIR_PRIVATE_LOAD:
    case AGX_APPLE9_VIR_SHARED_LOAD:
-   case AGX_APPLE9_VIR_TEXTURE_SAMPLE:
-   case AGX_APPLE9_VIR_DEVICE_ATOMIC:
    case AGX_APPLE9_VIR_SHARED_ATOMIC:
    case AGX_APPLE9_VIR_SPILL_LOAD:
    case AGX_APPLE9_VIR_TILE_LOAD:
-      return 16;
+      return 24;
+   case AGX_APPLE9_VIR_MMA:
+      return 18;
+   case AGX_APPLE9_VIR_IMUL_WIDE:
+      return 7;
+   case AGX_APPLE9_VIR_HRCP:
+   case AGX_APPLE9_VIR_HRCP_F32:
+      return 6;
+   case AGX_APPLE9_VIR_IMAD:
+   case AGX_APPLE9_VIR_ISHL:
+   case AGX_APPLE9_VIR_USHR:
+   case AGX_APPLE9_VIR_ISHR:
+   case AGX_APPLE9_VIR_EXTR:
+   case AGX_APPLE9_VIR_FRCP:
+   case AGX_APPLE9_VIR_FRSQ:
+   case AGX_APPLE9_VIR_FSQRT_FACTOR:
+   case AGX_APPLE9_VIR_FSIN_FACTOR:
+   case AGX_APPLE9_VIR_FEXP2:
+   case AGX_APPLE9_VIR_FLOG2:
+   case AGX_APPLE9_VIR_HRSQ:
+   case AGX_APPLE9_VIR_HSQRT_FACTOR:
+   case AGX_APPLE9_VIR_HEXP2:
+   case AGX_APPLE9_VIR_HLOG2:
+   case AGX_APPLE9_VIR_CUBE:
+   case AGX_APPLE9_VIR_SUBGROUP_REDUCE:
+   case AGX_APPLE9_VIR_SUBGROUP_REDUCE_UMAX:
+   case AGX_APPLE9_VIR_SUBGROUP_SHUFFLE:
+   case AGX_APPLE9_VIR_SUBGROUP_ROTATE:
+   case AGX_APPLE9_VIR_SUBGROUP_BALLOT:
+   case AGX_APPLE9_VIR_DERIVATIVE:
+      return 5;
+   case AGX_APPLE9_VIR_GET_SR:
+      return ins->encoding == AGX_APPLE9_ENC_GET_SR_ZEXT16 ? 2 : 5;
+   case AGX_APPLE9_VIR_SELECT:
+      return 3;
+   default:
+      return 2;
+   }
+}
+
+enum apple9_ra_exec_pipe
+apple9_ra_exec_pipe(const struct agx_apple9_vir_instr *ins)
+{
+   if (ins->encoding == AGX_APPLE9_ENC_PSEUDO && ins->op != AGX_APPLE9_VIR_MOV)
+      return APPLE9_RA_PIPE_NONE;
+
+   switch (ins->op) {
+   case AGX_APPLE9_VIR_IMAD:
+   case AGX_APPLE9_VIR_IMUL_WIDE:
+      return APPLE9_RA_PIPE_IMUL;
+   case AGX_APPLE9_VIR_ISHL:
+   case AGX_APPLE9_VIR_USHR:
+   case AGX_APPLE9_VIR_ISHR:
+   case AGX_APPLE9_VIR_EXTR:
+   case AGX_APPLE9_VIR_BIT_COUNT:
+   case AGX_APPLE9_VIR_UFIND_MSB:
+   case AGX_APPLE9_VIR_BIT_REVERSE:
+      return APPLE9_RA_PIPE_SHIFT;
    case AGX_APPLE9_VIR_FRCP:
    case AGX_APPLE9_VIR_FRSQ:
    case AGX_APPLE9_VIR_FSQRT_FACTOR:
@@ -821,13 +894,38 @@ apple9_ra_dependency_delay(const struct agx_apple9_vir_instr *ins)
    case AGX_APPLE9_VIR_HSQRT_FACTOR:
    case AGX_APPLE9_VIR_HEXP2:
    case AGX_APPLE9_VIR_HLOG2:
-   case AGX_APPLE9_VIR_SUBGROUP_REDUCE:
-   case AGX_APPLE9_VIR_SUBGROUP_SHUFFLE:
-   case AGX_APPLE9_VIR_SUBGROUP_ROTATE:
-   case AGX_APPLE9_VIR_MMA:
-      return 4;
+   case AGX_APPLE9_VIR_CUBE:
+      return APPLE9_RA_PIPE_SFU;
+   case AGX_APPLE9_VIR_DEVICE_LOAD:
+   case AGX_APPLE9_VIR_DEVICE_STORE:
+   case AGX_APPLE9_VIR_DEVICE_ATOMIC:
+   case AGX_APPLE9_VIR_SHARED_LOAD:
+   case AGX_APPLE9_VIR_SHARED_STORE:
+   case AGX_APPLE9_VIR_SHARED_ATOMIC:
+   case AGX_APPLE9_VIR_PRIVATE_LOAD:
+   case AGX_APPLE9_VIR_PRIVATE_STORE:
+   case AGX_APPLE9_VIR_SPILL_LOAD:
+   case AGX_APPLE9_VIR_SPILL_STORE:
+   case AGX_APPLE9_VIR_TEXTURE_SAMPLE:
+   case AGX_APPLE9_VIR_IMAGE_STORE:
+   case AGX_APPLE9_VIR_BLOCK_IMAGE_STORE:
+   case AGX_APPLE9_VIR_TILE_LOAD:
+   case AGX_APPLE9_VIR_TILE_STORE:
+   case AGX_APPLE9_VIR_ITER:
+   case AGX_APPLE9_VIR_ITER_FLAT:
+   case AGX_APPLE9_VIR_VARY_STORE:
+      return APPLE9_RA_PIPE_MEM;
+   case AGX_APPLE9_VIR_WAIT:
+   case AGX_APPLE9_VIR_WORKGROUP_BARRIER:
+   case AGX_APPLE9_VIR_DEVICE_FENCE:
+   case AGX_APPLE9_VIR_TILE_FENCE:
+   case AGX_APPLE9_VIR_TILE_ACCESS:
+   case AGX_APPLE9_VIR_HALT:
+      return APPLE9_RA_PIPE_NONE;
    default:
-      return 1;
+      /* FP32, FP16, IADD/IAND/IOR/IXOR/SELECT/MOV, and 0xCF MMA all share
+       * the 128-wide main ALU datapath on G16G. */
+      return APPLE9_RA_PIPE_MAIN;
    }
 }
 
@@ -1181,6 +1279,10 @@ struct vir_pressure_delta {
    int32_t bank16;
 };
 
+/* Optimal in-flight DEVICE_LOAD wave width measured on G16G (L1/L2/DRAM sweet
+ * spot without triggering L2 MSHR thrashing at N >= 8..12). */
+#define APPLE9_DEVICE_LOAD_MLP_CAP 4u
+
 struct vir_sched_state {
    const struct agx_apple9_vir_program *p;
    struct agx_apple9_vir_instr *const *defs;
@@ -1194,6 +1296,8 @@ struct vir_sched_state {
    int32_t cur_all;
    int32_t cur_64;
    int32_t cur_16;
+   enum apple9_ra_exec_pipe last_pipe;
+   unsigned inflight_dev_loads;
 };
 
 /* Edge data distinguishes true SSA data dependencies (1) from pure resource or
@@ -1423,13 +1527,46 @@ create_vir_dag(const struct agx_apple9_vir_program *p,
    return ok ? dag : NULL;
 }
 
+static inline bool
+dev_load_is_live(struct vir_sched_state *s,
+                 const struct agx_apple9_vir_instr *ld)
+{
+   if (ld->op != AGX_APPLE9_VIR_DEVICE_LOAD ||
+       ld->dest == AGX_APPLE9_VREG_INVALID)
+      return false;
+   for (unsigned c = 0; c < ld->dest_components; ++c) {
+      if (u_sparse_bitset_test(&s->live, ld->dest + c))
+         return true;
+   }
+   return false;
+}
+
+static unsigned
+node_opened_dev_loads(struct vir_sched_state *s,
+                      const struct vir_sched_node *n)
+{
+   unsigned opens = 0;
+   util_dynarray_foreach(&n->dag.edges, struct dag_edge, edge) {
+      if (!edge->data)
+         continue;
+      const struct vir_sched_node *prod =
+         (const struct vir_sched_node *)edge->child;
+      if (prod->instr->op == AGX_APPLE9_VIR_DEVICE_LOAD &&
+          !dev_load_is_live(s, prod->instr))
+         opens++;
+   }
+   return opens;
+}
+
 static struct vir_sched_node *
 choose_vir_instr(struct vir_sched_state *s)
 {
    struct vir_sched_node *best = NULL;
    bool best_over_budget = true;
+   bool best_over_dev_mlp = true;
    unsigned best_dependency = 0;
    int32_t best_score = INT32_MAX;
+   bool best_dual_issue = false;
    struct vir_pressure_delta best_delta = {INT32_MAX, INT32_MAX, INT32_MAX, INT32_MAX};
 
    if (s->latency) {
@@ -1460,29 +1597,49 @@ choose_vir_instr(struct vir_sched_state *s)
                           (delta.peak_all > 0 &&
                            s->cur_all + delta.peak_all > s->max_all_budget));
 
+      unsigned opened_loads = s->latency ? node_opened_dev_loads(s, n) : 0u;
+      unsigned closed_loads =
+         (s->latency && dev_load_is_live(s, n->instr)) ? 1u : 0u;
+      unsigned projected_loads =
+         s->inflight_dev_loads + opened_loads - closed_loads;
+      bool over_dev_mlp = s->latency && opened_loads > 0 &&
+                          projected_loads > APPLE9_DEVICE_LOAD_MLP_CAP;
+
       unsigned dependency = 0;
-      if (s->latency && !over_budget) {
+      if (s->latency && !over_budget && !over_dev_mlp) {
          util_dynarray_foreach(&n->dag.edges, struct dag_edge, edge) {
             if (!edge->data)
                continue;
             struct vir_sched_node *producer =
                (struct vir_sched_node *)edge->child;
-            dependency = MAX2(dependency,
-                              apple9_ra_dependency_delay(producer->instr) - 1);
+            unsigned delay = apple9_ra_dependency_delay(producer->instr);
+            /* Only multi-cycle latencies above the 2-cycle main-ALU baseline
+             * should override register-pressure minimization. */
+            if (delay > 2u)
+               dependency = MAX2(dependency, delay - 1u);
          }
       }
+
+      enum apple9_ra_exec_pipe pipe = apple9_ra_exec_pipe(n->instr);
+      bool dual_issue = s->latency && !over_budget &&
+                        s->last_pipe != APPLE9_RA_PIPE_NONE &&
+                        pipe != APPLE9_RA_PIPE_NONE && pipe != s->last_pipe;
 
       bool better = false;
       if (!best) {
          better = true;
       } else if (over_budget != best_over_budget) {
          better = !over_budget;
-      } else if (!over_budget && dependency != best_dependency) {
+      } else if (over_dev_mlp != best_over_dev_mlp) {
+         better = !over_dev_mlp;
+      } else if (!over_budget && !over_dev_mlp && dependency != best_dependency) {
          better = dependency > best_dependency;
       } else if (score != best_score) {
          better = score < best_score;
       } else if (delta.all != best_delta.all) {
          better = delta.all < best_delta.all;
+      } else if (dual_issue != best_dual_issue) {
+         better = dual_issue;
       } else if (delta.all > 0) {
          /* Depth-first expansion on positive-pressure ties avoids opening an
           * entire reduction tree breadth-first. */
@@ -1492,8 +1649,10 @@ choose_vir_instr(struct vir_sched_state *s)
       if (better) {
          best = n;
          best_over_budget = over_budget;
+         best_over_dev_mlp = over_dev_mlp;
          best_dependency = dependency;
          best_score = score;
+         best_dual_issue = dual_issue;
          best_delta = delta;
       }
    }
@@ -1546,7 +1705,54 @@ choose_vir_instr(struct vir_sched_state *s)
          return fallback;
    }
 
+   /* If every ready node would exceed the N=4 in-flight DEVICE_LOAD wave cap,
+    * retire the earliest-ready open DEVICE_LOAD head to form clean N=4 waves
+    * on distinct scoreboard slots instead of bursting to 8..12 in-flight loads. */
+   if (s->latency && best && !best_over_budget && best_over_dev_mlp) {
+      struct vir_sched_node *retire = NULL;
+      unsigned ret_ready = UINT_MAX;
+      list_for_each_entry(struct vir_sched_node, n, &s->dag->heads, dag.link) {
+         if (n->ready <= s->position)
+            continue;
+         if (n->instr->op != AGX_APPLE9_VIR_DEVICE_LOAD ||
+             !dev_load_is_live(s, n->instr))
+            continue;
+         if (s->max_all_budget < INT32_MAX) {
+            struct vir_pressure_delta delta = calc_pressure_delta(
+               s->p, s->defs, s->pub_defs, s->val_max_gpr, n->instr, &s->live);
+            if ((delta.all > 0 && s->cur_all + delta.all > s->max_all_budget) ||
+                (delta.peak_all > 0 &&
+                 s->cur_all + delta.peak_all > s->max_all_budget))
+               continue;
+         }
+         if (!retire || n->ready < ret_ready) {
+            retire = n;
+            ret_ready = n->ready;
+         }
+      }
+      if (retire)
+         return retire;
+   }
+
    return best;
+}
+
+static unsigned
+compute_dual_issue_transitions(struct vir_sched_node *const *nodes,
+                               unsigned count, bool reverse)
+{
+   enum apple9_ra_exec_pipe prev = APPLE9_RA_PIPE_NONE;
+   unsigned transitions = 0;
+   for (unsigned k = 0; k < count; ++k) {
+      struct vir_sched_node *node = nodes[reverse ? (count - 1 - k) : k];
+      enum apple9_ra_exec_pipe pipe = apple9_ra_exec_pipe(node->instr);
+      if (pipe == APPLE9_RA_PIPE_NONE)
+         continue;
+      if (prev != APPLE9_RA_PIPE_NONE && pipe != prev)
+         transitions++;
+      prev = pipe;
+   }
+   return transitions;
 }
 
 static unsigned
@@ -1582,6 +1788,7 @@ struct vir_sched_result {
    int32_t max_64;
    int32_t max_16;
    unsigned stalls;
+   unsigned dual_issue;
    bool valid;
 };
 
@@ -1596,7 +1803,8 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
                            int32_t base_all, int32_t base_64, int32_t base_16,
                            bool latency, int32_t max_all_budget,
                            struct vir_sched_node **last_write,
-                           void *attempt_ctx, unsigned *orig_stalls_out)
+                           void *attempt_ctx, unsigned *orig_stalls_out,
+                           unsigned *orig_dual_issue_out)
 {
    struct vir_sched_result res = {0};
    struct util_dynarray orig_order = UTIL_DYNARRAY_INIT;
@@ -1641,6 +1849,10 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
          *orig_stalls_out =
             compute_schedule_stalls(orig, count, false, dep_pool, dep_start);
       }
+      if (orig_dual_issue_out) {
+         *orig_dual_issue_out =
+            compute_dual_issue_transitions(orig, count, false);
+      }
    }
 
    struct vir_sched_node **sched_nodes =
@@ -1661,8 +1873,16 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
       .cur_all = base_all,
       .cur_64 = base_64,
       .cur_16 = base_16,
+      .last_pipe = APPLE9_RA_PIPE_NONE,
+      .inflight_dev_loads = 0,
    };
    u_sparse_bitset_dup_with_ctx(&s.live, live_after_body, attempt_ctx);
+   if (latency) {
+      for (unsigned i = 0; i < count; ++i) {
+         if (dev_load_is_live(&s, orig[i]->instr))
+            s.inflight_dev_loads++;
+      }
+   }
 
    res.max_all = base_all;
    res.max_64 = base_64;
@@ -1683,15 +1903,34 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
       res.max_64 = MAX2(res.max_64, s.cur_64);
       res.max_16 = MAX2(res.max_16, s.cur_16);
 
+      bool closed_dev_load = false;
+      struct agx_apple9_vir_instr *opened_loads[AGX_APPLE9_MAX_VIR_SRCS];
+      unsigned nr_opened_candidates = 0;
+
       if (latency) {
+         closed_dev_load = dev_load_is_live(&s, node->instr);
          s.position = MAX2(s.position, node->ready);
          util_dynarray_foreach(&node->dag.edges, struct dag_edge, edge) {
             struct vir_sched_node *producer =
                (struct vir_sched_node *)edge->child;
-            unsigned delay =
+            unsigned raw_delay =
                edge->data ? apple9_ra_dependency_delay(producer->instr) : 1u;
+            /* Keep 2-cycle main-ALU chains immediately schedulable (hidden by
+             * warp interleaving on G16G) so breadth-first bouncing doesn't
+             * fragment live ranges or VIR_COLLECT tuples; enforce full latency
+             * separation for all >2c ops (SELECT/IMAD/SHIFT/SFU/MMA/LOAD/TEX). */
+            unsigned delay = raw_delay <= 2u ? 1u : raw_delay;
             producer->ready = MAX2(producer->ready, s.position + delay);
+            if (edge->data &&
+                producer->instr->op == AGX_APPLE9_VIR_DEVICE_LOAD &&
+                !dev_load_is_live(&s, producer->instr) &&
+                nr_opened_candidates < ARRAY_SIZE(opened_loads)) {
+               opened_loads[nr_opened_candidates++] = producer->instr;
+            }
          }
+         enum apple9_ra_exec_pipe pipe = apple9_ra_exec_pipe(node->instr);
+         if (pipe != APPLE9_RA_PIPE_NONE)
+            s.last_pipe = pipe;
          ++s.position;
       }
 
@@ -1701,13 +1940,24 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
       nr++;
       liveness_ins_update_internal(p, defs, pub_defs, &s.live, node->instr,
                                    false, NULL);
+
+      if (latency) {
+         if (closed_dev_load && s.inflight_dev_loads > 0)
+            s.inflight_dev_loads--;
+         for (unsigned k = 0; k < nr_opened_candidates; ++k) {
+            if (dev_load_is_live(&s, opened_loads[k]))
+               s.inflight_dev_loads++;
+         }
+      }
    }
 
    assert(nr == count);
    res.count = count;
-   if (latency)
+   if (latency) {
       res.stalls = compute_schedule_stalls(sched_nodes, count, true, dep_pool,
                                            dep_start);
+      res.dual_issue = compute_dual_issue_transitions(sched_nodes, count, true);
+   }
    res.valid = true;
    return res;
 }
@@ -2954,7 +3204,7 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
             pres = run_block_schedule_attempt(
                p, defs, pub_defs, val_max_gpr, first_body, first_tail,
                &live_after_body, base_all, base_64, base_16, false, INT32_MAX,
-               last_write, pres_ctx, NULL);
+               last_write, pres_ctx, NULL, NULL);
             if (pres.valid &&
                 bank_limits_respected(pres.max_64, pres.max_16, orig_64,
                                       orig_16) &&
@@ -3039,11 +3289,11 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
             lat_limit = MIN2(safe_tier, min_all + (tier_gprs > 44u ? 16 : 8));
 
          void *lat_ctx = ralloc_context(blk_ctx);
-         unsigned orig_stalls = 0;
+         unsigned orig_stalls = 0, orig_dual_issue = 0;
          struct vir_sched_result lat = run_block_schedule_attempt(
             p, defs, pub_defs, val_max_gpr, first_body, first_tail,
             &live_after_body, base_all, base_64, base_16, true, lat_limit,
-            last_write, lat_ctx, &orig_stalls);
+            last_write, lat_ctx, &orig_stalls, &orig_dual_issue);
 
          bool accept_lat = false;
          if (lat.valid) {
@@ -3062,9 +3312,12 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                   accept_lat =
                      (lat.stalls < orig_stalls) ||
                      (lat.stalls == orig_stalls &&
-                      pressure_strictly_better(lat.max_all, lat.max_64,
-                                               lat.max_16, orig_all, orig_64,
-                                               orig_16));
+                      (pressure_strictly_better(lat.max_all, lat.max_64,
+                                                lat.max_16, orig_all, orig_64,
+                                                orig_16) ||
+                       (lat.max_all <= orig_all && lat.max_64 <= orig_64 &&
+                        lat.max_16 <= orig_16 &&
+                        lat.dual_issue > orig_dual_issue)));
                }
             }
          }
@@ -3090,11 +3343,11 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
 
       if (cfg->latency) {
          void *lat_ctx = ralloc_context(blk_ctx);
-         unsigned orig_stalls = 0;
+         unsigned orig_stalls = 0, orig_dual_issue = 0;
          struct vir_sched_result lat = run_block_schedule_attempt(
             p, defs, pub_defs, val_max_gpr, first_body, first_tail,
             &live_after_body, base_all, base_64, base_16, true, INT32_MAX,
-            last_write, lat_ctx, &orig_stalls);
+            last_write, lat_ctx, &orig_stalls, &orig_dual_issue);
 
          bool accept_lat = false;
          if (lat.valid) {
@@ -3108,8 +3361,11 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                accept_lat =
                   (lat.stalls < orig_stalls) ||
                   (lat.stalls == orig_stalls &&
-                   pressure_strictly_better(lat.max_all, lat.max_64, lat.max_16,
-                                            orig_all, orig_64, orig_16));
+                   (pressure_strictly_better(lat.max_all, lat.max_64, lat.max_16,
+                                             orig_all, orig_64, orig_16) ||
+                    (lat.max_all <= orig_all && lat.max_64 <= orig_64 &&
+                     lat.max_16 <= orig_16 &&
+                     lat.dual_issue > orig_dual_issue)));
             }
          }
 
@@ -3120,7 +3376,7 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                struct vir_sched_result pres = run_block_schedule_attempt(
                   p, defs, pub_defs, val_max_gpr, first_body, first_tail,
                   &live_after_body, base_all, base_64, base_16, false,
-                  INT32_MAX, last_write, pres_ctx, NULL);
+                  INT32_MAX, last_write, pres_ctx, NULL, NULL);
                if (pres.valid &&
                    bank_limits_respected(pres.max_64, pres.max_16, orig_64,
                                          orig_16) &&
@@ -3156,7 +3412,7 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
          struct vir_sched_result pres = run_block_schedule_attempt(
             p, defs, pub_defs, val_max_gpr, first_body, first_tail,
             &live_after_body, base_all, base_64, base_16, false, INT32_MAX,
-            last_write, pres_ctx, NULL);
+            last_write, pres_ctx, NULL, NULL);
 
          if (pres.valid &&
              bank_limits_respected(pres.max_64, pres.max_16, orig_64, orig_16) &&

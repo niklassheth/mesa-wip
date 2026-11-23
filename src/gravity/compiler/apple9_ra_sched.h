@@ -75,6 +75,17 @@ struct apple9_ra_operand_group {
    const struct agx_apple9_operand_constraint *constraint;
 };
 
+/* Five independently schedulable Apple9 (G16G) execution pipelines measured on
+ * silicon (70%..97% concurrent dual-issue overlap across distinct pipes). */
+enum apple9_ra_exec_pipe {
+   APPLE9_RA_PIPE_NONE = 0,
+   APPLE9_RA_PIPE_MAIN,  /* 128-wide FP32/FP16/INT-add/logic/select/0xCF MMA */
+   APPLE9_RA_PIPE_IMUL,  /* 32-wide quarter-rate IMAD / IMUL_WIDE */
+   APPLE9_RA_PIPE_SHIFT, /* 32-wide quarter-rate ISHL / USHR / ISHR / EXTR */
+   APPLE9_RA_PIPE_SFU,   /* 32-wide quarter-rate SFU */
+   APPLE9_RA_PIPE_MEM,   /* Load / store / texture / shared / tile / iter */
+};
+
 /* Shared VIR RA classification, operand-group, and latency helpers. */
 bool apple9_ra_after_logical_end(const struct agx_apple9_vir_instr *ins);
 bool apple9_ra_is_publication_instr(const struct agx_apple9_vir_instr *ins);
@@ -95,6 +106,8 @@ apple9_ra_dest_group(const struct agx_apple9_vir_instr *ins);
 void apple9_ra_schedule_resources(const struct agx_apple9_vir_instr *ins,
                                   uint32_t *reads, uint32_t *writes);
 unsigned apple9_ra_dependency_delay(const struct agx_apple9_vir_instr *ins);
+enum apple9_ra_exec_pipe
+apple9_ra_exec_pipe(const struct agx_apple9_vir_instr *ins);
 
 /* Native VIR partial dead code elimination. */
 bool apple9_ra_dce(struct agx_apple9_vir_program *p);
