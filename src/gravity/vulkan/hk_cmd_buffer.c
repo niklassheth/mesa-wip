@@ -1724,6 +1724,40 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
    clear_attachment_as_image(cmd, render, &render->stencil_att,
                              VK_IMAGE_ASPECT_STENCIL_BIT);
 
+   /* If the drawless render pass had an end timestamp, transfer it to a
+    * compute control stream so the firmware still writes it (even if there
+    * were no clears to convert).
+    */
+   if (cs->timestamp.end.handle) {
+      if (cmd->current_cs.cs && cmd->current_cs.cs->timestamp.end.handle) {
+         cmd->current_cs.cs->end_reason = HK_CS_END_QUERY;
+         hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.cs);
+      }
+
+      struct hk_cs *ts_cs = hk_cmd_buffer_get_cs_general(
+         cmd, &cmd->current_cs.cs, true, HK_SYNC_ALL);
+      if (ts_cs) {
+         ts_cs->timestamp.end = cs->timestamp.end;
+
+         /* If a post-graphics stream exists (e.g., a second timestamp write
+          * inside this render pass copying from cs->timestamp.end), ensure
+          * ts_cs executes before post_gfx. post_gfx already sets
+          * cmd->sync_fallback, so stream list order governs synchronization.
+          */
+         if (cmd->current_cs.post_gfx) {
+            list_del(&ts_cs->node);
+            list_addtail(&ts_cs->node, &cmd->current_cs.post_gfx->node);
+         }
+
+         /* Flush and close ts_cs immediately so the firmware receives the
+          * required end-of-stream cache drain and later compute work cannot
+          * merge onto or delay the timestamp write.
+          */
+         ts_cs->end_reason = HK_CS_END_QUERY;
+         hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.cs);
+      }
+   }
+
    /* Remove the VDM control stream from the command buffer, now that it is
     * replaced by equivalent other operations.
     */

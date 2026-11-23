@@ -8,20 +8,21 @@
 #include "compiler/libcl/libcl_vk.h"
 #include "query.h"
 
-static inline global uint64_t *
-query_report(global uint64_t *results, global uint16_t *oq_index,
-             uint reports_per_query, uint query)
+static inline uint
+query_report_offset(global uint16_t *oq_index, uint reports_per_query,
+                    uint query)
 {
    /* For occlusion queries, results[] points to the device global heap. We
     * need to remap indices according to the query pool's allocation.
     */
    uint result_index = oq_index ? oq_index[query] : query;
 
-   return results + (result_index * reports_per_query);
+   return result_index * reports_per_query;
 }
 
 KERNEL(32)
-libagx_copy_query(global uint32_t *availability, global uint64_t *results,
+libagx_copy_query(global uint32_t *availability,
+                  volatile global uint64_t *results,
                   global uint16_t *oq_index, uint64_t dst_addr,
                   uint64_t dst_stride, uint32_t first_query,
                   VkQueryResultFlagBits flags, uint16_t reports_per_query)
@@ -36,8 +37,8 @@ libagx_copy_query(global uint32_t *availability, global uint64_t *results,
    else
       available = (results[query] != LIBAGX_QUERY_UNAVAILABLE);
 
-   global uint64_t *report =
-      query_report(results, oq_index, reports_per_query, query);
+   volatile global uint64_t *report =
+      results + query_report_offset(oq_index, reports_per_query, query);
 
    if (available || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
       for (unsigned i = 0; i < reports_per_query; ++i) {
@@ -69,7 +70,7 @@ libagx_reset_query(global uint32_t *availability, global uint64_t *results,
    }
 
    global uint64_t *report =
-      query_report(results, oq_index, reports_per_query, query);
+      results + query_report_offset(oq_index, reports_per_query, query);
 
    /* XXX: is this supposed to happen on the begin? */
    for (unsigned j = 0; j < reports_per_query; ++j) {

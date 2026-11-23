@@ -518,7 +518,8 @@ hk_render_merge_end(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    struct hk_rendering_state *render = &cmd->state.gfx.render;
    struct hk_image_view *views[HK_MAX_RTS] = {NULL};
 
-   if (!cs || render->feedback || render->raw_color_mask || render->raw_zs ||
+   if (!cs || cs->timestamp.end.handle || render->feedback ||
+       render->raw_color_mask || render->raw_zs ||
        !hk_render_merge_enabled(cmd) ||
        cmd->sync_fallback || cmd->current_cs.pre_gfx ||
        cmd->current_cs.post_gfx || cmd->tess_batch.draws ||
