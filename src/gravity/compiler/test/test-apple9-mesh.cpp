@@ -3285,3 +3285,110 @@ TEST(Apple9MeshNativeExpand, CullingRegionAlignmentIs16ByteAligned)
       ralloc_free(nir);
    }
 }
+
+TEST(Apple9MeshNativeExpand, SixteenBitOutputsRejectedAndWidenedAccepted)
+{
+   auto build_i16_mesh = [](bool per_primitive, bool widen_to_32bit) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_MESH, &agx_nir_options, "mesh_i16_io");
+      nir_shader *nir = b.shader;
+      nir->info.workgroup_size[0] = 32;
+      nir->info.workgroup_size[1] = 1;
+      nir->info.workgroup_size[2] = 1;
+      nir->info.mesh.max_vertices_out = 4;
+      nir->info.mesh.max_primitives_out = 2;
+      nir->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 4),
+                                         nir_imm_int(&b, 2),
+                                         nir_imm_int(&b, 0));
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      nir_def *val16 = nir_vec2(&b, nir_imm_intN_t(&b, -7, 16),
+                                nir_imm_intN_t(&b, 13, 16));
+      nir_def *val = widen_to_32bit ? nir_i2i32(&b, val16) : val16;
+      nir_push_if(&b, nir_ult_imm(&b, lane, 4));
+      nir_store_per_vertex_output(
+         &b, nir_imm_vec4(&b, 0.0f, 0.0f, 0.0f, 1.0f), lane,
+         nir_imm_int(&b, 0), .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      if (!per_primitive) {
+         nir_store_per_vertex_output(
+            &b, val, lane, nir_imm_int(&b, 0), .write_mask = 0x3,
+            .src_type = widen_to_32bit ? nir_type_int32 : nir_type_int16,
+            .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      }
+      nir_pop_if(&b, NULL);
+
+      nir_push_if(&b, nir_ult_imm(&b, lane, 2));
+      nir_store_per_primitive_output(
+         &b, nir_imm_ivec3(&b, 0, 1, 2), lane, nir_imm_int(&b, 0),
+         .write_mask = 0x7, .src_type = nir_type_uint32,
+         .io_semantics = {
+            .location = VARYING_SLOT_PRIMITIVE_INDICES,
+            .num_slots = 1,
+         });
+      if (per_primitive) {
+         nir_store_per_primitive_output(
+            &b, val, lane, nir_imm_int(&b, 0), .write_mask = 0x3,
+            .src_type = widen_to_32bit ? nir_type_int32 : nir_type_int16,
+            .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      }
+      nir_pop_if(&b, NULL);
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+      return nir;
+   };
+
+   agx_apple9_native_mesh_options opts = {};
+   opts.physical_threads = 32;
+   opts.packed_index_publication = true;
+   opts.publication_rounds = true;
+   opts.attributes = true;
+   opts.primitive_vertices = true;
+   opts.outputs_flat = VARYING_BIT_VAR(0);
+
+   /* Raw 16-bit per-vertex and per-primitive outputs are rejected cleanly. */
+   for (bool per_prim : {false, true}) {
+      nir_shader *nir = build_i16_mesh(per_prim, false);
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      EXPECT_FALSE(agx_nir_lower_apple9_native_mesh(nir, true, &opts, &info,
+                                                    &reason));
+      EXPECT_NE(reason, nullptr);
+      ralloc_free(nir);
+   }
+
+   /* Widened 32-bit outputs (as produced by hk_lower_io_16bit_to_32bit for
+    * flat i16vec* mesh outputs) lower and compile cleanly with flat linking. */
+   for (bool per_prim : {false, true}) {
+      nir_shader *nir = build_i16_mesh(per_prim, true);
+      agx_shader_part code = {};
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_nir_lower_apple9_native_mesh(nir, true, &opts, &info,
+                                                   &reason))
+         << (reason ?: "");
+      if (info.primitive_vertices) {
+         nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
+            nir_foreach_instr_safe(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_load_provoking_last) {
+                  nir_builder nb = nir_builder_at(nir_before_instr(instr));
+                  nir_def_replace(&intr->def, nir_imm_int(&nb, 0));
+               }
+            }
+         }
+      }
+      ASSERT_TRUE(agx_compile_apple9_native_mesh_lowered(nir, &opts, &code,
+                                                         &info, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(code.binary && code.info.binary_size > 0);
+      EXPECT_EQ(code.info.apple9_varyings.count, 2u);
+      EXPECT_EQ(code.info.apple9_varyings.mask[VARYING_SLOT_VAR0], 0x3u);
+      EXPECT_EQ(code.info.apple9_varyings.group[VARYING_SLOT_VAR0], 1u);
+      EXPECT_EQ(info.layout.max_vertices, per_prim ? 6u : 4u);
+      free(code.binary);
+      ralloc_free(nir);
+   }
+}
