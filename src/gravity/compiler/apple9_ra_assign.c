@@ -694,6 +694,7 @@ a9_prepare_tuples_and_clobbers(struct agx_apple9_vir_program *program,
    struct {
       uint32_t src[4];
       unsigned width;
+      unsigned first;
       unsigned last;
       uint32_t dest_base;
    } tuples[32];
@@ -788,7 +789,8 @@ a9_prepare_tuples_and_clobbers(struct agx_apple9_vir_program *program,
             if (shared_existing) {
                bool reused_existing = false;
                for (unsigned t = 0; t < nr_tuples; ++t) {
-                  if (tuples[t].width != width || i - tuples[t].last > 128)
+                  if (tuples[t].width != width || i - tuples[t].last > 64 ||
+                      i - tuples[t].first > 128)
                      continue;
                   bool same = true;
                   for (unsigned c = 0; c < width; ++c)
@@ -815,6 +817,7 @@ a9_prepare_tuples_and_clobbers(struct agx_apple9_vir_program *program,
                   tuples[slot].width = width;
                   for (unsigned c = 0; c < width; ++c)
                      tuples[slot].src[c] = def->src[c];
+                  tuples[slot].first = i;
                   tuples[slot].last = i;
                   tuples[slot].dest_base = def->dest;
                }
@@ -831,7 +834,8 @@ a9_prepare_tuples_and_clobbers(struct agx_apple9_vir_program *program,
          bool reused = false;
          if (shared) {
             for (unsigned t = 0; t < nr_tuples; ++t) {
-               if (tuples[t].width != width || i - tuples[t].last > 128)
+               if (tuples[t].width != width || i - tuples[t].last > 64 ||
+                   i - tuples[t].first > 128)
                   continue;
                bool same = true;
                for (unsigned c = 0; c < width; ++c)
@@ -892,6 +896,7 @@ a9_prepare_tuples_and_clobbers(struct agx_apple9_vir_program *program,
                tuples[slot].width = width;
                for (unsigned c = 0; c < width; ++c)
                   tuples[slot].src[c] = csrcs[c];
+               tuples[slot].first = i;
                tuples[slot].last = i;
                tuples[slot].dest_base = base;
             }

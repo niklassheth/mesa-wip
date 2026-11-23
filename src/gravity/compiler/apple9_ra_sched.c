@@ -4,6 +4,7 @@
  */
 
 #include "apple9_ra_sched.h"
+#include "apple9_ra_spill.h"
 #include "agx_compile.h"
 
 #include <assert.h>
@@ -972,6 +973,7 @@ struct vir_sched_state {
    struct u_sparse_bitset live;
    bool latency;
    unsigned position;
+   int32_t max_all_budget;
    int32_t cur_all;
    int32_t cur_64;
    int32_t cur_16;
@@ -1197,6 +1199,7 @@ static struct vir_sched_node *
 choose_vir_instr(struct vir_sched_state *s)
 {
    struct vir_sched_node *best = NULL;
+   bool best_over_budget = true;
    unsigned best_dependency = 0;
    int32_t best_score = INT32_MAX;
    struct vir_pressure_delta best_delta = {INT32_MAX, INT32_MAX, INT32_MAX};
@@ -1223,8 +1226,12 @@ choose_vir_instr(struct vir_sched_state *s)
       if (s->cur_64 >= 56 || s->cur_64 + delta.bank64 > 64)
          score += 2 * delta.bank64;
 
+      bool over_budget = s->latency && s->max_all_budget < INT32_MAX &&
+                         delta.all > 0 &&
+                         s->cur_all + delta.all > s->max_all_budget;
+
       unsigned dependency = 0;
-      if (s->latency) {
+      if (s->latency && !over_budget) {
          util_dynarray_foreach(&n->dag.edges, struct dag_edge, edge) {
             if (!edge->data)
                continue;
@@ -1238,7 +1245,9 @@ choose_vir_instr(struct vir_sched_state *s)
       bool better = false;
       if (!best) {
          better = true;
-      } else if (dependency != best_dependency) {
+      } else if (over_budget != best_over_budget) {
+         better = !over_budget;
+      } else if (!over_budget && dependency != best_dependency) {
          better = dependency > best_dependency;
       } else if (score != best_score) {
          better = score < best_score;
@@ -1252,6 +1261,7 @@ choose_vir_instr(struct vir_sched_state *s)
 
       if (better) {
          best = n;
+         best_over_budget = over_budget;
          best_dependency = dependency;
          best_score = score;
          best_delta = delta;
@@ -1306,7 +1316,8 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
                            struct agx_apple9_vir_instr *first_tail,
                            struct u_sparse_bitset *live_after_body,
                            int32_t base_all, int32_t base_64, int32_t base_16,
-                           bool latency, struct vir_sched_node **last_write,
+                           bool latency, int32_t max_all_budget,
+                           struct vir_sched_node **last_write,
                            void *attempt_ctx, unsigned *orig_stalls_out)
 {
    struct vir_sched_result res = {0};
@@ -1368,6 +1379,7 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
       .dag = dag,
       .latency = latency,
       .position = 0,
+      .max_all_budget = max_all_budget,
       .cur_all = base_all,
       .cur_64 = base_64,
       .cur_16 = base_16,
@@ -1467,6 +1479,389 @@ apply_vir_schedule(struct agx_apple9_vir_program *p,
    }
 }
 
+static bool
+is_remat_long_span_alu(const struct agx_apple9_vir_program *p,
+                       const BITSET_WORD *pub_defs,
+                       const struct agx_apple9_vir_instr *ins)
+{
+   if (!ins || ins->dest == AGX_APPLE9_VREG_INVALID ||
+       ins->dest_components != 1 || ins->encoding == AGX_APPLE9_ENC_PSEUDO ||
+       ins->publication_handoff || apple9_ra_is_publication_instr(ins) ||
+       ins->memory_volatile || ins->local_control ||
+       ins->producer_scoreboard_slot != AGX_APPLE9_SCOREBOARD_SLOT_NONE ||
+       ins->scoreboard_slot != AGX_APPLE9_SCOREBOARD_SLOT_NONE)
+      return false;
+
+   uint32_t v = ins->dest;
+   if (!is_valid_gpr(p, pub_defs, v))
+      return false;
+   if (p->fixed_phys && p->fixed_phys[v] != AGX_APPLE9_PHYS_INVALID)
+      return false;
+
+   switch (ins->op) {
+   case AGX_APPLE9_VIR_IADD:
+   case AGX_APPLE9_VIR_ISUB:
+   case AGX_APPLE9_VIR_IAND:
+   case AGX_APPLE9_VIR_IOR:
+   case AGX_APPLE9_VIR_IXOR:
+   case AGX_APPLE9_VIR_ISHR:
+   case AGX_APPLE9_VIR_USHR:
+   case AGX_APPLE9_VIR_ISHL:
+   case AGX_APPLE9_VIR_IMAD:
+      break;
+   default:
+      return false;
+   }
+
+   if (agx_apple9_vir_nr_srcs(ins) != 1)
+      return false;
+   uint32_t s0 = agx_apple9_vir_src(ins, 0);
+   if (!is_valid_gpr(p, pub_defs, s0) || s0 == v)
+      return false;
+
+   return true;
+}
+
+/* On high-pressure blocks (> 52 live GPRs), undo overly aggressive CSE of cheap
+ * 1-GPR-source pure integer address derivations (IMAD/USHR/IADD/...) across
+ * long dead gaps (>= 48 instructions) when the base source is already live or
+ * shared by multiple derived values. This prevents e.g. skinned-mesh shaders
+ * from holding dozens of CSE'd bone-matrix offsets live across hundreds of
+ * instructions and crossing into the >80-GPR occupancy tier or spilling. */
+static bool
+apple9_ra_remat_long_spans(struct agx_apple9_vir_program *p,
+                           const struct apple9_ra_liveness_info *liveness)
+{
+   const unsigned vcount = p->value_count;
+   if (vcount == 0 || liveness->num_cfg_blocks == 0)
+      return false;
+
+   bool any_high_pressure = false;
+   for (unsigned b = 0; b < liveness->num_cfg_blocks; ++b) {
+      if (liveness->block_peak_gprs[b] > 52) {
+         any_high_pressure = true;
+         break;
+      }
+   }
+   if (!any_high_pressure)
+      return false;
+
+   void *mem_ctx = ralloc_context(NULL);
+   if (!mem_ctx)
+      return false;
+
+   struct agx_apple9_vir_instr **defs = NULL;
+   BITSET_WORD *pub_defs = NULL;
+   if (!build_defs_and_pub_mask(p, mem_ctx, &defs, &pub_defs)) {
+      ralloc_free(mem_ctx);
+      return false;
+   }
+
+   BITSET_WORD *global_live_out = BITSET_RZALLOC(mem_ctx, vcount);
+   if (!global_live_out) {
+      ralloc_free(mem_ctx);
+      return false;
+   }
+   if (p->output < vcount)
+      BITSET_SET(global_live_out, p->output);
+   for (unsigned k = 0; k < p->live_out_count; ++k) {
+      if (p->live_out[k] < vcount)
+         BITSET_SET(global_live_out, p->live_out[k]);
+   }
+
+   bool any_changed = false;
+
+   for (struct agx_apple9_block *blk = p->blocks; blk; blk = blk->next) {
+      if (!blk->cfg_active)
+         continue;
+      const unsigned b = blk->cfg_index;
+      if (liveness->block_peak_gprs[b] <= 52)
+         continue;
+
+      struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(blk);
+      while (I && is_pinned_entry(I))
+         I = agx_apple9_instr_next(I);
+      struct agx_apple9_vir_instr *first_body = I;
+      if (!first_body)
+         continue;
+
+      struct agx_apple9_vir_instr *first_tail = NULL;
+      for (struct agx_apple9_vir_instr *T = agx_apple9_block_last_instr(blk); T;
+           T = agx_apple9_instr_prev(T)) {
+         if (is_pinned_tail(T))
+            first_tail = T;
+         else
+            break;
+         if (T == first_body)
+            break;
+      }
+
+      unsigned body_count = 0;
+      for (I = first_body; I && I != first_tail; I = agx_apple9_instr_next(I))
+         body_count++;
+      if (body_count < 64)
+         continue;
+
+      unsigned blk_len = 0;
+      unsigned total_src_uses = 0;
+      for (I = agx_apple9_block_first_instr(blk); I; I = agx_apple9_instr_next(I)) {
+         blk_len++;
+         total_src_uses += agx_apple9_vir_nr_srcs(I);
+      }
+      if (total_src_uses == 0)
+         continue;
+
+      void *blk_ctx = ralloc_context(mem_ctx);
+      if (!blk_ctx)
+         continue;
+      struct agx_apple9_vir_instr **ins_arr =
+         ralloc_array(blk_ctx, struct agx_apple9_vir_instr *, blk_len);
+      uint32_t *ctrl_epoch = ralloc_array(blk_ctx, uint32_t, blk_len);
+      uint32_t *uniform_epoch = ralloc_array(blk_ctx, uint32_t, blk_len);
+      struct agx_apple9_vir_instr **cand_ins =
+         rzalloc_array(blk_ctx, struct agx_apple9_vir_instr *, vcount);
+      uint32_t *def_pos = ralloc_array(blk_ctx, uint32_t, vcount);
+      int32_t *last_use_pos = ralloc_array(blk_ctx, int32_t, vcount);
+      uint32_t *use_head = ralloc_array(blk_ctx, uint32_t, vcount);
+      uint32_t *use_tail = ralloc_array(blk_ctx, uint32_t, vcount);
+      uint32_t *use_pos = ralloc_array(blk_ctx, uint32_t, total_src_uses);
+      uint32_t *use_next = ralloc_array(blk_ctx, uint32_t, total_src_uses);
+      uint32_t *first_gap_use = ralloc_array(blk_ctx, uint32_t, vcount);
+      uint32_t *derived_cnt = rzalloc_array(blk_ctx, uint32_t, vcount);
+      BITSET_WORD *disqualify = BITSET_RZALLOC(blk_ctx, vcount);
+      BITSET_WORD *pinned_src = BITSET_RZALLOC(blk_ctx, vcount);
+      uint32_t *cand_order = ralloc_array(blk_ctx, uint32_t, body_count);
+      struct agx_apple9_vir_instr **to_remove =
+         ralloc_array(blk_ctx, struct agx_apple9_vir_instr *, body_count);
+
+      if (!blk_ctx || !ins_arr || !ctrl_epoch || !uniform_epoch || !cand_ins ||
+          !def_pos || !last_use_pos || !use_head || !use_tail || !use_pos ||
+          !use_next || !first_gap_use || !derived_cnt || !disqualify ||
+          !pinned_src || !cand_order || !to_remove) {
+         ralloc_free(blk_ctx);
+         continue;
+      }
+
+      for (unsigned v = 0; v < vcount; ++v) {
+         last_use_pos[v] = -1;
+         use_head[v] = UINT32_MAX;
+         use_tail[v] = UINT32_MAX;
+         first_gap_use[v] = UINT32_MAX;
+      }
+
+      unsigned pos = 0;
+      unsigned body_start_pos = UINT32_MAX;
+      unsigned tail_start_pos = blk_len;
+      uint32_t c_ep = 0;
+      uint32_t u_ep = 0;
+      unsigned use_cnt = 0;
+
+      for (I = agx_apple9_block_first_instr(blk); I; I = agx_apple9_instr_next(I), ++pos) {
+         if (I == first_body)
+            body_start_pos = pos;
+         if (I == first_tail)
+            tail_start_pos = pos;
+         if (I->op == AGX_APPLE9_VIR_STORE_UNIFORM)
+            u_ep++;
+         if (I->local_control || apple9_ra_after_logical_end(I))
+            c_ep++;
+
+         ins_arr[pos] = I;
+         ctrl_epoch[pos] = c_ep;
+         uniform_epoch[pos] = u_ep;
+
+         if (pos >= body_start_pos && pos < tail_start_pos &&
+             is_remat_long_span_alu(p, pub_defs, I) &&
+             I->dest < vcount && !BITSET_TEST(global_live_out, I->dest) &&
+             !u_sparse_bitset_test(&liveness->live_out[b], I->dest)) {
+            cand_ins[I->dest] = I;
+            def_pos[I->dest] = pos;
+         }
+
+         if (I->op == AGX_APPLE9_VIR_DEVICE_ATOMIC_RESULT ||
+             I->op == AGX_APPLE9_VIR_PHI)
+            continue;
+
+         const unsigned nr_srcs = agx_apple9_vir_nr_srcs(I);
+         bool bad_user = (I->op == AGX_APPLE9_VIR_SPLIT ||
+                          I->op == AGX_APPLE9_VIR_PHI_SRC ||
+                          I->op == AGX_APPLE9_VIR_ABI_RETURN);
+         for (unsigned s = 0; s < nr_srcs; ++s) {
+            uint32_t v = agx_apple9_vir_src(I, s);
+            if (v >= vcount)
+               continue;
+            if (bad_user)
+               BITSET_SET(disqualify, v);
+            last_use_pos[v] = (int32_t)pos;
+            if (use_tail[v] != UINT32_MAX && use_pos[use_tail[v]] == pos)
+               continue;
+            uint32_t uid = use_cnt++;
+            use_pos[uid] = pos;
+            use_next[uid] = UINT32_MAX;
+            if (use_tail[v] != UINT32_MAX)
+               use_next[use_tail[v]] = uid;
+            else
+               use_head[v] = uid;
+            use_tail[v] = uid;
+         }
+      }
+
+      unsigned cand_count = 0;
+      for (unsigned p_i = body_start_pos; p_i < tail_start_pos; ++p_i) {
+         struct agx_apple9_vir_instr *orig = ins_arr[p_i];
+         if (orig->dest >= vcount || cand_ins[orig->dest] != orig)
+            continue;
+         uint32_t v = orig->dest;
+         if (BITSET_TEST(disqualify, v) || use_head[v] == UINT32_MAX) {
+            cand_ins[v] = NULL;
+            continue;
+         }
+
+         /* Locate the first dead gap >= 48 instructions along v's uses. */
+         uint32_t prev_p = def_pos[v];
+         uint32_t gap_u = UINT32_MAX;
+         for (uint32_t u = use_head[v]; u != UINT32_MAX; u = use_next[u]) {
+            if (use_pos[u] >= prev_p + 48u) {
+               gap_u = u;
+               break;
+            }
+            prev_p = use_pos[u];
+         }
+         if (gap_u == UINT32_MAX) {
+            cand_ins[v] = NULL;
+            continue;
+         }
+
+         /* Every use from gap_u onward must be inside the schedulable body and
+          * share orig's uniform epoch if orig reads a uniform operand. */
+         bool ok = true;
+         uint32_t def_u_ep = uniform_epoch[def_pos[v]];
+         for (uint32_t u = gap_u; u != UINT32_MAX; u = use_next[u]) {
+            uint32_t up = use_pos[u];
+            if (up >= tail_start_pos) {
+               ok = false;
+               break;
+            }
+            if (orig->alu_src_uniform_mask && uniform_epoch[up] != def_u_ep) {
+               ok = false;
+               break;
+            }
+         }
+         if (!ok) {
+            cand_ins[v] = NULL;
+            continue;
+         }
+
+         first_gap_use[v] = gap_u;
+         uint32_t s0 = agx_apple9_vir_src(orig, 0);
+         if (s0 < vcount)
+            derived_cnt[s0]++;
+         cand_order[cand_count++] = v;
+      }
+
+      /* Process leaves first (descending def_pos) and pin each remat source so
+       * chained derivations stay SSA-consistent within a single pass. */
+      unsigned remove_count = 0;
+      for (unsigned ci = cand_count; ci-- > 0;) {
+         uint32_t v = cand_order[ci];
+         struct agx_apple9_vir_instr *orig = cand_ins[v];
+         if (!orig || BITSET_TEST(pinned_src, v))
+            continue;
+
+         uint32_t s0 = agx_apple9_vir_src(orig, 0);
+         int32_t max_up = last_use_pos[v];
+         bool s0_already_live =
+            u_sparse_bitset_test(&liveness->live_out[b], s0) ||
+            last_use_pos[s0] >= max_up;
+         if (!s0_already_live && derived_cnt[s0] < 2u)
+            continue;
+
+         uint32_t cur_clone_v = AGX_APPLE9_VREG_INVALID;
+         uint32_t cluster_start_pos = 0;
+         uint32_t cluster_c_ep = 0;
+         bool failed = false;
+
+         for (uint32_t u = first_gap_use[v]; u != UINT32_MAX; u = use_next[u]) {
+            uint32_t up = use_pos[u];
+            struct agx_apple9_vir_instr *u_ins = ins_arr[up];
+
+            if (cur_clone_v == AGX_APPLE9_VREG_INVALID ||
+                up >= cluster_start_pos + 32u ||
+                ctrl_epoch[up] != cluster_c_ep) {
+               uint32_t new_v = AGX_APPLE9_VREG_INVALID;
+               if (!apple9_ra_vir_grow_values(p, NULL, 1, &new_v)) {
+                  failed = true;
+                  break;
+               }
+               if (p->max_phys && v < p->value_count &&
+                   p->max_phys[v] != AGX_APPLE9_PHYS_INVALID)
+                  p->max_phys[new_v] = p->max_phys[v];
+
+               struct agx_apple9_block *saved_blk = p->current_block;
+               p->current_block = blk;
+               bool ok = agx_apple9_vir_emit_side_effect(
+                  p, orig->op, orig->encoding, &s0, 1, orig->immediate);
+               p->current_block = saved_blk;
+               if (!ok) {
+                  failed = true;
+                  break;
+               }
+
+               struct agx_apple9_vir_instr *copy =
+                  p->instructions[p->instruction_count - 1];
+               *copy = *orig;
+               copy->dest = new_v;
+               copy->dest_components = 1;
+               copy->phi_block = NULL;
+               copy->phi_edge = NULL;
+               copy->phi_srcs = NULL;
+               copy->phi_src_count = 0;
+               copy->completion_consumer = NULL;
+               copy->kill_mask = 0;
+               copy->retain_mask = 0;
+               copy->live_after_mask = 0;
+               copy->dead_dest_mask = 0;
+               copy->nr_srcs = 1;
+               copy->src[0] = s0;
+               agx_apple9_vir_move_before(p, copy, u_ins);
+
+               cur_clone_v = new_v;
+               cluster_start_pos = up;
+               cluster_c_ep = ctrl_epoch[up];
+            }
+
+            const unsigned nr_srcs = agx_apple9_vir_nr_srcs(u_ins);
+            for (unsigned s = 0; s < nr_srcs; ++s) {
+               uint32_t *sp = agx_apple9_vir_src_ptr(u_ins, s);
+               if (*sp == v)
+                  *sp = cur_clone_v;
+            }
+         }
+
+         if (failed) {
+            if (cur_clone_v != AGX_APPLE9_VREG_INVALID)
+               any_changed = true;
+            break;
+         }
+
+         BITSET_SET(pinned_src, s0);
+         if (max_up > last_use_pos[s0])
+            last_use_pos[s0] = max_up;
+         if (first_gap_use[v] == use_head[v])
+            to_remove[remove_count++] = orig;
+         any_changed = true;
+      }
+
+      if (remove_count > 0)
+         agx_apple9_vir_remove_many(p, to_remove, remove_count);
+
+      ralloc_free(blk_ctx);
+   }
+
+   ralloc_free(mem_ctx);
+   return any_changed;
+}
+
 bool
 apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                                  struct apple9_ra_sched_options *opts)
@@ -1490,6 +1885,14 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
       return true;
    }
 
+   for (unsigned pass = 0; pass < 2; ++pass) {
+      if (!apple9_ra_remat_long_spans(p, &liveness))
+         break;
+      apple9_ra_liveness_finish(&liveness);
+      if (!apple9_ra_liveness(p, &liveness))
+         return false;
+   }
+
    void *mem_ctx = ralloc_context(NULL);
    if (!mem_ctx) {
       apple9_ra_liveness_finish(&liveness);
@@ -1509,17 +1912,6 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
    }
 
    bool any_reordered = false;
-
-   /* Derive the shader's occupancy-tier ceiling from exact post-DCE CFG
-    * liveness (leaving 1 GPR headroom below the tier boundary so latency
-    * hiding does not drop occupancy tier or induce spilling). */
-   unsigned shader_peak = MIN2(MAX2(liveness.peak_live_gprs, 6u),
-                               (unsigned)AGX_APPLE9_GPR_COUNT);
-   unsigned shader_tier_gprs =
-      agx_occupancy_for_register_count(2u * shader_peak).max_registers / 2u;
-   shader_tier_gprs = MIN2(shader_tier_gprs, (unsigned)AGX_APPLE9_GPR_COUNT);
-   unsigned safe_tier_gprs =
-      shader_tier_gprs > 1u ? shader_tier_gprs - 1u : shader_tier_gprs;
 
    for (struct agx_apple9_block *blk = p->blocks; blk; blk = blk->next) {
       if (!blk->cfg_active)
@@ -1615,25 +2007,108 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
             break;
       }
 
-      unsigned blk_slack = cfg->pressure_slack;
-      if (cfg->auto_tier_slack && orig_all < (int32_t)safe_tier_gprs) {
-         unsigned tier_slack = MIN2(8u, (unsigned)(safe_tier_gprs - orig_all));
-         blk_slack = MAX2(blk_slack, tier_slack);
-      }
-
       bool committed = false;
+
+      if (cfg->latency && cfg->auto_tier_slack) {
+         /* Always find the best achievable occupancy tier before granting
+          * latency-hiding slack: unscheduled VIR blocks frequently exceed
+          * 52..80 GPRs even when pressure scheduling compresses them down to
+          * a higher-occupancy tier (e.g. 90 -> 61 or 88 -> 49 GPRs). */
+         void *pres_ctx = NULL;
+         struct vir_sched_result pres = {0};
+         bool have_pres = false;
+         int32_t min_all = orig_all;
+         if (orig_all > 48) {
+            pres_ctx = ralloc_context(blk_ctx);
+            pres = run_block_schedule_attempt(
+               p, defs, pub_defs, val_max_gpr, first_body, first_tail,
+               &live_after_body, base_all, base_64, base_16, false, INT32_MAX,
+               last_write, pres_ctx, NULL);
+            if (pres.valid &&
+                bank_limits_respected(pres.max_64, pres.max_16, orig_64,
+                                      orig_16) &&
+                pressure_strictly_better(pres.max_all, pres.max_64, pres.max_16,
+                                         orig_all, orig_64, orig_16)) {
+               have_pres = true;
+               min_all = pres.max_all;
+            }
+         }
+
+         unsigned clamped_min =
+            MIN2(MAX2((unsigned)MAX2(min_all, 6), 6u),
+                 (unsigned)AGX_APPLE9_GPR_COUNT);
+         unsigned tier_gprs =
+            MIN2(agx_occupancy_for_register_count(2u * clamped_min)
+                    .max_registers / 2u,
+                 (unsigned)AGX_APPLE9_GPR_COUNT);
+         /* Leave 4 GPRs of alignment/RA headroom below each tier ceiling
+          * (48 for 52, 60 for 64, 76 for 80, 92 for 96). */
+         int32_t safe_tier = (int32_t)(tier_gprs > 4u ? tier_gprs - 4u : tier_gprs);
+         int32_t lat_limit = min_all;
+         if (min_all < safe_tier)
+            lat_limit = MIN2(safe_tier, min_all + 12);
+         if (cfg->pressure_slack > 0 && orig_all + (int32_t)cfg->pressure_slack > lat_limit)
+            lat_limit = orig_all + (int32_t)cfg->pressure_slack;
+
+         void *lat_ctx = ralloc_context(blk_ctx);
+         unsigned orig_stalls = 0;
+         struct vir_sched_result lat = run_block_schedule_attempt(
+            p, defs, pub_defs, val_max_gpr, first_body, first_tail,
+            &live_after_body, base_all, base_64, base_16, true, lat_limit,
+            last_write, lat_ctx, &orig_stalls);
+
+         bool accept_lat = false;
+         if (lat.valid) {
+            if (lat.max_all > lat_limit) {
+               cfg->rejected_pressure_increase = MAX2(
+                  cfg->rejected_pressure_increase,
+                  (unsigned)MAX2(lat.max_all - min_all, 0));
+            } else if (bank_limits_respected(lat.max_64, lat.max_16, orig_64,
+                                             orig_16)) {
+               if (have_pres) {
+                  /* Accept latency schedule only if it stays within the
+                   * compressed tier ceiling and hides stalls (or matches pres). */
+                  accept_lat = (lat.stalls < orig_stalls) ||
+                               (lat.max_all <= pres.max_all);
+               } else {
+                  accept_lat =
+                     (lat.stalls < orig_stalls) ||
+                     (lat.stalls == orig_stalls &&
+                      pressure_strictly_better(lat.max_all, lat.max_64,
+                                               lat.max_16, orig_all, orig_64,
+                                               orig_16));
+               }
+            }
+         }
+
+         if (accept_lat) {
+            apply_vir_schedule(p, blk, last_entry, lat.order, lat.count);
+            committed = true;
+            any_reordered = true;
+         } else if (have_pres) {
+            apply_vir_schedule(p, blk, last_entry, pres.order, pres.count);
+            committed = true;
+            any_reordered = true;
+         }
+
+         ralloc_free(lat_ctx);
+         if (pres_ctx)
+            ralloc_free(pres_ctx);
+         ralloc_free(blk_ctx);
+         continue;
+      }
 
       if (cfg->latency) {
          void *lat_ctx = ralloc_context(blk_ctx);
          unsigned orig_stalls = 0;
          struct vir_sched_result lat = run_block_schedule_attempt(
             p, defs, pub_defs, val_max_gpr, first_body, first_tail,
-            &live_after_body, base_all, base_64, base_16, true, last_write,
-            lat_ctx, &orig_stalls);
+            &live_after_body, base_all, base_64, base_16, true, INT32_MAX,
+            last_write, lat_ctx, &orig_stalls);
 
          bool accept_lat = false;
          if (lat.valid) {
-            int32_t limit = orig_all + (int32_t)blk_slack;
+            int32_t limit = orig_all + (int32_t)cfg->pressure_slack;
             if (lat.max_all > limit) {
                cfg->rejected_pressure_increase = MAX2(
                   cfg->rejected_pressure_increase,
@@ -1650,37 +2125,22 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
 
          if (accept_lat) {
             bool overridden_by_pressure = false;
-            if (blk_slack == 0 && lat.max_all > base_all) {
+            if (cfg->pressure_slack == 0 && lat.max_all > base_all) {
                void *pres_ctx = ralloc_context(blk_ctx);
                struct vir_sched_result pres = run_block_schedule_attempt(
                   p, defs, pub_defs, val_max_gpr, first_body, first_tail,
                   &live_after_body, base_all, base_64, base_16, false,
-                  last_write, pres_ctx, NULL);
+                  INT32_MAX, last_write, pres_ctx, NULL);
                if (pres.valid &&
                    bank_limits_respected(pres.max_64, pres.max_16, orig_64,
                                          orig_16) &&
                    pressure_strictly_better(pres.max_all, pres.max_64,
                                             pres.max_16, lat.max_all,
                                             lat.max_64, lat.max_16)) {
-                  bool worth_override = true;
-                  if (cfg->auto_tier_slack && lat.stalls < orig_stalls &&
-                      lat.max_all <= (int32_t)AGX_APPLE9_GPR_COUNT) {
-                     unsigned lat_threads = agx_occupancy_for_register_count(
-                                               2u * MAX2((unsigned)lat.max_all, 1u))
-                                               .max_threads;
-                     unsigned pres_threads = agx_occupancy_for_register_count(
-                                                2u * MAX2((unsigned)pres.max_all, 1u))
-                                                .max_threads;
-                     /* Do not discard a lower-stall latency schedule for an
-                      * intra-tier GPR reduction that yields no occupancy win. */
-                     worth_override = pres_threads > lat_threads;
-                  }
-                  if (worth_override) {
-                     apply_vir_schedule(p, blk, last_entry, pres.order, pres.count);
-                     committed = true;
-                     any_reordered = true;
-                     overridden_by_pressure = true;
-                  }
+                  apply_vir_schedule(p, blk, last_entry, pres.order, pres.count);
+                  committed = true;
+                  any_reordered = true;
+                  overridden_by_pressure = true;
                }
                ralloc_free(pres_ctx);
             }
@@ -1697,33 +2157,20 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
        * zero slack is requested, or when pressure exceeds the register file
        * (avoiding undoing latency hiding in low-pressure blocks where the
        * caller explicitly granted occupancy-tier pressure slack). */
-      if (!committed && (!cfg->latency || blk_slack == 0 ||
+      if (!committed && (!cfg->latency || cfg->pressure_slack == 0 ||
                          orig_all > (int32_t)AGX_APPLE9_GPR_COUNT)) {
          void *pres_ctx = ralloc_context(blk_ctx);
          struct vir_sched_result pres = run_block_schedule_attempt(
             p, defs, pub_defs, val_max_gpr, first_body, first_tail,
-            &live_after_body, base_all, base_64, base_16, false, last_write,
-            pres_ctx, NULL);
+            &live_after_body, base_all, base_64, base_16, false, INT32_MAX,
+            last_write, pres_ctx, NULL);
 
          if (pres.valid &&
              bank_limits_respected(pres.max_64, pres.max_16, orig_64, orig_16) &&
              pressure_strictly_better(pres.max_all, pres.max_64, pres.max_16,
                                       orig_all, orig_64, orig_16)) {
-            bool worth_pres = true;
-            if (cfg->latency && cfg->auto_tier_slack &&
-                orig_all <= (int32_t)AGX_APPLE9_GPR_COUNT) {
-               unsigned orig_threads = agx_occupancy_for_register_count(
-                                          2u * MAX2((unsigned)orig_all, 1u))
-                                          .max_threads;
-               unsigned pres_threads = agx_occupancy_for_register_count(
-                                          2u * MAX2((unsigned)pres.max_all, 1u))
-                                          .max_threads;
-               worth_pres = pres_threads > orig_threads;
-            }
-            if (worth_pres) {
-               apply_vir_schedule(p, blk, last_entry, pres.order, pres.count);
-               any_reordered = true;
-            }
+            apply_vir_schedule(p, blk, last_entry, pres.order, pres.count);
+            any_reordered = true;
          }
          ralloc_free(pres_ctx);
       }

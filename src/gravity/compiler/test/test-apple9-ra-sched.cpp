@@ -1128,3 +1128,86 @@ TEST(Apple9RaPressureSchedule, AutoTierSlackOverlapsLoadsWithoutDroppingTier)
    verify_ssa_def_before_use_in_block(&p, b0);
    agx_apple9_vir_finish(&p);
 }
+
+TEST(Apple9RaPressureSchedule, RematLongSpanDerivedAluDropsHighBlockPressure)
+{
+   agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   ASSERT_NE(b0, nullptr);
+   agx_apple9_block_begin(&p, b0);
+
+   /* Create 20 single-source integer ALU offsets derived from one base GPR,
+    * use them once early, separate the second use by a 60-instruction chain of
+    * unrelated live values (driving peak live GPRs well past 52), and add one
+    * uniform-reading derivation that crosses a STORE_UNIFORM barrier (must NOT
+    * be rematerialized past STORE_UNIFORM). */
+   uint32_t base = agx_apple9_vir_input(&p, 0);
+   uint32_t acc = emit_imm(&p, 1);
+
+   std::vector<uint32_t> derived;
+   for (unsigned k = 0; k < 20; ++k) {
+      uint32_t v = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_IADD,
+                                       AGX_APPLE9_ENC_INT_ADD_EXTENDED, &base,
+                                       1, k + 1);
+      p.instructions[p.instruction_count - 1]->alu_src_immediate_mask = 1u << 1;
+      p.instructions[p.instruction_count - 1]->alu_src_value[1] = k + 1;
+      derived.push_back(v);
+      uint32_t ld = emit_dev_load(&p, 0, v, 1);
+      acc = emit_iadd(&p, acc, ld);
+   }
+
+   uint32_t unif_derived = agx_apple9_vir_emit(
+      &p, AGX_APPLE9_VIR_IADD, AGX_APPLE9_ENC_INT_ADD_EXTENDED, &base, 1, 0);
+   p.instructions[p.instruction_count - 1]->alu_src_uniform_mask = 1u << 1;
+   p.instructions[p.instruction_count - 1]->alu_src_value[1] = 4;
+   acc = emit_iadd(&p, acc, unif_derived);
+
+   /* 40 simultaneously live values across a middle region plus a STORE_UNIFORM
+    * barrier. */
+   std::vector<uint32_t> mid;
+   for (unsigned k = 0; k < 40; ++k) {
+      uint32_t x = emit_dev_load(&p, 1, acc, 1);
+      mid.push_back(x);
+      acc = emit_iadd(&p, acc, x);
+   }
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_STORE_UNIFORM, AGX_APPLE9_ENC_STORE_UNIFORM, &acc, 1,
+      4));
+   for (uint32_t x : mid)
+      acc = emit_iadd(&p, acc, x);
+
+   /* Distant reuse of all 20 derived values + the uniform-reading derivation. */
+   agx_apple9_vir_instr *unif_late_use = nullptr;
+   for (uint32_t v : derived) {
+      uint32_t ld = emit_dev_load(&p, 2, v, 1);
+      acc = emit_iadd(&p, acc, ld);
+   }
+   acc = emit_iadd(&p, acc, unif_derived);
+   unif_late_use = p.instructions[p.instruction_count - 1];
+   ASSERT_TRUE(emit_dev_store(&p, 3, base, acc));
+
+   apple9_ra_liveness_info before_live;
+   ASSERT_TRUE(apple9_ra_liveness(&p, &before_live));
+   unsigned peak_before = p.peak_live_gprs;
+   apple9_ra_liveness_finish(&before_live);
+   ASSERT_GT(peak_before, 60u);
+
+   apple9_ra_sched_options opts = {
+      .latency = true,
+      .pressure_slack = 0,
+      .auto_tier_slack = true,
+      .rejected_pressure_increase = 0,
+   };
+   ASSERT_TRUE(apple9_ra_pressure_schedule_opts(&p, &opts));
+
+   /* Peak pressure must drop substantially once the 20 long-span derivations
+    * are rematerialized at the distant cluster, while the uniform-reading
+    * derivation must remain the original SSA value across STORE_UNIFORM. */
+   EXPECT_LE(p.peak_live_gprs + 15u, peak_before);
+   EXPECT_EQ(agx_apple9_vir_src(unif_late_use, 1), unif_derived);
+
+   verify_ssa_def_before_use_in_block(&p, b0);
+   agx_apple9_vir_finish(&p);
+}
