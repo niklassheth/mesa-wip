@@ -32,9 +32,21 @@ libgravity_compiler_files = files(
   'agx_nir_lower_texture.c',
 )
 
+agx_apple9_machine_table = custom_target(
+  'agx_apple9_machine_table',
+  input : ['agx_apple9_isa.py', 'agx_apple9_machine.h'],
+  output : ['agx_apple9_machine_table.h', 'agx_apple9_machine_table.c'],
+  command : [
+    prog_python, '@INPUT0@',
+    '--check', '@INPUT1@',
+    '--out-h', '@OUTPUT0@',
+    '--out-c', '@OUTPUT1@',
+  ],
+)
+
 libgravity_compiler = static_library(
   'gravity_compiler',
-  libgravity_compiler_files,
+  [libgravity_compiler_files, agx_apple9_machine_table],
   dependencies: [idep_gravity_debug, idep_nir, idep_mesautil, idep_gravity_cl, idep_libpoly],
   c_args : [no_override_init_args, '-Wno-c2x-extensions'],
   gnu_symbol_visibility : 'hidden',
