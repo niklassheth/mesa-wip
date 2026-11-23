@@ -1748,7 +1748,8 @@ hk_apple9_native_can_append(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .native = native,
       .meta = cmd->in_meta,
       .queries = gfx->occlusion.active_count ||
-                 gfx->descriptors.root.draw.pipeline_stats_flags,
+                 gfx->descriptors.root.draw.pipeline_stats_flags ||
+                 hk_cond_render_applies(cmd),
       .task = gfx->shaders[MESA_SHADER_TASK],
       .xfb = gfx->xfb_enabled,
       .mesh = gfx->shaders[MESA_SHADER_MESH],
@@ -2046,6 +2047,15 @@ hk_apple9_check_native_block(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
 /* Record the final draw packet after its resources and pipeline are prepared.
  * Keep both routes here so admission and actual packet emission use one policy. */
+static inline void
+hk_apple9_add_native_primitives(struct hk_cs *cs, uint64_t primitives)
+{
+   cs->apple9_native_primitives =
+      primitives > UINT64_MAX - cs->apple9_native_primitives
+         ? UINT64_MAX
+         : cs->apple9_native_primitives + primitives;
+}
+
 static bool
 hk_apple9_record_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                        const struct agx_apple9_render_pipeline *pipeline,
@@ -2092,7 +2102,7 @@ hk_apple9_record_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       cs->current += bytes - 4;
       cs->apple9_native_mesh = true;
       ++cs->apple9_native_dispatches;
-      cs->apple9_native_primitives += cmd->apple9_draw_primitives;
+      hk_apple9_add_native_primitives(cs, cmd->apple9_draw_primitives);
       if (!hk_apple9_check_native_block(cmd, cs, before))
          return false;
       if (debug_get_option_native_batch_log())
@@ -2105,7 +2115,7 @@ hk_apple9_record_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       if (!hk_apple9_check_native_block(cmd, cs, before))
          return false;
       if (cs->apple9_native_mesh)
-         cs->apple9_native_primitives += cmd->apple9_draw_primitives;
+         hk_apple9_add_native_primitives(cs, cmd->apple9_draw_primitives);
    }
    return true;
 }
@@ -2224,7 +2234,7 @@ hk_apple9_try_cached_draw(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    if (!hk_apple9_check_native_block(cmd, cs, before))
       return true;
    if (cs->apple9_native_mesh)
-      cs->apple9_native_primitives += cmd->apple9_draw_primitives;
+      hk_apple9_add_native_primitives(cs, cmd->apple9_draw_primitives);
    hk_apple9_account_draw(cs, pipeline, draw, false,
                           cmd->apple9_draw_state.fragment);
    return true;

@@ -964,8 +964,8 @@ agx_nir_lower_apple9_object_calls(nir_shader *nir, const char **reason)
    return valid || fail(reason, "invalid closed NIR object call region");
 }
 
-nir_shader *
-agx_nir_apple9_taskless_object(const struct agx_apple9_mesh_key *key)
+static nir_shader *
+apple9_taskless_object(const struct agx_apple9_mesh_key *key, bool guard_empty)
 {
    if (!key || key->grid_root >= 64 ||
        (key->physical_threads &&
@@ -976,7 +976,8 @@ agx_nir_apple9_taskless_object(const struct agx_apple9_mesh_key *key)
        key->grid_offset_B > AGX_APPLE9_MAX_SHARED_BYTES - 12)
       return NULL;
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_TASK, &agx_nir_options, "apple9_taskless_object");
+      MESA_SHADER_TASK, &agx_nir_options,
+      guard_empty ? "apple9_taskless_object_guarded" : "apple9_taskless_object");
    b.shader->info.workgroup_size[0] = 1;
    b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
    nir_def *address = nir_pack_64_2x32(
@@ -988,9 +989,28 @@ agx_nir_apple9_taskless_object(const struct agx_apple9_mesh_key *key)
          &b, 1, 32, nir_iadd_imm(&b, address, 4 * i), .align_mul = 4,
          .access = ACCESS_NON_WRITEABLE);
    }
+   if (guard_empty) {
+      nir_def *active = nir_iand(
+         &b, nir_iand(&b, nir_ine_imm(&b, count[0], 0), nir_ine_imm(&b, count[1], 0)),
+         nir_ine_imm(&b, count[2], 0));
+      for (unsigned i = 0; i < 3; ++i)
+         count[i] = nir_bcsel(&b, active, count[i], nir_imm_int(&b, 1));
+   }
    nir_launch_mesh_workgroups(&b, nir_vec(&b, count, 3));
    nir_validate_shader(b.shader, "Apple9 taskless T1 object");
    return b.shader;
+}
+
+nir_shader *
+agx_nir_apple9_taskless_object(const struct agx_apple9_mesh_key *key)
+{
+   return apple9_taskless_object(key, false);
+}
+
+nir_shader *
+agx_nir_apple9_taskless_object_guarded(const struct agx_apple9_mesh_key *key)
+{
+   return apple9_taskless_object(key, true);
 }
 
 bool

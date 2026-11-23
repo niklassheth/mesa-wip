@@ -124,7 +124,7 @@ check_key(bool halfz, unsigned flat, unsigned linear)
    /* Execute the lowered NIR returned by the real hk compilation call. This
     * checks the key's effect on publication, independently of its options
     * construction and without a device or shader-upload mock. */
-   struct machine m = {0};
+   struct machine m = {.num_groups = {1, 1, 1}};
    nir_function_impl *impl = nir_shader_get_entrypoint(mesh);
    m.value = calloc(impl->ssa_alloc, sizeof(*m.value));
    CHECK(m.value);
@@ -260,7 +260,7 @@ check_output_array(bool primitive, bool reverse)
    uint32_t indices[3];
    for (unsigned j = 0; j < 3; ++j)
       indices[j] = reverse ? 2 - j : j;
-   struct machine m = {0};
+   struct machine m = {.num_groups = {1, 1, 1}};
    m.region[5] = (struct region){INPUT_ADDR, sizeof(indices), (uint8_t *)indices, NULL};
    nir_function_impl *impl = nir_shader_get_entrypoint(mesh);
    m.value = calloc(impl->ssa_alloc, sizeof(*m.value));

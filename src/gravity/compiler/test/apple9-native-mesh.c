@@ -408,6 +408,54 @@ check_num_workgroups(void)
    }
 }
 
+static void
+check_guard_empty_grid(void)
+{
+   const uint32_t grids[][3] = {
+      {0, 0, 0}, {0, 2, 3}, {2, 0, 3}, {2, 3, 0}, {1, 1, 1}, {2, 3, 4},
+   };
+   const struct agx_apple9_native_mesh_options options = {
+      .guard_empty_grid = true,
+   };
+   for (unsigned g = 0; g < ARRAY_SIZE(grids); ++g) {
+      bool empty = !grids[g][0] || !grids[g][1] || !grids[g][2];
+      nir_shader *nir = source(&h1_fixtures[0], 16);
+      nir_builder b =
+         nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(nir)));
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      nir_store_global(&b, nir_iadd_imm(&b, lane, 1),
+                       nir_iadd(&b, nir_imm_int64(&b, PRESSURE_OUTPUT),
+                                nir_u2u64(&b, nir_imul_imm(&b, lane, 4))),
+                       .align_mul = 4, .access = ACCESS_VOLATILE);
+      struct agx_apple9_mesh_body_info info = {0};
+      const char *reason = NULL;
+      CHECK(agx_nir_lower_apple9_native_mesh(nir, true, &options, &info, &reason));
+      CHECK(info.guard_empty_grid);
+      nir_lower_vars_to_ssa(nir);
+      nir_opt_dce(nir);
+
+      struct machine m = {0};
+      memcpy(m.num_groups, grids[g], sizeof(m.num_groups));
+      m.variable_counts = true;
+      m.expected_vertices = empty ? 0 : 3;
+      m.expected_primitives = empty ? 0 : 1;
+      uint32_t side_effect[LANES] = {0};
+      uint8_t side_effect_written[sizeof(side_effect)] = {0};
+      m.region[4] = (struct region){PRESSURE_OUTPUT, sizeof(side_effect),
+                                    (uint8_t *)side_effect, side_effect_written};
+      nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+      m.value = calloc(impl->ssa_alloc, sizeof(*m.value));
+      CHECK(m.value);
+      execute(&m, &impl->body, ALL_LANES);
+      CHECK(m.controls == ALL_LANES && m.scalars == 1);
+      CHECK(m.writes == (empty ? 0 : LANES));
+      for (unsigned i = 0; i < LANES; ++i)
+         CHECK(side_effect[i] == (empty ? 0 : i + 1));
+      free(m.value);
+      ralloc_free(nir);
+   }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -442,6 +490,7 @@ main(int argc, char **argv)
    }
    reject_unsupported();
    check_attributes();
+   check_guard_empty_grid();
    for (unsigned threads = 1; threads < 16; ++threads) {
       struct native_mesh_fixture f = h1_fixtures[0];
       char name[32];

@@ -157,6 +157,11 @@ struct agx_apple9_mesh_body_info {
     * completion compacts them after the actual application vertices. */
    uint64_t primitive_vertices;
    unsigned original_max_vertices;
+   /* User body is wrapped in a uniform non-empty grid check (gl_NumWorkGroups
+    * xyz != 0) so empty GPU grids (e.g. conditional rendering) can launch a
+    * safe (1,1,1) dummy workgroup without running application instructions or
+    * side effects. */
+   bool guard_empty_grid;
    unsigned argument_uniform_words;
 };
 
@@ -212,6 +217,12 @@ bool agx_nir_apple9_object_grid_export(struct nir_builder *b,
  * uint32_t mesh group counts passed to launch_mesh_workgroups. Compile through
  * native_object to mask the body and append the physical T16 collective. */
 nir_shader *agx_nir_apple9_taskless_object(
+   const struct agx_apple9_mesh_key *key);
+/* Guarded variant for GPU-zeroable grids (e.g. conditional rendering):
+ * substitutes (1, 1, 1) whenever any grid axis is zero so hardware never
+ * launches an unqualified empty child grid; paired with guard_empty_grid on
+ * the mesh shader. */
+nir_shader *agx_nir_apple9_taskless_object_guarded(
    const struct agx_apple9_mesh_key *key);
 
 /* Compile the taskless producer and a token-free collective grid call in one
@@ -280,6 +291,9 @@ struct agx_apple9_native_mesh_options {
    /* Opt-in lowering of per-primitive Layer/ViewportIndex via the packed
     * rasterizer word in VS UVS order (plus flat ViewportIndex varying). */
    bool layer_viewport;
+   /* Guard the lowered mesh body against GPU-zeroed grids (e.g. conditional
+    * rendering) launched as a (1, 1, 1) dummy workgroup by the guarded object. */
+   bool guard_empty_grid;
    uint64_t outputs_flat, outputs_linear;
 };
 

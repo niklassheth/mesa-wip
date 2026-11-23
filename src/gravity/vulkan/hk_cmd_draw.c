@@ -2103,16 +2103,17 @@ hk_apple9_native_mesh_state_eligible(struct hk_cmd_buffer *cmd,
 {
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   bool allow_predicated = hk_apple9_native_mesh_enabled() &&
+                           !gfx->shaders[MESA_SHADER_TASK];
    if (!hk_apple9_native_mesh_available_device(hk_cmd_buffer_device(cmd)) ||
-       !direct || count_addr ||
-       !hk_apple9_native_mesh_grid_valid(direct) ||
+       !direct || count_addr || !hk_apple9_native_mesh_grid_valid(direct) ||
        (gfx->shaders[MESA_SHADER_TASK] &&
         !hk_apple9_native_task_bridge_enabled()) ||
        gfx->shaders[MESA_SHADER_GEOMETRY] ||
        gfx->shaders[MESA_SHADER_TESS_EVAL] || gfx->render.view_mask ||
        !hk_apple9_native_layers_samples_eligible(
           gfx, dyn, hk_apple9_native_mesh_enabled()) ||
-       hk_cond_render_applies(cmd) ||
+       (hk_cond_render_applies(cmd) && !allow_predicated) ||
        gfx->mesh_pg_query || gfx->descriptors.root.draw.pipeline_stats_flags ||
        (!hk_apple9_native_mesh_enabled() && gfx->occlusion.active_count) ||
        gfx->xfb_enabled ||
@@ -2130,6 +2131,11 @@ bool
 hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
                           uint64_t count_addr)
 {
+   /* Unknown GPU indirect grids cannot yet enforce the native child-grid
+    * limits (axis <= 65535, total <= 1,048,575 vs Vulkan's 4,194,304) or the
+    * per-render TVB primitive budget without a GPU-driven fallback/split path. */
+   if (!direct || count_addr)
+      return false;
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
    const struct hk_api_shader *mesh =
       hk_api_shader_native(gfx->shaders[MESA_SHADER_MESH]);
@@ -2150,7 +2156,12 @@ hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
       hk_api_shader_native(gfx->shaders[MESA_SHADER_TASK]);
    if (main->info.mesh.native_task_bridge != !!gfx->shaders[MESA_SHADER_TASK])
       return false;
-   uint64_t groups = direct ? (uint64_t)direct[0] * direct[1] * direct[2] : 0;
+   /* Predicated draws can evaluate to an empty grid on the GPU and launch a
+    * safe (1, 1, 1) dummy group; require the compiler-emitted empty-grid guard
+    * on the mesh shader binary. */
+   if (hk_cond_render_applies(cmd) && !main->info.apple9_native.guard_empty_grid)
+      return false;
+   uint64_t groups = (uint64_t)direct[0] * direct[1] * direct[2];
    if (gfx->shaders[MESA_SHADER_TASK]) {
       if (!task || !task->apple9_native_leaf || !mesh->apple9_native_leaf ||
           memcmp(task->apple9_native_pair_id, mesh->apple9_native_pair_id,
@@ -2171,10 +2182,9 @@ hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
     * would lose work in its mesh-mode render; emulate it instead (ordinary
     * renders recover through a partial render). Likewise fall back when the
     * draw's vertex planes can wrap the 64 KiB hardware mesh output ring. */
-   if (direct &&
-       (groups * main->info.apple9_native.layout.max_primitives >
-           hk_apple9_native_render_primitives() ||
-        !agx_apple9_mesh_ring_fits(&main->info.apple9_native.layout, groups)))
+   if (groups * main->info.apple9_native.layout.max_primitives >
+          hk_apple9_native_render_primitives() ||
+       !agx_apple9_mesh_ring_fits(&main->info.apple9_native.layout, groups))
       return false;
    return hk_apple9_native_mesh_state_eligible(
       cmd, direct, count_addr,
@@ -2214,6 +2224,7 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       return;
 
    bool native = hk_apple9_use_native_mesh(cmd, direct, count_addr);
+   bool predicated = hk_cond_render_applies(cmd);
    cmd->apple9_draw_primitives =
       native ? (uint64_t)direct[0] * direct[1] * direct[2] *
                   (task ? hk_only_variant(hk_api_shader_native(task))
@@ -2273,10 +2284,21 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
             offsetof(struct libagx_mesh_params, mesh_dispatch));
          return;
       }
-      /* One object workgroup publishes the nonempty direct child grid. */
+      /* Taskless native object consumes a 3-word GPU grid directly. For
+       * conditional rendering, pre_gfx writes a zeroed grid when skipped and
+       * the guarded object/mesh pair emits an empty mesh. */
       uint64_t grid = hk_pool_upload(cmd, direct, 3 * sizeof(uint32_t), 4);
-      if (grid)
-         hk_apple9_draw_native_mesh(cmd, draw_id, grid);
+      if (predicated)
+         grid = hk_predicate_indirect(cmd, grid, 3, true);
+      if (!grid)
+         return;
+      if (predicated) {
+         struct hk_cs *cs = hk_cmd_buffer_get_cs(cmd, false);
+         if (!cs)
+            return;
+         cs->pre_raster_reads |= HK_READS_INTERNAL;
+      }
+      hk_apple9_draw_native_mesh(cmd, draw_id, grid);
       return;
    }
    struct hk_shader *task_main = task ? hk_only_variant(task) : NULL;
@@ -2292,7 +2314,6 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    /* Draws without a task shader and with a known grid are set up here.
     * Predicated draws read a grid of zeroes when skipped.
     */
-   bool predicated = hk_cond_render_applies(cmd);
    bool cpu_setup = direct && !task && !predicated;
    uint64_t direct_count =
       direct ? (uint64_t)direct[0] * direct[1] * direct[2] : 0;

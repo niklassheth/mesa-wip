@@ -184,6 +184,7 @@ hk_hash_apple9_native_mesh_abi(struct mesa_blake3 *ctx)
       2, /* Destination-addressed publication rounds beyond 32 entries. */
       hk_apple9_native_task_bridge_enabled(),
       1, /* Compute-task records and guarded native child grids. */
+      1, /* Guarded empty-grid taskless object/mesh for indirect & cond render. */
    };
    _mesa_blake3_update(ctx, abi, sizeof(abi));
 }
@@ -635,7 +636,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 }
 
 /* Version the container independently of the hardware programs it owns. */
-#define HK_SHADER_CONTAINER_VERSION 0x484b000eu
+#define HK_SHADER_CONTAINER_VERSION 0x484b000fu
 
 static VkResult
 hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *blob,

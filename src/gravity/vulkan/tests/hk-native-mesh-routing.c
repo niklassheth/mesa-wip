@@ -39,15 +39,22 @@ routes(struct hk_cmd_buffer *cmd)
           sizeof(nf->apple9_native_pair_id));
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native_stage =
       HK_APPLE9_NATIVE_MESH;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.guard_empty_grid = true;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_vertices = 3;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.vertex_components = 4;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_primitives = 1;
    gfx->shaders[MESA_SHADER_MESH] = mesh;
    gfx->shaders[MESA_SHADER_FRAGMENT] = fs;
    gfx->render.layer_count = 1;
    dyn->rs.polygon_mode = VK_POLYGON_MODE_FILL;
    const uint32_t direct[] = {2, 3, 4}, oversized[] = {1024, 1024, 1};
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
-   /* Latched VM profile=none refuses native submission even with HK_APPLE9_NATIVE_MESH=1,
-    * while latched research and qualified profiles admit it. */
+   /* Latched VM profile=none (including probe/read/parse failure on a real VM)
+    * refuses native submission even with HK_APPLE9_NATIVE_MESH=1, while latched
+    * research, qualified, and confirmed-absent (UNKNOWN) profiles admit it. */
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   uint32_t saved_vm_id = dev->dev.vm_id;
+   dev->dev.vm_id = 9;
    dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_NONE;
    CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
    dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_RESEARCH;
@@ -56,9 +63,21 @@ routes(struct hk_cmd_buffer *cmd)
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
    dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_UNKNOWN;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   dev->dev.vm_id = saved_vm_id;
+   /* Unknown GPU indirect / indirect-count grids stay on emulation (cannot
+    * bound native child-grid limits or per-render TVB primitive budget). */
    CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
    CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0x1000));
    CHECK(!hk_apple9_use_native_mesh(cmd, oversized, 0));
+   /* An unguarded binary (e.g. production 31-class cache) must fall back on
+    * conditional rendering. */
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.guard_empty_grid = false;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   cmd->state.cond_render.active = true;
+   CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
+   cmd->state.cond_render.active = false;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.guard_empty_grid = true;
 #define FALLBACK(field, value)                                                 \
    do {                                                                        \
       __typeof__(field) saved = field;                                         \
@@ -102,7 +121,13 @@ routes(struct hk_cmd_buffer *cmd)
    gfx->occlusion.active_count = 1;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
    gfx->occlusion.active_count = 0;
-   FALLBACK(cmd->state.cond_render.active, true);
+   /* Conditional rendering is admitted for guarded taskless direct draws;
+    * indirect / indirect-count draws remain on emulation. */
+   cmd->state.cond_render.active = true;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
+   cmd->state.cond_render.active = false;
    FALLBACK(dyn->rs.polygon_mode, VK_POLYGON_MODE_LINE);
    FALLBACK(dyn->rs.polygon_mode, VK_POLYGON_MODE_POINT);
    dyn->ms.rasterization_samples = 2;
@@ -159,6 +184,11 @@ routes(struct hk_cmd_buffer *cmd)
    const uint32_t ring_2d_fit[] = {3, 5, 1}, ring_2d_wrap[] = {4, 4, 1};
    CHECK(hk_apple9_use_native_mesh(cmd, ring_2d_fit, 0));
    CHECK(!hk_apple9_use_native_mesh(cmd, ring_2d_wrap, 0));
+   /* Direct predicated draws honor the same known-grid ring cap. */
+   cmd->state.cond_render.active = true;
+   CHECK(hk_apple9_use_native_mesh(cmd, ring_fit, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, ring_wrap, 0));
+   cmd->state.cond_render.active = false;
 #undef FALLBACK
    memset(gfx->shaders, 0, sizeof(gfx->shaders));
    free(mesh);
@@ -343,6 +373,13 @@ task_routes(struct hk_cmd_buffer *cmd)
    cmd->vk.dynamic_graphics_state.rs.polygon_mode = VK_POLYGON_MODE_FILL;
    uint32_t direct[] = {2,3,4};
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   /* Task-bridged native mesh keeps indirect, indirect-count, and conditional
+    * rendering on the emulated path so skipped tasks have no side effects. */
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
+   cmd->state.cond_render.active = true;
+   CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
+   cmd->state.cond_render.active = false;
    t->info.task.max_mesh_groups = 0;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
    t->info.task.max_mesh_groups = UINT32_MAX;

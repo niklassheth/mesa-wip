@@ -743,6 +743,8 @@ struct hk_apple9_graphics_key {
    bool native_index;
    /* Immutable task records feed native mesh children. API task stays compute. */
    bool native_task_bridge;
+   /* Generated mesh NIR from an API GS/TES stage (already guarded / own draw ABI). */
+   bool native_stage_generated;
    /* Independently keyed stage admission; never implied by a native mesh. */
    uint8_t native_stages;
 };

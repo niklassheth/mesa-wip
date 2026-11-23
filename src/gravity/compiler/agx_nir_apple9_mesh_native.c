@@ -891,12 +891,17 @@ agx_nir_lower_apple9_native_mesh(
    nir_lower_returns(nir);
    if (!agx_nir_mask_apple9_mesh_body(nir, &key, layout, reason))
       return false;
+   bool guard_empty_grid = options && options->guard_empty_grid;
+   info->guard_empty_grid = guard_empty_grid;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_cf_list user_body;
+   if (guard_empty_grid)
+      nir_cf_extract(&user_body, nir_before_impl(impl), nir_after_impl(impl));
    /* A uniform return can bypass SetMeshOutputs entirely. Such a workgroup
     * emits nothing. Initialize both count words before the application mask;
     * only lane zero writes them, and completion reads after its workgroup
     * barrier. No initialization of undefined output attributes is needed. */
-   nir_builder entry =
-      nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(nir)));
+   nir_builder entry = nir_builder_at(nir_before_impl(impl));
    nir_push_if(&entry, nir_ieq_imm(&entry,
                                  nir_load_local_invocation_index(&entry), 0));
    nir_store_local_apple9_agx(
@@ -975,8 +980,25 @@ agx_nir_lower_apple9_native_mesh(
       }
       agx_nir_apple9_mesh_workgroup_barrier(&entry);
    }
-   nir_builder b =
-      nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(nir)));
+   if (guard_empty_grid) {
+      /* Guard GPU-zeroed grids (e.g. conditional rendering) that substitute a
+       * (1, 1, 1) dummy launch when any grid axis is zero. Because
+       * load_num_workgroups reads the draw's immutable 3-word grid, the branch
+       * is workgroup-uniform: empty draws skip every application instruction
+       * and side effect and publish zero vertices/primitives via the
+       * pre-initialized header. */
+      nir_def *nwg = nir_load_num_workgroups(&entry);
+      nir_def *active = nir_iand(
+         &entry,
+         nir_iand(&entry, nir_ine_imm(&entry, nir_channel(&entry, nwg, 0), 0),
+                  nir_ine_imm(&entry, nir_channel(&entry, nwg, 1), 0)),
+         nir_ine_imm(&entry, nir_channel(&entry, nwg, 2), 0));
+      nir_if *guard = nir_push_if(&entry, active);
+      guard->control = nir_selection_control_dont_flatten;
+      entry.cursor = nir_cf_reinsert(&user_body, entry.cursor);
+      nir_pop_if(&entry, guard);
+   }
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
 
    agx_nir_apple9_mesh_workgroup_barrier(&b);
 

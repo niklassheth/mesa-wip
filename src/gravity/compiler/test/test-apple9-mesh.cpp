@@ -3394,3 +3394,58 @@ TEST(Apple9MeshNativeExpand, SixteenBitOutputsRejectedAndWidenedAccepted)
       ralloc_free(nir);
    }
 }
+
+TEST(Apple9MeshNativeExpand, GuardEmptyGridObjectAndMeshCompile)
+{
+   struct agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+   nir_shader *obj = agx_nir_apple9_taskless_object_guarded(&key);
+   ASSERT_NE(obj, nullptr);
+   agx_shader_part obj_code = {};
+   agx_apple9_mesh_body_info obj_info = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_native_object(obj, true, &key, &obj_code,
+                                                &obj_info, &reason))
+      << (reason ?: "");
+   EXPECT_TRUE(obj_code.binary && obj_code.info.binary_size > 0);
+   free(obj_code.binary);
+   ralloc_free(obj);
+
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_MESH, &agx_nir_options,
+                                                  "guard_empty_grid_mesh");
+   b.shader->info.workgroup_size[0] = 16;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.mesh.max_vertices_out = 3;
+   b.shader->info.mesh.max_primitives_out = 1;
+   b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+
+   nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 3), nir_imm_int(&b, 1),
+                                      nir_imm_int(&b, 0));
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_push_if(&b, nir_ult_imm(&b, lane, 3));
+   nir_store_per_vertex_output(
+      &b, nir_imm_vec4(&b, 0.0f, 0.0f, 0.0f, 1.0f), lane, nir_imm_int(&b, 0),
+      .write_mask = 0xf, .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   nir_pop_if(&b, nullptr);
+   nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
+   nir_store_per_primitive_output(
+      &b, nir_imm_ivec3(&b, 0, 1, 2), nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+      .write_mask = 0x7, .src_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES, .num_slots = 1});
+   nir_pop_if(&b, nullptr);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+
+   agx_apple9_native_mesh_options opts = {};
+   opts.attributes = true;
+   opts.guard_empty_grid = true;
+   agx_shader_part mesh_code = {};
+   agx_apple9_mesh_body_info mesh_info = {};
+   ASSERT_TRUE(agx_compile_apple9_native_mesh(b.shader, true, &opts, &mesh_code,
+                                              &mesh_info, &reason))
+      << (reason ?: "");
+   EXPECT_TRUE(mesh_info.guard_empty_grid);
+   EXPECT_TRUE(mesh_code.binary && mesh_code.info.binary_size > 0);
+   free(mesh_code.binary);
+   ralloc_free(b.shader);
+}

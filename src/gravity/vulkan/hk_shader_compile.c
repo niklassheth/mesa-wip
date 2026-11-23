@@ -889,8 +889,10 @@ hk_apple9_compile_tes_mesh_program(
    if (!mesh)
       return false;
    hk_apple9_lower_prerast_sysvals(mesh, MESA_SHADER_COMPUTE);
+   struct hk_apple9_graphics_key stage_key = *key;
+   stage_key.native_stage_generated = true;
    bool compiled =
-      hk_apple9_compile_native_mesh_program(mesh, key, out, info, reason);
+      hk_apple9_compile_native_mesh_program(mesh, &stage_key, out, info, reason);
    ralloc_free(mesh);
    return compiled;
 }
@@ -1321,7 +1323,9 @@ hk_apple9_compile_gs_mesh_program(
    if (!mesh)
       return false;
    hk_apple9_lower_prerast_sysvals(mesh, MESA_SHADER_COMPUTE);
-   bool compiled = hk_apple9_compile_native_mesh_program(mesh, key, out, info, reason);
+   struct hk_apple9_graphics_key stage_key = *key;
+   stage_key.native_stage_generated = true;
+   bool compiled = hk_apple9_compile_native_mesh_program(mesh, &stage_key, out, info, reason);
    ralloc_free(mesh);
    return compiled;
 }
@@ -1491,6 +1495,9 @@ hk_apple9_native_mesh_options(nir_shader *nir,
       .publication_rounds = rounds,
       .link_clip_distances = key->fs_reads_clip_distance,
       .layer_viewport = hk_apple9_native_mesh_primitive_lowering_enabled(),
+      .guard_empty_grid = hk_apple9_native_mesh_enabled() &&
+                          !key->native_task_bridge &&
+                          !key->native_stage_generated,
       .outputs_flat = key->vertex.outputs_flat,
       .outputs_linear = key->vertex.outputs_linear,
    };
@@ -1634,7 +1641,9 @@ hk_apple9_native_gs_check(const nir_shader *source,
           source->info.stage, mesh->info.workgroup_size[0],
           mesh->info.mesh.max_vertices_out, mesh->info.mesh.max_primitives_out))) {
       hk_apple9_lower_prerast_sysvals(mesh, MESA_SHADER_COMPUTE);
-      result = hk_apple9_native_mesh_check(mesh, key, supported, reason);
+      struct hk_apple9_graphics_key stage_key = *key;
+      stage_key.native_stage_generated = true;
+      result = hk_apple9_native_mesh_check(mesh, &stage_key, supported, reason);
    } else {
       *reason = "GS declaration is outside the admitted stage classes";
    }
@@ -1694,7 +1703,9 @@ hk_apple9_native_tess_check(const nir_shader *source,
           source->info.stage, mesh->info.workgroup_size[0],
           mesh->info.mesh.max_vertices_out, mesh->info.mesh.max_primitives_out))) {
       hk_apple9_lower_prerast_sysvals(mesh, MESA_SHADER_COMPUTE);
-      result = hk_apple9_native_mesh_check(mesh, key, supported, reason);
+      struct hk_apple9_graphics_key stage_key = *key;
+      stage_key.native_stage_generated = true;
+      result = hk_apple9_native_mesh_check(mesh, &stage_key, supported, reason);
    } else {
       *reason = "TES declaration is outside the admitted stage classes";
    }
@@ -1721,9 +1732,12 @@ hk_apple9_compile_native_mesh(struct hk_device *dev, nir_shader *nir,
    /* The API object may be GS; this program executes at the mesh stage. */
    mesh->info.stage = MESA_SHADER_MESH;
    mesh->info.apple9_native_stage = HK_APPLE9_NATIVE_MESH;
+   struct hk_apple9_graphics_key mesh_key = *key;
+   if (obj->vk.stage != MESA_SHADER_MESH)
+      mesh_key.native_stage_generated = true;
    hk_assert_final_push_mask(nir, mesh);
    bool compiled = hk_apple9_compile_native_mesh_program(
-      nir, key, &mesh->b, &mesh->info.apple9_native, reason);
+      nir, &mesh_key, &mesh->b, &mesh->info.apple9_native, reason);
    /* The backend may have allocated a binary before a final capability
     * check fails. Give it to the ordinary destruction path in either case. */
    mesh->code_ptr = mesh->b.binary;
@@ -1745,9 +1759,12 @@ hk_apple9_compile_native_mesh(struct hk_device *dev, nir_shader *nir,
       return result;
 
    struct agx_apple9_mesh_key k = AGX_APPLE9_MESH_KEY;
-   nir_shader *generated = obj->vk.stage == MESA_SHADER_TESS_EVAL
-                              ? hk_nir_tes_mesh_object()
-                              : agx_nir_apple9_taskless_object(&k);
+   nir_shader *generated =
+      obj->vk.stage == MESA_SHADER_TESS_EVAL
+         ? hk_nir_tes_mesh_object()
+         : mesh->info.apple9_native.guard_empty_grid
+              ? agx_nir_apple9_taskless_object_guarded(&k)
+              : agx_nir_apple9_taskless_object(&k);
    if (!generated)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    object->info.stage = MESA_SHADER_TASK;

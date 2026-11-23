@@ -257,6 +257,31 @@ check_rejected_region(unsigned kind)
    ralloc_free(b.shader);
 }
 
+static void
+check_guarded_object(const uint32_t groups[3])
+{
+   struct agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+   nir_shader *body = agx_nir_apple9_taskless_object_guarded(&key);
+   CHECK(body && body->info.workgroup_size[0] == 1);
+   struct agx_apple9_mesh_body_info info;
+   const char *reason = NULL;
+   CHECK(agx_nir_lower_apple9_native_object(body, true, &key, &info, &reason));
+   CHECK(agx_nir_lower_apple9_object_calls(body, &reason));
+   nir_validate_shader(body, "guarded taskless object");
+   struct machine m = {.local_root = key.grid_root};
+   m.region[6] = (struct region){INPUT_ADDR, 12, (uint8_t *)groups, NULL};
+   run(body, &m);
+   bool active = groups[0] && groups[1] && groups[2];
+   const uint32_t expected[3] = {
+      active ? groups[0] : 1,
+      active ? groups[1] : 1,
+      active ? groups[2] : 1,
+   };
+   CHECK(m.barriers == 1 && m.grid_exports == 7 && m.object_calls == 1);
+   CHECK(!memcmp(m.grid, expected, sizeof(expected)));
+   ralloc_free(body);
+}
+
 int
 main(void)
 {
@@ -266,6 +291,11 @@ main(void)
       for (unsigned off = 0; off <= 64; off += 64)
          for (unsigned i = 0; i < ARRAY_SIZE(groups); ++i)
             check_variant(r ? 10 : 7, off, groups[i]);
+   const uint32_t guarded_groups[][3] = {
+      {0, 0, 0}, {0, 5, 7}, {3, 0, 7}, {3, 5, 0}, {1, 1, 1}, {2, 3, 4},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(guarded_groups); ++i)
+      check_guarded_object(guarded_groups[i]);
    struct agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
    key.grid_root = AGX_APPLE9_MESH_DRAW_UNIFORM / 2;
    CHECK(!agx_nir_apple9_taskless_object(&key));
