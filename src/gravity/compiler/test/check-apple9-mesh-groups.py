@@ -41,6 +41,10 @@ def check(rows, grid):
         if r['op'] == 'IMM':
             if len(code) == 2:
                 return code[1]
+            if len(code) == 4:
+                assert (code[0] & 0x0f) == 0x0b and field(16, 3) == 0
+                assert not field(26) and not field(27)
+                return 0
             assert len(code) == 8
             return ((code[1] & 127) | ((code[4] & 30) << 6) |
                     ((code[5] & 12) << 9) | (code[6] << 13) |
