@@ -27,7 +27,9 @@ is_workgroup_barrier(nir_instr *instr)
 }
 
 bool
-agx_apple9_native_workgroup_supported(const nir_shader *nir, const char **reason)
+agx_apple9_native_workgroup_valid(const nir_shader *nir,
+                                  unsigned max_invocations,
+                                  const char **reason)
 {
    if (nir->info.workgroup_size_variable)
       return fail(reason, "native mesh/object requires a fixed API workgroup size");
@@ -36,13 +38,22 @@ agx_apple9_native_workgroup_supported(const nir_shader *nir, const char **reason
    unsigned threads = 1;
    for (unsigned d = 0; d < 3; ++d) {
       unsigned size = nir->info.workgroup_size[d];
-      if (!size || size > AGX_APPLE9_NATIVE_THREADS / threads)
+      if (!size || size > max_invocations / threads)
          return fail(reason,
-                     "native mesh/object supports 1..16 API invocations at "
-                     "physical T16; wider launches are unqualified");
+                     max_invocations == AGX_APPLE9_NATIVE_THREADS
+                        ? "native mesh/object supports 1..16 API invocations at "
+                          "physical T16; wider launches are unqualified"
+                        : "native mesh supports 1..128 API invocations at physical T32");
       threads *= size;
    }
    return true;
+}
+
+bool
+agx_apple9_native_workgroup_supported(const nir_shader *nir, const char **reason)
+{
+   return agx_apple9_native_workgroup_valid(nir, AGX_APPLE9_NATIVE_THREADS,
+                                            reason);
 }
 
 static bool
@@ -130,15 +141,14 @@ validate(nir_shader *nir, const struct agx_apple9_mesh_key *key,
    if (nir->info.stage == MESA_SHADER_MESH) {
       layout->max_vertices = nir->info.mesh.max_vertices_out;
       layout->max_primitives = nir->info.mesh.max_primitives_out;
+      layout->indices_per_primitive =
+         agx_apple9_mesh_indices_per_primitive(nir->info.mesh.primitive_type);
       if (!layout->max_vertices || layout->max_vertices > 256 ||
           !layout->max_primitives || layout->max_primitives > 512 ||
-          (nir->info.mesh.primitive_type != MESA_PRIM_TRIANGLES &&
-           nir->info.mesh.primitive_type != MESA_PRIM_LINES))
+          !layout->indices_per_primitive)
          return fail(
             reason,
-            "Apple9 native body requires line or triangle output with u8 indices");
-      layout->indices_per_primitive =
-         nir->info.mesh.primitive_type == MESA_PRIM_LINES ? 2 : 3;
+            "Apple9 native body requires point, line or triangle output with u8 indices");
    }
 
    bool payload = false, local_output = false;
@@ -228,14 +238,22 @@ validate(nir_shader *nir, const struct agx_apple9_mesh_key *key,
                layout->culling |= slot == VARYING_SLOT_CULL_PRIMITIVE;
                continue;
             }
-            /* Clip distances are per-vertex planes, linked like user
-             * varyings; completion adds the rasterizer copy. */
+            /* Clip distances, point size (points topology), and lowered
+             * primitive builtins (PrimitiveID, Layer, ViewportIndex) occupy
+             * per-vertex planes in the native local layout. */
             bool clip = (slot == VARYING_SLOT_CLIP_DIST0 ||
                          slot == VARYING_SLOT_CLIP_DIST1 ||
                          slot == AGX_APPLE9_CLIP_MIRROR_SLOT ||
                          slot == AGX_APPLE9_CLIP_MIRROR_SLOT + 1) && !prim;
-            if (slot != VARYING_SLOT_POS && !clip &&
-                !(slot == VARYING_SLOT_PRIMITIVE_ID && !prim) &&
+            bool psiz = slot == VARYING_SLOT_PSIZ && !prim &&
+                        nir->info.mesh.primitive_type == MESA_PRIM_POINTS;
+            bool scalar_builtin = !prim && (slot == VARYING_SLOT_PRIMITIVE_ID ||
+                                            slot == VARYING_SLOT_LAYER ||
+                                            slot == VARYING_SLOT_VIEWPORT);
+            if ((psiz || scalar_builtin) && (comp || components != 1))
+               return fail(reason,
+                           "Apple9 native scalar output builtin must be scalar");
+            if (slot != VARYING_SLOT_POS && !clip && !psiz && !scalar_builtin &&
                 slot < VARYING_SLOT_VAR0)
                return fail(reason,
                            "Apple9 native output builtin is not implemented");
@@ -261,19 +279,25 @@ validate(nir_shader *nir, const struct agx_apple9_mesh_key *key,
    if (nir->info.stage == MESA_SHADER_TASK)
       return true;
 
+   /* ViewportIndex is linked as a flat varying for fragment reads AND packed
+    * into the rasterizer's shared Layer/Viewport word at VARYING_SLOT_LAYER. */
+   if (vertex[VARYING_SLOT_VIEWPORT] & 1)
+      vertex[VARYING_SLOT_LAYER] |= 1;
+
    /* Output contract validated with the retained opaque mesh completion at
     * 256V/32P, 64V/512P and 64V/32P with primitive attributes (dynamic indices).
     * Culling remains provisional. Which fields fixed-function hardware reads
     * directly is unknown; revalidate when replacing that completion.
     * The index area is padded to a 16-byte count/header region. Position
     * and user values are component planes, each rounded to four vertices.
-    * Culling reserves one four-byte slot per primitive before positions. */
-   layout->primitive_count_B =
-      ALIGN_POT(layout->max_primitives * layout->indices_per_primitive, 16);
+    * Culling/control reserves 16-byte-aligned four-byte slots before positions. */
+   layout->primitive_count_B = agx_apple9_mesh_primitive_count_offset(
+      layout->max_primitives, layout->indices_per_primitive);
    layout->vertex_count_B = layout->primitive_count_B + 4;
    layout->cull_B = layout->primitive_count_B + 16;
    layout->position_B =
-      layout->cull_B + (layout->culling ? layout->max_primitives * 4 : 0);
+      layout->cull_B +
+      (layout->culling ? ALIGN_POT(layout->max_primitives * 4, 16) : 0);
    layout->vertex_pitch_B = ALIGN_POT(layout->max_vertices, 4) * 4;
    for (unsigned c = 0; c < 4; ++c)
       layout->vertex_component[VARYING_SLOT_POS][c] =
@@ -339,14 +363,20 @@ mask_region(nir_cursor start, nir_cursor end, unsigned threads)
 }
 
 /* A workgroup rendezvous that also orders local memory: the nested-barrier
- * flag below depends on its memory semantics, not only on execution. */
-static void
-workgroup_rendezvous(nir_builder *b)
+ * flag below and native mesh completion depend on its memory semantics. */
+void
+agx_nir_apple9_mesh_workgroup_barrier(nir_builder *b)
 {
    nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
                .memory_scope = SCOPE_WORKGROUP,
                .memory_semantics = NIR_MEMORY_ACQ_REL,
                .memory_modes = nir_var_mem_shared);
+}
+
+static inline void
+workgroup_rendezvous(nir_builder *b)
+{
+   agx_nir_apple9_mesh_workgroup_barrier(b);
 }
 
 /* Barriers inside application control flow, with more than one simdgroup of

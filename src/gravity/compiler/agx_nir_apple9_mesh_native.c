@@ -31,13 +31,12 @@ eligible(nir_shader *nir, unsigned physical_threads, bool packed_indices,
        * AGX_APPLE9_PUBLICATION_ROUND entries, so the API maxima are covered,
        * subject to the local output allocation. */
       if (nir->info.stage != MESA_SHADER_MESH || nir->info.task_payload_size ||
-          (nir->info.mesh.primitive_type != MESA_PRIM_TRIANGLES &&
-           nir->info.mesh.primitive_type != MESA_PRIM_LINES) ||
+          !agx_apple9_mesh_indices_per_primitive(nir->info.mesh.primitive_type) ||
           !nir->info.mesh.max_vertices_out ||
           nir->info.mesh.max_vertices_out > 256 ||
           !nir->info.mesh.max_primitives_out ||
           nir->info.mesh.max_primitives_out > 256)
-         return fail(reason, "packed index candidate requires V1..256 P1..256 lines or triangles");
+         return fail(reason, "packed index candidate requires V1..256 P1..256 points, lines or triangles");
    } else if (!agx_apple9_native_mesh_shape_eligible(nir))
       return fail(reason,
                   "native mesh development class requires V3 P1 triangles without payload");
@@ -47,17 +46,9 @@ eligible(nir_shader *nir, unsigned physical_threads, bool packed_indices,
    } else {
       if (physical_threads != AGX_APPLE9_NATIVE_SERIAL_THREADS)
          return fail(reason, "native mesh physical workgroup must be T16 or T32");
-      if (nir->info.workgroup_size_variable)
-         return fail(reason, "native mesh requires a fixed API workgroup size");
-      if (nir->info.api_subgroup_size && nir->info.api_subgroup_size != 32)
-         return fail(reason, "native mesh requires architectural subgroup size 32");
-      unsigned threads = 1;
-      for (unsigned d = 0; d < 3; ++d) {
-         unsigned size = nir->info.workgroup_size[d];
-         if (!size || size > AGX_APPLE9_NATIVE_MAX_INVOCATIONS / threads)
-            return fail(reason, "native mesh supports 1..128 API invocations at physical T32");
-         threads *= size;
-      }
+      if (!agx_apple9_native_workgroup_valid(
+             nir, AGX_APPLE9_NATIVE_MAX_INVOCATIONS, reason))
+         return false;
    }
 
    /* SetMeshOutputs operands need not be constants, and mutually exclusive
@@ -65,6 +56,25 @@ eligible(nir_shader *nir, unsigned physical_threads, bool packed_indices,
     * counts against the declaration and bounds runtime counts before
     * publishing lane zero's normalized values.
     * Vulkan requires at most one executed call under uniform control flow. */
+   return true;
+}
+
+/* Point size does not participate in line or triangle rasterization. Strip
+ * constant-offset stores before body IO validation so shaders writing
+ * gl_PointSize in gl_PerVertex are not rejected; indirect offsets and loads
+ * remain for the IO validator to decline. */
+static bool
+drop_unused_point_size(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_per_vertex_output)
+      return false;
+   if (!nir_src_is_const(intr->src[2]))
+      return false;
+   uint64_t slot = nir_intrinsic_io_semantics(intr).location +
+                   (uint64_t)nir_src_as_uint(intr->src[2]);
+   if (slot != VARYING_SLOT_PSIZ)
+      return false;
+   nir_instr_remove(&intr->instr);
    return true;
 }
 
@@ -81,12 +91,6 @@ consume_count(nir_builder *b, nir_intrinsic_instr *intr, void *data)
                                  nir_imm_int(b, info->layout.vertex_count_B),
                                  .base = info->key.output_root, .bit_size = 32);
       nir_pop_if(b, NULL);
-      nir_instr_remove(&intr->instr);
-      return true;
-   }
-   /* Point size does not participate in line or triangle rasterization. */
-   if (intr->intrinsic == nir_intrinsic_store_per_vertex_output &&
-       nir_intrinsic_io_semantics(intr).location == VARYING_SLOT_PSIZ) {
       nir_instr_remove(&intr->instr);
       return true;
    }
@@ -182,14 +186,12 @@ lower_primitive_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
 static bool
 primitive_outputs(nir_shader *nir, const struct agx_apple9_mesh_key *key,
-                  bool duplicate, uint64_t *mask, const char **reason)
+                  bool duplicate, bool allow_layer_viewport, uint64_t *mask,
+                  const char **reason)
 {
    if (!duplicate && (nir->info.mesh.max_primitives_out != 1 ||
                       nir->info.mesh.max_vertices_out > 3))
       return fail(reason, "primitive broadcast requires P1 and at most V3");
-   if (duplicate && nir->info.mesh.max_vertices_out +
-                    nir->info.mesh.max_primitives_out > 256)
-      return fail(reason, "primitive vertex copies exceed 256 native vertices");
 
    uint64_t vertex = 0;
    *mask = 0;
@@ -225,9 +227,12 @@ primitive_outputs(nir_shader *nir, const struct agx_apple9_mesh_key *key,
                continue;
             bool user = slot >= VARYING_SLOT_VAR0 && slot <= VARYING_SLOT_VAR31;
             bool cull = slot == VARYING_SLOT_CULL_PRIMITIVE;
+            bool layer_vp = allow_layer_viewport &&
+                            (slot == VARYING_SLOT_LAYER ||
+                             slot == VARYING_SLOT_VIEWPORT);
             if (duplicate && cull)
                return fail(reason, "primitive vertex copies require separately lowered culling");
-            if (!user && !cull && slot != VARYING_SLOT_PRIMITIVE_ID)
+            if (!user && !cull && !layer_vp && slot != VARYING_SLOT_PRIMITIVE_ID)
                return fail(reason, "primitive broadcast builtin is unsupported");
             unsigned bits = store ? nir_src_bit_size(intr->src[0]) : intr->def.bit_size;
             if (bits != 32 && !(cull && store && bits == 1))
@@ -238,16 +243,24 @@ primitive_outputs(nir_shader *nir, const struct agx_apple9_mesh_key *key,
          }
       }
    }
+   if (!*mask)
+      return true;
+   if (duplicate && nir->info.mesh.max_vertices_out +
+                    nir->info.mesh.max_primitives_out > 256)
+      return fail(reason, "primitive vertex copies exceed 256 native vertices");
    if (*mask & vertex)
       return fail(reason, "primitive and vertex outputs cannot share a broadcast slot");
    struct primitive_lower lower = {
       .mask = *mask, .root = key->output_root,
-      .cull_B = ALIGN_POT(nir->info.mesh.max_primitives_out * 3, 16) + 8,
+      .cull_B = agx_apple9_mesh_primitive_count_offset(
+                   nir->info.mesh.max_primitives_out,
+                   agx_apple9_mesh_indices_per_primitive(
+                      nir->info.mesh.primitive_type)) + 8,
       .vertex_base = duplicate ? nir->info.mesh.max_vertices_out : 0,
    };
    nir_shader_intrinsics_pass(nir, lower_primitive_output, nir_metadata_none, &lower);
    nir->info.per_primitive_outputs &= ~*mask;
-   if (duplicate && *mask) {
+   if (duplicate) {
       /* Keep runtime count normalization bounded by the application's
        * original declaration, before expanding the allocation. */
       nir_foreach_function_impl(impl, nir) {
@@ -305,11 +318,15 @@ duplicate_primitive_vertices(nir_builder *b,
          nir_imul_imm(b, nir_iand_imm(b, byte, 3), 8)), 0xff);
       for (unsigned slot = 0; slot < VARYING_SLOT_MAX; ++slot) {
          bool primitive = slot < 64 && (info->primitive_vertices & BITFIELD64_BIT(slot));
+         /* A reserved Layer plane (when only ViewportIndex was authored) is
+          * populated by pack_layer_viewport after duplication completes. */
+         if (slot == VARYING_SLOT_LAYER && !primitive)
+            continue;
          for (unsigned c = 0; c < 4; ++c) {
             unsigned component = l->vertex_component[slot][c];
             if (component == AGX_APPLE9_MESH_UNUSED)
                continue;
-            unsigned plane = l->position_B + l->vertex_pitch_B * component;
+            unsigned plane = agx_apple9_mesh_plane_offset(l, slot, c);
             nir_def *src = primitive ? nir_iadd_imm(b, p, info->original_max_vertices)
                                      : vertex;
             nir_def *v = nir_load_local_apple9_agx(
@@ -329,16 +346,13 @@ duplicate_primitive_vertices(nir_builder *b,
                value[slot][c] = nir_if_phi(b, value[slot][c], undefined);
          }
       }
-      nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
-                     .memory_scope = SCOPE_WORKGROUP,
-                     .memory_semantics = NIR_MEMORY_ACQ_REL,
-                     .memory_modes = nir_var_mem_shared);
+      agx_nir_apple9_mesh_workgroup_barrier(b);
       nir_push_if(b, active);
       u_foreach_bit64(slot, info->primitive_vertices) {
          for (unsigned c = 0; c < 4; ++c) {
             if (!value[slot][c])
                continue;
-            unsigned plane = l->position_B + l->vertex_pitch_B * l->vertex_component[slot][c];
+            unsigned plane = agx_apple9_mesh_plane_offset(l, slot, c);
             nir_store_local_apple9_agx(
                b, value[slot][c], nir_iadd_imm(b, nir_imul_imm(b, dst, 4), plane),
                .base = root, .bit_size = 32);
@@ -347,10 +361,7 @@ duplicate_primitive_vertices(nir_builder *b,
       nir_store_local_apple9_agx(b, dst, byte, .base = root, .bit_size = 8);
       nir_pop_if(b, NULL);
    }
-   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
-                  .memory_scope = SCOPE_WORKGROUP,
-                  .memory_semantics = NIR_MEMORY_ACQ_REL,
-                  .memory_modes = nir_var_mem_shared);
+   agx_nir_apple9_mesh_workgroup_barrier(b);
    return nir_iadd(b, vertices, primitives);
 }
 
@@ -363,10 +374,9 @@ broadcast_primitive(nir_builder *b, const struct agx_apple9_mesh_body_info *info
    nir_push_if(b, nir_ult(b, lane, vertices));
    u_foreach_bit64(slot, info->primitive_broadcast) {
       for (unsigned c = 0; c < 4; ++c) {
-         unsigned component = l->vertex_component[slot][c];
-         if (component == AGX_APPLE9_MESH_UNUSED)
+         if (l->vertex_component[slot][c] == AGX_APPLE9_MESH_UNUSED)
             continue;
-         unsigned plane = l->position_B + l->vertex_pitch_B * component;
+         unsigned plane = agx_apple9_mesh_plane_offset(l, slot, c);
          nir_def *value = nir_load_local_apple9_agx(b, nir_imm_int(b, plane), .base = root);
          nir_store_local_apple9_agx(
             b, value, nir_iadd_imm(b, nir_imul_imm(b, lane, 4), plane),
@@ -390,10 +400,46 @@ broadcast_primitive(nir_builder *b, const struct agx_apple9_mesh_body_info *info
                                  .base = root, .bit_size = 32);
       nir_pop_if(b, NULL);
    }
-   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
-                  .memory_scope = SCOPE_WORKGROUP,
-                  .memory_semantics = NIR_MEMORY_ACQ_REL,
-                  .memory_modes = nir_var_mem_shared);
+   agx_nir_apple9_mesh_workgroup_barrier(b);
+}
+
+/* Pack the rasterizer's shared Layer/Viewport word into VARYING_SLOT_LAYER:
+ * layer in the low 16 bits, viewport index in the high 16 bits, matching
+ * apple9_lower_layer_viewport_output() in the vertex path. */
+static void
+pack_layer_viewport(nir_builder *b, const struct agx_apple9_mesh_body_info *info,
+                    nir_def *lane, nir_def *vertices, unsigned physical_threads)
+{
+   const struct agx_apple9_mesh_layout *l = &info->layout;
+   unsigned root = info->key.output_root;
+   unsigned layer_plane = agx_apple9_mesh_plane_offset(l, VARYING_SLOT_LAYER, 0);
+   bool has_layer =
+      (info->primitive_broadcast | info->primitive_vertices) & VARYING_BIT_LAYER;
+   bool has_vp = l->vertex_component[VARYING_SLOT_VIEWPORT][0] != AGX_APPLE9_MESH_UNUSED;
+   unsigned vp_plane =
+      has_vp ? agx_apple9_mesh_plane_offset(l, VARYING_SLOT_VIEWPORT, 0) : 0;
+
+   for (unsigned first = 0; first < l->max_vertices; first += physical_threads) {
+      nir_def *v = nir_iadd_imm(b, lane, first);
+      nir_push_if(b, nir_ult(b, v, vertices));
+      nir_def *off = nir_imul_imm(b, v, 4);
+      nir_def *word = nir_imm_int(b, 0);
+      if (has_layer) {
+         nir_def *layer = nir_load_local_apple9_agx(
+            b, nir_iadd_imm(b, off, layer_plane), .base = root);
+         word = nir_iand_imm(b, layer, 0xffff);
+      }
+      if (has_vp) {
+         nir_def *vp = nir_load_local_apple9_agx(
+            b, nir_iadd_imm(b, off, vp_plane), .base = root);
+         nir_def *shifted = nir_ishl_imm(b, vp, 16);
+         word = has_layer ? nir_ior(b, word, shifted) : shifted;
+      }
+      nir_store_local_apple9_agx(b, word, nir_iadd_imm(b, off, layer_plane),
+                                 .base = root, .bit_size = 32);
+      nir_pop_if(b, NULL);
+   }
+   agx_nir_apple9_mesh_workgroup_barrier(b);
 }
 
 /* Local planes stay in semantic/component order for shader output reads.
@@ -409,18 +455,21 @@ varying_layout(const struct agx_apple9_mesh_body_info *info,
    if (layout->primitive_components || layout->culling)
       return fail(reason,
                   "native mesh primitive attributes/culling are not implemented");
-   if (layout->vertex_components > 4 && (!options || !options->attributes))
-      return fail(reason, "native mesh attributes development path is disabled");
-   if (layout->vertex_components > 4 + AGX_APPLE9_MAX_VARYING_COMPONENTS)
-      return fail(reason, "native mesh exceeds 124 user varying scalars");
+   unsigned count = 0;
+   uint64_t flat = (options ? options->outputs_flat : 0) |
+                   info->primitive_broadcast | info->primitive_vertices |
+                   VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_VIEWPORT;
+   uint64_t linear = options ? options->outputs_linear : 0;
    for (unsigned slot = 0; slot < VARYING_SLOT_MAX; ++slot) {
       /* Link clip distances only when the fragment stage reads them. The
        * rasterizer then consumes distinct mirror planes; excluding those
-       * from the varyings keeps the stride equal to the PPP output count. */
+       * from the varyings keeps the stride equal to the PPP output count.
+       * PointSize and the packed Layer/Viewport word are rasterizer-only. */
       bool clip = slot == VARYING_SLOT_CLIP_DIST0 || slot == VARYING_SLOT_CLIP_DIST1;
       bool mirror = slot == AGX_APPLE9_CLIP_MIRROR_SLOT ||
                     slot == AGX_APPLE9_CLIP_MIRROR_SLOT + 1;
-      if (slot == VARYING_SLOT_POS || (clip && !info->clip_linked) ||
+      if (slot == VARYING_SLOT_POS || slot == VARYING_SLOT_PSIZ ||
+          slot == VARYING_SLOT_LAYER || (clip && !info->clip_linked) ||
           (mirror && info->clip_linked))
          continue;
       for (unsigned c = 0; c < 4; ++c) {
@@ -430,13 +479,16 @@ varying_layout(const struct agx_apple9_mesh_body_info *info,
              !agx_apple9_varying_supported(slot))
             return fail(reason, "native mesh varying location is unsupported");
          varyings->mask[slot] |= BITFIELD_BIT(c);
-         ++varyings->count;
+         ++count;
       }
       if (slot < ARRAY_SIZE(varyings->mask) && varyings->mask[slot])
-         varyings->group[slot] = agx_apple9_varying_group(
-            options->outputs_flat | info->primitive_broadcast | info->primitive_vertices,
-            options->outputs_linear, slot);
+         varyings->group[slot] = agx_apple9_varying_group(flat, linear, slot);
    }
+   if (count && (!options || !options->attributes))
+      return fail(reason, "native mesh attributes development path is disabled");
+   if (count > AGX_APPLE9_MAX_VARYING_COMPONENTS)
+      return fail(reason, "native mesh exceeds 124 user varying scalars");
+   varyings->count = count;
    return true;
 }
 
@@ -626,10 +678,18 @@ cull_primitives(nir_builder *b, const struct agx_apple9_mesh_body_info *info,
       nir_pop_if(b, NULL);
       nir_pop_if(b, NULL);
    }
-   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
-               .memory_scope = SCOPE_WORKGROUP,
-               .memory_semantics = NIR_MEMORY_ACQ_REL,
-               .memory_modes = nir_var_mem_shared);
+   agx_nir_apple9_mesh_workgroup_barrier(b);
+}
+
+/* nir_shader_gather_info resets clip/cull_distance_array_size when IO is
+ * already lowered without nir_var_shader_out variables. Preserve the
+ * remaining rasterizer clip-distance count across internal re-gathers. */
+static void
+gather_mesh_info_preserving_clips(nir_shader *nir, unsigned clip_distances)
+{
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   nir->info.clip_distance_array_size = clip_distances;
+   nir->info.cull_distance_array_size = 0;
 }
 
 bool
@@ -652,15 +712,23 @@ agx_nir_lower_apple9_native_mesh(
    bool rounds = options && options->publication_rounds;
    if (rounds && (!packed_indices || physical_threads != AGX_APPLE9_NATIVE_SERIAL_THREADS))
       return fail(reason, "multi-round publication requires packed indices at T32");
-   if (nir->info.mesh.primitive_type == MESA_PRIM_LINES) {
+   if (nir->info.mesh.primitive_type == MESA_PRIM_LINES ||
+       nir->info.mesh.primitive_type == MESA_PRIM_POINTS) {
       if (!rounds)
-         return fail(reason, "native lines require publication rounds at T32");
-      /* A zero-length line can rasterize. The degenerate-triangle culling
-       * model cannot represent a culled line. Keep both cull forms emulated. */
+         return fail(reason, "native points/lines require publication rounds at T32");
+      /* Degenerate-triangle index culling cannot represent culled points or
+       * lines (a zero-length line or point still rasterizes). */
       if (nir->info.cull_distance_array_size ||
           (nir->info.outputs_written & VARYING_BIT_CULL_PRIMITIVE))
-         return fail(reason, "native line culling is unsupported");
+         return fail(reason, "native point/line culling is unsupported");
    }
+
+   /* Strip unused gl_PointSize stores on lines and triangles before IO
+    * validation runs. Point topology retains VARYING_SLOT_PSIZ. */
+   if (nir->info.mesh.primitive_type != MESA_PRIM_POINTS &&
+       nir_shader_intrinsics_pass(nir, drop_unused_point_size,
+                                  nir_metadata_control_flow, NULL))
+      nir->info.outputs_written &= ~VARYING_BIT_PSIZ;
 
    nir_remove_dead_variables(nir, nir_var_mem_shared, NULL);
    nir_lower_vars_to_explicit_types(nir, nir_var_mem_shared,
@@ -674,8 +742,10 @@ agx_nir_lower_apple9_native_mesh(
       .base = ALIGN_POT(nir->info.shared_size, 4),
    };
    if (cull.cull) {
-      if (!packed_indices || nir->info.mesh.max_vertices_out * cull.cull * 4 >
-                                AGX_APPLE9_MAX_SHARED_BYTES - cull.base)
+      if (!packed_indices || cull.cull > 8 ||
+          cull.base > AGX_APPLE9_MAX_SHARED_BYTES ||
+          nir->info.mesh.max_vertices_out * cull.cull * 4 >
+             AGX_APPLE9_MAX_SHARED_BYTES - cull.base)
          return fail(reason, "native mesh cull distances need packed indices and shared space");
       nir_shader_intrinsics_pass(nir, move_cull_distance, nir_metadata_control_flow, &cull);
       if (cull.failed)
@@ -692,9 +762,13 @@ agx_nir_lower_apple9_native_mesh(
       if (primitive_cull.failed)
          return fail(reason, "native mesh CullPrimitive requires scalar stores with zero slot offset");
       if (primitive_cull.written) {
+         if (primitive_cull.base > AGX_APPLE9_MAX_SHARED_BYTES ||
+             nir->info.mesh.max_primitives_out * 4 >
+                AGX_APPLE9_MAX_SHARED_BYTES - primitive_cull.base)
+            return fail(reason, "native mesh CullPrimitive exceeds local shared capacity");
          nir->info.shared_size = primitive_cull.base +
                                 nir->info.mesh.max_primitives_out * 4;
-         nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+         gather_mesh_info_preserving_clips(nir, cull.clip);
       }
    }
    bool clip_linked = options && options->link_clip_distances &&
@@ -707,9 +781,7 @@ agx_nir_lower_apple9_native_mesh(
       nir_shader_intrinsics_pass(nir, mirror_clip_distance, nir_metadata_control_flow, &clip);
       if (clip.failed)
          return fail(reason, "native mesh linked clip distances require constant slot offsets");
-      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-      nir->info.clip_distance_array_size = clip.distances;
-      nir->info.cull_distance_array_size = 0;
+      gather_mesh_info_preserving_clips(nir, clip.distances);
    }
 
    uint16_t logical_size[3];
@@ -733,19 +805,21 @@ agx_nir_lower_apple9_native_mesh(
          progress |= nir_opt_remove_phis(nir);
          progress |= nir_opt_dce(nir);
       } while (progress);
-      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+      gather_mesh_info_preserving_clips(nir, cull.clip);
    }
 
    struct agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
    uint64_t primitive_broadcast = 0;
    uint64_t primitive_vertices = 0;
    unsigned original_max_vertices = nir->info.mesh.max_vertices_out;
+   bool allow_layer_viewport = options && options->layer_viewport;
    if (options && options->attributes && options->primitive_broadcast &&
-       !primitive_outputs(nir, &key, false, &primitive_broadcast, reason))
+       !primitive_outputs(nir, &key, false, allow_layer_viewport,
+                          &primitive_broadcast, reason))
       return false;
    if (rounds && options->attributes && options->primitive_vertices &&
-       (nir->info.per_primitive_outputs & ~VARYING_BIT_PRIMITIVE_INDICES) &&
-       !primitive_outputs(nir, &key, true, &primitive_vertices, reason))
+       !primitive_outputs(nir, &key, true, allow_layer_viewport,
+                          &primitive_vertices, reason))
       return false;
 
    key.physical_threads = physical_threads;
@@ -761,8 +835,12 @@ agx_nir_lower_apple9_native_mesh(
    info->clip_linked = clip_linked;
    if (!varying_layout(info, options, &varyings, reason))
       return false;
-   /* Clip distances need rasterizer planes; cull distances stay in shared
-    * storage until completion evaluates whole-primitive culling. */
+   /* Clip distances, point size, and packed layer/viewport need rasterizer
+    * planes; cull distances stay in shared storage until completion. */
+   info->writes_point_size =
+      layout->vertex_component[VARYING_SLOT_PSIZ][0] != AGX_APPLE9_MESH_UNUSED;
+   info->writes_layer_viewport =
+      layout->vertex_component[VARYING_SLOT_LAYER][0] != AGX_APPLE9_MESH_UNUSED;
    info->clip_distances = nir->info.clip_distance_array_size;
    info->cull_distances = cull.cull;
    info->cull_B = cull.base;
@@ -775,8 +853,9 @@ agx_nir_lower_apple9_native_mesh(
           AGX_APPLE9_MESH_UNUSED)
          return fail(reason, "native mesh clip distance is declared but not written");
    }
-   if (4 + varyings.count + info->clip_distances > 4 + AGX_APPLE9_MAX_VARYING_COMPONENTS)
-      return fail(reason, "native mesh varyings and clip distances exceed the UVS");
+   if (4 + varyings.count + info->writes_point_size + info->writes_layer_viewport +
+       info->clip_distances > 4 + AGX_APPLE9_MAX_VARYING_COMPONENTS)
+      return fail(reason, "native mesh varyings and rasterizer outputs exceed the UVS");
    nir_shader_intrinsics_pass(nir, consume_count, nir_metadata_none, info);
    nir_lower_returns(nir);
    if (!agx_nir_mask_apple9_mesh_body(nir, &key, layout, reason))
@@ -815,10 +894,7 @@ agx_nir_lower_apple9_native_mesh(
             .base = key.output_root, .bit_size = 32);
          nir_pop_if(&entry, NULL);
       }
-      nir_barrier(&entry, .execution_scope = SCOPE_WORKGROUP,
-                         .memory_scope = SCOPE_WORKGROUP,
-                         .memory_semantics = NIR_MEMORY_ACQ_REL,
-                         .memory_modes = nir_var_mem_shared);
+      agx_nir_apple9_mesh_workgroup_barrier(&entry);
    }
    if (primitive_broadcast & VARYING_BIT_CULL_PRIMITIVE) {
       nir_push_if(&entry, nir_ieq_imm(&entry,
@@ -829,18 +905,37 @@ agx_nir_lower_apple9_native_mesh(
          .base = key.output_root, .bit_size = 32);
       nir_pop_if(&entry, NULL);
       /* All physical lanes rendezvous before any application cull store. */
-      nir_barrier(&entry, .execution_scope = SCOPE_WORKGROUP,
-                         .memory_scope = SCOPE_WORKGROUP,
-                         .memory_semantics = NIR_MEMORY_ACQ_REL,
-                         .memory_modes = nir_var_mem_shared);
+      agx_nir_apple9_mesh_workgroup_barrier(&entry);
+   }
+   if (info->writes_layer_viewport) {
+      /* Initialize Layer/Viewport planes to zero so conditionally unwritten
+       * primitives never read stale LDS values from a prior workgroup. */
+      nir_def *lane = nir_load_local_invocation_index(&entry);
+      unsigned layer_plane = agx_apple9_mesh_plane_offset(layout, VARYING_SLOT_LAYER, 0);
+      bool has_vp =
+         layout->vertex_component[VARYING_SLOT_VIEWPORT][0] != AGX_APPLE9_MESH_UNUSED;
+      unsigned vp_plane =
+         has_vp ? agx_apple9_mesh_plane_offset(layout, VARYING_SLOT_VIEWPORT, 0) : 0;
+      for (unsigned first = 0; first < layout->max_vertices;
+           first += physical_threads) {
+         nir_def *v = nir_iadd_imm(&entry, lane, first);
+         nir_push_if(&entry, nir_ult_imm(&entry, v, layout->max_vertices));
+         nir_def *off = nir_imul_imm(&entry, v, 4);
+         nir_store_local_apple9_agx(&entry, nir_imm_int(&entry, 0),
+                                    nir_iadd_imm(&entry, off, layer_plane),
+                                    .base = key.output_root, .bit_size = 32);
+         if (has_vp)
+            nir_store_local_apple9_agx(&entry, nir_imm_int(&entry, 0),
+                                       nir_iadd_imm(&entry, off, vp_plane),
+                                       .base = key.output_root, .bit_size = 32);
+         nir_pop_if(&entry, NULL);
+      }
+      agx_nir_apple9_mesh_workgroup_barrier(&entry);
    }
    nir_builder b =
       nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(nir)));
 
-   nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
-               .memory_scope = SCOPE_WORKGROUP,
-               .memory_semantics = NIR_MEMORY_ACQ_REL,
-               .memory_modes = nir_var_mem_shared);
+   agx_nir_apple9_mesh_workgroup_barrier(&b);
 
    /* Counts are the
     * actual shader publication, not maxima or register-descriptor constants.
@@ -862,6 +957,8 @@ agx_nir_lower_apple9_native_mesh(
    if (primitive_vertices)
       vertices = duplicate_primitive_vertices(&b, info, lane, vertices, primitives,
                                                physical_threads);
+   if (info->writes_layer_viewport)
+      pack_layer_viewport(&b, info, lane, vertices, physical_threads);
    if (options && (options->clip_halfz || options->dynamic_clip_z)) {
       /* Convert the completed homogeneous position, after all body writes and
        * output reads. Doing this at publication also handles scalar/partial
@@ -878,17 +975,15 @@ agx_nir_lower_apple9_native_mesh(
          : nir_imm_float(&b, 0.5f);
       if (options->dynamic_clip_z)
          nir_push_if(&b, nir_fneu_imm(&b, coeff, 0.0f));
+      unsigned z_plane = agx_apple9_mesh_plane_offset(layout, VARYING_SLOT_POS, 2);
+      unsigned w_plane = agx_apple9_mesh_plane_offset(layout, VARYING_SLOT_POS, 3);
       for (unsigned first = 0; first < layout->max_vertices;
            first += physical_threads) {
          nir_def *vertex = nir_iadd_imm(&b, lane, first);
          nir_push_if(&b, nir_ult(&b, vertex, vertices));
          nir_def *offset = nir_imul_imm(&b, vertex, 4);
-         nir_def *z_address = nir_iadd_imm(
-            &b, offset, layout->position_B + layout->vertex_pitch_B *
-                           layout->vertex_component[VARYING_SLOT_POS][2]);
-         nir_def *w_address = nir_iadd_imm(
-            &b, offset, layout->position_B + layout->vertex_pitch_B *
-                           layout->vertex_component[VARYING_SLOT_POS][3]);
+         nir_def *z_address = nir_iadd_imm(&b, offset, z_plane);
+         nir_def *w_address = nir_iadd_imm(&b, offset, w_plane);
          nir_def *z = nir_load_local_apple9_agx(&b, z_address,
                                                 .base = key.output_root);
          nir_def *w = nir_load_local_apple9_agx(&b, w_address,
@@ -901,10 +996,7 @@ agx_nir_lower_apple9_native_mesh(
       }
       if (options->dynamic_clip_z)
          nir_pop_if(&b, NULL);
-      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
-                  .memory_scope = SCOPE_WORKGROUP,
-                  .memory_semantics = NIR_MEMORY_ACQ_REL,
-                  .memory_modes = nir_var_mem_shared);
+      agx_nir_apple9_mesh_workgroup_barrier(&b);
    }
    /* Publish the completed output memory before issuing mesh allocation.
     * U0 consumes the counts but does not write these global output planes.
@@ -932,9 +1024,7 @@ agx_nir_lower_apple9_native_mesh(
       nir_push_if(&b, active);
       const uint32_t destination = first << 16;
       for (unsigned c = 0; c < 4; ++c) {
-         unsigned plane =
-            layout->position_B +
-            layout->vertex_pitch_B * layout->vertex_component[VARYING_SLOT_POS][c];
+         unsigned plane = agx_apple9_mesh_plane_offset(layout, VARYING_SLOT_POS, c);
          nir_mesh_submit_channel_apple9_agx(&b, nir_imm_int(&b, c | destination),
                                             nir_imm_int(&b, plane + 4 * first));
          device_fence(&b);
@@ -942,25 +1032,40 @@ agx_nir_lower_apple9_native_mesh(
       for (unsigned slot = 0; slot < ARRAY_SIZE(varyings.mask); ++slot) {
          u_foreach_bit(c, varyings.mask[slot]) {
             unsigned channel = 4 + agx_apple9_varying_index(&varyings, slot, c);
-            unsigned plane = layout->position_B + layout->vertex_pitch_B *
-                                layout->vertex_component[slot][c];
+            unsigned plane = agx_apple9_mesh_plane_offset(layout, slot, c);
             nir_mesh_submit_channel_apple9_agx(
                &b, nir_imm_int(&b, channel | destination),
                nir_imm_int(&b, plane + 4 * first));
             device_fence(&b);
          }
       }
-      /* Rasterizer clip distances follow the user varyings, as in the
-       * vertex path's UVS order (mesh writes no point size or layer word).
-       * They are published once, so the mesh state's plane count equals the
-       * PPP output count 4 + varyings + clip distances. */
+      /* Rasterizer outputs follow the user varyings in VS UVS order:
+       * PointSize, packed Layer/Viewport word, then ClipDistances.
+       * The total published channel count equals the PPP output count
+       * 4 + varyings + point_size + layer_viewport + clip_distances. */
+      unsigned raster_channel = 4 + varyings.count;
+      if (info->writes_point_size) {
+         unsigned plane = agx_apple9_mesh_plane_offset(layout, VARYING_SLOT_PSIZ, 0);
+         nir_mesh_submit_channel_apple9_agx(
+            &b, nir_imm_int(&b, raster_channel | destination),
+            nir_imm_int(&b, plane + 4 * first));
+         device_fence(&b);
+         ++raster_channel;
+      }
+      if (info->writes_layer_viewport) {
+         unsigned plane = agx_apple9_mesh_plane_offset(layout, VARYING_SLOT_LAYER, 0);
+         nir_mesh_submit_channel_apple9_agx(
+            &b, nir_imm_int(&b, raster_channel | destination),
+            nir_imm_int(&b, plane + 4 * first));
+         device_fence(&b);
+         ++raster_channel;
+      }
       for (unsigned d = 0; d < clip_distances; ++d) {
          unsigned slot = (info->clip_linked ? AGX_APPLE9_CLIP_MIRROR_SLOT
                                             : VARYING_SLOT_CLIP_DIST0) + d / 4;
-         unsigned plane = layout->position_B + layout->vertex_pitch_B *
-                             layout->vertex_component[slot][d % 4];
+         unsigned plane = agx_apple9_mesh_plane_offset(layout, slot, d % 4);
          nir_mesh_submit_channel_apple9_agx(
-            &b, nir_imm_int(&b, (4 + varyings.count + d) | destination),
+            &b, nir_imm_int(&b, (raster_channel + d) | destination),
             nir_imm_int(&b, plane + 4 * first));
          device_fence(&b);
       }
@@ -1019,6 +1124,8 @@ agx_compile_apple9_native_mesh_lowered(
    memset(out, 0, sizeof(*out));
    if (!agx_compile_apple9_mesh_lowered(nir, &info->key, out, reason))
       return false;
+   out->info.apple9_writes_point_size = info->writes_point_size;
+   out->info.writes_layer_viewport = info->writes_layer_viewport;
    out->info.apple9_clip_distance_count = info->clip_distances;
    return varying_layout(info, options, &out->info.apple9_varyings,
                          reason);

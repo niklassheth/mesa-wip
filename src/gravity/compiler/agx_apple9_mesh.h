@@ -52,8 +52,33 @@ struct agx_apple9_mesh_key {
 #define AGX_APPLE9_NATIVE_SERIAL_THREADS 32
 #define AGX_APPLE9_NATIVE_MAX_INVOCATIONS 128
 
+bool agx_apple9_native_workgroup_valid(const nir_shader *nir,
+                                       unsigned max_invocations,
+                                       const char **reason);
 bool agx_apple9_native_workgroup_supported(const nir_shader *nir,
                                           const char **reason);
+
+static inline unsigned
+agx_apple9_mesh_indices_per_primitive(enum mesa_prim prim)
+{
+   switch (prim) {
+   case MESA_PRIM_POINTS:
+      return 1;
+   case MESA_PRIM_LINES:
+      return 2;
+   case MESA_PRIM_TRIANGLES:
+      return 3;
+   default:
+      return 0;
+   }
+}
+
+static inline unsigned
+agx_apple9_mesh_primitive_count_offset(unsigned max_primitives,
+                                       unsigned indices_per_primitive)
+{
+   return ALIGN_POT(max_primitives * indices_per_primitive, 16);
+}
 
 /* Output declaration class shared by early driver IO lowering and the native
  * compiler. Other eligibility checks still depend on the body and shader key. */
@@ -82,6 +107,15 @@ struct agx_apple9_mesh_layout {
    bool culling;
 };
 
+static inline unsigned
+agx_apple9_mesh_plane_offset(const struct agx_apple9_mesh_layout *layout,
+                             unsigned slot, unsigned component)
+{
+   unsigned idx = layout->vertex_component[slot][component];
+   assert(idx != AGX_APPLE9_MESH_UNUSED);
+   return layout->position_B + layout->vertex_pitch_B * idx;
+}
+
 struct agx_apple9_mesh_body_info {
    struct agx_apple9_mesh_layout layout;
    struct agx_apple9_mesh_key key;
@@ -100,6 +134,10 @@ struct agx_apple9_mesh_body_info {
    bool uses_vertex_count;
    /* Lowered for multi-round publication at T32 (bound at upload). */
    bool publication_rounds;
+   /* Rasterizer point size (points topology) and packed layer/viewport word
+    * published in VS UVS order after user varyings and before clip distances. */
+   bool writes_point_size;
+   bool writes_layer_viewport;
    /* Rasterizer clip distances published after the user varyings. */
    unsigned clip_distances;
    /* Clip distances are also linked varyings; their rasterizer copy reads
@@ -157,6 +195,7 @@ bool agx_nir_mask_apple9_mesh_body(nir_shader *nir,
  * The caller must provide a collective helper context. This is not a valid
  * inline task epilogue: call/frame/entry setup remains unresolved. */
 struct nir_builder;
+void agx_nir_apple9_mesh_workgroup_barrier(struct nir_builder *b);
 /* Expand collective grid calls after NIR optimization and validate closed
  * regions before selection. Returns success, including when no calls exist. */
 bool agx_nir_lower_apple9_object_calls(struct nir_shader *nir, const char **reason);
@@ -233,6 +272,9 @@ struct agx_apple9_native_mesh_options {
    /* The fragment shader reads gl_ClipDistance: also link the distances as
     * varyings; the rasterizer copy then reads private mirror planes. */
    bool link_clip_distances;
+   /* Opt-in lowering of per-primitive Layer/ViewportIndex via the packed
+    * rasterizer word in VS UVS order (plus flat ViewportIndex varying). */
+   bool layer_viewport;
    uint64_t outputs_flat, outputs_linear;
 };
 

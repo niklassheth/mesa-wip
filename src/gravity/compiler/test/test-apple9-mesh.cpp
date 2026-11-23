@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "agx_apple9_ir.h"
+#include "agx_apple9_mesh.h"
 #include "agx_apple9_mesh_encoding.h"
 #include "agx_compile_apple9.h"
 extern "C" {
@@ -527,8 +528,9 @@ TEST(Apple9MeshIR, SubmitsDrainIndependentProducers)
                EXPECT_EQ(waited, issued);
                EXPECT_EQ(I->scoreboard_slot != 0, count != 0);
                EXPECT_EQ(I->producer_scoreboard_slot, 0u);
-               if (i)
+               if (i) {
                   EXPECT_NE(p.instructions[i - 1]->op, AGX_APPLE9_VIR_WAIT);
+               }
             }
          }
          EXPECT_EQ(submits, 1u);
@@ -1088,8 +1090,9 @@ TEST_F(Apple9MeshCompletion, JoinedSlotOneResultAndControlFoldTogether)
    unsigned loads = 0, consumers = 0;
    for (unsigned i = 0; i < p.instruction_count; ++i) {
       const auto *I = p.instructions[i];
-      if (I->op == AGX_APPLE9_VIR_DEVICE_LOAD)
+      if (I->op == AGX_APPLE9_VIR_DEVICE_LOAD) {
          EXPECT_EQ(I->producer_scoreboard_slot, loads++ ? 1u : 6u);
+      }
       if (I->op == AGX_APPLE9_VIR_IXOR) {
          EXPECT_EQ(I->scoreboard_slot, AGX_APPLE9_SCOREBOARD_SLOT_1);
          ++consumers;
@@ -2390,5 +2393,629 @@ TEST(Apple9MemEncoding, Tier2TextureModesAndCompact2DImageWrite)
       unsigned dst_pub = ((packed.bytes[10 * c + 0] >> 4) & 0xf) |
                          (((packed.bytes[10 * c + 4] >> 4) & 0x3) << 4);
       EXPECT_EQ(dst_pub, exp_pub[c]);
+   }
+}
+
+namespace {
+
+struct NativeMeshSpec {
+   enum mesa_prim prim = MESA_PRIM_TRIANGLES;
+   unsigned max_v = 3;
+   unsigned max_p = 1;
+   uint16_t wg[3] = {16, 1, 1};
+   bool dynamic_counts = false;
+   bool write_var0 = false;
+   bool write_psiz = false;
+   bool read_psiz = false;
+   bool write_layer = false;
+   bool write_viewport = false;
+   bool write_prim_id = false;
+   bool write_cull_prim = false;
+   unsigned clip_distances = 0;
+   unsigned cull_distances = 0;
+   bool gather_info = true;
+};
+
+static nir_shader *
+build_native_mesh_shader(const NativeMeshSpec &spec)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_MESH, &agx_nir_options, "native_mesh_expand_test");
+   nir_shader *nir = b.shader;
+   nir->info.io_lowered = true;
+   for (unsigned d = 0; d < 3; ++d)
+      nir->info.workgroup_size[d] = spec.wg[d];
+   nir->info.mesh.max_vertices_out = spec.max_v;
+   nir->info.mesh.max_primitives_out = spec.max_p;
+   nir->info.mesh.primitive_type = spec.prim;
+
+   unsigned k = agx_apple9_mesh_indices_per_primitive(spec.prim);
+   unsigned logical = spec.wg[0] * spec.wg[1] * spec.wg[2];
+
+   nir_def *verts = spec.dynamic_counts
+      ? nir_load_global(&b, 1, 32, nir_imm_int64(&b, 0x10000), .align_mul = 4)
+      : nir_imm_int(&b, spec.max_v);
+   nir_def *prims = spec.dynamic_counts
+      ? nir_load_global(&b, 1, 32, nir_imm_int64(&b, 0x10004), .align_mul = 4)
+      : nir_imm_int(&b, spec.max_p);
+   nir_set_vertex_and_primitive_count(&b, verts, prims, nir_imm_int(&b, 0));
+
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   for (unsigned first = 0; first < spec.max_v; first += logical) {
+      nir_def *v = nir_iadd_imm(&b, lane, first);
+      nir_push_if(&b, nir_ult(&b, v, verts));
+      nir_store_per_vertex_output(
+         &b, nir_imm_vec4(&b, 0.25f, -0.25f, 0.5f, 1.0f), v, nir_imm_int(&b, 0),
+         .write_mask = 15, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      if (spec.write_var0) {
+         nir_store_per_vertex_output(
+            &b, nir_u2f32(&b, v), v, nir_imm_int(&b, 0),
+            .write_mask = 1, .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      }
+      if (spec.write_psiz) {
+         nir_store_per_vertex_output(
+            &b, nir_imm_float(&b, 4.0f), v, nir_imm_int(&b, 0),
+            .write_mask = 1, .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
+      }
+      if (spec.read_psiz) {
+         nir_def *ps = nir_load_per_vertex_output(
+            &b, 1, 32, v, nir_imm_int(&b, 0), .dest_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
+         nir_store_global(&b, ps, nir_imm_int64(&b, 0x20000), .align_mul = 4);
+      }
+      unsigned total_cc = spec.clip_distances + spec.cull_distances;
+      if (total_cc) {
+         nir_store_per_vertex_output(
+            &b, nir_imm_vec4(&b, 1.0f, 0.5f, -0.5f, 2.0f), v, nir_imm_int(&b, 0),
+            .write_mask = BITFIELD_MASK(MIN2(total_cc, 4u)),
+            .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_CLIP_DIST0, .num_slots = 1});
+         if (total_cc > 4) {
+            nir_store_per_vertex_output(
+               &b, nir_imm_vec4(&b, 1.0f, 1.0f, 1.0f, 1.0f), v, nir_imm_int(&b, 0),
+               .write_mask = BITFIELD_MASK(total_cc - 4),
+               .src_type = nir_type_float32,
+               .io_semantics = {.location = VARYING_SLOT_CLIP_DIST1, .num_slots = 1});
+         }
+      }
+      nir_pop_if(&b, NULL);
+   }
+
+   for (unsigned first = 0; first < spec.max_p; first += logical) {
+      nir_def *p = nir_iadd_imm(&b, lane, first);
+      nir_push_if(&b, nir_ult(&b, p, prims));
+      nir_def *idx[3];
+      for (unsigned c = 0; c < k; ++c)
+         idx[c] = nir_umod(&b, nir_iadd_imm(&b, nir_imul_imm(&b, p, k), c), verts);
+      nir_store_per_primitive_output(
+         &b, nir_vec(&b, idx, k), p, nir_imm_int(&b, 0),
+         .write_mask = BITFIELD_MASK(k), .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES, .num_slots = 1});
+      if (spec.write_layer) {
+         nir_store_per_primitive_output(
+            &b, nir_iadd_imm(&b, p, 1), p, nir_imm_int(&b, 0),
+            .write_mask = 1, .src_type = nir_type_uint32,
+            .io_semantics = {.location = VARYING_SLOT_LAYER, .num_slots = 1});
+      }
+      if (spec.write_viewport) {
+         nir_store_per_primitive_output(
+            &b, nir_iadd_imm(&b, p, 2), p, nir_imm_int(&b, 0),
+            .write_mask = 1, .src_type = nir_type_uint32,
+            .io_semantics = {.location = VARYING_SLOT_VIEWPORT, .num_slots = 1});
+      }
+      if (spec.write_prim_id) {
+         nir_store_per_primitive_output(
+            &b, nir_iadd_imm(&b, p, 100), p, nir_imm_int(&b, 0),
+            .write_mask = 1, .src_type = nir_type_uint32,
+            .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_ID, .num_slots = 1});
+      }
+      if (spec.write_cull_prim) {
+         nir_store_per_primitive_output(
+            &b, nir_ieq_imm(&b, nir_iand_imm(&b, p, 1), 1), p, nir_imm_int(&b, 0),
+            .write_mask = 1, .src_type = nir_type_bool1,
+            .io_semantics = {.location = VARYING_SLOT_CULL_PRIMITIVE, .num_slots = 1});
+      }
+      nir_pop_if(&b, NULL);
+   }
+
+   if (spec.gather_info)
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   nir->info.clip_distance_array_size = spec.clip_distances;
+   nir->info.cull_distance_array_size = spec.cull_distances;
+   return nir;
+}
+
+struct PublicationAudit {
+   unsigned controls = 0;
+   std::set<std::pair<unsigned, unsigned>> channels; /* (channel, offset) */
+   std::set<unsigned> scalar_offsets;
+};
+
+static PublicationAudit
+audit_publication(nir_shader *nir)
+{
+   PublicationAudit out;
+   nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_mesh_control_apple9_agx) {
+            ++out.controls;
+         } else if (intr->intrinsic == nir_intrinsic_mesh_submit_channel_apple9_agx) {
+            out.channels.insert({nir_src_as_uint(intr->src[0]),
+                                 nir_src_as_uint(intr->src[1])});
+         } else if (intr->intrinsic == nir_intrinsic_mesh_submit_scalar_apple9_agx) {
+            out.scalar_offsets.insert(nir_src_as_uint(intr->src[1]));
+         }
+      }
+   }
+   return out;
+}
+
+} /* namespace */
+
+TEST(Apple9MeshNativeExpand, MultiVertexMultiPrimitiveTrianglesAndWorkgroups)
+{
+   struct {
+      unsigned max_v, max_p;
+      uint16_t wg[3];
+      unsigned physical;
+      bool rounds;
+      bool dynamic_counts;
+      bool write_var0;
+   } cases[] = {
+      {6, 2, {6, 1, 1}, 16, false, false, false},
+      {6, 2, {16, 1, 1}, 32, true, true, true},
+      {64, 64, {32, 1, 1}, 32, true, true, true},
+      {64, 64, {4, 4, 4}, 32, true, true, true},
+      {96, 32, {2, 4, 16}, 32, true, false, true},
+      {256, 256, {32, 1, 1}, 32, true, true, false},
+   };
+
+   for (const auto &c : cases) {
+      SCOPED_TRACE(::testing::Message()
+                   << "V" << c.max_v << "P" << c.max_p << " T" << c.physical);
+      NativeMeshSpec spec;
+      spec.max_v = c.max_v;
+      spec.max_p = c.max_p;
+      memcpy(spec.wg, c.wg, sizeof(spec.wg));
+      spec.dynamic_counts = c.dynamic_counts;
+      spec.write_var0 = c.write_var0;
+
+      agx_apple9_native_mesh_options opts = {};
+      opts.physical_threads = c.physical;
+      opts.packed_index_publication = true;
+      opts.publication_rounds = c.rounds;
+      opts.attributes = c.write_var0;
+
+      nir_shader *lowered = build_native_mesh_shader(spec);
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_nir_lower_apple9_native_mesh(lowered, true, &opts, &info,
+                                                   &reason))
+         << (reason ?: "");
+      EXPECT_FALSE(info.requires_mesh_completion);
+      EXPECT_EQ(info.layout.max_vertices, c.max_v);
+      EXPECT_EQ(info.layout.max_primitives, c.max_p);
+      EXPECT_EQ(info.layout.indices_per_primitive, 3u);
+      EXPECT_EQ(info.layout.primitive_count_B, ALIGN_POT(c.max_p * 3, 16));
+      EXPECT_EQ(info.layout.vertex_count_B, info.layout.primitive_count_B + 4);
+      EXPECT_EQ(info.layout.vertex_pitch_B, ALIGN_POT(c.max_v, 4) * 4);
+      EXPECT_EQ(info.layout.vertex_components, c.write_var0 ? 5u : 4u);
+
+      auto audit = audit_publication(lowered);
+      EXPECT_EQ(audit.controls, 1u);
+      unsigned round = MIN2(c.physical, AGX_APPLE9_PUBLICATION_ROUND);
+      unsigned expected_v_rounds = DIV_ROUND_UP(c.max_v, round);
+      unsigned expected_p_rounds =
+         DIV_ROUND_UP(DIV_ROUND_UP(c.max_p * 3, 4), round);
+      EXPECT_EQ(audit.channels.size(),
+                expected_v_rounds * info.layout.vertex_components);
+      EXPECT_EQ(audit.scalar_offsets.size(), expected_p_rounds);
+      for (unsigned r = 0; r < expected_v_rounds; ++r) {
+         unsigned first = r * round;
+         for (unsigned comp = 0; comp < 4; ++comp) {
+            unsigned plane =
+               agx_apple9_mesh_plane_offset(&info.layout, VARYING_SLOT_POS, comp);
+            EXPECT_TRUE(audit.channels.count({comp | (first << 16),
+                                              plane + 4 * first}));
+         }
+         if (c.write_var0) {
+            unsigned plane =
+               agx_apple9_mesh_plane_offset(&info.layout, VARYING_SLOT_VAR0, 0);
+            EXPECT_TRUE(audit.channels.count({4u | (first << 16),
+                                              plane + 4 * first}));
+         }
+      }
+      for (unsigned r = 0; r < expected_p_rounds; ++r)
+         EXPECT_TRUE(audit.scalar_offsets.count(4 * r * round));
+      ralloc_free(lowered);
+
+      nir_shader *nir = build_native_mesh_shader(spec);
+      agx_shader_part code = {};
+      ASSERT_TRUE(agx_compile_apple9_native_mesh(nir, true, &opts, &code, &info,
+                                                 &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(code.binary && code.info.binary_size > 0);
+      EXPECT_TRUE(code.info.apple9_body_only);
+      EXPECT_EQ(code.info.workgroup_size[0], c.physical);
+      EXPECT_EQ(code.info.workgroup_size[1], 1u);
+      EXPECT_EQ(code.info.workgroup_size[2], 1u);
+      EXPECT_EQ(code.info.apple9_varyings.count, c.write_var0 ? 1u : 0u);
+      free(code.binary);
+      ralloc_free(nir);
+   }
+}
+
+TEST(Apple9MeshNativeExpand, UnusedPointSizeDroppedOnTrianglesAndLines)
+{
+   for (enum mesa_prim prim : {MESA_PRIM_TRIANGLES, MESA_PRIM_LINES}) {
+      NativeMeshSpec spec;
+      spec.prim = prim;
+      spec.max_v = prim == MESA_PRIM_TRIANGLES ? 6 : 4;
+      spec.max_p = 2;
+      spec.wg[0] = 32;
+      spec.write_psiz = true;
+
+      agx_apple9_native_mesh_options opts = {};
+      opts.physical_threads = 32;
+      opts.packed_index_publication = true;
+      opts.publication_rounds = true;
+
+      nir_shader *nir = build_native_mesh_shader(spec);
+      agx_shader_part code = {};
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_native_mesh(nir, true, &opts, &code, &info,
+                                                 &reason))
+         << (reason ?: "");
+      EXPECT_FALSE(info.writes_point_size);
+      EXPECT_FALSE(code.info.apple9_writes_point_size);
+      EXPECT_EQ(info.layout.vertex_components, 4u);
+      EXPECT_EQ(code.info.apple9_varyings.count, 0u);
+      free(code.binary);
+      ralloc_free(nir);
+   }
+
+   /* Reading gl_PointSize back on triangles must still be rejected cleanly. */
+   NativeMeshSpec bad;
+   bad.max_v = 3;
+   bad.max_p = 1;
+   bad.wg[0] = 16;
+   bad.read_psiz = true;
+   nir_shader *nir = build_native_mesh_shader(bad);
+   agx_apple9_mesh_body_info info = {};
+   const char *reason = nullptr;
+   EXPECT_FALSE(agx_nir_lower_apple9_native_mesh(nir, true, nullptr, &info, &reason));
+   EXPECT_NE(reason, nullptr);
+   ralloc_free(nir);
+}
+
+TEST(Apple9MeshNativeExpand, PointsTopologyAndPointSizeBuiltin)
+{
+   for (bool with_psiz : {false, true}) {
+      for (unsigned max_v : {12u, 64u}) {
+         SCOPED_TRACE(::testing::Message()
+                      << "V" << max_v << " psiz=" << with_psiz);
+         NativeMeshSpec spec;
+         spec.prim = MESA_PRIM_POINTS;
+         spec.max_v = max_v;
+         spec.max_p = max_v;
+         spec.wg[0] = 32;
+         spec.dynamic_counts = true;
+         spec.write_var0 = true;
+         spec.write_psiz = with_psiz;
+         spec.clip_distances = 2;
+
+         agx_apple9_native_mesh_options opts = {};
+         opts.physical_threads = 32;
+         opts.packed_index_publication = true;
+         opts.publication_rounds = true;
+         opts.attributes = true;
+
+         nir_shader *lowered = build_native_mesh_shader(spec);
+         agx_apple9_mesh_body_info info = {};
+         const char *reason = nullptr;
+         ASSERT_TRUE(agx_nir_lower_apple9_native_mesh(lowered, true, &opts,
+                                                      &info, &reason))
+            << (reason ?: "");
+         EXPECT_EQ(info.layout.indices_per_primitive, 1u);
+         EXPECT_EQ(info.layout.primitive_count_B, ALIGN_POT(max_v, 16));
+         EXPECT_EQ(info.writes_point_size, with_psiz);
+         EXPECT_EQ(info.clip_distances, 2u);
+         EXPECT_EQ(info.layout.vertex_components, 4u + 1u + with_psiz + 2u);
+
+         auto audit = audit_publication(lowered);
+         unsigned v_rounds = DIV_ROUND_UP(max_v, 32u);
+         unsigned p_rounds = DIV_ROUND_UP(DIV_ROUND_UP(max_v, 4u), 32u);
+         EXPECT_EQ(audit.controls, 1u);
+         EXPECT_EQ(audit.scalar_offsets.size(), p_rounds);
+         EXPECT_EQ(audit.channels.size(), v_rounds * info.layout.vertex_components);
+         /* Verify exact UVS order: 0..3 POS, 4 VAR0, [5 PSIZ], next CLIP0..1. */
+         unsigned psiz_ch = 5;
+         unsigned clip_ch = with_psiz ? 6 : 5;
+         if (with_psiz) {
+            unsigned plane =
+               agx_apple9_mesh_plane_offset(&info.layout, VARYING_SLOT_PSIZ, 0);
+            EXPECT_TRUE(audit.channels.count({psiz_ch, plane}));
+         }
+         for (unsigned d = 0; d < 2; ++d) {
+            unsigned plane = agx_apple9_mesh_plane_offset(
+               &info.layout, VARYING_SLOT_CLIP_DIST0, d);
+            EXPECT_TRUE(audit.channels.count({clip_ch + d, plane}));
+         }
+         ralloc_free(lowered);
+
+         nir_shader *nir = build_native_mesh_shader(spec);
+         agx_shader_part code = {};
+         ASSERT_TRUE(agx_compile_apple9_native_mesh(nir, true, &opts, &code,
+                                                    &info, &reason))
+            << (reason ?: "");
+         EXPECT_EQ(code.info.apple9_writes_point_size, with_psiz);
+         EXPECT_EQ(code.info.apple9_clip_distance_count, 2u);
+         EXPECT_EQ(code.info.apple9_varyings.count, 1u);
+         free(code.binary);
+         ralloc_free(nir);
+      }
+   }
+
+   /* Points reject culling and require publication_rounds at T32. */
+   for (unsigned bad_mode = 0; bad_mode < 3; ++bad_mode) {
+      NativeMeshSpec spec;
+      spec.prim = MESA_PRIM_POINTS;
+      spec.max_v = 8;
+      spec.max_p = 8;
+      spec.wg[0] = 32;
+      if (bad_mode == 0)
+         spec.write_cull_prim = true;
+      else if (bad_mode == 1)
+         spec.cull_distances = 1;
+
+      agx_apple9_native_mesh_options opts = {};
+      opts.physical_threads = 32;
+      opts.packed_index_publication = true;
+      opts.publication_rounds = bad_mode != 2;
+
+      nir_shader *nir = build_native_mesh_shader(spec);
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      EXPECT_FALSE(agx_nir_lower_apple9_native_mesh(nir, true, &opts, &info,
+                                                    &reason));
+      EXPECT_NE(reason, nullptr);
+      ralloc_free(nir);
+   }
+}
+
+TEST(Apple9MeshNativeExpand, LayerViewportAndPrimitiveIdBuiltins)
+{
+   struct {
+      unsigned max_v, max_p;
+      bool broadcast;
+      bool layer, viewport, prim_id, var0;
+      unsigned clips;
+      bool gather_info;
+   } cases[] = {
+      /* P1 broadcast: Layer only, Viewport only, and both + PrimitiveID. */
+      {3, 1, true, true, false, false, false, 0, true},
+      {3, 1, true, false, true, false, false, 0, true},
+      {3, 1, true, true, true, true, true, 2, true},
+      /* Multi-primitive (V6/P2 and V64/P64) via provoking-vertex copies. */
+      {6, 2, false, true, false, false, false, 0, true},
+      {6, 2, false, false, true, false, false, 0, true},
+      {64, 64, false, true, true, true, true, 2, true},
+      /* Works even if caller did not pre-populate nir->info.per_primitive_outputs. */
+      {6, 2, false, true, true, true, false, 0, false},
+   };
+
+   for (const auto &c : cases) {
+      SCOPED_TRACE(::testing::Message()
+                   << "V" << c.max_v << "P" << c.max_p << " L=" << c.layer
+                   << " VP=" << c.viewport << " PID=" << c.prim_id);
+      NativeMeshSpec spec;
+      spec.max_v = c.max_v;
+      spec.max_p = c.max_p;
+      spec.wg[0] = c.broadcast ? 16 : 32;
+      spec.write_var0 = c.var0;
+      spec.write_layer = c.layer;
+      spec.write_viewport = c.viewport;
+      spec.write_prim_id = c.prim_id;
+      spec.clip_distances = c.clips;
+      spec.gather_info = c.gather_info;
+
+      agx_apple9_native_mesh_options opts = {};
+      opts.physical_threads = c.broadcast ? 16 : 32;
+      opts.packed_index_publication = !c.broadcast;
+      opts.publication_rounds = !c.broadcast;
+      opts.attributes = true;
+      opts.primitive_broadcast = c.broadcast;
+      opts.primitive_vertices = !c.broadcast;
+      opts.layer_viewport = true;
+
+      nir_shader *lowered = build_native_mesh_shader(spec);
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_nir_lower_apple9_native_mesh(lowered, true, &opts, &info,
+                                                   &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(info.writes_layer_viewport);
+      EXPECT_FALSE(info.writes_point_size);
+      EXPECT_EQ(info.clip_distances, c.clips);
+      if (!c.broadcast) {
+         EXPECT_EQ(info.layout.max_vertices, c.max_v + c.max_p);
+      }
+
+      unsigned expected_varyings =
+         unsigned(c.var0) + unsigned(c.viewport) + unsigned(c.prim_id);
+      EXPECT_EQ(info.layout.vertex_components,
+                4u + expected_varyings + 1u + c.clips);
+
+      /* Verify packed Layer/Viewport bit packing (layer & 0xffff | vp << 16)
+       * and that the channel sits right after varyings and before ClipDist. */
+      bool saw_layer_mask = false, saw_vp_shift = false, saw_pack_or = false;
+      nir_foreach_block(block, nir_shader_get_entrypoint(lowered)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op == nir_op_iand && nir_src_is_const(alu->src[1].src) &&
+                nir_src_as_uint(alu->src[1].src) == 0xffffu)
+               saw_layer_mask = true;
+            if (alu->op == nir_op_ishl && nir_src_is_const(alu->src[1].src) &&
+                nir_src_as_uint(alu->src[1].src) == 16u)
+               saw_vp_shift = true;
+            if (alu->op == nir_op_ior)
+               saw_pack_or = true;
+         }
+      }
+      if (c.layer) {
+         EXPECT_TRUE(saw_layer_mask);
+      }
+      if (c.viewport) {
+         EXPECT_TRUE(saw_vp_shift);
+      }
+      if (c.layer && c.viewport) {
+         EXPECT_TRUE(saw_pack_or);
+      }
+
+      /* Verify packed Layer/Viewport channel sits right after user varyings
+       * and immediately before ClipDistances in every vertex round. */
+      auto audit = audit_publication(lowered);
+      unsigned layer_ch = 4 + expected_varyings;
+      unsigned layer_plane =
+         agx_apple9_mesh_plane_offset(&info.layout, VARYING_SLOT_LAYER, 0);
+      EXPECT_TRUE(audit.channels.count({layer_ch, layer_plane}));
+      for (unsigned d = 0; d < c.clips; ++d) {
+         unsigned clip_plane = agx_apple9_mesh_plane_offset(
+            &info.layout, VARYING_SLOT_CLIP_DIST0, d);
+         EXPECT_TRUE(audit.channels.count({layer_ch + 1 + d, clip_plane}));
+      }
+      ralloc_free(lowered);
+
+      /* Full compilation (for primitive_vertices, replace load_provoking_last
+       * like hk_apple9_lower_prerast_sysvals does). */
+      nir_shader *nir = build_native_mesh_shader(spec);
+      ASSERT_TRUE(agx_nir_lower_apple9_native_mesh(nir, true, &opts, &info,
+                                                   &reason))
+         << (reason ?: "");
+      if (info.primitive_vertices) {
+         nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
+            nir_foreach_instr_safe(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_load_provoking_last) {
+                  nir_builder nb = nir_builder_at(nir_before_instr(instr));
+                  nir_def_replace(&intr->def, nir_imm_int(&nb, 0));
+               }
+            }
+         }
+      }
+      agx_shader_part code = {};
+      ASSERT_TRUE(agx_compile_apple9_native_mesh_lowered(nir, &opts, &code,
+                                                         &info, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(code.binary && code.info.binary_size > 0);
+      EXPECT_TRUE(code.info.writes_layer_viewport);
+      EXPECT_EQ(code.info.apple9_clip_distance_count, c.clips);
+      EXPECT_EQ(code.info.apple9_varyings.count, expected_varyings);
+      EXPECT_EQ(code.info.apple9_varyings.mask[VARYING_SLOT_LAYER], 0u);
+      EXPECT_EQ(code.info.apple9_varyings.mask[VARYING_SLOT_VIEWPORT],
+                c.viewport ? 1u : 0u);
+      if (c.viewport) {
+         EXPECT_EQ(code.info.apple9_varyings.group[VARYING_SLOT_VIEWPORT], 1u);
+      }
+      if (c.prim_id) {
+         EXPECT_EQ(code.info.apple9_varyings.group[VARYING_SLOT_PRIMITIVE_ID], 1u);
+      }
+      free(code.binary);
+      ralloc_free(nir);
+
+      /* Without opts.layer_viewport, Layer/ViewportIndex remain rejected. */
+      opts.layer_viewport = false;
+      nir = build_native_mesh_shader(spec);
+      EXPECT_FALSE(agx_nir_lower_apple9_native_mesh(nir, true, &opts, &info,
+                                                    &reason));
+      EXPECT_NE(reason, nullptr);
+      ralloc_free(nir);
+   }
+}
+
+TEST(Apple9MeshNativeExpand, ClipDistancePreservedAcrossCullPrimitiveAndSerialization)
+{
+   struct {
+      uint16_t wg[3];
+      unsigned clips, culls;
+      bool cull_prim, link_clips;
+   } cases[] = {
+      {{32, 1, 1}, 3, 0, true, false},
+      {{64, 1, 1}, 4, 0, false, false},
+      {{4, 4, 4}, 2, 2, true, false},
+      {{128, 1, 1}, 2, 2, true, true},
+   };
+
+   for (const auto &c : cases) {
+      SCOPED_TRACE(::testing::Message()
+                   << "wg=" << c.wg[0] << "x" << c.wg[1] << "x" << c.wg[2]
+                   << " clips=" << c.clips << " culls=" << c.culls
+                   << " cull_prim=" << c.cull_prim << " link=" << c.link_clips);
+      NativeMeshSpec spec;
+      spec.max_v = 64;
+      spec.max_p = 64;
+      memcpy(spec.wg, c.wg, sizeof(spec.wg));
+      spec.clip_distances = c.clips;
+      spec.cull_distances = c.culls;
+      spec.write_cull_prim = c.cull_prim;
+
+      agx_apple9_native_mesh_options opts = {};
+      opts.physical_threads = 32;
+      opts.packed_index_publication = true;
+      opts.publication_rounds = true;
+      opts.attributes = true;
+      opts.link_clip_distances = c.link_clips;
+
+      nir_shader *nir = build_native_mesh_shader(spec);
+      agx_shader_part code = {};
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_native_mesh(nir, true, &opts, &code, &info,
+                                                 &reason))
+         << (reason ?: "");
+      EXPECT_EQ(info.clip_distances, c.clips);
+      EXPECT_EQ(info.cull_distances, c.culls);
+      EXPECT_EQ(info.cull_primitive, c.cull_prim);
+      EXPECT_EQ(info.clip_linked, c.link_clips);
+      EXPECT_EQ(code.info.apple9_clip_distance_count, c.clips);
+      EXPECT_EQ(code.info.apple9_varyings.count, c.link_clips ? c.clips : 0u);
+      EXPECT_EQ(info.layout.vertex_components,
+                4u + c.clips * (c.link_clips ? 2u : 1u));
+      free(code.binary);
+      ralloc_free(nir);
+   }
+}
+
+TEST(Apple9MeshNativeExpand, CullingRegionAlignmentIs16ByteAligned)
+{
+   for (unsigned max_p : {1u, 2u, 3u, 4u, 5u, 8u, 17u}) {
+      NativeMeshSpec spec;
+      spec.max_v = 6;
+      spec.max_p = max_p;
+      spec.wg[0] = 16;
+      spec.write_cull_prim = true;
+
+      nir_shader *nir = build_native_mesh_shader(spec);
+      agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_nir_lower_apple9_mesh(nir, &key, &info, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(info.layout.culling);
+      EXPECT_EQ(info.layout.position_B,
+                info.layout.cull_B + ALIGN_POT(max_p * 4, 16));
+      EXPECT_EQ((info.layout.local_size_B - info.layout.cull_B) % 16, 0u);
+      ralloc_free(nir);
    }
 }
