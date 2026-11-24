@@ -109,9 +109,11 @@ struct hk_mesh_info {
    uint8_t polygon_points;
    /* Native mesh consumes compute-task grids and per-parent payloads. */
    bool native_task_bridge;
+   /* Native mesh runs behind a hardware OBJECT stage (no Task Bridge). */
+   bool native_object;
    /* Native mesh publishes root.draw.view_index as its rasterizer Layer. */
    bool native_multiview;
-   uint8_t _pad[4];
+   uint8_t _pad[3];
 };
 
 /* Fragment shaders read user per-primitive varyings from the output records,
@@ -765,6 +767,12 @@ struct hk_apple9_graphics_key {
    bool native_index;
    /* Immutable task records feed native mesh children. API task stays compute. */
    bool native_task_bridge;
+   /* True native hardware OBJECT -> MESH with <= 16 KiB task payload. */
+   bool native_object;
+   /* Native OBJECT writes emitted child mesh grid for MESH gl_NumWorkGroups. */
+   bool native_object_write_child_grid;
+   /* Maximum payload bytes across paired native OBJECT and MESH stages. */
+   uint32_t native_object_payload_B;
    /* Generated mesh NIR from an API GS/TES stage (already guarded / own draw ABI). */
    bool native_stage_generated;
    /* Pipeline compiles for a multiview render pass (viewMask != 0). */

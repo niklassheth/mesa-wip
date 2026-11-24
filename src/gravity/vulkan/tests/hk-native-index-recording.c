@@ -157,7 +157,7 @@ main(int argc, char **argv)
    const struct agx_apple9_uniform_draw record = {0};
    const struct agx_draw draw = {.b = agx_3d(6, 1, 1)};
    CHECK(hk_apple9_record_draw(cmd, &cs, &pipeline, draw, route ? 0x8000 : 0,
-                             native, main, &record));
+                             NULL, 0, native, main, &record));
    CHECK(cmd->vk.record_result == VK_SUCCESS);
    CHECK(cs.apple9_native_mesh == expected);
    if (expected) {
@@ -173,7 +173,7 @@ main(int argc, char **argv)
       CHECK(!memcmp(command, ordinary, end - ordinary));
       CHECK(main->apple9_body->entry_pins == 0 && object->apple9_body->entry_pins == 0);
       uint32_t state[AGX_APPLE9_MESH_STATE_WORDS];
-      CHECK(!hk_apple9_prepare_native_mesh(cmd, main, object, &record, 0x8000, state));
+      CHECK(!hk_apple9_prepare_native_mesh(cmd, main, object, &record, 0x8000, 0, state));
    }
    hk_DestroyCommandPool(device, pool, NULL);
    hk_cmd_bo_cache_finish(dev); /* idle command BOs belong to the device */

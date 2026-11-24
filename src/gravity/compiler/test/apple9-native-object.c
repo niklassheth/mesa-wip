@@ -150,7 +150,7 @@ check_rejected_caller(unsigned width, bool divergent)
    const char *reason = NULL;
    CHECK(!agx_compile_apple9_mesh_lowered(b.shader, &key, &part, &reason));
    CHECK(!part.binary && reason);
-   CHECK(!strcmp(reason, "object grid calls require a converged T16 leaf caller"));
+   CHECK(!strcmp(reason, "object grid calls require a converged T16 or T32 leaf caller"));
    ralloc_free(b.shader);
 }
 
@@ -282,6 +282,74 @@ check_guarded_object(const uint32_t groups[3])
    ralloc_free(body);
 }
 
+static void
+check_app_object_execution(bool emit_nonzero)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_TASK, &agx_nir_options, "exec_app_object");
+   b.shader->info.workgroup_size[0] = 16;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.shared_size = 64;
+   b.shader->info.task_payload_size = 64;
+
+   nir_def *lid = nir_load_local_invocation_index(&b);
+   nir_store_shared(&b, nir_iadd_imm(&b, lid, 100), nir_imul_imm(&b, lid, 4),
+                    .write_mask = 1, .align_mul = 4);
+   nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_shared);
+   nir_push_if(&b, nir_ieq_imm(&b, lid, 0));
+   nir_def *v0 = nir_load_shared(&b, 1, 32, nir_imm_int(&b, 0), .align_mul = 4);
+   nir_def *v15 = nir_load_shared(&b, 1, 32, nir_imm_int(&b, 60), .align_mul = 4);
+   nir_store_task_payload(&b, nir_iadd(&b, v0, v15), nir_imm_int(&b, 0),
+                          .write_mask = 1, .align_mul = 4);
+   nir_pop_if(&b, NULL);
+   if (emit_nonzero) {
+      nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 3, 5, 2));
+   } else {
+      nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 0, 5, 2));
+   }
+
+   struct agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+   struct agx_apple9_native_object_options opts = {
+      .payload_stride_B = 64,
+      .write_child_grid = true,
+   };
+   struct agx_apple9_mesh_body_info info = {0};
+   const char *reason = NULL;
+   CHECK(agx_nir_lower_apple9_native_object_ex(
+      b.shader, true, &key, &opts, &info, &reason));
+   CHECK(agx_nir_lower_apple9_object_calls(b.shader, &reason));
+   nir_validate_shader(b.shader, "executed app native object");
+
+   uint32_t payload[20];
+   uint8_t payload_written[sizeof(payload)] = {0};
+   memset(payload, 0xcd, sizeof(payload));
+   const uint32_t obj_grid[3] = {1, 1, 1};
+   struct machine m = {
+      .local_root = key.grid_root,
+      .shared_begin = 16,
+      .shared_end = 16 + 64,
+      .side_effect_address = UINT64_C(0x500000),
+   };
+   memset(m.local, 0xcd, sizeof(m.local));
+   m.region[6] = (struct region){INPUT_ADDR, 12, (uint8_t *)obj_grid, NULL};
+   m.region[7] = (struct region){m.side_effect_address, sizeof(payload),
+                                 (uint8_t *)payload, payload_written};
+   run(b.shader, &m);
+   CHECK(m.object_calls == 1 && m.grid_exports == 7);
+   CHECK(payload[0] == 215); /* (0 + 100) + (15 + 100) */
+   const uint32_t expect_grid[3] = {
+      emit_nonzero ? 3u : 0u,
+      emit_nonzero ? 5u : 0u,
+      emit_nonzero ? 2u : 0u,
+   };
+   CHECK(!memcmp(m.grid, expect_grid, sizeof(expect_grid)));
+   CHECK(!memcmp(&payload[16], expect_grid, sizeof(expect_grid)));
+   ralloc_free(b.shader);
+}
+
 int
 main(void)
 {
@@ -296,6 +364,8 @@ main(void)
    };
    for (unsigned i = 0; i < ARRAY_SIZE(guarded_groups); ++i)
       check_guarded_object(guarded_groups[i]);
+   check_app_object_execution(true);
+   check_app_object_execution(false);
    struct agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
    key.grid_root = AGX_APPLE9_MESH_DRAW_UNIFORM / 2;
    CHECK(!agx_nir_apple9_taskless_object(&key));
@@ -313,8 +383,9 @@ main(void)
    check_multiple_calls(12);
    check_multiple_calls(40);
    check_rejected_caller(1, false);
-   check_rejected_caller(32, false);
+   check_rejected_caller(64, false);
    check_rejected_caller(16, true);
+   check_rejected_caller(32, true);
    glsl_type_singleton_decref();
    return 0;
 }

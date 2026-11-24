@@ -325,3 +325,405 @@ TEST(Apple9ObjectIR, RejectsUnclosedRegionsAndScratchFrames)
    EXPECT_STREQ(reason, "object calls require scheduled allocation without scratch");
    agx_apple9_vir_finish(&p);
 }
+
+static bool
+has_intrinsic(const nir_shader *nir, nir_intrinsic_op op)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == op)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static bool
+has_native_pointer_base(const nir_shader *nir, unsigned base)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_native_pointer_apple9_agx &&
+                (unsigned)nir_intrinsic_base(intr) == base)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static nir_shader *
+build_app_task_shader(unsigned wx, unsigned wy, unsigned wz,
+                      unsigned payload_B, unsigned shared_B,
+                      bool use_atomics, bool use_sysvals)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_TASK, &agx_nir_options, "app_native_object");
+   b.shader->info.workgroup_size[0] = wx;
+   b.shader->info.workgroup_size[1] = wy;
+   b.shader->info.workgroup_size[2] = wz;
+   b.shader->info.task_payload_size = payload_B;
+   b.shader->info.shared_size = shared_B;
+
+   nir_def *lid = nir_load_local_invocation_index(&b);
+   nir_def *val = lid;
+   if (use_sysvals) {
+      nir_def *lid3 = nir_load_local_invocation_id(&b);
+      nir_def *wgid = nir_load_workgroup_id(&b);
+      nir_def *gid = nir_load_global_invocation_id(&b, 32);
+      nir_def *nwg = nir_load_num_workgroups(&b);
+      val = nir_iadd(&b, val, nir_channel(&b, lid3, 0));
+      val = nir_iadd(&b, val, nir_channel(&b, lid3, 1));
+      val = nir_iadd(&b, val, nir_channel(&b, lid3, 2));
+      val = nir_iadd(&b, val, nir_channel(&b, wgid, 0));
+      val = nir_iadd(&b, val, nir_channel(&b, gid, 1));
+      val = nir_iadd(&b, val, nir_channel(&b, nwg, 2));
+   }
+
+   if (shared_B >= 4) {
+      nir_def *soff = nir_imul_imm(&b, nir_iand_imm(&b, lid, (shared_B / 4) - 1), 4);
+      nir_store_shared(&b, val, soff, .write_mask = 1, .align_mul = 4);
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_shared);
+      nir_def *loaded = nir_load_shared(&b, 1, 32, nir_imm_int(&b, 0),
+                                        .align_mul = 4);
+      val = nir_iadd(&b, val, loaded);
+   }
+
+   if (payload_B >= 16) {
+      nir_push_if(&b, nir_ieq_imm(&b, lid, 0));
+      nir_store_task_payload(&b, val, nir_imm_int(&b, 0),
+                             .write_mask = 1, .align_mul = 4);
+      if (payload_B >= 16) {
+         nir_store_task_payload(&b, val, nir_imm_int(&b, payload_B - 4),
+                                .write_mask = 1, .align_mul = 4);
+      }
+      nir_pop_if(&b, nullptr);
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_task_payload);
+      if (use_atomics) {
+         nir_def *old = nir_task_payload_atomic(
+            &b, 32, nir_imm_int(&b, 4), nir_imm_int(&b, 1),
+            .atomic_op = nir_atomic_op_iadd);
+         nir_def *prev = nir_task_payload_atomic_swap(
+            &b, 32, nir_imm_int(&b, 8), old, val,
+            .atomic_op = nir_atomic_op_cmpxchg);
+         nir_push_if(&b, nir_ieq_imm(&b, lid, 0));
+         nir_def *rd = nir_load_task_payload(&b, 1, 32, nir_imm_int(&b, 0),
+                                             .align_mul = 4);
+         nir_store_task_payload(&b, nir_iadd(&b, rd, prev), nir_imm_int(&b, 12),
+                                .write_mask = 1, .align_mul = 4);
+         nir_pop_if(&b, nullptr);
+      }
+   }
+
+   nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 4, 2, 1));
+   return b.shader;
+}
+
+TEST(Apple9NativeObject, PayloadLoadStoreAndAtomics)
+{
+   for (unsigned payload_B : {16u, 256u, 16384u}) {
+      nir_shader *nir = build_app_task_shader(16, 1, 1, payload_B, 0, true, false);
+      nir_shader *lower_probe = nir_shader_clone(nullptr, nir);
+      agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+      agx_apple9_native_object_options opts = {
+         .payload_stride_B = payload_B,
+         .write_child_grid = true,
+      };
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_nir_lower_apple9_native_object_ex(
+         lower_probe, true, &key, &opts, &info, &reason))
+         << (reason ? reason : "");
+      EXPECT_EQ(info.task_payload_size_B, payload_B);
+      EXPECT_EQ(info.task_payload_stride_B, payload_B);
+      EXPECT_TRUE(info.writes_child_grid);
+      EXPECT_FALSE(has_intrinsic(lower_probe, nir_intrinsic_load_task_payload));
+      EXPECT_FALSE(has_intrinsic(lower_probe, nir_intrinsic_store_task_payload));
+      EXPECT_FALSE(has_intrinsic(lower_probe, nir_intrinsic_task_payload_atomic));
+      EXPECT_FALSE(has_intrinsic(lower_probe, nir_intrinsic_task_payload_atomic_swap));
+      EXPECT_TRUE(has_native_pointer_base(lower_probe, AGX_APPLE9_MESH_PAYLOAD_UNIFORM));
+      ralloc_free(lower_probe);
+
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_apple9_native_object_ex(
+         nir, true, &key, &opts, &part, &info, &reason))
+         << (reason ? reason : "");
+      EXPECT_TRUE(part.info.apple9_body_only);
+      EXPECT_GT(part.info.binary_size, 0u);
+      EXPECT_GT(part.info.nr_gprs, 0u);
+      EXPECT_EQ(part.info.scratch_size, 0u);
+      EXPECT_EQ(part.info.workgroup_size[0], 16u);
+      free(part.binary);
+      ralloc_free(nir);
+   }
+
+   /* Payload > 16 KiB must be rejected cleanly. */
+   nir_shader *too_big = build_app_task_shader(16, 1, 1, 16388, 0, false, false);
+   agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+   agx_apple9_native_object_options opts = {.payload_stride_B = 16400};
+   agx_apple9_mesh_body_info info = {};
+   const char *reason = nullptr;
+   EXPECT_FALSE(agx_nir_lower_apple9_native_object_ex(
+      too_big, true, &key, &opts, &info, &reason));
+   EXPECT_NE(reason, nullptr);
+   ralloc_free(too_big);
+
+   /* Out-of-bounds static payload offset > 16 KiB must be rejected. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_TASK, &agx_nir_options, "oob_payload");
+   b.shader->info.workgroup_size[0] = 16;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.task_payload_size = 16384;
+   nir_store_task_payload(&b, nir_imm_int(&b, 1), nir_imm_int(&b, 16384),
+                          .write_mask = 1, .align_mul = 4);
+   nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 1, 1, 1));
+   opts.payload_stride_B = 16384;
+   reason = nullptr;
+   EXPECT_FALSE(agx_nir_lower_apple9_native_object_ex(
+      b.shader, true, &key, &opts, &info, &reason));
+   EXPECT_NE(reason, nullptr);
+   ralloc_free(b.shader);
+}
+
+TEST(Apple9NativeObject, SharedMemoryAndBarriers)
+{
+   for (unsigned shared_B : {64u, 256u, 16384u}) {
+      nir_shader *nir = build_app_task_shader(32, 1, 1, 64, shared_B, false, false);
+      agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+      key.physical_threads = 32;
+      agx_apple9_native_object_options opts = {.payload_stride_B = 64};
+      agx_shader_part part = {};
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_native_object_ex(
+         nir, true, &key, &opts, &part, &info, &reason))
+         << (reason ? reason : "");
+      EXPECT_GE(info.shared_size_B, shared_B);
+      EXPECT_GE(info.local_allocation_B, 16u + shared_B);
+      EXPECT_EQ(part.info.scratch_size, 0u);
+      EXPECT_EQ(part.info.workgroup_size[0], 32u);
+      free(part.binary);
+      ralloc_free(nir);
+   }
+
+   /* Shared memory overflowing 32 KiB after the grid header must be rejected. */
+   nir_shader *overflow = build_app_task_shader(16, 1, 1, 0, 32768, false, false);
+   agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+   agx_apple9_native_object_options opts = {};
+   agx_apple9_mesh_body_info info = {};
+   const char *reason = nullptr;
+   EXPECT_FALSE(agx_nir_lower_apple9_native_object_ex(
+      overflow, true, &key, &opts, &info, &reason));
+   EXPECT_NE(reason, nullptr);
+   ralloc_free(overflow);
+}
+
+TEST(Apple9NativeObject, WorkgroupSizes1To128AndSysvals)
+{
+   struct Shape { unsigned x, y, z, phys; };
+   const Shape shapes[] = {
+      {1, 1, 1, 16},
+      {3, 1, 1, 16},
+      {2, 2, 3, 16},
+      {16, 1, 1, 16},
+      {17, 1, 1, 32},
+      {32, 1, 1, 32},
+      {4, 8, 1, 32},
+      {64, 1, 1, 32},
+      {4, 4, 4, 32},
+      {128, 1, 1, 32},
+   };
+   for (const Shape &s : shapes) {
+      nir_shader *nir = build_app_task_shader(s.x, s.y, s.z, 64, 128, false, true);
+      agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+      key.physical_threads = s.phys;
+      agx_apple9_native_object_options opts = {
+         .payload_stride_B = 64,
+         .write_child_grid = true,
+      };
+      agx_shader_part part = {};
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_native_object_ex(
+         nir, true, &key, &opts, &part, &info, &reason))
+         << "shape " << s.x << "x" << s.y << "x" << s.z << ": "
+         << (reason ? reason : "");
+      EXPECT_EQ(part.info.workgroup_size[0], s.phys);
+      EXPECT_EQ(part.info.workgroup_size[1], 1u);
+      EXPECT_EQ(part.info.workgroup_size[2], 1u);
+      EXPECT_EQ(info.logical_size[0], s.x);
+      EXPECT_EQ(info.logical_size[1], s.y);
+      EXPECT_EQ(info.logical_size[2], s.z);
+      EXPECT_EQ(part.info.scratch_size, 0u);
+      EXPECT_GT(part.info.binary_size, 0u);
+      free(part.binary);
+      ralloc_free(nir);
+   }
+
+   /* > 128 invocations must be rejected cleanly. */
+   for (const Shape &bad : std::initializer_list<Shape>{{129, 1, 1, 32}, {8, 8, 4, 32}}) {
+      nir_shader *nir = build_app_task_shader(bad.x, bad.y, bad.z, 0, 0, false, false);
+      agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+      key.physical_threads = bad.phys;
+      agx_apple9_native_object_options opts = {};
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      EXPECT_FALSE(agx_nir_lower_apple9_native_object_ex(
+         nir, true, &key, &opts, &info, &reason));
+      EXPECT_NE(reason, nullptr);
+      ralloc_free(nir);
+   }
+}
+
+TEST(Apple9NativeObject, ZeroGridConditionalAndEarlyReturn)
+{
+   for (unsigned mode = 0; mode < 4; ++mode) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_TASK, &agx_nir_options, "zero_or_cond_task");
+      b.shader->info.workgroup_size[0] = mode == 3 ? 64 : 16;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.task_payload_size = 32;
+      nir_def *wgid = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+      if (mode == 0) {
+         nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 0, 0, 0));
+      } else if (mode == 1) {
+         nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 0, 5, 1));
+      } else if (mode == 2) {
+         /* Early return without calling EmitMeshTasksEXT: exports (0,0,0). */
+         nir_push_if(&b, nir_ieq_imm(&b, wgid, 0));
+         nir_store_task_payload(&b, nir_imm_int(&b, 7), nir_imm_int(&b, 0),
+                                .write_mask = 1, .align_mul = 4);
+         nir_jump(&b, nir_jump_return);
+         nir_pop_if(&b, nullptr);
+         nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 2, 1, 1));
+      } else {
+         /* Serialized T64 with conditional launch_mesh_workgroups. */
+         nir_push_if(&b, nir_ine_imm(&b, wgid, 0));
+         nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 3, 2, 1));
+         nir_pop_if(&b, nullptr);
+      }
+      agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+      key.physical_threads = mode == 3 ? 32 : 16;
+      agx_apple9_native_object_options opts = {
+         .payload_stride_B = 32,
+         .write_child_grid = true,
+      };
+      agx_shader_part part = {};
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_native_object_ex(
+         b.shader, true, &key, &opts, &part, &info, &reason))
+         << "mode " << mode << ": " << (reason ? reason : "");
+      EXPECT_EQ(part.info.scratch_size, 0u);
+      EXPECT_GT(part.info.binary_size, 0u);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+static nir_shader *
+build_mesh_with_payload(unsigned payload_B, bool read_num_workgroups,
+                        bool illegal_store)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_MESH, &agx_nir_options, "mesh_with_payload");
+   b.shader->info.workgroup_size[0] = 16;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.task_payload_size = payload_B;
+   b.shader->info.mesh.max_vertices_out = 3;
+   b.shader->info.mesh.max_primitives_out = 1;
+   b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+
+   nir_def *pv = nir_load_task_payload(&b, 1, 32, nir_imm_int(&b, payload_B - 4),
+                                       .align_mul = 4);
+   if (illegal_store) {
+      nir_store_task_payload(&b, pv, nir_imm_int(&b, 0),
+                             .write_mask = 1, .align_mul = 4);
+   }
+   nir_def *nwg_x = read_num_workgroups
+                       ? nir_channel(&b, nir_load_num_workgroups(&b), 0)
+                       : nir_imm_int(&b, 1);
+   nir_def *xf = nir_u2f32(&b, nir_iadd(&b, pv, nwg_x));
+   nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 3),
+                                      nir_imm_int(&b, 1), nir_imm_int(&b, 0));
+   for (unsigned i = 0; i < 3; ++i) {
+      nir_store_per_vertex_output(
+         &b, nir_vec4(&b, xf, nir_imm_float(&b, float(i)),
+                      nir_imm_float(&b, 0.5f), nir_imm_float(&b, 1.0f)),
+         nir_imm_int(&b, i), nir_imm_int(&b, 0),
+         .write_mask = 15, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   }
+   nir_store_per_primitive_output(
+      &b, nir_imm_ivec3(&b, 0, 1, 2), nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+      .write_mask = 7, .src_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES, .num_slots = 1});
+   return b.shader;
+}
+
+TEST(Apple9NativeObject, MeshPayloadReadAndNumWorkgroups)
+{
+   for (unsigned payload_B : {16u, 256u, 16384u}) {
+      nir_shader *nir = build_mesh_with_payload(payload_B, true, false);
+      nir_shader *lower_probe = nir_shader_clone(nullptr, nir);
+      agx_apple9_native_mesh_options opts = {
+         .attributes = true,
+         .native_object_payload = true,
+         .native_object_payload_stride_B = payload_B,
+      };
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_nir_lower_apple9_native_mesh(
+         lower_probe, true, &opts, &info, &reason))
+         << (reason ? reason : "");
+      EXPECT_TRUE(info.reads_native_payload);
+      EXPECT_EQ(info.task_payload_size_B, payload_B);
+      EXPECT_FALSE(has_intrinsic(lower_probe, nir_intrinsic_load_task_payload));
+      EXPECT_FALSE(has_intrinsic(lower_probe, nir_intrinsic_load_num_workgroups));
+      EXPECT_TRUE(has_native_pointer_base(lower_probe, AGX_APPLE9_MESH_PAYLOAD_UNIFORM));
+      ralloc_free(lower_probe);
+
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_apple9_native_mesh(
+         nir, true, &opts, &part, &info, &reason))
+         << (reason ? reason : "");
+      EXPECT_TRUE(info.reads_native_payload);
+      EXPECT_EQ(part.info.scratch_size, 0u);
+      EXPECT_GT(part.info.binary_size, 0u);
+      free(part.binary);
+      ralloc_free(nir);
+   }
+
+   /* Mesh payload write is illegal and must be rejected. */
+   nir_shader *bad_write = build_mesh_with_payload(64, false, true);
+   agx_apple9_native_mesh_options opts = {
+      .attributes = true,
+      .native_object_payload = true,
+      .native_object_payload_stride_B = 64,
+   };
+   agx_apple9_mesh_body_info info = {};
+   const char *reason = nullptr;
+   EXPECT_FALSE(agx_nir_lower_apple9_native_mesh(
+      bad_write, true, &opts, &info, &reason));
+   ralloc_free(bad_write);
+
+   /* Mesh payload read without native_object_payload option must be rejected. */
+   nir_shader *disabled = build_mesh_with_payload(64, false, false);
+   opts.native_object_payload = false;
+   EXPECT_FALSE(agx_nir_lower_apple9_native_mesh(
+      disabled, true, &opts, &info, &reason));
+   ralloc_free(disabled);
+}

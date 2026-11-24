@@ -366,6 +366,27 @@ if with_tests
   test('gravity-hk-native-task-routing', gravity_routing_test,
     env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_NATIVE_TASK_BRIDGE=1'],
     suite : ['gravity'])
+  gravity_native_object_test = executable(
+    'gravity-hk-native-object', 'tests/hk-native-object.c',
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include,
+                           inc_src, inc_gravity],
+    dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
+    link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_reference',
+                 '-Wl,--wrap=agx_bo_unreference', '-Wl,--wrap=__vk_errorf'],
+  )
+  test('gravity-hk-native-object', gravity_native_object_test,
+    args : ['phase2'],
+    env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_NATIVE_TASK_BRIDGE=1'],
+    suite : ['gravity'])
+  test('gravity-hk-native-object-env-off', gravity_native_object_test,
+    args : ['object-disabled'],
+    env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_NATIVE_TASK_BRIDGE=1',
+           'HK_APPLE9_NATIVE_OBJECT=0'],
+    suite : ['gravity'])
+  test('gravity-hk-native-object-mesh-disabled', gravity_native_object_test,
+    args : ['mesh-disabled'],
+    env : ['HK_APPLE9_NATIVE_MESH=0'],
+    suite : ['gravity'])
   test('gravity-hk-native-gs-routing', gravity_routing_test,
     env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_GS_NATIVE=1',
            'HK_APPLE9_NATIVE_MESH_PACKED_SHAPES=T16V3P1,T16V4P2'],

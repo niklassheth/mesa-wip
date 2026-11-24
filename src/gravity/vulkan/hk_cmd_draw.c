@@ -2126,16 +2126,18 @@ hk_apple9_native_mesh_state_eligible(struct hk_cmd_buffer *cmd,
                                      const uint32_t *direct,
                                      uint64_t count_addr, bool cull_primitive)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    bool allow_native_mesh = hk_apple9_native_mesh_enabled();
+   bool allow_task_native = hk_apple9_native_task_bridge_enabled() ||
+                            hk_apple9_native_object_available_device(dev);
    bool allow_taskless_gpu_grid = allow_native_mesh &&
                                   !gfx->shaders[MESA_SHADER_TASK];
-   if (!hk_apple9_native_mesh_available_device(hk_cmd_buffer_device(cmd)) ||
+   if (!hk_apple9_native_mesh_available_device(dev) ||
        (direct ? (count_addr || !hk_apple9_native_mesh_grid_valid(direct))
                : !allow_taskless_gpu_grid) ||
-       (gfx->shaders[MESA_SHADER_TASK] &&
-        !hk_apple9_native_task_bridge_enabled()) ||
+       (gfx->shaders[MESA_SHADER_TASK] && !allow_task_native) ||
        gfx->shaders[MESA_SHADER_GEOMETRY] ||
        gfx->shaders[MESA_SHADER_TESS_EVAL] ||
        (!allow_native_mesh && gfx->render.view_mask) ||
@@ -2200,7 +2202,11 @@ hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
       return false;
    const struct hk_api_shader *task =
       hk_api_shader_native(gfx->shaders[MESA_SHADER_TASK]);
-   if (main->info.mesh.native_task_bridge != !!gfx->shaders[MESA_SHADER_TASK])
+   const bool has_task = !!gfx->shaders[MESA_SHADER_TASK];
+   if (main->info.mesh.native_task_bridge && main->info.mesh.native_object)
+      return false;
+   if ((main->info.mesh.native_task_bridge || main->info.mesh.native_object) !=
+       has_task)
       return false;
    if (!!gfx->render.view_mask != main->info.mesh.native_multiview ||
        (gfx->render.view_mask && !main->info.apple9_native.writes_layer_viewport))
@@ -2223,27 +2229,60 @@ hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
          const struct hk_shader *t = &task->variants[0];
          const uint32_t max_groups =
             hk_apple9_native_mesh_max_groups(&main->info.apple9_native.layout);
-         if (!max_groups ||
-             groups * ALIGN_POT(t->info.task.payload_B, 16) > UINT32_MAX ||
-             groups * 16 > UINT32_MAX)
-            return false;
-         if (t->info.task.max_mesh_groups == UINT32_MAX) {
-            /* Dynamic EmitMeshTasksEXT counts cannot be bounded on the CPU:
-             * execute the task stage once, route totals <= max_groups natively
-             * (factored into 2D up to 2^20 - 1), and hand totals > max_groups
-             * to the paired emulated mesh variant. Standalone native leaves
-             * lack an emulated fallback, and task grids >= 1024 could legally
-             * sum to >= 2^32 (1024 * maxMeshWorkGroupTotalCount) and wrap the
-             * 32-bit prefix sum, so keep those off this path. */
-            if (groups > UINT32_MAX / (1u << 22) ||
-                api_mesh->apple9_native_leaf ||
-                (api_fs && api_fs != hk_cmd_buffer_device(cmd)->null_fs &&
-                 api_fs->apple9_native_leaf))
+         if (main->info.mesh.native_object) {
+            struct hk_device *dev = hk_cmd_buffer_device(cmd);
+            if (!hk_apple9_native_object_available_device(dev) ||
+                hk_cond_render_applies(cmd) ||
+                t->info.apple9_native_stage != HK_APPLE9_NATIVE_OBJECT ||
+                !max_groups ||
+                groups > dev->dev.native_object.max_groups ||
+                (groups > 1 && !dev->dev.native_object.multi_parent) ||
+                t->info.apple9_native.key.physical_threads >
+                   dev->dev.native_object.max_threads ||
+                t->info.apple9_native.task_payload_size_B >
+                   dev->dev.native_object.payload_bytes ||
+                (t->info.apple9_native.writes_child_grid &&
+                 !dev->dev.native_object.payload_bytes) ||
+                hk_apple9_native_object_tg_memory_bytes(
+                   &t->info.apple9_native) >
+                   dev->dev.native_object.max_shared)
+               return false;
+            /* args.payload is a single draw-wide 64-bit uniform shared across
+             * all parents and child meshes in the draw. Keep payload and
+             * child-grid traffic isolated to single-parent draws; payload-free
+             * multi-parent OBJECT -> MESH runs natively up to max_groups. */
+            if (groups > 1 &&
+                (t->info.apple9_native.task_payload_size_B ||
+                 t->info.apple9_native.writes_child_grid ||
+                 main->info.apple9_native.reads_native_payload))
+               return false;
+            if (t->info.task.max_mesh_groups == UINT32_MAX ||
+                (t->info.task.max_mesh_groups &&
+                 groups > max_groups / t->info.task.max_mesh_groups))
                return false;
          } else {
-            groups *= t->info.task.max_mesh_groups;
-            if (groups > max_groups)
+            if (!max_groups ||
+                groups * ALIGN_POT(t->info.task.payload_B, 16) > UINT32_MAX ||
+                groups * 16 > UINT32_MAX)
                return false;
+            if (t->info.task.max_mesh_groups == UINT32_MAX) {
+               /* Dynamic EmitMeshTasksEXT counts cannot be bounded on the CPU:
+                * execute the task stage once, route totals <= max_groups natively
+                * (factored into 2D up to 2^20 - 1), and hand totals > max_groups
+                * to the paired emulated mesh variant. Standalone native leaves
+                * lack an emulated fallback, and task grids >= 1024 could legally
+                * sum to >= 2^32 (1024 * maxMeshWorkGroupTotalCount) and wrap the
+                * 32-bit prefix sum, so keep those off this path. */
+               if (groups > UINT32_MAX / (1u << 22) ||
+                   api_mesh->apple9_native_leaf ||
+                   (api_fs && api_fs != hk_cmd_buffer_device(cmd)->null_fs &&
+                    api_fs->apple9_native_leaf))
+                  return false;
+            } else {
+               groups *= t->info.task.max_mesh_groups;
+               if (groups > max_groups)
+                  return false;
+            }
          }
       } else if (groups * main->info.apple9_native.layout.max_primitives >
                     hk_apple9_native_render_primitives() ||
@@ -2312,8 +2351,10 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
              : NULL;
    struct hk_shader *main = &mesh->variants[HK_MESH_VARIANT_MAIN];
    const struct hk_mesh_info *info = &main->info.mesh;
+   const bool native_object =
+      native && task && native_main->info.mesh.native_object;
    const bool task_dynamic =
-      native && direct && task &&
+      native && direct && task && !native_object &&
       hk_only_variant(hk_api_shader_native(task))->info.task.max_mesh_groups ==
          UINT32_MAX;
    uint64_t draw_primitives = UINT64_MAX;
@@ -2365,6 +2406,24 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
             return;
          if (task) {
             struct hk_shader *t = hk_only_variant(hk_api_shader_native(task));
+            if (native_object) {
+               uint64_t grid =
+                  hk_pool_upload(cmd, direct, 3 * sizeof(uint32_t), 4);
+               if (!grid)
+                  return;
+               uint64_t payload_gpu = 0;
+               uint32_t payload_alloc_B =
+                  t->info.apple9_native.task_payload_stride_B +
+                  (t->info.apple9_native.writes_child_grid ? 16 : 0);
+               if (payload_alloc_B) {
+                  payload_gpu = hk_pool_alloc(cmd, payload_alloc_B, 16).gpu;
+                  if (!payload_gpu)
+                     return;
+               }
+               hk_apple9_draw_native_object(cmd, draw_id, direct, grid,
+                                            payload_gpu);
+               continue;
+            }
             uint32_t groups = (uint64_t)direct[0] * direct[1] * direct[2];
             struct agx_ptr params = hk_pool_alloc(cmd, sizeof(struct libagx_mesh_params), 16);
             if (!params.gpu)

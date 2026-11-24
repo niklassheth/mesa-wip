@@ -7,6 +7,7 @@
 #include "gravity/lib/agx_apple9.h"
 #include "gravity/lib/agx_apple9_launch.h"
 #include "gravity/lib/agx_apple9_mesh.h"
+#include "util/u_math.h"
 
 /* Explicit userspace/kernel development pairing. The stable UAPI has no
  * native-mesh capability bit; enabling this requires the matching kernel. */
@@ -23,6 +24,9 @@ uint64_t hk_apple9_native_index_shapes(void);
 bool hk_apple9_native_gs_enabled(void);
 bool hk_apple9_native_tess_enabled(void);
 bool hk_apple9_native_task_bridge_enabled(void);
+bool hk_apple9_native_object_enabled(void);
+bool hk_apple9_native_object_available(const struct hk_physical_device *pdev);
+bool hk_apple9_native_object_available_device(struct hk_device *dev);
 
 /* Generic 32-bit stage I/O shares the native mesh per-vertex layout. Builtins
  * other than Position need their own stage/rasterization semantics. */
@@ -91,6 +95,20 @@ enum hk_apple9_native_stage {
  * in one 32-KiB allocation. Larger output classes need a new storage model. */
 #define HK_APPLE9_NATIVE_SHARED_BYTES 28672
 
+/* Actual hardware threadgroup memory allocation (power of two, >= 128 B)
+ * requested by hk_apple9_native_launch_parameters() for a native OBJECT stage. */
+static inline uint64_t
+hk_apple9_native_object_tg_memory_bytes(
+   const struct agx_apple9_mesh_body_info *info)
+{
+   uint64_t raw =
+      (uint64_t)HK_APPLE9_NATIVE_GRID_ROOT + info->local_allocation_B;
+   if (raw > 32768)
+      return raw;
+   return util_next_power_of_two(
+      MAX2((unsigned)HK_APPLE9_NATIVE_LOCAL_BYTES, (unsigned)raw));
+}
+
 /* One taskless object publishes one mesh-child grid. Apple's Metal Feature
  * Set Tables give Apple9 a total of 2^20 - 1 mesh groups per grid. Retain the
  * existing, more conservative Vulkan per-axis bound. These are grid limits,
@@ -115,6 +133,8 @@ bool hk_apple9_native_mesh_round_counts_eligible(const uint16_t local_size[3],
 bool hk_apple9_native_mesh_model_counts_eligible(const uint16_t local_size[3],
                                                  unsigned vertices,
                                                  unsigned primitives);
+bool hk_apple9_native_mesh_round_shape_eligible_ex(const nir_shader *nir,
+                                                   bool allow_task_payload);
 bool hk_apple9_native_mesh_round_shape_eligible(const nir_shader *nir);
 
 bool hk_apple9_native_shader_valid(
@@ -129,11 +149,22 @@ bool hk_apple9_native_launch_parameters(
    uint64_t code_address);
 
 #define HK_APPLE9_MESH_COMMAND_BYTES 160
+bool hk_apple9_mesh_command_build_delta_ex(
+   void *out, size_t capacity, const struct agx_apple9_render_pipeline *p,
+   const uint32_t state[AGX_APPLE9_MESH_STATE_WORDS], const uint32_t groups[3],
+   const uint32_t object_local_size[3], bool enable, bool multi_parent,
+   const uint8_t *previous, const uint8_t *record, size_t *bytes);
 bool hk_apple9_mesh_command_build_delta(
    void *out, size_t capacity, const struct agx_apple9_render_pipeline *p,
    const uint32_t state[AGX_APPLE9_MESH_STATE_WORDS], const uint32_t groups[3],
    const uint32_t object_local_size[3], bool enable, const uint8_t *previous,
    const uint8_t *record, size_t *bytes);
+bool hk_apple9_mesh_command_build_ex(
+   void *out, size_t capacity,
+   const struct agx_apple9_render_pipeline *pipeline,
+   const uint32_t state[AGX_APPLE9_MESH_STATE_WORDS],
+   const uint32_t object_groups[3], const uint32_t object_local_size[3],
+   bool enable, bool multi_parent);
 bool hk_apple9_mesh_command_build(
    void *out, size_t capacity,
    const struct agx_apple9_render_pipeline *pipeline,

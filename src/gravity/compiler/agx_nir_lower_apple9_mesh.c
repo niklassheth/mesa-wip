@@ -105,20 +105,24 @@ validate(nir_shader *nir, const struct agx_apple9_mesh_key *key,
         key->physical_threads < logical_threads || key->physical_threads > 256))
       return fail(reason, "invalid Apple9 mesh physical workgroup width");
    if (key && key->physical_threads && nir->info.stage == MESA_SHADER_TASK &&
-       (key->physical_threads != AGX_APPLE9_NATIVE_THREADS ||
-        !agx_apple9_native_workgroup_supported(nir, reason)))
-      return fail(reason, "native object expansion requires physical T16 and 1..16 API invocations");
+       ((key->physical_threads != AGX_APPLE9_NATIVE_THREADS &&
+         key->physical_threads != AGX_APPLE9_NATIVE_SERIAL_THREADS) ||
+        !agx_apple9_native_workgroup_valid(nir, key->physical_threads, reason)))
+      return fail(reason,
+                  "native object expansion requires physical T16 or T32 within workgroup limits");
    if (expanded && nir->info.derivative_group != DERIVATIVE_GROUP_NONE)
       return fail(reason,
                   "expanded Apple9 mesh derivative groups are unsupported");
-   if (nir->info.shared_size && nir->info.stage != MESA_SHADER_MESH)
-      return fail(reason,
-                  "Apple9 native task bodies do not support user shared memory");
    if (nir->info.shared_size > AGX_APPLE9_MAX_SHARED_BYTES)
       return fail(reason, "Apple9 mesh shared allocation exceeds local capacity");
+   if (nir->info.task_payload_size > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES)
+      return fail(reason, "Apple9 native task payload exceeds 16 KiB hardware limit");
    nir_foreach_variable_with_modes(var, nir, nir_var_mem_shared)
       return fail(reason,
                   "Apple9 native bodies require explicit shared IO");
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_task_payload)
+      return fail(reason,
+                  "Apple9 native bodies require explicit payload IO");
    /* Local root N owns uniform words 2*N and 2*N+1. Check the entire
     * fixed graphics window, including its group-count and shared roots. */
    if (!key || key->output_root >= 64 || key->grid_root >= 64 ||
@@ -130,9 +134,17 @@ validate(nir_shader *nir, const struct agx_apple9_mesh_key *key,
        key->output_root == key->grid_root ||
        key->payload_uniform / 2 == key->output_root ||
        key->payload_uniform / 2 == key->grid_root || (key->grid_offset_B & 3) ||
-       key->grid_offset_B > AGX_APPLE9_MAX_SHARED_BYTES - 12)
+       key->grid_offset_B > AGX_APPLE9_MAX_SHARED_BYTES - 16)
       return fail(reason,
                   "Apple9 native stage arguments overlap or are out of range");
+   if (nir->info.stage == MESA_SHADER_TASK && nir->info.shared_size) {
+      unsigned shared_offset = ALIGN_POT(key->grid_offset_B + 16, 16);
+      if (shared_offset > AGX_APPLE9_MAX_SHARED_BYTES ||
+          ALIGN_POT(nir->info.shared_size, 4) >
+             AGX_APPLE9_MAX_SHARED_BYTES - shared_offset)
+         return fail(reason,
+                     "Apple9 native task grid and shared allocations exceed local capacity");
+   }
 
    memset(layout, 0, sizeof(*layout));
    memset(layout->vertex_component, 0xff, sizeof(layout->vertex_component));
@@ -168,16 +180,49 @@ validate(nir_shader *nir, const struct agx_apple9_mesh_key *key,
                return fail(
                   reason,
                   "Apple9 native shared IO requires an allocated byte range");
-            payload |= intr->intrinsic == nir_intrinsic_load_task_payload ||
-                       intr->intrinsic == nir_intrinsic_store_task_payload;
+            bool is_payload_write =
+               intr->intrinsic == nir_intrinsic_store_task_payload ||
+               intr->intrinsic == nir_intrinsic_task_payload_atomic ||
+               intr->intrinsic == nir_intrinsic_task_payload_atomic_swap;
+            bool is_payload_op =
+               intr->intrinsic == nir_intrinsic_load_task_payload ||
+               is_payload_write;
+            payload |= is_payload_op;
             local_output |=
                is_output(intr->intrinsic) ||
                intr->intrinsic ==
                   nir_intrinsic_set_vertex_and_primitive_count ||
                intr->intrinsic == nir_intrinsic_launch_mesh_workgroups;
-            if (intr->intrinsic == nir_intrinsic_task_payload_atomic ||
-                intr->intrinsic == nir_intrinsic_task_payload_atomic_swap ||
-                intr->intrinsic ==
+            if (is_payload_write && nir->info.stage != MESA_SHADER_TASK)
+               return fail(
+                  reason,
+                  "Apple9 native mesh task payload is read-only");
+            if (is_payload_op) {
+               if (!nir->info.task_payload_size ||
+                   nir_intrinsic_base(intr) >= nir->info.task_payload_size)
+                  return fail(
+                     reason,
+                     "Apple9 native task payload IO requires an allocated 16 KiB byte range");
+               nir_src *off_src = nir_get_io_offset_src(intr);
+               if (off_src && nir_src_is_const(*off_src)) {
+                  unsigned access_B;
+                  if (intr->intrinsic == nir_intrinsic_store_task_payload) {
+                     access_B = (intr->src[0].ssa->bit_size / 8) *
+                                intr->src[0].ssa->num_components;
+                  } else {
+                     access_B = (intr->def.bit_size / 8) *
+                                intr->def.num_components;
+                  }
+                  uint64_t end_B = (uint64_t)nir_intrinsic_base(intr) +
+                                   nir_src_as_uint(*off_src) + access_B;
+                  if (end_B > nir->info.task_payload_size ||
+                      end_B > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES)
+                     return fail(
+                        reason,
+                        "Apple9 native task payload IO exceeds 16 KiB byte range");
+               }
+            }
+            if (intr->intrinsic ==
                    nir_intrinsic_launch_mesh_workgroups_with_payload_deref)
                return fail(
                   reason,
@@ -649,6 +694,21 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
                        .access = nir_intrinsic_access(intr));
       break;
    }
+   case nir_intrinsic_task_payload_atomic:
+   case nir_intrinsic_task_payload_atomic_swap: {
+      bool swap = intr->intrinsic == nir_intrinsic_task_payload_atomic_swap;
+      nir_def *off =
+         nir_iadd_imm(b, intr->src[0].ssa, nir_intrinsic_base(intr));
+      nir_def *ptr = payload_pointer(b, s, off);
+      nir_def *v = swap
+         ? nir_global_atomic_swap(b, intr->def.bit_size, ptr,
+                                  intr->src[1].ssa, intr->src[2].ssa,
+                                  .atomic_op = nir_intrinsic_atomic_op(intr))
+         : nir_global_atomic(b, intr->def.bit_size, ptr, intr->src[1].ssa,
+                             .atomic_op = nir_intrinsic_atomic_op(intr));
+      nir_def_replace(&intr->def, v);
+      return true;
+   }
    case nir_intrinsic_barrier: {
       nir_variable_mode modes = nir_intrinsic_memory_modes(intr);
       if (!(modes & (nir_var_mem_task_payload | nir_var_shader_out)))
@@ -783,11 +843,21 @@ agx_nir_lower_apple9_mesh(nir_shader *nir,
       return false;
    result.key = *key;
    result.shared_size_B = nir->info.shared_size;
-   result.shared_offset_B = result.shared_size_B
-                              ? ALIGN_POT(result.layout.local_size_B, 16) : 0;
-   result.local_allocation_B = result.shared_size_B
-      ? result.shared_offset_B + ALIGN_POT(result.shared_size_B, 4)
-      : result.layout.local_size_B;
+   if (nir->info.stage == MESA_SHADER_TASK) {
+      result.shared_offset_B = result.shared_size_B
+                                  ? ALIGN_POT(key->grid_offset_B + 16, 16) : 0;
+      result.local_allocation_B = result.shared_size_B
+         ? result.shared_offset_B + ALIGN_POT(result.shared_size_B, 4)
+         : 0;
+   } else {
+      result.shared_offset_B = result.shared_size_B
+                                  ? ALIGN_POT(result.layout.local_size_B, 16) : 0;
+      result.local_allocation_B = result.shared_size_B
+         ? result.shared_offset_B + ALIGN_POT(result.shared_size_B, 4)
+         : result.layout.local_size_B;
+   }
+   result.task_payload_size_B = nir->info.task_payload_size;
+   result.task_payload_stride_B = ALIGN_POT(nir->info.task_payload_size, 16);
    memcpy(result.logical_size, nir->info.workgroup_size,
           sizeof(result.logical_size));
    result.argument_uniform_words = agx_apple9_mesh_argument_words(key);
@@ -900,12 +970,13 @@ agx_nir_lower_apple9_object_calls(nir_shader *nir, const char **reason)
          found = true;
          if (nir->info.stage != MESA_SHADER_TASK ||
              nir->info.workgroup_size_variable ||
-             nir->info.workgroup_size[0] != 16 ||
+             (nir->info.workgroup_size[0] != AGX_APPLE9_NATIVE_THREADS &&
+              nir->info.workgroup_size[0] != AGX_APPLE9_NATIVE_SERIAL_THREADS) ||
              nir->info.workgroup_size[1] != 1 ||
              nir->info.workgroup_size[2] != 1 ||
              block->cf_node.parent->type != nir_cf_node_function) {
             util_dynarray_fini(&calls);
-            return fail(reason, "object grid calls require a converged T16 leaf caller");
+            return fail(reason, "object grid calls require a converged T16 or T32 leaf caller");
          }
          if (call)
             util_dynarray_append(&calls, intr);
@@ -1013,60 +1084,191 @@ agx_nir_apple9_taskless_object_guarded(const struct agx_apple9_mesh_key *key)
 }
 
 bool
+agx_nir_lower_apple9_native_object_ex(
+   nir_shader *nir, bool enable_native_mesh,
+   const struct agx_apple9_mesh_key *key,
+   const struct agx_apple9_native_object_options *options,
+   struct agx_apple9_mesh_body_info *info, const char **reason)
+{
+   if (!enable_native_mesh)
+      return fail(reason, "native object development path is disabled");
+   if (!key || nir->info.stage != MESA_SHADER_TASK)
+      return fail(reason, "native object requires task NIR and a mesh key");
+
+   unsigned physical_threads =
+      key->physical_threads ? key->physical_threads : AGX_APPLE9_NATIVE_THREADS;
+   if (physical_threads == AGX_APPLE9_NATIVE_THREADS) {
+      if (!agx_apple9_native_workgroup_supported(nir, reason))
+         return false;
+   } else if (physical_threads == AGX_APPLE9_NATIVE_SERIAL_THREADS) {
+      if (!agx_apple9_native_workgroup_valid(
+             nir, AGX_APPLE9_NATIVE_MAX_INVOCATIONS, reason))
+         return false;
+   } else {
+      return fail(reason, "native object physical workgroup must be T16 or T32");
+   }
+
+   nir_remove_dead_variables(nir, nir_var_mem_shared, NULL);
+   nir_lower_vars_to_explicit_types(nir, nir_var_mem_shared,
+                                    glsl_get_natural_size_align_bytes);
+   nir_lower_explicit_io(nir, nir_var_mem_shared, nir_address_format_32bit_offset);
+   nir_remove_dead_variables(nir, nir_var_mem_shared, NULL);
+
+   nir_remove_dead_variables(nir, nir_var_mem_task_payload, NULL);
+   nir_lower_vars_to_explicit_types(nir, nir_var_mem_task_payload,
+                                    glsl_get_natural_size_align_bytes);
+   nir_lower_explicit_io(nir, nir_var_mem_task_payload,
+                         nir_address_format_32bit_offset);
+   nir_remove_dead_variables(nir, nir_var_mem_task_payload, NULL);
+
+   if (nir->info.task_payload_size > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES)
+      return fail(reason, "native object task payload exceeds 16 KiB hardware limit");
+
+   unsigned min_stride = ALIGN_POT(nir->info.task_payload_size, 16);
+   unsigned payload_stride_B =
+      options && options->payload_stride_B ? options->payload_stride_B : min_stride;
+   if ((payload_stride_B & 15) || payload_stride_B < min_stride ||
+       payload_stride_B > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES)
+      return fail(reason, "native object task payload stride is invalid");
+   bool write_child_grid = options && options->write_child_grid;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   struct util_dynarray launches = UTIL_DYNARRAY_INIT;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic ==
+             nir_intrinsic_launch_mesh_workgroups_with_payload_deref) {
+            util_dynarray_fini(&launches);
+            return fail(reason, "native object requires explicit payload IO");
+         }
+         if (intr->intrinsic == nir_intrinsic_launch_mesh_workgroups) {
+            if (nir_intrinsic_base(intr)) {
+               util_dynarray_fini(&launches);
+               return fail(reason, "Apple9 task grid requires the workgroup's payload base");
+            }
+            util_dynarray_append(&launches, intr);
+         }
+      }
+   }
+
+   uint16_t logical_size[3];
+   memcpy(logical_size, nir->info.workgroup_size, sizeof(logical_size));
+   unsigned logical_threads =
+      logical_size[0] * logical_size[1] * logical_size[2];
+   if (logical_threads > physical_threads) {
+      /* Ensure every serialized logical subgroup completes all user payload
+       * and shared writes before a terminating EmitMeshTasks executes, and
+       * lower the termination return before serializing across subgroups. */
+      util_dynarray_foreach(&launches, nir_intrinsic_instr *, launch) {
+         nir_builder lb = nir_builder_at(nir_before_instr(&(*launch)->instr));
+         workgroup_rendezvous(&lb);
+         lb.cursor = nir_after_instr(&(*launch)->instr);
+         nir_push_if(&lb, nir_imm_true(&lb));
+         nir_jump(&lb, nir_jump_return);
+         nir_pop_if(&lb, NULL);
+      }
+      nir_progress(launches.size != 0, impl, nir_metadata_none);
+      nir_lower_system_values(nir);
+      agx_nir_lower_apple9_mesh_global_id(nir);
+      nir_lower_halt_to_return(nir);
+      nir_lower_returns(nir);
+      nir_lower_workgroup_size(nir, physical_threads);
+      bool progress;
+      do {
+         progress = nir_lower_vars_to_ssa(nir);
+         progress |= nir_opt_copy_prop(nir);
+         progress |= nir_opt_constant_folding(nir);
+         progress |= nir_opt_dead_cf(nir);
+         progress |= nir_opt_remove_phis(nir);
+         progress |= nir_opt_dce(nir);
+      } while (progress);
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   }
+   util_dynarray_fini(&launches);
+
+   struct agx_apple9_mesh_key physical = *key;
+   physical.physical_threads = physical_threads;
+   if (!agx_nir_lower_apple9_mesh(nir, &physical, info, reason))
+      return false;
+   memcpy(info->logical_size, logical_size, sizeof(logical_size));
+   info->task_payload_stride_B = payload_stride_B;
+   info->writes_child_grid = write_child_grid;
+   nir_lower_returns(nir);
+   if (!agx_nir_mask_apple9_mesh_body(nir, &physical, NULL, reason))
+      return false;
+
+   /* Initialize the local grid record to (0, 0, 0) from physical lane 0 before
+    * the user body runs so early returns or shaders without a dynamic launch
+    * cleanly publish an empty 0-group child grid. */
+   impl = nir_shader_get_entrypoint(nir);
+   nir_builder entry = nir_builder_at(nir_before_impl(impl));
+   nir_push_if(&entry,
+               nir_ieq_imm(&entry, nir_load_local_invocation_index(&entry), 0));
+   for (unsigned c = 0; c < 3; ++c)
+      store_local(&entry, key->grid_root, nir_imm_int(&entry, 0),
+                  nir_imm_int(&entry, key->grid_offset_B + 4 * c), 32);
+   nir_pop_if(&entry, NULL);
+
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   /* Application stores (including payload writes and all three grid words
+    * from API lane 0) finish before the compiler-owned collective sees
+    * physical lanes 0..physical_threads-1. */
+   workgroup_rendezvous(&b);
+   if (options) {
+      /* Normalize any partial-zero child grid (e.g. (0, 5, 2)) to canonical
+       * (0, 0, 0) in both the local export record and the optional payload
+       * child-grid slot before the 3-lane grid export reads local memory. */
+      nir_push_if(&b, nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0));
+      nir_def *g[3];
+      for (unsigned c = 0; c < 3; ++c) {
+         g[c] = nir_load_local_apple9_agx(
+            &b, nir_imm_int(&b, key->grid_offset_B + 4 * c),
+            .base = key->grid_root);
+      }
+      nir_def *active =
+         nir_iand(&b, nir_iand(&b, nir_ine_imm(&b, g[0], 0),
+                               nir_ine_imm(&b, g[1], 0)),
+                  nir_ine_imm(&b, g[2], 0));
+      nir_def *base = write_child_grid
+                         ? nir_pack_64_2x32(
+                              &b, nir_load_native_pointer_apple9_agx(
+                                     &b, .base = key->payload_uniform))
+                         : NULL;
+      for (unsigned c = 0; c < 3; ++c) {
+         nir_def *word = nir_bcsel(&b, active, g[c], nir_imm_int(&b, 0));
+         store_local(&b, key->grid_root, word,
+                     nir_imm_int(&b, key->grid_offset_B + 4 * c), 32);
+         if (write_child_grid) {
+            nir_store_global(&b, word,
+                             nir_iadd_imm(&b, base, payload_stride_B + 4 * c),
+                             .align_mul = 4);
+         }
+      }
+      nir_pop_if(&b, NULL);
+      workgroup_rendezvous(&b);
+   }
+   if (info->task_payload_size_B || write_child_grid) {
+      nir_barrier(&b, .memory_scope = SCOPE_DEVICE,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_global);
+   }
+   nir_launch_mesh_workgroups_apple9_agx(&b, .base = key->grid_root,
+                                         .range_base = key->grid_offset_B);
+   info->requires_object_completion = false;
+   nir_progress(true, impl, nir_metadata_none);
+   nir_validate_shader(nir, "Apple9 native object workgroup expansion");
+   return true;
+}
+
+bool
 agx_nir_lower_apple9_native_object(
    nir_shader *nir, bool enable_native_mesh,
    const struct agx_apple9_mesh_key *key,
    struct agx_apple9_mesh_body_info *info, const char **reason)
 {
-   if (!enable_native_mesh)
-      return fail(reason, "native object development path is disabled");
-   if (!key || nir->info.stage != MESA_SHADER_TASK ||
-       nir->info.task_payload_size || nir->info.shared_size ||
-       (key->physical_threads &&
-        key->physical_threads != AGX_APPLE9_NATIVE_THREADS))
-      return fail(reason,
-                  "native object requires physical T16 without payload or user shared memory");
-   if (!agx_apple9_native_workgroup_supported(nir, reason))
-      return false;
-   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
-   unsigned launches = 0;
-   nir_foreach_block(block, impl) {
-      nir_foreach_instr(instr, block) {
-         if (instr->type == nir_instr_type_jump && !launches &&
-             nir_instr_as_jump(instr)->type == nir_jump_return)
-            return fail(reason, "native object return may bypass the grid launch");
-         if (instr->type != nir_instr_type_intrinsic)
-            continue;
-         nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
-         if (op == nir_intrinsic_launch_mesh_workgroups) {
-            if (block->cf_node.parent != &impl->cf_node)
-               return fail(reason,
-                           "native object requires one top-level API grid launch");
-            ++launches;
-         }
-         if (op == nir_intrinsic_load_task_payload ||
-             op == nir_intrinsic_store_task_payload)
-            return fail(reason, "native object payload is unqualified");
-      }
-   }
-   if (launches != 1)
-      return fail(reason, "native object requires one top-level API grid launch");
-   struct agx_apple9_mesh_key physical = *key;
-   physical.physical_threads = AGX_APPLE9_NATIVE_THREADS;
-   if (!agx_nir_lower_apple9_mesh(nir, &physical, info, reason))
-      return false;
-   nir_lower_returns(nir);
-   if (!agx_nir_mask_apple9_mesh_body(nir, &physical, NULL, reason))
-      return false;
-   nir_builder b = nir_builder_at(nir_after_impl(impl));
-   /* Application stores (including all three grid words from API lane 0)
-    * finish before the compiler-owned collective sees physical lanes 0..15.
-    * The callee's three-word export is independent of the API lane mask. */
-   workgroup_rendezvous(&b);
-   nir_launch_mesh_workgroups_apple9_agx(&b, .base = key->grid_root,
-                                        .range_base = key->grid_offset_B);
-   info->requires_object_completion = false;
-   nir_progress(true, impl, nir_metadata_none);
-   nir_validate_shader(nir, "Apple9 native object workgroup expansion");
-   return true;
+   return agx_nir_lower_apple9_native_object_ex(nir, enable_native_mesh, key,
+                                                NULL, info, reason);
 }

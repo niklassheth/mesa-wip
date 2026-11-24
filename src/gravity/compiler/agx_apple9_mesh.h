@@ -51,6 +51,8 @@ struct agx_apple9_mesh_key {
  * This compiler model does not qualify physical multi-subgroup execution. */
 #define AGX_APPLE9_NATIVE_SERIAL_THREADS 32
 #define AGX_APPLE9_NATIVE_MAX_INVOCATIONS 128
+/* Hardware task payload limit (16 KiB, matching Profile::PAYLOAD_BYTES). */
+#define AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES 16384u
 
 bool agx_apple9_native_workgroup_valid(const nir_shader *nir,
                                        unsigned max_invocations,
@@ -161,6 +163,15 @@ struct agx_apple9_mesh_body_info {
     * safe (1,1,1) dummy workgroup without running application instructions or
     * side effects. */
    bool guard_empty_grid;
+   /* Hardware task payload bytes (<= 16 KiB) and 16-byte aligned stride.
+    * When writes_child_grid is set, the object epilogue stores the emitted
+    * child mesh grid (3 x u32) at task_payload_stride_B so a paired native
+    * mesh shader reading gl_NumWorkGroups reads the child grid instead of the
+    * task draw grid. */
+   unsigned task_payload_size_B;
+   unsigned task_payload_stride_B;
+   bool writes_child_grid;
+   bool reads_native_payload;
    unsigned argument_uniform_words;
 };
 
@@ -233,13 +244,39 @@ bool agx_compile_apple9_taskless_object(
    bool enable_native_mesh, const struct agx_apple9_mesh_key *key,
    struct agx_shader_part *out, const char **reason);
 
-/* Bounded ordinary task NIR: one top-level grid launch, no application shared
- * memory or payload. Mask application effects, then reconverge the physical
- * workgroup for the collective call. Both entrypoints retain body_only. */
+/* Options for lowering real application MESA_SHADER_TASK shaders into native
+ * Apple9 OBJECT programs with optional 16 KiB task payload and child-grid
+ * handoff. NULL retains default payload stride with no child-grid write. */
+struct agx_apple9_native_object_options {
+   /* 16-byte aligned stride (bytes) for placing the optional 12-byte child-grid
+    * handoff after user payload bytes. Zero uses ALIGN_POT(task_payload_size, 16). */
+   unsigned payload_stride_B;
+   /* Store the emitted (x, y, z) child mesh grid to payload + task_payload_stride_B
+    * before OBJECT_GRID_EXPORT so a paired native mesh reading gl_NumWorkGroups
+    * receives the emitted child grid. */
+   bool write_child_grid;
+};
+
+/* Application or taskless task NIR -> native Apple9 OBJECT program.
+ * Supports 1..16 invocations at physical T16 or 1..128 invocations at physical
+ * T32 (serialized), user shared memory (<= 32 KiB minus grid header), task
+ * payload (<= 16 KiB) with loads/stores/atomics via AGX_APPLE9_MESH_PAYLOAD_UNIFORM,
+ * and 0/1/conditional launch_mesh_workgroups. Both entrypoints retain body_only. */
+bool agx_nir_lower_apple9_native_object_ex(
+   nir_shader *nir, bool enable_native_mesh,
+   const struct agx_apple9_mesh_key *key,
+   const struct agx_apple9_native_object_options *options,
+   struct agx_apple9_mesh_body_info *info, const char **reason);
 bool agx_nir_lower_apple9_native_object(
    nir_shader *nir, bool enable_native_mesh,
    const struct agx_apple9_mesh_key *key,
    struct agx_apple9_mesh_body_info *info, const char **reason);
+bool agx_compile_apple9_native_object_ex(
+   nir_shader *nir, bool enable_native_mesh,
+   const struct agx_apple9_mesh_key *key,
+   const struct agx_apple9_native_object_options *options,
+   struct agx_shader_part *out, struct agx_apple9_mesh_body_info *info,
+   const char **reason);
 bool agx_compile_apple9_native_object(
    nir_shader *nir, bool enable_native_mesh,
    const struct agx_apple9_mesh_key *key, struct agx_shader_part *out,
@@ -293,6 +330,12 @@ struct agx_apple9_native_mesh_options {
    /* Guard the lowered mesh body against GPU-zeroed grids (e.g. conditional
     * rendering) launched as a (1, 1, 1) dummy workgroup by the guarded object. */
    bool guard_empty_grid;
+   /* Mesh shader paired with a native hardware OBJECT stage: allow task payload
+    * up to AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES directly via
+    * AGX_APPLE9_MESH_PAYLOAD_UNIFORM, and lower load_num_workgroups from the
+    * emitted child grid at native_object_payload_stride_B. */
+   bool native_object_payload;
+   unsigned native_object_payload_stride_B;
    uint64_t outputs_flat, outputs_linear;
 };
 

@@ -190,7 +190,7 @@ record(struct hk_device *dev, const char *name, mesa_shader_stage producer,
    const struct agx_apple9_uniform_draw uniform = {0};
    uint64_t start = cpu_time_ns();
    CHECK(hk_apple9_record_draw(cmd, &cs, &pipeline, draw, expected ? 0x8000 : 0,
-                              native, program, &uniform));
+                              NULL, 0, native, program, &uniform));
    uint64_t ns = cpu_time_ns() - start;
    CHECK(cs.apple9_native_mesh == expected && cmd->vk.record_result == VK_SUCCESS);
    char file[256]; snprintf(file,sizeof(file),"%s.packet",name);

@@ -184,6 +184,8 @@ hk_hash_apple9_native_mesh_abi(struct mesa_blake3 *ctx)
       2, /* Destination-addressed publication rounds beyond 32 entries. */
       hk_apple9_native_task_bridge_enabled(),
       2, /* 2D/3D-linearized compute-task records and dynamic overflow bridge. */
+      hk_apple9_native_object_enabled(),
+      1, /* Phase 2 native hardware OBJECT -> MESH with 16 KiB task payload. */
       1, /* Guarded empty-grid taskless object/mesh for indirect & cond render. */
       1, /* Multiview native mesh layer lowering from root.draw.view_index. */
       1, /* Native-only indirect output-slot lowering without fallback bloat. */
@@ -230,6 +232,23 @@ hk_compiler_env_hash_init(void)
    free(vars);
 }
 
+static void
+hk_hash_apple9_native_object_cap(struct mesa_blake3 *ctx,
+                                 const struct hk_physical_device *pdev)
+{
+   const struct agx_native_object_support *no = &pdev->dev.native_object;
+   const bool avail = hk_apple9_native_object_available(pdev);
+   const uint32_t cap[] = {
+      avail,
+      avail ? (uint32_t)no->multi_parent : 0u,
+      avail ? no->payload_bytes : 0u,
+      avail ? no->max_threads : 0u,
+      avail ? no->max_shared : 0u,
+      avail ? no->max_groups : 0u,
+   };
+   _mesa_blake3_update(ctx, cap, sizeof(cap));
+}
+
 uint64_t
 hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
 {
@@ -242,7 +261,16 @@ hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
                     ((uint64_t)pdev->apple9_d3d_mip_rounding << 61) |
                     ((uint64_t)hk_apple9_native_index_enabled(pdev) << 60) |
                     ((uint64_t)hk_apple9_native_stage_policy(pdev) << 58);
-   return flags ^ hk_compiler_env_hash_value;
+   uint64_t native_obj_hash = 0;
+   if (hk_apple9_native_object_available(pdev)) {
+      struct mesa_blake3 ctx;
+      blake3_hash hash;
+      _mesa_blake3_init(&ctx);
+      hk_hash_apple9_native_object_cap(&ctx, pdev);
+      _mesa_blake3_final(&ctx, hash);
+      memcpy(&native_obj_hash, hash, sizeof(native_obj_hash));
+   }
+   return flags ^ hk_compiler_env_hash_value ^ native_obj_hash;
 }
 
 const nir_shader_compiler_options *
@@ -467,8 +495,10 @@ hk_hash_graphics_state(struct vk_physical_device *device,
    }
 
    if ((stages & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) &&
-       hk_apple9_native_mesh_available(pdev))
+       hk_apple9_native_mesh_available(pdev)) {
       hk_hash_apple9_native_mesh_abi(&blake3_ctx);
+      hk_hash_apple9_native_object_cap(&blake3_ctx, pdev);
+   }
 
    enum hk_feature_key feature_key = hk_make_feature_key(features);
    _mesa_blake3_update(&blake3_ctx, &feature_key, sizeof(feature_key));
@@ -676,7 +706,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 }
 
 /* Version the container independently of the hardware programs it owns. */
-#define HK_SHADER_CONTAINER_VERSION 0x484b0013u
+#define HK_SHADER_CONTAINER_VERSION 0x484b0014u
 
 static VkResult
 hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *blob,
@@ -730,9 +760,13 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
        (obj->apple9_native_stage_mask == HK_APPLE9_NATIVE_TES_BIT)) &&
       (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_TESS_CTRL ||
        stage == MESA_SHADER_TESS_EVAL);
+   bool task_leaf =
+      (hk_apple9_native_task_bridge_enabled() ||
+       hk_apple9_native_object_available_device(dev)) &&
+      stage == MESA_SHADER_TASK;
    if (blob->overrun ||
        (obj->apple9_native_leaf && stage != MESA_SHADER_MESH &&
-        stage != MESA_SHADER_FRAGMENT && !gs_leaf && !tess_leaf)) {
+        stage != MESA_SHADER_FRAGMENT && !gs_leaf && !tess_leaf && !task_leaf)) {
       hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
    }
@@ -743,6 +777,37 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return result;
+      }
+   }
+   /* Revalidate cached native task/mesh realizations against this VM's latched
+    * Phase 2 object capability and limits so a mode downgrade rebuilds cleanly
+    * (e.g. selecting Task Bridge) instead of accepting a stale Phase 2 leaf. */
+   if (obj->apple9_native_leaf && stage == MESA_SHADER_TASK) {
+      const struct hk_shader *t = &obj->variants[0];
+      if (t->info.apple9_native_stage == HK_APPLE9_NATIVE_OBJECT) {
+         if (!hk_apple9_native_object_available_device(dev) ||
+             t->info.apple9_native.key.physical_threads >
+                dev->dev.native_object.max_threads ||
+             t->info.apple9_native.task_payload_size_B >
+                dev->dev.native_object.payload_bytes ||
+             (t->info.apple9_native.writes_child_grid &&
+              !dev->dev.native_object.payload_bytes) ||
+             hk_apple9_native_object_tg_memory_bytes(&t->info.apple9_native) >
+                dev->dev.native_object.max_shared) {
+            hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
+            return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+         }
+      } else if (!hk_apple9_native_task_bridge_enabled()) {
+         hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      }
+   } else if (obj->apple9_native_leaf && stage == MESA_SHADER_MESH) {
+      const struct hk_mesh_info *mi = &obj->variants[HK_MESH_VARIANT_MAIN].info.mesh;
+      if ((mi->native_object &&
+           !hk_apple9_native_object_available_device(dev)) ||
+          (mi->native_task_bridge && !hk_apple9_native_task_bridge_enabled())) {
+         hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       }
    }
    obj->writes_memory = blob_read_uint8(blob);

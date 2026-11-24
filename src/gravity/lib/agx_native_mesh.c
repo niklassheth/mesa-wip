@@ -242,6 +242,86 @@ agx_native_blocks_probe(int drm_fd)
    return agx_native_blocks_parse(text, size);
 }
 
+/* asahi-native-object v1 generation=<G> profile=<qualified|research|none>
+ * multi_parent=<0|1> payload_bytes=<B> max_threads=<T> max_shared=<S>
+ * max_groups=<M>\n, exact single spaces. Fails closed on any mismatch. */
+struct agx_native_object_support
+agx_native_object_parse(const char *text, size_t size)
+{
+   const struct agx_native_object_support no = {0};
+   if (!text || !size || size > AGX_NATIVE_MESH_ADVERTISEMENT_MAX ||
+       text[size - 1] != '\n')
+      return no;
+   size_t pos = 0, end = size - 1;
+   uint64_t generation, multi_parent, payload_bytes, max_threads, max_shared,
+      max_groups;
+   enum agx_native_mesh_profile profile;
+   if (!parse_literal(text, end, &pos, "asahi-native-object v1 generation=") ||
+       !parse_decimal(text, end, &pos, AGX_NATIVE_MESH_GENERATION_MAX,
+                      &generation))
+      return no;
+   if (parse_literal(text, end, &pos, " profile=qualified"))
+      profile = AGX_NATIVE_MESH_PROFILE_QUALIFIED;
+   else if (parse_literal(text, end, &pos, " profile=research"))
+      profile = AGX_NATIVE_MESH_PROFILE_RESEARCH;
+   else if (parse_literal(text, end, &pos, " profile=none"))
+      profile = AGX_NATIVE_MESH_PROFILE_NONE;
+   else
+      return no;
+   if (!parse_literal(text, end, &pos, " multi_parent=") ||
+       !parse_decimal(text, end, &pos, 1, &multi_parent) ||
+       !parse_literal(text, end, &pos, " payload_bytes=") ||
+       !parse_decimal(text, end, &pos, AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES,
+                      &payload_bytes) ||
+       !parse_literal(text, end, &pos, " max_threads=") ||
+       !parse_decimal(text, end, &pos, AGX_NATIVE_OBJECT_MAX_THREADS,
+                      &max_threads) ||
+       !parse_literal(text, end, &pos, " max_shared=") ||
+       !parse_decimal(text, end, &pos, AGX_NATIVE_OBJECT_MAX_SHARED_BYTES,
+                      &max_shared) ||
+       !parse_literal(text, end, &pos, " max_groups=") ||
+       !parse_decimal(text, end, &pos, AGX_NATIVE_OBJECT_MAX_GROUPS,
+                      &max_groups) ||
+       pos != end)
+      return no;
+   if (profile == AGX_NATIVE_MESH_PROFILE_NONE) {
+      if (multi_parent || payload_bytes || max_threads != 16 || max_shared ||
+          max_groups != 1)
+         return no;
+      return (struct agx_native_object_support){
+         .profile = AGX_NATIVE_MESH_PROFILE_NONE,
+         .generation = generation,
+         .max_threads = 16,
+         .max_groups = 1,
+      };
+   }
+   if (!multi_parent || !payload_bytes ||
+       (max_threads != 16 && max_threads != 32) || !max_shared ||
+       max_groups < 2)
+      return no;
+   return (struct agx_native_object_support){
+      .profile = profile,
+      .generation = generation,
+      .multi_parent = true,
+      .payload_bytes = payload_bytes,
+      .max_threads = max_threads,
+      .max_shared = max_shared,
+      .max_groups = max_groups,
+   };
+}
+
+struct agx_native_object_support
+agx_native_object_probe(int drm_fd)
+{
+   const struct agx_native_object_support no = {0};
+   char text[AGX_NATIVE_MESH_ADVERTISEMENT_MAX + 1];
+   size_t size = 0;
+   if (read_attribute(drm_fd, "asahi_native_object", text, sizeof(text),
+                      &size) != AGX_ATTR_READ_OK || !size)
+      return no;
+   return agx_native_object_parse(text, size);
+}
+
 bool
 agx_native_mesh_parse_disabled(const char *text, size_t size)
 {

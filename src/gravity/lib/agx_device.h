@@ -99,6 +99,10 @@ struct agx_device {
    /* The VM's latched asahi_native_blocks profile; qualified only together
     * with native_mesh_qualified, at the same generation. */
    struct agx_native_blocks_support native_blocks;
+   /* The VM's latched asahi_native_object profile (Phase 2 multi-parent
+    * OBJECT -> MESH with 16 KiB task payload), sampled at the same generation
+    * as asahi_native_mesh around VM_CREATE. */
+   struct agx_native_object_support native_object;
 
    /* VM handle */
    uint32_t vm_id;

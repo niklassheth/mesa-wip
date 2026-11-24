@@ -92,3 +92,54 @@ agx_native_blocks_same(struct agx_native_blocks_support before,
           before.max_native == after.max_native &&
           before.mixed == after.mixed && before.words == after.words;
 }
+
+/* asahi_native_object (driver-local, beside asahi_native_mesh): whether the
+ * VM's kernel admits Phase 2 multi-parent native OBJECT -> MESH dispatches
+ * with 16 KiB task payload and up to 32 KiB object shared memory. Shares the
+ * same atomic generation counter as asahi_native_mesh. */
+#define AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES 16384u
+#define AGX_NATIVE_OBJECT_MAX_THREADS 32u
+#define AGX_NATIVE_OBJECT_MAX_SHARED_BYTES 32768u
+#define AGX_NATIVE_OBJECT_MAX_GROUPS ((1u << 20) - 1)
+
+struct agx_native_object_support {
+   enum agx_native_mesh_profile profile;
+   uint64_t generation;
+   bool multi_parent;
+   uint32_t payload_bytes;
+   uint32_t max_threads;
+   uint32_t max_shared;
+   uint32_t max_groups;
+};
+
+struct agx_native_object_support
+agx_native_object_parse(const char *text, size_t size);
+
+struct agx_native_object_support agx_native_object_probe(int drm_fd);
+
+static inline bool
+agx_native_object_enabled(const struct agx_native_object_support *o)
+{
+   return o &&
+          (o->profile == AGX_NATIVE_MESH_PROFILE_QUALIFIED ||
+           o->profile == AGX_NATIVE_MESH_PROFILE_RESEARCH) &&
+          o->multi_parent && o->payload_bytes &&
+          o->payload_bytes <= AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES &&
+          (o->max_threads == 16 || o->max_threads == 32) &&
+          o->max_shared && o->max_shared <= AGX_NATIVE_OBJECT_MAX_SHARED_BYTES &&
+          o->max_groups && o->max_groups <= AGX_NATIVE_OBJECT_MAX_GROUPS;
+}
+
+static inline bool
+agx_native_object_same(struct agx_native_object_support before,
+                       struct agx_native_object_support after)
+{
+   return agx_native_object_enabled(&before) &&
+          before.profile == after.profile &&
+          before.generation == after.generation &&
+          before.multi_parent == after.multi_parent &&
+          before.payload_bytes == after.payload_bytes &&
+          before.max_threads == after.max_threads &&
+          before.max_shared == after.max_shared &&
+          before.max_groups == after.max_groups;
+}

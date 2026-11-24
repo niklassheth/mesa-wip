@@ -8993,7 +8993,8 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
        * mesh NumWorkGroups must read the task-launch counts here instead
        * of the direct draw grid. */
       .groups_argument = resources->native_key &&
-                               nir->info.stage == MESA_SHADER_MESH
+                               (nir->info.stage == MESA_SHADER_MESH ||
+                                nir->info.stage == MESA_SHADER_TASK)
                             ? AGX_APPLE9_MESH_DRAW_UNIFORM / 2
                             : resources->descriptor_tables
                                  ? AGX_APPLE9_COMPUTE_GROUPS_ROOT : 0,
@@ -9005,10 +9006,12 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
       .structured_cf = apple9_cf_list_has_control_flow(&impl->body),
    };
    if (nir->info.shared_size) {
-      /* Native mesh shared offsets were rebased after the output planes.
-       * Both regions use one local root and one bounded allocation. */
+      /* Native mesh shared offsets were rebased after the output planes;
+       * native object shared offsets were rebased after the grid record. */
       lower.shared_root = resources->native_key
-         ? resources->native_key->output_root
+         ? (nir->info.stage == MESA_SHADER_TASK
+               ? resources->native_key->grid_root
+               : resources->native_key->output_root)
          : resources->descriptor_tables
               ? AGX_APPLE9_COMPUTE_SHARED_ARGUMENT
               : lower.argument_base + apple9_buffer_argument(
@@ -10391,13 +10394,26 @@ agx_compile_apple9_taskless_object(
 }
 
 bool
+agx_compile_apple9_native_object_ex(
+   nir_shader *nir, bool enable_native_mesh,
+   const struct agx_apple9_mesh_key *key,
+   const struct agx_apple9_native_object_options *options,
+   struct agx_shader_part *out, struct agx_apple9_mesh_body_info *info,
+   const char **reason)
+{
+   memset(out, 0, sizeof(*out));
+   if (!agx_nir_lower_apple9_native_object_ex(nir, enable_native_mesh, key,
+                                              options, info, reason))
+      return false;
+   return agx_compile_apple9_mesh_lowered(nir, &info->key, out, reason);
+}
+
+bool
 agx_compile_apple9_native_object(
    nir_shader *nir, bool enable_native_mesh,
    const struct agx_apple9_mesh_key *key, struct agx_shader_part *out,
    struct agx_apple9_mesh_body_info *info, const char **reason)
 {
-   if (!agx_nir_lower_apple9_native_object(nir, enable_native_mesh, key, info,
-                                         reason))
-      return false;
-   return agx_compile_apple9_mesh_lowered(nir, &info->key, out, reason);
+   return agx_compile_apple9_native_object_ex(nir, enable_native_mesh, key,
+                                              NULL, out, info, reason);
 }

@@ -51,6 +51,9 @@ if with_tests
   test('gravity-native-blocks-advertisement', executable('gravity-native-blocks-advertisement',
     'tests/test-native-blocks-advertisement.c', 'agx_native_mesh.c'),
     suite : ['gravity'])
+  test('gravity-native-object-advertisement', executable('gravity-native-object-advertisement',
+    'tests/test-native-object-advertisement.c', 'agx_native_mesh.c'),
+    suite : ['gravity'])
   test('gravity-apple9-draw-tables', executable('gravity-apple9-draw-tables',
     'tests/test-apple9-draw-tables.c',
     include_directories : [inc_gravity],

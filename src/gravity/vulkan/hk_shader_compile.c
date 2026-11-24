@@ -1448,9 +1448,15 @@ static struct agx_apple9_native_mesh_options
 hk_apple9_native_mesh_options(nir_shader *nir,
                               const struct hk_apple9_graphics_key *key)
 {
-   bool rounds = hk_apple9_native_mesh_round_shape_eligible(nir);
-   bool packed = (key->native_index || hk_apple9_native_mesh_enabled()) &&
+   bool rounds =
+      hk_apple9_native_mesh_round_shape_eligible_ex(nir, key->native_object);
+   bool packed = !key->native_object &&
+                 (key->native_index || hk_apple9_native_mesh_enabled()) &&
                  hk_apple9_native_mesh_packed_shape_eligible(nir);
+   unsigned payload_B =
+      key->native_object
+         ? MAX2(nir->info.task_payload_size, key->native_object_payload_B)
+         : 0;
    return (struct agx_apple9_native_mesh_options){
       .physical_threads = rounds ? AGX_APPLE9_NATIVE_SERIAL_THREADS
                                  : hk_apple9_native_mesh_threads(nir->info.workgroup_size),
@@ -1468,7 +1474,11 @@ hk_apple9_native_mesh_options(nir_shader *nir,
       .layer_viewport = hk_apple9_native_mesh_primitive_lowering_enabled(),
       .guard_empty_grid = hk_apple9_native_mesh_enabled() &&
                           !key->native_task_bridge &&
+                          !key->native_object &&
                           !key->native_stage_generated,
+      .native_object_payload = key->native_object,
+      .native_object_payload_stride_B =
+         key->native_object ? ALIGN_POT(payload_B, 16) : 0,
       .outputs_flat = key->vertex.outputs_flat,
       .outputs_linear = key->vertex.outputs_linear,
    };
@@ -1548,6 +1558,85 @@ hk_apple9_lower_native_mesh_multiview(nir_shader *nir)
    nir->info.per_primitive_outputs |= VARYING_BIT_LAYER;
    nir_progress(true, impl, nir_metadata_none);
    return true;
+}
+
+static bool
+hk_apple9_nir_reads_num_workgroups(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_load_num_workgroups)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static VkResult
+hk_apple9_native_object_check(struct hk_device *dev, nir_shader *task,
+                              nir_shader *mesh,
+                              const struct hk_apple9_graphics_key *key,
+                              bool *supported, const char **reason)
+{
+   *supported = false;
+   if (reason)
+      *reason = NULL;
+   if (!hk_apple9_native_object_available_device(dev) || !task || !mesh ||
+       !key->native_object || key->line_stipple)
+      return VK_SUCCESS;
+
+   unsigned physical_threads =
+      hk_apple9_native_mesh_threads(task->info.workgroup_size);
+   if (!physical_threads ||
+       physical_threads > dev->dev.native_object.max_threads) {
+      if (reason)
+         *reason = "native object workgroup exceeds kernel thread limit";
+      return VK_SUCCESS;
+   }
+   if (key->native_object_payload_B > dev->dev.native_object.payload_bytes ||
+       task->info.task_payload_size > dev->dev.native_object.payload_bytes ||
+       mesh->info.task_payload_size > dev->dev.native_object.payload_bytes ||
+       (key->native_object_write_child_grid &&
+        !dev->dev.native_object.payload_bytes)) {
+      if (reason)
+         *reason = "native object task payload exceeds kernel payload limit";
+      return VK_SUCCESS;
+   }
+   /* Dynamic unbounded EmitMeshTasksEXT counts cannot be bounded against the
+    * single-render TVB/ring cap at draw time; let those use the task bridge
+    * (which supports runtime overflow to emulation) instead of failing at draw. */
+   if (hk_nir_task_mesh_bound(task) == UINT32_MAX) {
+      if (reason)
+         *reason = "native object requires bounded EmitMeshTasksEXT count";
+      return VK_SUCCESS;
+   }
+
+   nir_shader *task_probe = nir_shader_clone(NULL, task);
+   if (!task_probe)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   struct agx_apple9_mesh_key k = AGX_APPLE9_MESH_KEY;
+   k.physical_threads = physical_threads;
+   struct agx_apple9_native_object_options opts = {
+      .payload_stride_B = ALIGN_POT(key->native_object_payload_B, 16),
+      .write_child_grid = key->native_object_write_child_grid,
+   };
+   struct agx_apple9_mesh_body_info task_info;
+   bool task_ok = agx_nir_lower_apple9_native_object_ex(
+      task_probe, true, &k, &opts, &task_info, reason);
+   ralloc_free(task_probe);
+   if (!task_ok)
+      return VK_SUCCESS;
+   if (hk_apple9_native_object_tg_memory_bytes(&task_info) >
+       dev->dev.native_object.max_shared) {
+      if (reason)
+         *reason = "native object shared allocation exceeds kernel limit";
+      return VK_SUCCESS;
+   }
+   return hk_apple9_native_mesh_check(mesh, key, supported, reason);
 }
 
 /* Native incompatibility is a capability result, not a Vulkan error. Run the
@@ -1792,6 +1881,7 @@ hk_apple9_compile_native_mesh(struct hk_device *dev, nir_shader *nir,
    struct hk_shader *object = hk_native_producer_object(obj);
    hk_mesh_gather_info(nir, &mesh->info.mesh);
    mesh->info.mesh.native_task_bridge = key->native_task_bridge;
+   mesh->info.mesh.native_object = key->native_object;
    /* The API object may be GS; this program executes at the mesh stage. */
    mesh->info.stage = MESA_SHADER_MESH;
    mesh->info.apple9_native_stage = HK_APPLE9_NATIVE_MESH;
@@ -1828,6 +1918,12 @@ hk_apple9_compile_native_mesh(struct hk_device *dev, nir_shader *nir,
    if (result != VK_SUCCESS)
       return result;
 
+   /* When paired with a real application MESA_SHADER_TASK compiled as a native
+    * OBJECT shader, the task stage's native leaf owns HK_APPLE9_NATIVE_OBJECT;
+    * no taskless stub object is needed on the mesh shader. */
+   if (key->native_object)
+      return VK_SUCCESS;
+
    struct agx_apple9_mesh_key k = AGX_APPLE9_MESH_KEY;
    nir_shader *generated =
       obj->vk.stage == MESA_SHADER_TESS_EVAL
@@ -1861,6 +1957,60 @@ hk_apple9_compile_native_mesh(struct hk_device *dev, nir_shader *nir,
    }
    ralloc_free(generated);
    return result;
+}
+
+/* Real application MESA_SHADER_TASK compiled directly as an Apple9 hardware
+ * OBJECT stage with <= 16 KiB task payload and <= 32 KiB shared memory. */
+static VkResult
+hk_apple9_compile_native_object(struct hk_device *dev, nir_shader *nir,
+                                struct hk_shader *shader,
+                                const struct hk_apple9_graphics_key *key,
+                                const char **reason, bool *unsupported)
+{
+   unsigned physical_threads =
+      hk_apple9_native_mesh_threads(nir->info.workgroup_size);
+   if (!physical_threads ||
+       physical_threads > dev->dev.native_object.max_threads) {
+      if (reason)
+         *reason = "native object workgroup exceeds kernel thread limit";
+      *unsupported = true;
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   shader->info.task.payload_B = nir->info.task_payload_size;
+   shader->info.task.max_mesh_groups = hk_nir_task_mesh_bound(nir);
+   shader->info.stage = MESA_SHADER_TASK;
+   shader->info.apple9_native_stage = HK_APPLE9_NATIVE_OBJECT;
+   hk_apple9_lower_prerast_sysvals(nir, MESA_SHADER_COMPUTE);
+   NIR_PASS(_, nir, nir_opt_dce);
+   hk_assert_final_push_mask(nir, shader);
+
+   struct agx_apple9_mesh_key k = AGX_APPLE9_MESH_KEY;
+   k.physical_threads = physical_threads;
+   struct agx_apple9_native_object_options opts = {
+      .payload_stride_B = ALIGN_POT(
+         MAX2(nir->info.task_payload_size, key->native_object_payload_B), 16),
+      .write_child_grid = key->native_object_write_child_grid,
+   };
+   bool compiled = agx_compile_apple9_native_object_ex(
+      nir, hk_apple9_native_mesh_available(hk_device_physical(dev)),
+      &k, &opts, &shader->b, &shader->info.apple9_native, reason);
+   shader->code_ptr = shader->b.binary;
+   shader->code_size = shader->b.info.binary_size;
+   if (!compiled) {
+      *unsupported = true;
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   if (!hk_apple9_native_shader_valid(&shader->b.info,
+                                      &shader->info.apple9_native,
+                                      HK_APPLE9_NATIVE_OBJECT) ||
+       shader->info.apple9_native.task_payload_size_B >
+          dev->dev.native_object.payload_bytes ||
+       hk_apple9_native_object_tg_memory_bytes(&shader->info.apple9_native) >
+          dev->dev.native_object.max_shared) {
+      *unsupported = true;
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   return hk_apple9_finish_shader(dev, shader, nir);
 }
 
 /* Task shaders run as compute kernels writing their payloads and the grids of
@@ -2248,7 +2398,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
       simple_mtx_lock(lock);
 
    memset(out, 0, count * sizeof(*out));
-   if (native_mesh && !key.native_task_bridge) {
+   if (native_mesh && !key.native_task_bridge && !key.native_object) {
       for (unsigned i = 0; i < count; ++i) {
          if (infos[i].stage == MESA_SHADER_TASK) {
             reason = "native mesh does not support API task shaders";
@@ -2849,7 +2999,12 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
             varyings = shader->b.info.apple9_varyings;
             continue;
          } else if (stage == MESA_SHADER_TASK) {
-            result = hk_apple9_compile_task(dev, nir, shader, &reason);
+            if (native_mesh && key.native_object) {
+               result = hk_apple9_compile_native_object(
+                  dev, nir, shader, &key, &reason, native_unsupported);
+            } else {
+               result = hk_apple9_compile_task(dev, nir, shader, &reason);
+            }
             if (result != VK_SUCCESS)
                goto done;
             continue;
@@ -3165,7 +3320,7 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
       }
    }
 
-   nir_shader *mesh = NULL, *gs = NULL, *tes = NULL;
+   nir_shader *mesh = NULL, *task_nir = NULL, *gs = NULL, *tes = NULL;
    bool task = false, tess = false, per_vertex = false, fs_inputs = false;
    bool producer_effects = false;
    for (unsigned i = 0; i < count; ++i) {
@@ -3173,6 +3328,8 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
          producer_effects |= infos[i].nir->info.writes_memory || infos[i].nir->xfb_info;
       if (infos[i].stage == MESA_SHADER_MESH)
          mesh = infos[i].nir;
+      if (infos[i].stage == MESA_SHADER_TASK)
+         task_nir = infos[i].nir;
       if (infos[i].stage == MESA_SHADER_GEOMETRY)
          gs = infos[i].nir;
       if (infos[i].stage == MESA_SHADER_TESS_EVAL)
@@ -3199,25 +3356,50 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
    }
 
    bool native = false;
+   bool bridge_fallback = false;
    VkResult result = VK_SUCCESS;
    const char *reason = NULL;
-   key.native_task_bridge = mesh && task && hk_apple9_native_task_bridge_enabled();
-   if (mesh && (!task || key.native_task_bridge) &&
-       !per_vertex && !key.polygon_points)
+   if (mesh && task && !per_vertex && !key.polygon_points) {
+      if (hk_apple9_native_object_available_device(dev)) {
+         key.native_object = true;
+         key.native_object_payload_B =
+            MAX2(task_nir->info.task_payload_size, mesh->info.task_payload_size);
+         key.native_object_write_child_grid =
+            hk_apple9_nir_reads_num_workgroups(mesh);
+         result = hk_apple9_native_object_check(dev, task_nir, mesh, &key,
+                                                &native, &reason);
+         if (result == VK_SUCCESS && native) {
+            bridge_fallback = hk_apple9_native_task_bridge_enabled();
+         } else {
+            key.native_object = false;
+            key.native_object_payload_B = 0;
+            key.native_object_write_child_grid = false;
+         }
+      }
+      if (result == VK_SUCCESS && !native &&
+          hk_apple9_native_task_bridge_enabled()) {
+         key.native_task_bridge = true;
+         result = hk_apple9_native_mesh_check(mesh, &key, &native, &reason);
+         if (!native)
+            key.native_task_bridge = false;
+      }
+   } else if (mesh && !task && !per_vertex && !key.polygon_points) {
       result = hk_apple9_native_mesh_check(mesh, &key, &native, &reason);
-   else if (gs && !mesh && !task && !tess && !per_vertex &&
+   } else if (gs && !mesh && !task && !tess && !per_vertex &&
             (!fs_inputs || hk_apple9_native_gs_enabled()) &&
             !producer_effects &&
-            !key.polygon_points && !key.line_stipple)
+            !key.polygon_points && !key.line_stipple) {
       result = hk_apple9_native_gs_check(gs, &key, &native, &reason);
-   else if (tes && !gs && !mesh && !task && !per_vertex &&
+   } else if (tes && !gs && !mesh && !task && !per_vertex &&
             (!fs_inputs || hk_apple9_native_tess_enabled()) &&
             !producer_effects &&
-            !key.polygon_points && !key.line_stipple)
+            !key.polygon_points && !key.line_stipple) {
       result = hk_apple9_native_tess_check(tes, &key, &native, &reason);
+   }
 
    struct vk_shader_compile_info native_infos[HK_APPLE9_GFX_STAGES] = {0};
-   unsigned cloned = 0;
+   struct vk_shader_compile_info bridge_infos[HK_APPLE9_GFX_STAGES] = {0};
+   unsigned cloned = 0, bridge_cloned = 0;
    if (result == VK_SUCCESS && native) {
       for (; cloned < count; ++cloned) {
          native_infos[cloned] = infos[cloned];
@@ -3228,7 +3410,20 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
          }
       }
    }
+   if (result == VK_SUCCESS && native && bridge_fallback) {
+      for (; bridge_cloned < count; ++bridge_cloned) {
+         bridge_infos[bridge_cloned] = infos[bridge_cloned];
+         bridge_infos[bridge_cloned].nir =
+            nir_shader_clone(NULL, infos[bridge_cloned].nir);
+         if (!bridge_infos[bridge_cloned].nir) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            break;
+         }
+      }
+   }
    if (result != VK_SUCCESS) {
+      for (unsigned i = 0; i < bridge_cloned; ++i)
+         ralloc_free(bridge_infos[i].nir);
       for (unsigned i = 0; i < cloned; ++i)
          ralloc_free(native_infos[i].nir);
       for (unsigned i = 0; i < count; ++i)
@@ -3242,6 +3437,8 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
       result = hk_apple9_compile_graphics_path(
          dev, count, infos, state, &key, fs_interp, alloc, out, false, NULL);
       if (result != VK_SUCCESS || !native) {
+         for (unsigned i = 0; i < bridge_cloned; ++i)
+            ralloc_free(bridge_infos[i].nir);
          for (unsigned i = 0; i < cloned; ++i)
             ralloc_free(native_infos[i].nir);
          return result;
@@ -3254,6 +3451,38 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
                                            &key, fs_interp, alloc,
                                            native_out, true,
                                            &native_unsupported);
+   if (native_unsupported && bridge_cloned) {
+      /* Native object failed late (e.g. spill or returned-atomic frame): retry
+       * the widened Task Bridge before falling back to emulation. */
+      assert(result == VK_ERROR_FEATURE_NOT_PRESENT);
+      key.native_object = false;
+      key.native_object_payload_B = 0;
+      key.native_object_write_child_grid = false;
+      key.native_task_bridge = true;
+      bool bridge_ok = false;
+      nir_shader *bridge_mesh = NULL;
+      for (unsigned i = 0; i < count; ++i) {
+         if (bridge_infos[i].stage == MESA_SHADER_MESH)
+            bridge_mesh = bridge_infos[i].nir;
+      }
+      result = bridge_mesh
+                  ? hk_apple9_native_mesh_check(bridge_mesh, &key, &bridge_ok,
+                                                &reason)
+                  : VK_SUCCESS;
+      if (result == VK_SUCCESS && bridge_ok) {
+         native_unsupported = false;
+         memset(native_out, 0, sizeof(native_out));
+         result = hk_apple9_compile_graphics_path(dev, count, bridge_infos,
+                                                  state, &key, fs_interp, alloc,
+                                                  native_out, true,
+                                                  &native_unsupported);
+         bridge_cloned = 0;
+      } else if (result == VK_SUCCESS) {
+         result = VK_ERROR_FEATURE_NOT_PRESENT;
+      }
+   }
+   for (unsigned i = 0; i < bridge_cloned; ++i)
+      ralloc_free(bridge_infos[i].nir);
    if (native_unsupported) {
       assert(result == VK_ERROR_FEATURE_NOT_PRESENT);
       /* Allocation failures remain real Vulkan errors. Only a native-only

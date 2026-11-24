@@ -24,23 +24,32 @@ agx_apple9_native_mesh_shape_eligible(const nir_shader *nir)
 
 static bool
 eligible(nir_shader *nir, unsigned physical_threads, bool packed_indices,
-         const char **reason)
+         bool allow_task_payload, const char **reason)
 {
+   if (allow_task_payload &&
+       nir->info.task_payload_size > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES)
+      return fail(reason, "native mesh task payload exceeds 16 KiB hardware limit");
    if (packed_indices) {
       /* This compiler option does not widen the driver's native shape
        * predicate. Publication repeats in rounds of at most
        * AGX_APPLE9_PUBLICATION_ROUND entries, so the API maxima are covered,
        * subject to the local output allocation. */
-      if (nir->info.stage != MESA_SHADER_MESH || nir->info.task_payload_size ||
+      if (nir->info.stage != MESA_SHADER_MESH ||
+          (!allow_task_payload && nir->info.task_payload_size) ||
           !agx_apple9_mesh_indices_per_primitive(nir->info.mesh.primitive_type) ||
           !nir->info.mesh.max_vertices_out ||
           nir->info.mesh.max_vertices_out > 256 ||
           !nir->info.mesh.max_primitives_out ||
           nir->info.mesh.max_primitives_out > 256)
          return fail(reason, "packed index candidate requires V1..256 P1..256 points, lines or triangles");
-   } else if (!agx_apple9_native_mesh_shape_eligible(nir))
+   } else if (nir->info.stage != MESA_SHADER_MESH ||
+              (!allow_task_payload && nir->info.task_payload_size) ||
+              nir->info.mesh.max_vertices_out != 3 ||
+              nir->info.mesh.max_primitives_out != 1 ||
+              nir->info.mesh.primitive_type != MESA_PRIM_TRIANGLES) {
       return fail(reason,
                   "native mesh development class requires V3 P1 triangles without payload");
+   }
    if (physical_threads == AGX_APPLE9_NATIVE_THREADS) {
       if (!agx_apple9_native_workgroup_supported(nir, reason))
          return false;
@@ -844,6 +853,30 @@ lower_indirect_io_slots(nir_shader *nir)
    return true;
 }
 
+struct native_child_grid_lower {
+   unsigned payload_uniform;
+   unsigned grid_offset_B;
+   bool lowered;
+};
+
+static bool
+lower_native_mesh_child_num_workgroups(nir_builder *b,
+                                       nir_intrinsic_instr *intr, void *data)
+{
+   struct native_child_grid_lower *st = data;
+   if (intr->intrinsic != nir_intrinsic_load_num_workgroups)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *base = nir_pack_64_2x32(
+      b, nir_load_native_pointer_apple9_agx(b, .base = st->payload_uniform));
+   nir_def *addr = nir_iadd_imm(b, base, st->grid_offset_B);
+   nir_def *nwg = nir_load_global(b, 3, 32, addr, .align_mul = 4,
+                                  .access = ACCESS_NON_WRITEABLE);
+   nir_def_replace(&intr->def, nir_u2uN(b, nwg, intr->def.bit_size));
+   st->lowered = true;
+   return true;
+}
+
 bool
 agx_nir_lower_apple9_native_mesh(
    nir_shader *nir, bool enable_native_mesh,
@@ -856,7 +889,9 @@ agx_nir_lower_apple9_native_mesh(
                                   ? options->physical_threads
                                   : AGX_APPLE9_NATIVE_THREADS;
    bool packed_indices = options && options->packed_index_publication;
-   if (!eligible(nir, physical_threads, packed_indices, reason))
+   bool native_object_payload = options && options->native_object_payload;
+   if (!eligible(nir, physical_threads, packed_indices, native_object_payload,
+                 reason))
       return false;
 
    if (packed_indices && options->primitive_broadcast)
@@ -893,6 +928,33 @@ agx_nir_lower_apple9_native_mesh(
                                     glsl_get_natural_size_align_bytes);
    nir_lower_explicit_io(nir, nir_var_mem_shared, nir_address_format_32bit_offset);
    nir_remove_dead_variables(nir, nir_var_mem_shared, NULL);
+
+   unsigned payload_stride_B = 0;
+   struct native_child_grid_lower child_grid = {0};
+   if (native_object_payload) {
+      nir_remove_dead_variables(nir, nir_var_mem_task_payload, NULL);
+      nir_lower_vars_to_explicit_types(nir, nir_var_mem_task_payload,
+                                       glsl_get_natural_size_align_bytes);
+      nir_lower_explicit_io(nir, nir_var_mem_task_payload,
+                            nir_address_format_32bit_offset);
+      nir_remove_dead_variables(nir, nir_var_mem_task_payload, NULL);
+      if (nir->info.task_payload_size > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES)
+         return fail(reason,
+                     "native mesh task payload exceeds 16 KiB hardware limit");
+      unsigned min_stride = ALIGN_POT(nir->info.task_payload_size, 16);
+      payload_stride_B = options->native_object_payload_stride_B
+                            ? options->native_object_payload_stride_B
+                            : min_stride;
+      if ((payload_stride_B & 15) || payload_stride_B < min_stride ||
+          payload_stride_B > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES)
+         return fail(reason, "native mesh task payload stride is invalid");
+      child_grid = (struct native_child_grid_lower){
+         .payload_uniform = AGX_APPLE9_MESH_PAYLOAD_UNIFORM,
+         .grid_offset_B = payload_stride_B,
+      };
+      nir_shader_intrinsics_pass(nir, lower_native_mesh_child_num_workgroups,
+                                 nir_metadata_control_flow, &child_grid);
+   }
 
    struct cull_storage cull = {
       .clip = nir->info.clip_distance_array_size,
@@ -985,6 +1047,11 @@ agx_nir_lower_apple9_native_mesh(
    key.physical_threads = physical_threads;
    if (!agx_nir_lower_apple9_mesh(nir, &key, info, reason))
       return false;
+   if (native_object_payload) {
+      info->task_payload_stride_B = payload_stride_B;
+      info->reads_native_payload =
+         info->task_payload_size_B > 0 || child_grid.lowered;
+   }
    memcpy(info->logical_size, logical_size, sizeof(logical_size));
    info->primitive_broadcast = primitive_broadcast;
    info->primitive_vertices = primitive_vertices;

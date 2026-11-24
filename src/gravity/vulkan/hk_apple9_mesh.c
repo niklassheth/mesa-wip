@@ -41,11 +41,18 @@ hk_apple9_native_gs_packed_class(unsigned threads, unsigned vertices,
 }
 
 DEBUG_GET_ONCE_BOOL_OPTION(native_task_bridge, "HK_APPLE9_NATIVE_TASK_BRIDGE", false)
+DEBUG_GET_ONCE_BOOL_OPTION(native_object, "HK_APPLE9_NATIVE_OBJECT", true)
 
 bool
 hk_apple9_native_task_bridge_enabled(void)
 {
    return debug_get_option_native_task_bridge();
+}
+
+bool
+hk_apple9_native_object_enabled(void)
+{
+   return hk_apple9_native_mesh_enabled() && debug_get_option_native_object();
 }
 
 bool
@@ -206,6 +213,22 @@ hk_apple9_native_mesh_available_device(struct hk_device *dev)
           hk_apple9_native_index_enabled(hk_device_physical(dev));
 }
 
+bool
+hk_apple9_native_object_available(const struct hk_physical_device *pdev)
+{
+   return hk_apple9_native_object_enabled() && pdev &&
+          pdev->dev.chip == AGX_CHIP_G16G &&
+          agx_native_object_enabled(&pdev->dev.native_object);
+}
+
+bool
+hk_apple9_native_object_available_device(struct hk_device *dev)
+{
+   return hk_apple9_native_object_enabled() &&
+          hk_apple9_native_mesh_available_device(dev) && dev &&
+          agx_native_object_enabled(&dev->dev.native_object);
+}
+
 uint8_t
 hk_apple9_native_stage_policy(const struct hk_physical_device *pdev)
 {
@@ -335,11 +358,16 @@ hk_apple9_native_mesh_model_counts_eligible(const uint16_t size[3],
 }
 
 bool
-hk_apple9_native_mesh_round_shape_eligible(const nir_shader *nir)
+hk_apple9_native_mesh_round_shape_eligible_ex(const nir_shader *nir,
+                                              bool allow_task_payload)
 {
    bool points_or_lines = nir->info.mesh.primitive_type == MESA_PRIM_POINTS ||
                           nir->info.mesh.primitive_type == MESA_PRIM_LINES;
-   return nir->info.stage == MESA_SHADER_MESH && !nir->info.task_payload_size &&
+   bool payload_ok = allow_task_payload
+                        ? nir->info.task_payload_size <=
+                             AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES
+                        : !nir->info.task_payload_size;
+   return nir->info.stage == MESA_SHADER_MESH && payload_ok &&
           (points_or_lines || nir->info.mesh.primitive_type == MESA_PRIM_TRIANGLES) &&
           !nir->info.workgroup_size_variable &&
           (!nir->info.api_subgroup_size || nir->info.api_subgroup_size == 32) &&
@@ -357,12 +385,19 @@ hk_apple9_native_mesh_round_shape_eligible(const nir_shader *nir)
           /* Within one round, position-only shapes stay under the explicit
            * class list (T16V16P16 is deliberately excluded); the model takes
            * only the outputs that path cannot carry. */
-          (points_or_lines || hk_apple9_native_mesh_round_counts_eligible(
+          (points_or_lines || allow_task_payload ||
+           hk_apple9_native_mesh_round_counts_eligible(
               nir->info.workgroup_size, nir->info.mesh.max_vertices_out,
               nir->info.mesh.max_primitives_out) ||
            (nir->info.outputs_written &
             ~(VARYING_BIT_POS | VARYING_BIT_PRIMITIVE_INDICES |
               VARYING_BIT_PRIMITIVE_COUNT | VARYING_BIT_PSIZ)));
+}
+
+bool
+hk_apple9_native_mesh_round_shape_eligible(const nir_shader *nir)
+{
+   return hk_apple9_native_mesh_round_shape_eligible_ex(nir, false);
 }
 
 bool
@@ -444,17 +479,27 @@ hk_apple9_native_mesh_threads(const uint16_t local_size[3])
 
 static bool
 local_allocation_valid(const struct agx_shader_info *code,
-                       const struct agx_apple9_mesh_body_info *body)
+                       const struct agx_apple9_mesh_body_info *body,
+                       enum hk_apple9_native_stage stage)
 {
    unsigned output = body->layout.local_size_B;
    if (output > AGX_APPLE9_MAX_SHARED_BYTES ||
        body->shared_size_B > AGX_APPLE9_MAX_SHARED_BYTES)
       return false;
-   unsigned offset = body->shared_size_B ? ALIGN_POT(output, 16) : 0;
+   unsigned offset = 0;
+   if (body->shared_size_B) {
+      offset = stage == HK_APPLE9_NATIVE_OBJECT
+                  ? ALIGN_POT(body->key.grid_offset_B + 16, 16)
+                  : ALIGN_POT(output, 16);
+   }
    unsigned shared = ALIGN_POT(body->shared_size_B, 4);
-   if (shared > AGX_APPLE9_MAX_SHARED_BYTES - offset)
+   if (offset > AGX_APPLE9_MAX_SHARED_BYTES ||
+       shared > AGX_APPLE9_MAX_SHARED_BYTES - offset)
       return false;
    unsigned total = body->shared_size_B ? offset + shared : output;
+   if (stage == HK_APPLE9_NATIVE_OBJECT &&
+       total > AGX_APPLE9_MAX_SHARED_BYTES - HK_APPLE9_NATIVE_GRID_ROOT)
+      return false;
    return body->shared_offset_B == offset &&
           body->local_allocation_B == total &&
           code->local_size == (body->shared_size_B ? total : 0);
@@ -481,17 +526,31 @@ hk_apple9_native_shader_valid(const struct agx_shader_info *code,
        k->payload_uniform != expected.payload_uniform ||
        k->grid_root != expected.grid_root || k->grid_offset_B ||
        code->workgroup_size[0] != k->physical_threads ||
-       !local_allocation_valid(code, body) ||
+       !local_allocation_valid(code, body, stage) ||
+       body->task_payload_size_B > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES ||
+       (body->task_payload_stride_B & 15) ||
+       body->task_payload_stride_B < ALIGN_POT(body->task_payload_size_B, 16) ||
+       body->task_payload_stride_B > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES ||
        code->apple9_writes_point_size != body->writes_point_size ||
        code->writes_layer_viewport != body->writes_layer_viewport ||
        code->apple9_clip_distance_count != body->clip_distances ||
        body->clip_distances > 8)
       return false;
-   if (stage == HK_APPLE9_NATIVE_OBJECT)
-      return k->physical_threads == AGX_APPLE9_NATIVE_THREADS &&
-             body->logical_size[0] == 1 && body->logical_size[1] == 1 &&
-             body->logical_size[2] == 1 && !body->shared_size_B &&
-             !body->layout.local_size_B && !code->local_size;
+   if (stage == HK_APPLE9_NATIVE_OBJECT) {
+      unsigned logical_limit =
+         k->physical_threads == AGX_APPLE9_NATIVE_THREADS
+            ? AGX_APPLE9_NATIVE_THREADS
+            : k->physical_threads == AGX_APPLE9_NATIVE_SERIAL_THREADS
+                 ? AGX_APPLE9_NATIVE_MAX_INVOCATIONS : 0;
+      if (!logical_limit ||
+          !logical_size_valid(body->logical_size, logical_limit))
+         return false;
+      return !body->layout.local_size_B && !body->reads_native_payload;
+   }
+   if (body->writes_child_grid ||
+       ((body->task_payload_size_B || body->reads_native_payload) &&
+        !hk_apple9_native_mesh_enabled()))
+      return false;
    const struct agx_apple9_mesh_layout *l = &body->layout;
    if (body->primitive_vertices) {
       if (!body->publication_rounds || !body->original_max_vertices ||
@@ -619,7 +678,7 @@ hk_apple9_native_launch_parameters(
       .frame_extent_a = frame,
       .frame_extent_b = frame,
       .threadgroup_memory_bytes = stage == HK_APPLE9_NATIVE_OBJECT
-                                    ? HK_APPLE9_NATIVE_LOCAL_BYTES
+                                    ? (uint32_t)hk_apple9_native_object_tg_memory_bytes(body)
                                     : util_next_power_of_two(MAX2(
                                          HK_APPLE9_NATIVE_LOCAL_BYTES,
                                          body->local_allocation_B)),
@@ -630,17 +689,29 @@ hk_apple9_native_launch_parameters(
 }
 
 bool
+hk_apple9_mesh_command_build_ex(void *out, size_t capacity,
+                                const struct agx_apple9_render_pipeline *p,
+                                const uint32_t state[AGX_APPLE9_MESH_STATE_WORDS],
+                                const uint32_t groups[3],
+                                const uint32_t object_local_size[3], bool enable,
+                                bool multi_parent)
+{
+   size_t bytes;
+   return hk_apple9_mesh_command_build_delta_ex(
+             out, capacity, p, state, groups, object_local_size, enable,
+             multi_parent, NULL, NULL, &bytes) &&
+          bytes == HK_APPLE9_MESH_COMMAND_BYTES;
+}
+
+bool
 hk_apple9_mesh_command_build(void *out, size_t capacity,
                              const struct agx_apple9_render_pipeline *p,
                              const uint32_t state[AGX_APPLE9_MESH_STATE_WORDS],
                              const uint32_t groups[3],
                              const uint32_t object_local_size[3], bool enable)
 {
-   size_t bytes;
-   return hk_apple9_mesh_command_build_delta(out, capacity, p, state, groups,
-                                             object_local_size, enable, NULL,
-                                             NULL, &bytes) &&
-          bytes == HK_APPLE9_MESH_COMMAND_BYTES;
+   return hk_apple9_mesh_command_build_ex(out, capacity, p, state, groups,
+                                          object_local_size, enable, false);
 }
 
 /* The PPP state blocks of a record, in update-chain order: byte offset and
@@ -662,30 +733,39 @@ hk_apple9_ppp_blocks(const struct agx_apple9_render_pipeline *p,
    return 9;
 }
 
-/* As hk_apple9_mesh_command_build, but when the previous native block of the
+/* As hk_apple9_mesh_command_build_ex, but when the previous native block of the
  * same render left PPP state `previous` (CPU bytes of its record), update only
  * the blocks whose bytes changed, always including the first (its header):
  * PPP state persists across a render's blocks, and Metal's second block of a
  * render updates one block (Air D2 capture). *bytes is the block length. */
 bool
-hk_apple9_mesh_command_build_delta(void *out, size_t capacity,
-                                   const struct agx_apple9_render_pipeline *p,
-                                   const uint32_t state[AGX_APPLE9_MESH_STATE_WORDS],
-                                   const uint32_t groups[3],
-                                   const uint32_t object_local_size[3], bool enable,
-                                   const uint8_t *previous, const uint8_t *record,
-                                   size_t *bytes)
+hk_apple9_mesh_command_build_delta_ex(void *out, size_t capacity,
+                                      const struct agx_apple9_render_pipeline *p,
+                                      const uint32_t state[AGX_APPLE9_MESH_STATE_WORDS],
+                                      const uint32_t groups[3],
+                                      const uint32_t object_local_size[3],
+                                      bool enable, bool multi_parent,
+                                      const uint8_t *previous,
+                                      const uint8_t *record, size_t *bytes)
 {
    if (!enable || !out || !p || !state || !groups || !object_local_size ||
-       capacity < HK_APPLE9_MESH_COMMAND_BYTES || groups[0] != 1 ||
-       groups[1] != 1 || groups[2] != 1 ||
-       object_local_size[0] != AGX_APPLE9_NATIVE_THREADS ||
+       !bytes || capacity < HK_APPLE9_MESH_COMMAND_BYTES ||
        object_local_size[1] != 1 || object_local_size[2] != 1 ||
        p->primitive > 0xf || (p->ppp & 3) ||
        p->ppp > UINT32_MAX - AGX_APPLE9_PPP_RECORD_MAX ||
        p->ppp_viewport_words > 255 || (p->ppp_viewport_offset & 3) ||
        p->ppp_viewport_offset > AGX_APPLE9_PPP_RECORD_MAX - 12)
       return false;
+   if (multi_parent) {
+      if (!hk_apple9_native_mesh_grid_valid(groups) ||
+          (object_local_size[0] != AGX_APPLE9_NATIVE_THREADS &&
+           object_local_size[0] != AGX_APPLE9_NATIVE_SERIAL_THREADS))
+         return false;
+   } else {
+      if (groups[0] != 1 || groups[1] != 1 || groups[2] != 1 ||
+          object_local_size[0] != AGX_APPLE9_NATIVE_THREADS)
+         return false;
+   }
    uint32_t words[HK_APPLE9_MESH_COMMAND_BYTES / 4];
    memcpy(words, state, AGX_APPLE9_MESH_STATE_WORDS * 4);
    unsigned at = AGX_APPLE9_MESH_STATE_WORDS;
@@ -714,4 +794,18 @@ hk_apple9_mesh_command_build_delta(void *out, size_t capacity,
    memcpy(out, words, at * 4);
    *bytes = at * 4;
    return true;
+}
+
+bool
+hk_apple9_mesh_command_build_delta(void *out, size_t capacity,
+                                   const struct agx_apple9_render_pipeline *p,
+                                   const uint32_t state[AGX_APPLE9_MESH_STATE_WORDS],
+                                   const uint32_t groups[3],
+                                   const uint32_t object_local_size[3], bool enable,
+                                   const uint8_t *previous, const uint8_t *record,
+                                   size_t *bytes)
+{
+   return hk_apple9_mesh_command_build_delta_ex(
+      out, capacity, p, state, groups, object_local_size, enable, false,
+      previous, record, bytes);
 }

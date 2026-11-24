@@ -1675,6 +1675,9 @@ bool hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct
                                 uint64_t count_addr);
 void hk_apple9_draw_native_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                                 uint64_t grid);
+void hk_apple9_draw_native_object(struct hk_cmd_buffer *cmd, uint32_t draw_id,
+                                  const uint32_t object_groups[3],
+                                  uint64_t grid, uint64_t payload);
 /* Software-stage outputs, queries and multiview have additional per-draw
  * state. Keep their existing preparation path. A null/out-of-range index
  * binding allocates a fresh zero range, so it must also use that path. */
