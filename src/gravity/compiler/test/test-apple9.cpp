@@ -20582,3 +20582,143 @@ TEST(Apple9Compiler, NirSinkLoadsAndCarry64PastBranch)
    free(compiled.binary);
    ralloc_free(b.shader);
 }
+
+TEST(Apple9IsaTable, VirOpcodeMetadataAndLegalityAreConsistent)
+{
+   const unsigned count = agx_apple9_vir_opcode_count();
+   ASSERT_EQ(count, (unsigned)AGX_APPLE9_VIR_ABI_RETURN + 1u);
+   EXPECT_EQ(agx_apple9_vir_opcode_info((enum agx_apple9_vir_opcode)count), nullptr);
+
+   for (unsigned i = 0; i < count; ++i) {
+      const enum agx_apple9_vir_opcode op = (enum agx_apple9_vir_opcode)i;
+      const struct agx_apple9_vir_opcode_info *info =
+         agx_apple9_vir_opcode_info(op);
+      ASSERT_NE(info, nullptr) << "opcode " << i;
+      EXPECT_NE(info->name, nullptr) << "opcode " << i;
+      EXPECT_EQ(info->half_src_hi_mask & ~info->half_src_mask, 0u) << info->name;
+      EXPECT_EQ(info->half_src_sext_mask & ~info->half_src_mask, 0u) << info->name;
+      if (info->fixed_encoding != AGX_APPLE9_ENC_PSEUDO) {
+         ASSERT_LT(info->fixed_encoding, AGX_APPLE9_ENC_COUNT) << info->name;
+         const struct agx_apple9_encoding_info *enc =
+            agx_apple9_encoding_info(info->fixed_encoding);
+         EXPECT_EQ(info->inline_uniform_mask & ~enc->uniform_src_mask, 0u)
+            << info->name;
+         EXPECT_EQ(info->inline_immediate_mask & ~enc->immediate_src_mask, 0u)
+            << info->name;
+         EXPECT_EQ(info->half_src_mask & ~enc->half_src_mask, 0u) << info->name;
+         EXPECT_EQ(info->half_src_hi_mask & ~enc->half_src_hi_mask, 0u)
+            << info->name;
+         EXPECT_EQ(info->half_src_sext_mask & ~enc->half_src_sext_mask, 0u)
+            << info->name;
+      }
+   }
+
+   /* Commutativity: IAND/IOR/IXOR commute; IANDN must never commute. */
+   EXPECT_TRUE(agx_apple9_vir_is_commutative(AGX_APPLE9_VIR_IAND));
+   EXPECT_TRUE(agx_apple9_vir_is_commutative(AGX_APPLE9_VIR_IOR));
+   EXPECT_TRUE(agx_apple9_vir_is_commutative(AGX_APPLE9_VIR_IXOR));
+   EXPECT_FALSE(agx_apple9_vir_is_commutative(AGX_APPLE9_VIR_IANDN));
+
+   /* Per-encoding legality helpers match generated encoding table. */
+   EXPECT_TRUE(agx_apple9_integer_immediate_encoding(AGX_APPLE9_ENC_INT_ADD_EXTENDED));
+   EXPECT_TRUE(agx_apple9_integer_immediate_encoding(AGX_APPLE9_ENC_LOGIC_EXTENDED));
+   EXPECT_FALSE(agx_apple9_integer_immediate_encoding(AGX_APPLE9_ENC_FLOAT2_COMPACT));
+   EXPECT_FALSE(agx_apple9_integer_immediate_encoding(AGX_APPLE9_ENC_PSEUDO));
+   EXPECT_TRUE(agx_apple9_wide_float_immediate_slot(AGX_APPLE9_ENC_MINMAX_COMPACT, 1));
+   EXPECT_FALSE(agx_apple9_wide_float_immediate_slot(AGX_APPLE9_ENC_MINMAX_COMPACT, 0));
+   EXPECT_TRUE(agx_apple9_wide_float_immediate_slot(AGX_APPLE9_ENC_FLOAT3_EXTENDED, 2));
+   EXPECT_FALSE(agx_apple9_wide_float_immediate_slot(AGX_APPLE9_ENC_FLOAT3_EXTENDED, 1));
+}
+
+TEST(Apple9IsaTable, PackerEnforcesOpcodeBoundsAndPerSlotLegality)
+{
+   const uint8_t phys[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+   struct agx_apple9_packed_instruction packed = {};
+   const char *reason = nullptr;
+
+   /* Out-of-range VIR opcode and encoding are rejected cleanly. */
+   struct agx_apple9_vir_instr bad_op = {};
+   bad_op.op = (enum agx_apple9_vir_opcode)agx_apple9_vir_opcode_count();
+   bad_op.encoding = AGX_APPLE9_ENC_HALT;
+   bad_op.dest = AGX_APPLE9_VREG_INVALID;
+   EXPECT_FALSE(agx_apple9_pack_vir_instruction(&bad_op, phys, &packed, &reason));
+   EXPECT_NE(reason, nullptr);
+
+   struct agx_apple9_vir_instr bad_enc = {};
+   bad_enc.op = AGX_APPLE9_VIR_HALT;
+   bad_enc.encoding = AGX_APPLE9_ENC_COUNT;
+   bad_enc.dest = AGX_APPLE9_VREG_INVALID;
+   EXPECT_FALSE(agx_apple9_pack_vir_instruction(&bad_enc, phys, &packed, &reason));
+
+   /* Per-slot uniform + half overlap on the same slot is illegal. */
+   struct agx_apple9_vir_instr bad_overlap = {};
+   bad_overlap.op = AGX_APPLE9_VIR_FADD;
+   bad_overlap.encoding = AGX_APPLE9_ENC_FLOAT2_COMPACT;
+   bad_overlap.dest = 0;
+   bad_overlap.dest_components = 1;
+   bad_overlap.src[0] = 1;
+   bad_overlap.nr_srcs = 1;
+   bad_overlap.alu_src_uniform_mask = 0x1;
+   bad_overlap.alu_src_value[0] = 4;
+   bad_overlap.src_half_mask = 0x1;
+   EXPECT_FALSE(agx_apple9_pack_vir_instruction(&bad_overlap, phys, &packed, &reason));
+
+   /* Compact FMA rejects uniform in slot 0. */
+   struct agx_apple9_vir_instr bad_fma_compact = {};
+   bad_fma_compact.op = AGX_APPLE9_VIR_FMA;
+   bad_fma_compact.encoding = AGX_APPLE9_ENC_FLOAT3_COMPACT;
+   bad_fma_compact.dest = 0;
+   bad_fma_compact.dest_components = 1;
+   bad_fma_compact.src[0] = 1;
+   bad_fma_compact.src[1] = 2;
+   bad_fma_compact.nr_srcs = 2;
+   bad_fma_compact.alu_src_uniform_mask = 0x1;
+   bad_fma_compact.alu_src_value[0] = 4;
+   EXPECT_FALSE(agx_apple9_pack_vir_instruction(&bad_fma_compact, phys, &packed, &reason));
+
+   /* FP32 SFU op rejects half-special encoding. */
+   struct agx_apple9_vir_instr bad_sfu = {};
+   bad_sfu.op = AGX_APPLE9_VIR_FRSQ;
+   bad_sfu.encoding = AGX_APPLE9_ENC_HALF_SPECIAL;
+   bad_sfu.dest = 0;
+   bad_sfu.dest_components = 1;
+   bad_sfu.src[0] = 1;
+   bad_sfu.nr_srcs = 1;
+   bad_sfu.immediate = 0x03;
+   EXPECT_FALSE(agx_apple9_pack_vir_instruction(&bad_sfu, phys, &packed, &reason));
+}
+
+TEST(Apple9IsaTable, CheckedTextureModeTableRejectsUnmeasuredForms)
+{
+   const uint8_t phys[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+   struct agx_apple9_packed_instruction packed = {};
+   const char *reason = nullptr;
+
+   /* 2D-array bias + min_lod is valid ONLY with offset (0x03c1), never without. */
+   struct agx_apple9_vir_instr tex = {};
+   tex.op = AGX_APPLE9_VIR_TEXTURE_SAMPLE;
+   tex.encoding = AGX_APPLE9_ENC_TEXTURE_LOD;
+   tex.dest = 4;
+   tex.dest_components = 4;
+   tex.nr_srcs = 4;
+   for (unsigned s = 0; s < 4; ++s)
+      tex.src[s] = s;
+   tex.texture_dimension = 2;
+   tex.immediate = 1;
+   tex.texture_min_lod = true;
+   tex.producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_1;
+
+   tex.texture_has_offset = false;
+   EXPECT_FALSE(agx_apple9_pack_vir_instruction(&tex, phys, &packed, &reason));
+
+   tex.texture_has_offset = true;
+   tex.texture_offset = 1u;
+   ASSERT_TRUE(agx_apple9_pack_vir_instruction(&tex, phys, &packed, &reason))
+      << (reason ?: "");
+   EXPECT_EQ((uint16_t)(packed.bytes[6] | (packed.bytes[7] << 8)), 0x03c1u);
+
+   /* Out-of-range dimension fails cleanly. */
+   tex.texture_dimension = 7;
+   EXPECT_FALSE(agx_apple9_pack_vir_instruction(&tex, phys, &packed, &reason));
+   EXPECT_EQ(agx_apple9_texture_mode(false, false, false, 7, false, false), 0xffffu);
+}

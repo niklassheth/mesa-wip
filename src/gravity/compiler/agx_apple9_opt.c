@@ -14,97 +14,19 @@
 bool
 agx_apple9_instr_is_pure_alu(const struct agx_apple9_vir_instr *I)
 {
-   if ((I->dest_components != 1 && I->op != AGX_APPLE9_VIR_IMUL_WIDE &&
-        I->op != AGX_APPLE9_VIR_UNPACK_NORM) ||
+   const struct agx_apple9_vir_opcode_info *info =
+      agx_apple9_vir_opcode_info(I->op);
+   if (!info || !(info->props & AGX_APPLE9_VIR_PROP_PURE_ALU))
+      return false;
+
+   if ((I->dest_components != 1 &&
+        !(info->props & AGX_APPLE9_VIR_PROP_PURE_ALU_MULTI_DEST)) ||
        I->publication_handoff ||
        I->encoding == AGX_APPLE9_ENC_FLOAT2_EXPORT ||
        I->encoding == AGX_APPLE9_ENC_LOGIC_EXPORT)
       return false;
 
-   switch (I->op) {
-   case AGX_APPLE9_VIR_IMM:
-   case AGX_APPLE9_VIR_BIT_COUNT:
-   case AGX_APPLE9_VIR_UFIND_MSB:
-   case AGX_APPLE9_VIR_BIT_REVERSE:
-   case AGX_APPLE9_VIR_HADD:
-   case AGX_APPLE9_VIR_HSUB:
-   case AGX_APPLE9_VIR_HMUL:
-   case AGX_APPLE9_VIR_HFMA:
-   case AGX_APPLE9_VIR_HMIN:
-   case AGX_APPLE9_VIR_HMAX:
-   case AGX_APPLE9_VIR_HRCP_F32:
-   case AGX_APPLE9_VIR_HRCP:
-   case AGX_APPLE9_VIR_HSQRT_FACTOR:
-   case AGX_APPLE9_VIR_HMUL_MIXED:
-   case AGX_APPLE9_VIR_HRSQ:
-   case AGX_APPLE9_VIR_HEXP2:
-   case AGX_APPLE9_VIR_HLOG2:
-   case AGX_APPLE9_VIR_HFLOOR:
-   case AGX_APPLE9_VIR_HCEIL:
-   case AGX_APPLE9_VIR_HTRUNC:
-   case AGX_APPLE9_VIR_HROUND_EVEN:
-   case AGX_APPLE9_VIR_U2F32:
-   case AGX_APPLE9_VIR_I2F32:
-   case AGX_APPLE9_VIR_F2I32:
-   case AGX_APPLE9_VIR_F2U32:
-   case AGX_APPLE9_VIR_U2F16:
-   case AGX_APPLE9_VIR_I2F16:
-   case AGX_APPLE9_VIR_U16_2F16:
-   case AGX_APPLE9_VIR_I16_2F16:
-   case AGX_APPLE9_VIR_F2I16:
-   case AGX_APPLE9_VIR_F2U16:
-   case AGX_APPLE9_VIR_F2I8:
-   case AGX_APPLE9_VIR_F2U8:
-   case AGX_APPLE9_VIR_F2F16:
-   case AGX_APPLE9_VIR_PACK_HALF_2X16:
-   case AGX_APPLE9_VIR_PACK_UNORM_2X16:
-   case AGX_APPLE9_VIR_PACK_UNORM_4X8:
-   case AGX_APPLE9_VIR_PACK_SNORM_2X16:
-   case AGX_APPLE9_VIR_PACK_SNORM_4X8:
-   case AGX_APPLE9_VIR_PACK_FORMAT:
-   case AGX_APPLE9_VIR_UNPACK_HALF:
-   case AGX_APPLE9_VIR_UNPACK_NORM:
-   case AGX_APPLE9_VIR_IADD:
-   case AGX_APPLE9_VIR_ISUB:
-   case AGX_APPLE9_VIR_IMAD:
-   case AGX_APPLE9_VIR_IMUL_WIDE:
-   case AGX_APPLE9_VIR_IAND:
-   case AGX_APPLE9_VIR_IANDN:
-   case AGX_APPLE9_VIR_IOR_UNIFORM:
-   case AGX_APPLE9_VIR_IOR:
-   case AGX_APPLE9_VIR_IXOR:
-   case AGX_APPLE9_VIR_ISHR:
-   case AGX_APPLE9_VIR_USHR:
-   case AGX_APPLE9_VIR_ISHL:
-   case AGX_APPLE9_VIR_EXTR:
-   case AGX_APPLE9_VIR_IMIN:
-   case AGX_APPLE9_VIR_IMAX:
-   case AGX_APPLE9_VIR_UMIN:
-   case AGX_APPLE9_VIR_UMAX:
-   case AGX_APPLE9_VIR_FADD:
-   case AGX_APPLE9_VIR_FSUB:
-   case AGX_APPLE9_VIR_FMUL:
-   case AGX_APPLE9_VIR_FADD_IMM:
-   case AGX_APPLE9_VIR_FMUL_IMM:
-   case AGX_APPLE9_VIR_FSAT:
-   case AGX_APPLE9_VIR_FMIN:
-   case AGX_APPLE9_VIR_FMAX:
-   case AGX_APPLE9_VIR_FMA:
-   case AGX_APPLE9_VIR_FRCP:
-   case AGX_APPLE9_VIR_FRSQ:
-   case AGX_APPLE9_VIR_FSQRT_FACTOR:
-   case AGX_APPLE9_VIR_FSIN_FACTOR:
-   case AGX_APPLE9_VIR_FEXP2:
-   case AGX_APPLE9_VIR_FLOG2:
-   case AGX_APPLE9_VIR_FFLOOR:
-   case AGX_APPLE9_VIR_FCEIL:
-   case AGX_APPLE9_VIR_FTRUNC:
-   case AGX_APPLE9_VIR_FROUND_EVEN:
-   case AGX_APPLE9_VIR_SELECT:
-      return true;
-   default:
-      return false;
-   }
+   return true;
 }
 
 static bool
@@ -134,27 +56,9 @@ agx_apple9_supports_saturate(const struct agx_apple9_vir_instr *I)
        I->encoding == AGX_APPLE9_ENC_FLOAT2_EXPORT ||
        I->encoding == AGX_APPLE9_ENC_FLOAT2_PROJECT)
       return false;
-   switch (I->op) {
-   case AGX_APPLE9_VIR_FADD:
-   case AGX_APPLE9_VIR_FSUB:
-   case AGX_APPLE9_VIR_FMUL:
-   case AGX_APPLE9_VIR_FADD_IMM:
-   case AGX_APPLE9_VIR_FMUL_IMM:
-   case AGX_APPLE9_VIR_FSAT:
-   case AGX_APPLE9_VIR_FMA:
-   case AGX_APPLE9_VIR_FRCP:
-   case AGX_APPLE9_VIR_FRSQ:
-   case AGX_APPLE9_VIR_FSQRT_FACTOR:
-   case AGX_APPLE9_VIR_FSIN_FACTOR:
-   case AGX_APPLE9_VIR_FEXP2:
-   case AGX_APPLE9_VIR_FLOG2:
-   case AGX_APPLE9_VIR_DERIVATIVE:
-      return true;
-   default:
-      /* The ordinary SFU saturation bit is ineffective on direct rounding.
-       * Min/max and selects also need an explicit clamping operation. */
-      return false;
-   }
+   /* The ordinary SFU saturation bit is ineffective on direct rounding.
+    * Min/max and selects also need an explicit clamping operation. */
+   return agx_apple9_vir_opcode_has_prop(I->op, AGX_APPLE9_VIR_PROP_SATURATABLE);
 }
 
 static void
@@ -330,18 +234,8 @@ fold_iadd_shift(struct agx_apple9_vir_instr *I,
 bool
 agx_apple9_supports_special_uniform(enum agx_apple9_vir_opcode op)
 {
-   switch (op) {
-   case AGX_APPLE9_VIR_FFLOOR:
-   case AGX_APPLE9_VIR_FCEIL:
-   case AGX_APPLE9_VIR_FTRUNC:
-   case AGX_APPLE9_VIR_FROUND_EVEN:
-   case AGX_APPLE9_VIR_FRSQ:
-   case AGX_APPLE9_VIR_FEXP2:
-   case AGX_APPLE9_VIR_FLOG2:
-      return true;
-   default:
-      return false;
-   }
+   return agx_apple9_vir_opcode_has_prop(op,
+                                         AGX_APPLE9_VIR_PROP_SPECIAL_UNIFORM);
 }
 
 static void
@@ -887,39 +781,27 @@ inline_alu_sources(struct agx_apple9_vir_instr *I,
                    const struct uniform_facts *uf,
                    const bool *constant, const uint32_t *values)
 {
-   bool special = I->encoding == AGX_APPLE9_ENC_FLOAT_SPECIAL &&
-                  agx_apple9_supports_special_uniform(I->op);
-   bool unary = special || I->op == AGX_APPLE9_VIR_BIT_COUNT ||
-                I->op == AGX_APPLE9_VIR_UFIND_MSB ||
-                I->op == AGX_APPLE9_VIR_BIT_REVERSE ||
-                 I->op == AGX_APPLE9_VIR_U2F32 ||
-                I->op == AGX_APPLE9_VIR_I2F32 ||
-                I->op == AGX_APPLE9_VIR_F2U32 ||
-                I->op == AGX_APPLE9_VIR_F2I32;
-   bool shift = I->op == AGX_APPLE9_VIR_ISHR || I->op == AGX_APPLE9_VIR_USHR ||
-                I->op == AGX_APPLE9_VIR_ISHL;
-   bool predicate = I->op == AGX_APPLE9_VIR_PREDICATE_COMPARE &&
-      (I->encoding == AGX_APPLE9_ENC_PREDICATE_COMPARE_SHORT ||
-       I->encoding == AGX_APPLE9_ENC_PREDICATE_COMPARE_EXTENDED);
-   bool select = I->op == AGX_APPLE9_VIR_SELECT &&
-      I->encoding != AGX_APPLE9_ENC_HALF_COMPARE_SELECT;
-   bool fma = I->op == AGX_APPLE9_VIR_FMA;
-   bool minmax_float = (I->op == AGX_APPLE9_VIR_FMIN || I->op == AGX_APPLE9_VIR_FMAX) &&
-                       I->encoding == AGX_APPLE9_ENC_MINMAX_COMPACT;
-   bool integer = I->op == AGX_APPLE9_VIR_IADD || I->op == AGX_APPLE9_VIR_ISUB ||
-                  I->op == AGX_APPLE9_VIR_IMAD || I->op == AGX_APPLE9_VIR_IMUL_WIDE;
-   unsigned arity = unary ? 1 : shift ? I->nr_srcs : select ? 4 : fma || I->op == AGX_APPLE9_VIR_IMAD ? 3 : 2;
-   bool float2 = I->op == AGX_APPLE9_VIR_FADD || I->op == AGX_APPLE9_VIR_FSUB ||
-                 I->op == AGX_APPLE9_VIR_FMUL;
-   bool binary = float2 || I->op == AGX_APPLE9_VIR_IAND ||
-      I->op == AGX_APPLE9_VIR_IOR || I->op == AGX_APPLE9_VIR_IXOR ||
-      I->op == AGX_APPLE9_VIR_IMIN || I->op == AGX_APPLE9_VIR_IMAX ||
-      I->op == AGX_APPLE9_VIR_UMIN || I->op == AGX_APPLE9_VIR_UMAX ||
-      I->op == AGX_APPLE9_VIR_FMIN || I->op == AGX_APPLE9_VIR_FMAX;
+   const struct agx_apple9_vir_opcode_info *info =
+      agx_apple9_vir_opcode_info(I->op);
+   if (!info || !(info->props & AGX_APPLE9_VIR_PROP_OPT_UNIFORM_INLINE))
+      return;
+   const bool special = I->encoding == AGX_APPLE9_ENC_FLOAT_SPECIAL &&
+                        (info->props & AGX_APPLE9_VIR_PROP_SPECIAL_UNIFORM);
+   const bool enc_admits_uniform =
+      special || (I->encoding < AGX_APPLE9_ENC_COUNT &&
+                  agx_apple9_encoding_info(I->encoding)->uniform_src_mask != 0);
+   const bool shift = info->family == AGX_APPLE9_VIR_FAMILY_SHIFT;
+   const bool fma = I->op == AGX_APPLE9_VIR_FMA;
+   const bool minmax_float =
+      (I->op == AGX_APPLE9_VIR_FMIN || I->op == AGX_APPLE9_VIR_FMAX) &&
+      I->encoding == AGX_APPLE9_ENC_MINMAX_COMPACT;
+   const bool dual_uniform =
+      !!(info->props & AGX_APPLE9_VIR_PROP_INLINE_DUAL_UNIFORM);
+   const unsigned arity = shift ? I->nr_srcs : info->arity;
    /* A later pass may fill logical slots left as registers by an earlier
     * one, for example after literal folding selected some operands. */
    const unsigned filled = I->alu_src_uniform_mask | I->alu_src_immediate_mask;
-   if ((!unary && !shift && !predicate && !select && !fma && !binary && !integer) ||
+   if (!enc_admits_uniform || arity == AGX_APPLE9_VIR_ARITY_VARIABLE ||
        I->nr_srcs + util_bitcount(filled) != arity)
       return;
 
@@ -985,8 +867,7 @@ inline_alu_sources(struct agx_apple9_vir_instr *I,
    if (filled) {
       /* Only one of the two leading operands of a plain binary operation may
        * leave the register file; keep whichever was already selected. */
-      if (!shift && !predicate && !select && !fma && !float2 && !integer &&
-          (filled & 3) && (file[0] || file[1]))
+      if (!dual_uniform && (filled & 3) && (file[0] || file[1]))
          file[0] = file[1] = 0;
       unsigned source = 0;
       for (unsigned s = 0; s < arity; ++s) {
@@ -1043,8 +924,7 @@ inline_alu_sources(struct agx_apple9_vir_instr *I,
       } else {
          file[0] = 0;
       }
-   } else if (!shift && !predicate && !select && !fma && !float2 && !integer &&
-              file[0] && file[1]) {
+   } else if (!dual_uniform && file[0] && file[1]) {
       file[0] = 0;
    }
 
@@ -1094,24 +974,9 @@ fold_saturate(struct agx_apple9_vir_program *p, const uint32_t *replacement)
          block = agx_apple9_instr_block(I);
          ++epoch;
       }
-      switch (I->op) {
-      case AGX_APPLE9_VIR_STORE_UNIFORM:
-      case AGX_APPLE9_VIR_OBJECT_CALL:
-      case AGX_APPLE9_VIR_OBJECT_RETURN:
-      case AGX_APPLE9_VIR_OBJECT_RESUME:
-      case AGX_APPLE9_VIR_ABI_RETURN:
-      case AGX_APPLE9_VIR_EXEC_MASK_PUSH:
-      case AGX_APPLE9_VIR_EXEC_MASK_ELSE:
-      case AGX_APPLE9_VIR_EXEC_MASK_POP:
-      case AGX_APPLE9_VIR_LOOP_MASK_PUSH:
-      case AGX_APPLE9_VIR_LOOP_MASK_UPDATE:
-      case AGX_APPLE9_VIR_LOOP_MASK_POP:
-      case AGX_APPLE9_VIR_BREAK_MASK_UNWIND:
+      if (I->op == AGX_APPLE9_VIR_STORE_UNIFORM ||
+          agx_apple9_vir_opcode_has_prop(I->op, AGX_APPLE9_VIR_PROP_OPT_BARRIER))
          ++epoch;
-         break;
-      default:
-         break;
-      }
       bool eliminated = I->dest != AGX_APPLE9_VREG_INVALID &&
                         replacement[I->dest] != I->dest;
       if (!eliminated) {
@@ -1447,30 +1312,36 @@ fold_half_sources(struct agx_apple9_vir_program *p,
              R->nr_srcs >= 2 && R->src[1] != D->dest && R->src[0] == D->dest)
             nodes[u].source = 0;
          const int slot = register_slot(R, nodes[u].source);
-         const bool add = R->op == AGX_APPLE9_VIR_IADD || R->op == AGX_APPLE9_VIR_ISUB;
-         const bool mad = R->op == AGX_APPLE9_VIR_IMAD && !R->immediate;
-         const bool float2 = (R->op == AGX_APPLE9_VIR_FADD || R->op == AGX_APPLE9_VIR_FSUB ||
-                              R->op == AGX_APPLE9_VIR_FMUL) &&
-                             (R->encoding == AGX_APPLE9_ENC_FLOAT2_COMPACT ||
-                              R->encoding == AGX_APPLE9_ENC_FLOAT2_BASE ||
-                              R->encoding == AGX_APPLE9_ENC_FLOAT2_MODIFIER_EXTENDED ||
-                              R->encoding == AGX_APPLE9_ENC_FLOAT2_ABS_EXTENDED ||
-                              R->encoding == AGX_APPLE9_ENC_FLOAT2_MUL_ABS_EXTENDED);
+         const struct agx_apple9_vir_opcode_info *r_info =
+            agx_apple9_vir_opcode_info(R->op);
+         const struct agx_apple9_encoding_info *r_enc =
+            R->encoding < AGX_APPLE9_ENC_COUNT
+               ? agx_apple9_encoding_info(R->encoding) : NULL;
          const bool fma = R->op == AGX_APPLE9_VIR_FMA;
-         bool reader_ok;
          /* FMA's multiplicands commute: a half in A moves to B, which takes
           * a low half, when B is an ordinary register. */
          const bool fma_swap = fma && slot == 0 && !hi && R->nr_srcs >= 2 &&
             !((R->alu_src_uniform_mask | R->alu_src_immediate_mask | R->src_half_mask) & 3) &&
             R->src[1] != D->dest;
-         if (fp16)
-            reader_ok = (float2 && slot < 2) ||
-                        (fma && (slot == 2 || (slot == 1 && !hi) || fma_swap));
-         else
-            reader_ok = (add && !R->saturate && !R->immediate &&
-                         R->encoding == AGX_APPLE9_ENC_INT_ADD_EXTENDED && slot < 2) ||
-                        (mad && R->encoding == AGX_APPLE9_ENC_INT_MAD_EXTENDED &&
-                         (!sext || slot == 0));
+         bool reader_ok = false;
+         if (slot >= 0 && r_info && r_enc) {
+            const uint8_t bit = BITFIELD_BIT(slot);
+            if (fp16) {
+               const bool direct_ok =
+                  (r_info->props & AGX_APPLE9_VIR_PROP_FP16_HALF_SRC) &&
+                  (r_enc->half_src_mask & bit) &&
+                  (!hi || (r_enc->half_src_hi_mask & bit));
+               reader_ok = direct_ok ||
+                           (fma_swap && (r_enc->half_src_mask & BITFIELD_BIT(1)));
+            } else {
+               reader_ok =
+                  (r_info->props & AGX_APPLE9_VIR_PROP_INT_HALF_SRC) &&
+                  !R->saturate && !R->immediate &&
+                  (r_enc->half_src_mask & bit) &&
+                  (!hi || (r_enc->half_src_hi_mask & bit)) &&
+                  (!sext || (r_enc->half_src_sext_mask & bit));
+            }
+         }
          all = slot >= 0 && reader_ok && !(R->src_half_mask & BITFIELD_BIT(slot)) &&
                agx_apple9_instr_block(R) == agx_apple9_instr_block(D);
       }
@@ -1588,32 +1459,18 @@ agx_apple9_optimize_vir_with_constants(
          if (*sp < p->value_count)
             *sp = resolve(replacement, *sp);
       }
-      switch (I->op) {
-      case AGX_APPLE9_VIR_STORE_UNIFORM:
+      if (I->op == AGX_APPLE9_VIR_STORE_UNIFORM) {
          /* Uniform reads are reusable only while their argument window is
           * unchanged. Setup may publish another value to the same word. */
          _mesa_hash_table_clear(expressions, NULL);
          uniform_facts_clear(&uf);
-         break;
-      case AGX_APPLE9_VIR_OBJECT_CALL:
-      case AGX_APPLE9_VIR_OBJECT_RETURN:
-      case AGX_APPLE9_VIR_OBJECT_RESUME:
-      case AGX_APPLE9_VIR_ABI_RETURN:
-      case AGX_APPLE9_VIR_EXEC_MASK_PUSH:
-      case AGX_APPLE9_VIR_EXEC_MASK_ELSE:
-      case AGX_APPLE9_VIR_EXEC_MASK_POP:
-      case AGX_APPLE9_VIR_LOOP_MASK_PUSH:
-      case AGX_APPLE9_VIR_LOOP_MASK_UPDATE:
-      case AGX_APPLE9_VIR_LOOP_MASK_POP:
-      case AGX_APPLE9_VIR_BREAK_MASK_UNWIND:
+      } else if (agx_apple9_vir_opcode_has_prop(I->op,
+                                                AGX_APPLE9_VIR_PROP_OPT_BARRIER)) {
          /* A synthetic mask transition may share a logical block. Values
           * produced under its old active lanes need not cover the new ones. */
          _mesa_hash_table_clear(expressions, NULL);
          if (uniform_writes)
             uniform_facts_clear(&uf);
-         break;
-      default:
-         break;
       }
       const bool pure_alu = agx_apple9_instr_is_pure_alu(I);
       if (!pure_alu && !apple9_instr_is_cse_eligible(I)) {

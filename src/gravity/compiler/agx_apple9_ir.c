@@ -4,6 +4,7 @@
  */
 
 #include "agx_apple9_ir_priv.h"
+#include "agx_apple9_vir_table.h"
 #include "agx_apple9_mesh_encoding.h"
 #include "agx_compile_apple9.h"
 #include "agx_compile.h"
@@ -16,6 +17,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+unsigned
+agx_apple9_vir_opcode_count(void)
+{
+   return AGX_APPLE9_VIR_OPCODE_COUNT;
+}
+
+const struct agx_apple9_vir_opcode_info *
+agx_apple9_vir_opcode_info(enum agx_apple9_vir_opcode op)
+{
+   if ((unsigned)op >= AGX_APPLE9_VIR_OPCODE_COUNT)
+      return NULL;
+   return &agx_apple9_vir_opcodes[op];
+}
 
 
 static void
@@ -1658,31 +1673,15 @@ static bool
 apple9_subgroup_reduce_valid(enum agx_apple9_subgroup_reduce_op op,
                              unsigned bits, bool prefix_exclusive)
 {
-   switch (op) {
-   case AGX_APPLE9_SUBGROUP_REDUCE_AND:
-   case AGX_APPLE9_SUBGROUP_REDUCE_OR:
-   case AGX_APPLE9_SUBGROUP_REDUCE_XOR:
-   case AGX_APPLE9_SUBGROUP_REDUCE_IMIN:
-   case AGX_APPLE9_SUBGROUP_REDUCE_IMAX:
-   case AGX_APPLE9_SUBGROUP_REDUCE_UMIN:
-   case AGX_APPLE9_SUBGROUP_REDUCE_UMAX:
-      return !prefix_exclusive && (bits == 16 || bits == 32);
-   case AGX_APPLE9_SUBGROUP_REDUCE_IADD:
-      return bits == 16 || bits == 32;
-   case AGX_APPLE9_SUBGROUP_REDUCE_FADD:
-   case AGX_APPLE9_SUBGROUP_REDUCE_FMUL:
-      return bits == 32;
-   case AGX_APPLE9_SUBGROUP_REDUCE_FMIN:
-   case AGX_APPLE9_SUBGROUP_REDUCE_FMAX:
-      return !prefix_exclusive && bits == 32;
-   case AGX_APPLE9_SUBGROUP_REDUCE_HADD:
-      return bits == 16;
-   case AGX_APPLE9_SUBGROUP_REDUCE_HMIN:
-   case AGX_APPLE9_SUBGROUP_REDUCE_HMAX:
-      return !prefix_exclusive && bits == 16;
-   default:
+   if ((unsigned)op >= AGX_APPLE9_SUBGROUP_REDUCE_COUNT)
       return false;
-   }
+   const struct agx_apple9_subgroup_reduce_desc *desc =
+      &agx_apple9_subgroup_reduce_table[op];
+   const uint8_t width = bits == 16 ? AGX_APPLE9_WIDTH_16
+                       : bits == 32 ? AGX_APPLE9_WIDTH_32
+                                    : 0;
+   return (desc->width_mask & width) &&
+          (!prefix_exclusive || desc->prefix_supported);
 }
 
 uint32_t
@@ -3292,27 +3291,8 @@ agx_apple9_vir_set_source(struct agx_apple9_vir_program *program,
 bool
 agx_apple9_vir_is_control_side_effect(enum agx_apple9_vir_opcode op)
 {
-   return op == AGX_APPLE9_VIR_OBJECT_CALL ||
-          op == AGX_APPLE9_VIR_OBJECT_RETURN ||
-          op == AGX_APPLE9_VIR_OBJECT_RESUME ||
-          op == AGX_APPLE9_VIR_MESH_CONTROL ||
-          op == AGX_APPLE9_VIR_MESH_SUBMIT_SCALAR ||
-          op == AGX_APPLE9_VIR_MESH_SUBMIT_CHANNEL ||
-          op == AGX_APPLE9_VIR_PREDICATE_COMPARE ||
-          op == AGX_APPLE9_VIR_EXEC_MASK_PUSH ||
-          op == AGX_APPLE9_VIR_EXEC_MASK_ELSE ||
-          op == AGX_APPLE9_VIR_EXEC_MASK_POP ||
-          op == AGX_APPLE9_VIR_LOOP_MASK_PUSH ||
-          op == AGX_APPLE9_VIR_LOOP_MASK_UPDATE ||
-          op == AGX_APPLE9_VIR_LOOP_MASK_POP ||
-          op == AGX_APPLE9_VIR_JMP_EXEC_ANY ||
-          op == AGX_APPLE9_VIR_JMP_EXEC_NONE ||
-          op == AGX_APPLE9_VIR_BREAK_MASK_UNWIND ||
-          op == AGX_APPLE9_VIR_WORKGROUP_BARRIER ||
-          op == AGX_APPLE9_VIR_DEVICE_FENCE ||
-          op == AGX_APPLE9_VIR_WAIT ||
-          op == AGX_APPLE9_VIR_HALT ||
-          op == AGX_APPLE9_VIR_ABI_RETURN;
+   return agx_apple9_vir_opcode_has_prop(op,
+                                         AGX_APPLE9_VIR_PROP_CONTROL_SIDE_EFFECT);
 }
 
 /* The publication selector changes the destination namespace, not its
@@ -4283,6 +4263,10 @@ static bool
 pack_i2f32(const struct agx_apple9_vir_instr *instruction, const uint8_t *phys,
            struct agx_apple9_packed_instruction *packed)
 {
+   const struct agx_apple9_vir_opcode_info *info =
+      &agx_apple9_vir_opcodes[instruction->op];
+   const struct agx_apple9_i2f_desc *desc =
+      &agx_apple9_i2f_table[info->family_index];
    const unsigned dst = phys[instruction->dest];
    uint32_t source[1];
    uint8_t live;
@@ -4290,28 +4274,8 @@ pack_i2f32(const struct agx_apple9_vir_instr *instruction, const uint8_t *phys,
        !apple9_alu_sources(instruction, phys, 1, source, &live))
       return false;
    const unsigned src = source[0];
-   bool is_f32_dst, is_32bit_src, is_signed;
-   switch (instruction->op) {
-   case AGX_APPLE9_VIR_U2F32:
-      is_f32_dst = true; is_32bit_src = true; is_signed = false; break;
-   case AGX_APPLE9_VIR_I2F32:
-      is_f32_dst = true; is_32bit_src = true; is_signed = true; break;
-   case AGX_APPLE9_VIR_U2F16:
-      is_f32_dst = false; is_32bit_src = true; is_signed = false; break;
-   case AGX_APPLE9_VIR_I2F16:
-      is_f32_dst = false; is_32bit_src = true; is_signed = true; break;
-   case AGX_APPLE9_VIR_U16_2F16:
-      is_f32_dst = false; is_32bit_src = false; is_signed = false; break;
-   case AGX_APPLE9_VIR_I16_2F16:
-      is_f32_dst = false; is_32bit_src = false; is_signed = true; break;
-   default:
-      return false;
-   }
-   enum agx_apple9_encoding expected =
-      !is_f32_dst ? AGX_APPLE9_ENC_INT_TO_HALF
-      : is_signed ? AGX_APPLE9_ENC_SINT_TO_FLOAT
-                  : AGX_APPLE9_ENC_UINT_TO_FLOAT;
-   if (dst >= AGX_APPLE9_GPR_COUNT || instruction->encoding != expected)
+   if (dst >= AGX_APPLE9_GPR_COUNT ||
+       instruction->encoding != info->fixed_encoding)
       return false;
    const bool retain_source = live & 1u;
 
@@ -4322,8 +4286,7 @@ pack_i2f32(const struct agx_apple9_vir_instr *instruction, const uint8_t *phys,
     * 16-bit source (0x08), and FP32 vs FP16 destination (0x04).
     */
    uint8_t b6 = (retain_source ? 0x80 : 0xa0) |
-                (is_32bit_src ? 0x08 : 0x00) |
-                (is_f32_dst ? 0x04 : 0x00) |
+                desc->b6_type_bits |
                 ((src >> 6) & 1);
    uint8_t bytes[] = {
       0xa7,
@@ -4333,7 +4296,7 @@ pack_i2f32(const struct agx_apple9_vir_instr *instruction, const uint8_t *phys,
       0x03,
       (uint8_t)((src & 63) << 2),
       b6,
-      is_signed ? 0x60 : 0x20,
+      desc->b7,
    };
    if (instruction->alu_src_uniform_mask)
       pack_integer_source(bytes, src, true, false, 42, 53, 61);
@@ -4345,6 +4308,10 @@ static bool
 pack_f2i32(const struct agx_apple9_vir_instr *instruction, const uint8_t *phys,
            struct agx_apple9_packed_instruction *packed)
 {
+   const struct agx_apple9_vir_opcode_info *info =
+      &agx_apple9_vir_opcodes[instruction->op];
+   const struct agx_apple9_f2i_desc *desc =
+      &agx_apple9_f2i_table[info->family_index];
    const unsigned dst = phys[instruction->dest];
    uint32_t source[1];
    uint8_t live;
@@ -4352,31 +4319,16 @@ pack_f2i32(const struct agx_apple9_vir_instr *instruction, const uint8_t *phys,
        !apple9_alu_sources(instruction, phys, 1, source, &live))
       return false;
    const unsigned src = source[0];
-   bool wide;
-   uint8_t b7, b8;
-   switch (instruction->op) {
-   case AGX_APPLE9_VIR_F2I32: wide = true;  b7 = 0x48; b8 = 0x03; break;
-   case AGX_APPLE9_VIR_F2U32: wide = true;  b7 = 0x08; b8 = 0x02; break;
-   case AGX_APPLE9_VIR_F2I16: wide = false; b7 = 0xc8; b8 = 0x02; break;
-   case AGX_APPLE9_VIR_F2U16: wide = false; b7 = 0x08; b8 = 0x03; break;
-   case AGX_APPLE9_VIR_F2I8:  wide = false; b7 = 0x48; b8 = 0x02; break;
-   case AGX_APPLE9_VIR_F2U8:  wide = false; b7 = 0x88; b8 = 0x02; break;
-   default:
-      return false;
-   }
-   enum agx_apple9_encoding expected =
-      !wide ? AGX_APPLE9_ENC_FLOAT_TO_NARROW_INT
-      : instruction->op == AGX_APPLE9_VIR_F2I32 ? AGX_APPLE9_ENC_FLOAT_TO_SINT
-                                              : AGX_APPLE9_ENC_FLOAT_TO_UINT;
-   if (dst >= AGX_APPLE9_GPR_COUNT || instruction->encoding != expected)
+   if (dst >= AGX_APPLE9_GPR_COUNT ||
+       instruction->encoding != info->fixed_encoding)
       return false;
 
    /* EXP-0013 proves truncation toward zero and the signed/unsigned selector;
     * EXP-0144 independently locates dst=byte3>>1 and src=byte5>>2. Narrow
     * conversions clear bit 2 of byte 6 (0x92 retained, 0xb0 last use) and
     * write the low 16-bit half of dst. */
-   uint8_t b6 = wide ? ((live & 1) ? 0x96 : 0xb4)
-                     : ((live & 1) ? 0x92 : 0xb0);
+   uint8_t b6 = desc->wide ? ((live & 1) ? 0x96 : 0xb4)
+                           : ((live & 1) ? 0x92 : 0xb0);
    uint8_t bytes[] = {
       0x27,
       0x07,
@@ -4385,8 +4337,8 @@ pack_f2i32(const struct agx_apple9_vir_instr *instruction, const uint8_t *phys,
       0x03,
       (uint8_t)((src & 63) << 2),
       (uint8_t)(b6 | ((src >> 6) & 1)),
-      b7,
-      b8,
+      desc->b7,
+      desc->b8,
       0x00,
    };
    if (instruction->alu_src_uniform_mask)
@@ -4399,6 +4351,10 @@ static bool
 pack_fspecial(const struct agx_apple9_vir_instr *instruction, const uint8_t *phys,
               struct agx_apple9_packed_instruction *packed)
 {
+   const struct agx_apple9_vir_opcode_info *info =
+      &agx_apple9_vir_opcodes[instruction->op];
+   const struct agx_apple9_fspecial_desc *desc =
+      &agx_apple9_fspecial_table[info->family_index];
    const unsigned dst = phys[instruction->dest];
    bool uniform_form = instruction->encoding == AGX_APPLE9_ENC_FLOAT_SPECIAL_UNIFORM;
    if (uniform_form && !agx_apple9_supports_special_uniform(instruction->op))
@@ -4409,11 +4365,10 @@ pack_fspecial(const struct agx_apple9_vir_instr *instruction, const uint8_t *phy
        !apple9_alu_sources(instruction, phys, 1, source, &live))
       return false;
    const unsigned src = source[0];
-   bool reciprocal = instruction->op == AGX_APPLE9_VIR_FRCP ||
-                     instruction->op == AGX_APPLE9_VIR_HRCP ||
-                     instruction->op == AGX_APPLE9_VIR_HRCP_F32;
+   bool reciprocal = desc->reciprocal;
    bool half = instruction->encoding == AGX_APPLE9_ENC_HALF_SPECIAL;
-   if ((!half && !uniform_form && instruction->encoding != AGX_APPLE9_ENC_FLOAT_SPECIAL) ||
+   if (half != desc->is_half_op ||
+       (!half && !uniform_form && instruction->encoding != AGX_APPLE9_ENC_FLOAT_SPECIAL) ||
        dst >= AGX_APPLE9_GPR_COUNT ||
        ((instruction->src_abs_mask | instruction->src_neg_mask) & ~1u) ||
        (instruction->immediate != 0x02 && instruction->immediate != 0x03))
@@ -4424,57 +4379,9 @@ pack_fspecial(const struct agx_apple9_vir_instr *instruction, const uint8_t *phy
     * Source lifetime and pending dependencies are independent of selection.
     * EXP-M4-41/42 establish reciprocal and the mask; EXP-0026/0165/0237
     * document the other datapaths and direct-round selector family. */
-   unsigned family = 0, function = 0;
-   unsigned precision = 0x40, rounding = 0;
-   switch (instruction->op) {
-   case AGX_APPLE9_VIR_HRCP_F32:
-   case AGX_APPLE9_VIR_HRCP:
-   case AGX_APPLE9_VIR_FRCP:
-      family = 1;
-      precision = 0x48;
-      rounding = 0x20;
-      break;
-   case AGX_APPLE9_VIR_HRSQ:
-   case AGX_APPLE9_VIR_FRSQ:
-      family = 1;
-      function = 1;
-      break;
-   case AGX_APPLE9_VIR_HSQRT_FACTOR:
-   case AGX_APPLE9_VIR_FSQRT_FACTOR:
-      function = 1;
-      break;
-   case AGX_APPLE9_VIR_FSIN_FACTOR:
-      function = 3;
-      break;
-   case AGX_APPLE9_VIR_HEXP2:
-   case AGX_APPLE9_VIR_FEXP2:
-      family = 1;
-      function = 2;
-      break;
-   case AGX_APPLE9_VIR_HLOG2:
-   case AGX_APPLE9_VIR_FLOG2:
-      function = 2;
-      break;
-   case AGX_APPLE9_VIR_HFLOOR:
-   case AGX_APPLE9_VIR_FFLOOR:
-      rounding = 2;
-      break;
-   case AGX_APPLE9_VIR_HCEIL:
-   case AGX_APPLE9_VIR_FCEIL:
-      rounding = 4;
-      break;
-   case AGX_APPLE9_VIR_HTRUNC:
-   case AGX_APPLE9_VIR_FTRUNC:
-      rounding = 6;
-      break;
-   case AGX_APPLE9_VIR_HROUND_EVEN:
-   case AGX_APPLE9_VIR_FROUND_EVEN:
-      break;
-   default:
-      return false;
-   }
-   bool wide_factor = instruction->op == AGX_APPLE9_VIR_HSQRT_FACTOR ||
-                      instruction->op == AGX_APPLE9_VIR_HRCP_F32;
+   unsigned family = desc->family, function = desc->function;
+   unsigned precision = desc->precision, rounding = desc->rounding;
+   bool wide_factor = desc->wide_factor;
    if (half)
       precision = reciprocal ? (wide_factor ? 0x44 : 0x46)
                              : wide_factor ? 0x40 : 0x60;
@@ -5511,142 +5418,26 @@ uint16_t
 agx_apple9_texture_mode(bool explicit_lod, bool gradient, bool bias,
                         unsigned dimension, bool shadow, bool min_lod)
 {
-   /* Mirrors the sample packer's mode bytes for ordinary samples. */
-   uint8_t b6 = 0, b7 = 0;
-   if (gradient) {
-      b6 = 4;
-      b7 = 1;
-   }
-   if (explicit_lod) {
-      b6 = bias ? 4 : 0;
-      b7 = bias ? 0 : 1;
-   }
-   bool shadow_applied = false;
-   if (!gradient && dimension == 5) {
-      b6 = 0x80;
-      b7 = 0x00;
-   } else if (!gradient && dimension == 6) {
-      b6 = 0xa0;
-      b7 = 0x00;
-   } else if (!gradient && dimension == 2) {
-      if (!explicit_lod && !min_lod) {
-         b6 = shadow ? 0x20 : 0x08;
-         b7 = 0x04;
-         shadow_applied = shadow;
-      } else {
-         b6 = bias ? 0x0c : 0x08;
-         b7 = bias ? 4 : 5;
-      }
-   }
-   if (!gradient && dimension == 3) {
-      b6 = bias ? 0x90 : 0x88;
-      b7 = bias ? 0x01 : 0x21;
-   } else if (!gradient && dimension == 1) {
-      b6 = bias ? 0x14 : 0x00;
-      b7 = bias ? 0x00 : 0x03;
-   } else if (!gradient && dimension == 4) {
-      if (shadow && !explicit_lod && !min_lod) {
-         b6 = 0x30;
-         b7 = 0x04;
-         shadow_applied = true;
-      } else if (shadow && bias && !min_lod) {
-         b6 = 0x38;
-         b7 = 0x00;
-         shadow_applied = true;
-      } else {
-         b6 = bias ? 0x1c : 0x08;
-         b7 = bias ? 0x00 : 0x03;
-      }
-   }
-   if (gradient && dimension == 1) {
-      b6 = 0x04;
-      b7 = 0x03;
-   } else if (gradient && dimension == 2) {
-      b6 = 0x0c;
-      b7 = 5;
-   } else if (gradient && dimension == 3) {
-      b6 = 0x9c;
-      b7 = 1;
-   } else if (gradient && dimension == 4) {
-      b6 = 0x0c;
-      b7 = 0x03;
-   }
-   if (min_lod) {
-      if (gradient) {
-         if (dimension == 3) {
-            b6 = 0x9c;
-            b7 = 0x21;
-         } else {
-            b6 |= 0x10;
-         }
-      } else if (explicit_lod) {
-         if (shadow && dimension == 0) {
-            b6 = bias ? 0x24 : 0x20;
-            b7 = 0x08;
-            shadow_applied = true;
-         } else if (shadow && dimension == 2 && !bias) {
-            b6 = 0x20;
-            b7 = 0x0c;
-            shadow_applied = true;
-         } else if (!shadow && dimension == 0 && bias) {
-            b6 = 0x04;
-            b7 = 0x08;
-         } else if (!shadow && dimension == 1) {
-            b6 = bias ? 0x14 : 0x10;
-            b7 = 0x08;
-         } else if (!shadow && dimension == 3) {
-            b6 = bias ? 0x90 : 0x80;
-            b7 = 0x21;
-         } else if (!shadow && dimension == 4 && !bias) {
-            b6 = 0x10;
-            b7 = 0x0c;
-         } else {
-            b6 |= 0x10;
-         }
-      } else {
-         b6 |= 0x10;
-      }
-   }
-   if (shadow && !shadow_applied)
-      b6 |= 0x20;
-   return b6 | (b7 << 8);
+   if (dimension >= AGX_APPLE9_TEXTURE_DIM_COUNT)
+      return AGX_APPLE9_TEXTURE_MODE_INVALID;
+   enum agx_apple9_texture_mode_kind kind =
+      gradient       ? AGX_APPLE9_TEX_MODE_GRAD
+      : !explicit_lod ? AGX_APPLE9_TEX_MODE_IMPLICIT
+      : bias          ? AGX_APPLE9_TEX_MODE_BIAS
+                      : AGX_APPLE9_TEX_MODE_EXPLICIT_LOD;
+   return agx_apple9_texture_modes[kind][dimension][shadow][min_lod][0];
 }
 
 /* A texel offset selects the offset form of the sample mode word. The
- * pairs were measured from our own MSL compiled for G16, form by form
- * (artifacts/msl-encodings-20261011). Our 2D-array mode words carry the
- * layer with the LOD (bit 0x0400), unlike Metal's; the explicit-LOD array
- * form takes Metal's array offset form with that bit (0x0651), checked on
- * G16 against a CPU reference for ten offsets on every layer
- * (array-offset-probe). Other array forms are not measured. */
+ * pairs are generated from agx_apple9_isa.py (measured from our own MSL
+ * compiled for G16, form by form, and array-offset-probe). */
 bool
 agx_apple9_texture_offset_mode(uint16_t mode, uint16_t *offset_mode)
 {
-   static const uint16_t modes[][2] = {
-      {0x0000, 0x0201}, /* implicit LOD, gather */
-      {0x0004, 0x0281}, /* bias */
-      {0x0804, 0x02c1}, /* bias, minimum LOD */
-      {0x0100, 0x0211}, /* explicit LOD */
-      {0x0408, 0x0301}, /* 2D array, implicit LOD / gather */
-      {0x0508, 0x0651}, /* 2D array, explicit LOD */
-      {0x0104, 0x0209}, /* gradient */
-      {0x0114, 0x0249}, /* gradient, minimum LOD */
-      {0x0020, 0x0221}, /* compare, implicit LOD */
-      {0x0024, 0x02a1}, /* compare, bias */
-      {0x0120, 0x0231}, /* compare, explicit LOD */
-      {0x0124, 0x0229}, /* compare, gradient */
-      {0x0420, 0x0321}, /* 2D array compare, implicit LOD / gather */
-      {0x042c, 0x03a1}, /* 2D array compare, dynamic bias */
-      {0x0c20, 0x0361}, /* 2D array compare, minimum LOD */
-      {0x0180, 0x0291}, /* 3D, implicit LOD */
-      {0x0190, 0x0299}, /* 3D, bias */
-      {0x2188, 0x0219}, /* 3D, explicit LOD */
-      {0x019c, 0x0319}, /* 3D, gradient */
-   };
-   for (unsigned m = 0; m < ARRAY_SIZE(modes); ++m) {
-      if (modes[m][0] == mode) {
+   for (unsigned m = 0; m < AGX_APPLE9_TEXTURE_OFFSET_PAIR_COUNT; ++m) {
+      if (agx_apple9_texture_offset_pairs[m].mode == mode) {
          if (offset_mode)
-            *offset_mode = modes[m][1];
+            *offset_mode = agx_apple9_texture_offset_pairs[m].offset_mode;
          return true;
       }
    }
@@ -6218,45 +6009,24 @@ pack_minmax(const struct agx_apple9_vir_instr *instruction, const uint8_t *phys,
        (instruction->alu_src_immediate_mask & 1) ||
        (instruction->alu_src_uniform_mask | instruction->alu_src_immediate_mask) == 3)
       return false;
+   const struct agx_apple9_vir_opcode_info *info =
+      &agx_apple9_vir_opcodes[instruction->op];
+   const struct agx_apple9_minmax_desc *desc =
+      &agx_apple9_minmax_table[info->family_index];
    bool half = instruction->encoding == AGX_APPLE9_ENC_HALF_MINMAX;
-   bool floating = half || instruction->op == AGX_APPLE9_VIR_FMIN ||
-                   instruction->op == AGX_APPLE9_VIR_FMAX;
+   bool floating = desc->floating;
    /* FP32 min/max takes a wide minifloat operand B; integer min/max takes
     * an 8-bit unsigned immediate (0..255). */
    if (instruction->alu_src_immediate_mask &&
        (half || (instruction->src_neg_mask & 2)))
       return false;
-   if ((!half && instruction->encoding != AGX_APPLE9_ENC_MINMAX_COMPACT) ||
+   if (instruction->encoding != info->fixed_encoding ||
        instruction->nr_srcs + util_bitcount(instruction->alu_src_uniform_mask |
                                             instruction->alu_src_immediate_mask) != 2 ||
        instruction->src_abs_mask ||
        (instruction->src_neg_mask & ~(floating ? 2u : 0u)))
       return false;
-   uint8_t select;
-   switch (instruction->op) {
-   case AGX_APPLE9_VIR_HMAX:
-   case AGX_APPLE9_VIR_FMAX:
-      select = 0;
-      break;
-   case AGX_APPLE9_VIR_HMIN:
-   case AGX_APPLE9_VIR_FMIN:
-      select = 1;
-      break;
-   case AGX_APPLE9_VIR_UMAX:
-      select = 4;
-      break;
-   case AGX_APPLE9_VIR_UMIN:
-      select = 5;
-      break;
-   case AGX_APPLE9_VIR_IMAX:
-      select = 6;
-      break;
-   case AGX_APPLE9_VIR_IMIN:
-      select = 7;
-      break;
-   default:
-      return false;
-   }
+   uint8_t select = desc->select;
 
    uint8_t bytes[6] = {0x02, 0x01, 0x1e, 0x05, select, 0x00};
 
@@ -6655,6 +6425,47 @@ pack_mesh(const struct agx_apple9_vir_instr *I, const uint8_t *phys,
 }
 
 static bool
+pack_bit_unary(const struct agx_apple9_vir_instr *instruction,
+               const uint8_t *phys,
+               struct agx_apple9_packed_instruction *packed)
+{
+   const struct agx_apple9_vir_opcode_info *info =
+      &agx_apple9_vir_opcodes[instruction->op];
+   const struct agx_apple9_bit_unary_desc *desc =
+      &agx_apple9_bit_unary_table[info->family_index];
+   unsigned dst = phys[instruction->dest];
+   uint32_t source[1];
+   uint8_t live;
+   if (instruction->alu_src_immediate_mask ||
+       !apple9_alu_sources(instruction, phys, 1, source, &live))
+      return false;
+   unsigned src = source[0];
+   if (instruction->encoding != AGX_APPLE9_ENC_BIT_UNARY ||
+       instruction->immediate || dst >= AGX_APPLE9_GPR_COUNT)
+      return false;
+
+   /* T8132 integer unary probes establish the shared conversion operand
+    * layout, including zero -> -1 for UFIND_MSB, high registers, retained
+    * sources and direct pending-load consumption. Operation selection is
+    * independent of lifetime, register bits and the dependency mask. */
+   uint8_t bytes[8] = {
+      desc->b0, desc->b1, 0x54, dst << 1, 0x02, (src & 63) << 2,
+      ((live & 1) ? 0x4e : 0x5c) | ((src >> 6) & 1), 0x04,
+   };
+   if (instruction->alu_src_uniform_mask) {
+      /* The population-count uniform probe validated the alternate
+       * destination format. Keep that measured form for this opcode. */
+      if (desc->uniform_alt_fmt) {
+         bytes[4] = 0x03;
+         bytes[6] = 0xcc;
+      }
+      pack_integer_source(bytes, src, true, false, 42, 52, 58);
+   }
+   packed_init(packed, bytes, sizeof(bytes));
+   return true;
+}
+
+static bool
 pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
                           const uint8_t *phys,
                           struct agx_apple9_packed_instruction *packed,
@@ -6664,11 +6475,55 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
    if (reason != NULL)
       *reason = NULL;
 
-   switch (instruction->op) {
-   case AGX_APPLE9_VIR_MESH_CONTROL:
-   case AGX_APPLE9_VIR_MESH_SUBMIT_SCALAR:
-   case AGX_APPLE9_VIR_MESH_SUBMIT_CHANNEL:
+   const struct agx_apple9_vir_opcode_info *info =
+      &agx_apple9_vir_opcodes[instruction->op];
+
+   switch (info->family) {
+   case AGX_APPLE9_VIR_FAMILY_FIXED_BYTES: {
+      const struct agx_apple9_fixed_bytes_desc *desc =
+         &agx_apple9_fixed_bytes_table[info->family_index];
+      if (instruction->encoding != info->fixed_encoding ||
+          instruction->nr_srcs != 0 || instruction->immediate != 0 ||
+          instruction->dest != AGX_APPLE9_VREG_INVALID)
+         goto fail;
+      packed_init(packed, desc->bytes, desc->length);
+      return true;
+   }
+   case AGX_APPLE9_VIR_FAMILY_I2F:
+      return pack_i2f32(instruction, phys, packed);
+   case AGX_APPLE9_VIR_FAMILY_F2I:
+      return pack_f2i32(instruction, phys, packed);
+   case AGX_APPLE9_VIR_FAMILY_FSPECIAL:
+      return pack_fspecial(instruction, phys, packed);
+   case AGX_APPLE9_VIR_FAMILY_MINMAX:
+      return pack_minmax(instruction, phys, packed);
+   case AGX_APPLE9_VIR_FAMILY_BIT_UNARY:
+      return pack_bit_unary(instruction, phys, packed);
+   case AGX_APPLE9_VIR_FAMILY_HALF_ALU:
+      return pack_half_alu(instruction, phys, packed, packed_layout);
+   case AGX_APPLE9_VIR_FAMILY_FLOAT2:
+      return pack_float2(instruction, phys, packed);
+   case AGX_APPLE9_VIR_FAMILY_FLOAT2_IMM:
+      return pack_float2_immediate(instruction, phys, packed);
+   case AGX_APPLE9_VIR_FAMILY_IADD:
+      return pack_iadd(instruction, phys, packed);
+   case AGX_APPLE9_VIR_FAMILY_LOGIC:
+      return pack_logic(instruction, phys, packed, packed_layout);
+   case AGX_APPLE9_VIR_FAMILY_SHIFT:
+      return pack_shift(instruction, phys, packed);
+   case AGX_APPLE9_VIR_FAMILY_UNIFORM:
+      return pack_uniform(instruction, phys, packed, packed_layout);
+   case AGX_APPLE9_VIR_FAMILY_MESH:
       return pack_mesh(instruction, phys, packed);
+   case AGX_APPLE9_VIR_FAMILY_NONE:
+      break;
+   }
+
+   if (info->kind == AGX_APPLE9_VIR_KIND_PSEUDO &&
+       instruction->op != AGX_APPLE9_VIR_ENTRY_REG)
+      goto fail;
+
+   switch (instruction->op) {
    case AGX_APPLE9_VIR_UNPACK_NORM: {
       unsigned mode = instruction->immediate & 0xff;
       bool narrow = mode == AGX_APPLE9_UNPACK_UNORM8 || mode == AGX_APPLE9_UNPACK_SNORM8;
@@ -7173,17 +7028,12 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
    case AGX_APPLE9_VIR_WORKGROUP_BARRIER: {
       if (instruction->encoding != AGX_APPLE9_ENC_WORKGROUP_BARRIER ||
           instruction->nr_srcs ||
-          instruction->immediate > AGX_APPLE9_WORKGROUP_BARRIER_DEVICE ||
+          instruction->immediate >= AGX_APPLE9_WORKGROUP_BARRIER_COUNT ||
           instruction->dest != AGX_APPLE9_VREG_INVALID)
          return false;
-      const uint8_t b3 =
-         instruction->immediate == AGX_APPLE9_WORKGROUP_BARRIER_NONE     ? 0x41
-         : instruction->immediate == AGX_APPLE9_WORKGROUP_BARRIER_DEVICE ? 0x85
-                                                                         : 0x61;
-      const uint8_t b4 =
-         instruction->immediate == AGX_APPLE9_WORKGROUP_BARRIER_DEVICE ? 0x08
-                                                                       : 0x09;
-      const uint8_t bytes[] = {0x07, 0x04, 0x54, b3, b4, 0};
+      const struct agx_apple9_workgroup_barrier_desc *desc =
+         &agx_apple9_workgroup_barrier_table[instruction->immediate];
+      const uint8_t bytes[] = {0x07, 0x04, 0x54, desc->b3, desc->b4, 0};
       packed_init(packed, bytes, sizeof(bytes));
       return true;
    }
@@ -7207,94 +7057,30 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
          packed->length = 0;
          return true;
       }
-      const bool uses_slot_mask =
-         instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE ||
-         instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS ||
-         instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP ||
-         instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP_MEM;
       if (instruction->encoding != AGX_APPLE9_ENC_DEVICE_FENCE ||
           instruction->nr_srcs ||
-          instruction->immediate > AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP_MEM ||
-          (uses_slot_mask
-              ? (instruction->fence_slot_mask & ~BITFIELD_MASK(6)) != 0
-              : instruction->fence_slot_mask != 0) ||
+          instruction->immediate >= AGX_APPLE9_DEVICE_FENCE_HW_COUNT ||
           instruction->dest != AGX_APPLE9_VREG_INVALID)
          return false;
-      /* A device memory fence has no execution rendezvous. It is safe in
-       * divergent control flow, unlike a workgroup barrier. Immediate 1 is
-       * the form Metal places at the end of a raster order group critical
-       * section, before the fragment's tile release.
-       *
-       * FENCE_IMAGE_WRITE (0x0650) drains native PBE image writes to memory,
-       * encoding a 6-bit scoreboard slot wait mask in bits 12..17
-       * (byte 1 = 0x04 | ((mask & 0xf) << 4), byte 2 |= (mask >> 4) & 0x3);
-       * FENCE_TEX_INVALIDATE (0x06d0) invalidates the texture cache so
-       * subsequent texture loads observe the written memory. Fragment PBE
-       * drain uses byte 2 base 0x64; workgroup texture barriers use
-       * 0x0e51 / 0x0ed1 (with rendezvous) and 0x0e50 / 0x0ed0 (mem-only). */
-      if (instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE ||
-          instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS) {
-         const uint8_t mask = (instruction->fence_slot_mask & 0x3fu)
-                                 ? (instruction->fence_slot_mask & 0x3fu)
-                                 : 0x01u;
-         const uint8_t base2 =
-            instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_FS ? 0x64u : 0x54u;
-         const uint8_t bytes[] = {
-            0x07,
-            (uint8_t)(0x04u | ((mask & 0x0fu) << 4)),
-            (uint8_t)(base2 | ((mask >> 4) & 0x03u)),
-            0x50, 0x06, 0};
-         packed_init(packed, bytes, sizeof(bytes));
-         return true;
-      }
-      if (instruction->immediate == AGX_APPLE9_FENCE_TEX_INVALIDATE) {
-         const uint8_t bytes[] = {0x07, 0x04, 0x54, 0xd0, 0x06, 0};
-         packed_init(packed, bytes, sizeof(bytes));
-         return true;
-      }
-      if (instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP ||
-          instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP_MEM) {
-         const uint8_t mask = (instruction->fence_slot_mask & 0x3fu)
-                                 ? (instruction->fence_slot_mask & 0x3fu)
-                                 : 0x01u;
-         const uint8_t b3 =
-            instruction->immediate == AGX_APPLE9_FENCE_IMAGE_WRITE_WORKGROUP
-               ? 0x51u : 0x50u;
-         const uint8_t bytes[] = {
-            0x07,
-            (uint8_t)(0x04u | ((mask & 0x0fu) << 4)),
-            (uint8_t)(0x54u | ((mask >> 4) & 0x03u)),
-            b3, 0x0e, 0};
-         packed_init(packed, bytes, sizeof(bytes));
-         return true;
-      }
-      if (instruction->immediate == AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP ||
-          instruction->immediate == AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP_MEM) {
-         const uint8_t b3 =
-            instruction->immediate == AGX_APPLE9_FENCE_TEX_INVALIDATE_WORKGROUP
-               ? 0xd1u : 0xd0u;
-         const uint8_t bytes[] = {0x07, 0x04, 0x54, b3, 0x0e, 0};
-         packed_init(packed, bytes, sizeof(bytes));
-         return true;
-      }
+      const struct agx_apple9_device_fence_desc *desc =
+         &agx_apple9_device_fence_table[instruction->immediate];
+      if (desc->uses_slot_mask
+             ? (instruction->fence_slot_mask & ~BITFIELD_MASK(6)) != 0
+             : instruction->fence_slot_mask != 0)
+         return false;
+      const uint8_t mask = desc->uses_slot_mask
+                              ? ((instruction->fence_slot_mask & 0x3fu)
+                                    ? (instruction->fence_slot_mask & 0x3fu)
+                                    : 0x01u)
+                              : 0u;
       const uint8_t bytes[] = {
          0x07,
-         0x04,
-         0x54,
-         instruction->immediate == AGX_APPLE9_FENCE_OBJECT_GRID    ? 0x44
-         : instruction->immediate == AGX_APPLE9_FENCE_RASTER_ORDER ? 0xc4
-                                                                   : 0x84,
-         instruction->immediate == AGX_APPLE9_FENCE_RASTER_ORDER ? 0x08 : 0x0a,
-         0};
-      packed_init(packed, bytes, sizeof(bytes));
-      return true;
-   }
-   case AGX_APPLE9_VIR_HALT: {
-      if (instruction->encoding != AGX_APPLE9_ENC_HALT ||
-          instruction->nr_srcs || instruction->immediate ||
-          instruction->dest != AGX_APPLE9_VREG_INVALID)
-         return false;
-      const uint8_t bytes[] = {0x0e, 0, 0, 0};
+         (uint8_t)(0x04u | ((mask & 0x0fu) << 4)),
+         (uint8_t)(desc->b2_base | ((mask >> 4) & 0x03u)),
+         desc->b3,
+         desc->b4,
+         0,
+      };
       packed_init(packed, bytes, sizeof(bytes));
       return true;
    }
@@ -7306,34 +7092,14 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       packed->length = 0;
       return true;
    }
-   case AGX_APPLE9_VIR_ABI_RETURN: {
-      if (instruction->encoding != AGX_APPLE9_ENC_ABI_RETURN ||
-          instruction->nr_srcs || instruction->immediate ||
-          instruction->dest != AGX_APPLE9_VREG_INVALID)
-         return false;
-      uint8_t bytes[4];
-      if (!agx_apple9_encode_return(bytes, 0))
-         return false;
-      packed_init(packed, bytes, sizeof(bytes));
-      return true;
-   }
-   case AGX_APPLE9_VIR_OBJECT_CALL:
-   case AGX_APPLE9_VIR_OBJECT_RETURN:
-   case AGX_APPLE9_VIR_OBJECT_RESUME: {
-      bool call = instruction->op == AGX_APPLE9_VIR_OBJECT_CALL;
-      bool ret = instruction->op == AGX_APPLE9_VIR_OBJECT_RETURN;
-      if (instruction->encoding != (call ? AGX_APPLE9_ENC_OBJECT_CALL
-               : ret ? AGX_APPLE9_ENC_OBJECT_RETURN : AGX_APPLE9_ENC_OBJECT_RESUME) ||
-          instruction->nr_srcs || instruction->dest != AGX_APPLE9_VREG_INVALID ||
-          (!call && instruction->immediate))
+   case AGX_APPLE9_VIR_OBJECT_CALL: {
+      if (instruction->encoding != AGX_APPLE9_ENC_OBJECT_CALL ||
+          instruction->nr_srcs || instruction->dest != AGX_APPLE9_VREG_INVALID)
          return false;
       uint8_t bytes[10];
-      bool ok = call ? agx_apple9_encode_call(bytes, 1, (int32_t)instruction->immediate)
-               : ret ? agx_apple9_encode_return(bytes, 1)
-                     : agx_apple9_encode_exec_pop(bytes, 2);
-      if (!ok)
+      if (!agx_apple9_encode_call(bytes, 1, (int32_t)instruction->immediate))
          return false;
-      packed_init(packed, bytes, call ? 10 : ret ? 4 : 6);
+      packed_init(packed, bytes, sizeof(bytes));
       return true;
    }
    case AGX_APPLE9_VIR_PRIVATE_LOAD:
@@ -7619,26 +7385,9 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
          return false;
       bool retain = !!(instruction->live_after_mask & 1u);
       uint8_t src_hi = (src >> 6) & 1;
-      uint8_t b0, b1, b6, b7;
-      switch (op) {
-      case AGX_APPLE9_SUBGROUP_REDUCE_AND:  b0 = 0x3f; b1 = 0x00; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_OR:   b0 = 0xbf; b1 = 0x00; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_XOR:  b0 = 0x3f; b1 = 0x01; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_IADD: b0 = 0xbf; b1 = 0x01; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_IMIN: b0 = 0x3f; b1 = 0x02; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_IMAX: b0 = 0xbf; b1 = 0x02; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_UMIN: b0 = 0x3f; b1 = 0x03; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_UMAX: b0 = 0xbf; b1 = 0x03; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_FADD: b0 = 0x3f; b1 = 0x06; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_FMUL: b0 = 0xbf; b1 = 0x06; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_FMIN: b0 = 0xbf; b1 = 0x05; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_FMAX: b0 = 0xbf; b1 = 0x07; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_HADD: b0 = 0x3f; b1 = 0x04; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_HMIN: b0 = 0xbf; b1 = 0x05; break;
-      case AGX_APPLE9_SUBGROUP_REDUCE_HMAX: b0 = 0xbf; b1 = 0x07; break;
-      default:
-         return false;
-      }
+      const struct agx_apple9_subgroup_reduce_desc *desc =
+         &agx_apple9_subgroup_reduce_table[op];
+      uint8_t b0 = desc->b0, b1 = desc->b1, b6, b7;
       if (quad)
          b0 &= ~0x08;
       if (op <= AGX_APPLE9_SUBGROUP_REDUCE_UMAX) {
@@ -7686,19 +7435,13 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       if (dst >= AGX_APPLE9_GPR_COUNT || src0 >= AGX_APPLE9_GPR_COUNT ||
           (imm ? lane > 31 : lane >= 64))
          return false;
-      static const uint8_t op_pair[][2] = {
-         {0x47, 0x04}, /* SIMD_SHUFFLE_IDX */
-         {0xc7, 0x04}, /* SIMD_SHUFFLE_XOR */
-         {0x47, 0x05}, /* SIMD_SHUFFLE_UP */
-         {0xc7, 0x05}, /* SIMD_SHUFFLE_DOWN */
-         {0x47, 0x00}, /* QUAD_SHUFFLE_IDX */
-         {0xc7, 0x00}, /* QUAD_SHUFFLE_XOR */
-      };
+      const struct agx_apple9_subgroup_shuffle_desc *sdesc =
+         &agx_apple9_subgroup_shuffle_table[instruction->immediate];
       bool live0 = !!(instruction->live_after_mask & BITFIELD_BIT(0));
       bool live1 = !imm && !!(instruction->live_after_mask & BITFIELD_BIT(1));
       const uint8_t bytes[10] = {
-         op_pair[instruction->immediate][0],
-         op_pair[instruction->immediate][1],
+         sdesc->b0,
+         sdesc->b1,
          0x54,
          (uint8_t)(dst << 1),
          0x02,
@@ -8287,181 +8030,69 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
        * read and filtered-sample shaders with multiple outstanding results. */
       unsigned tag = instruction->producer_scoreboard_slot - 1;
       bytes[5] = (tag << 2) | (tag << 5);
+      if (instruction->texture_dimension >= AGX_APPLE9_TEXTURE_DIM_COUNT)
+         return false;
       if (instruction->texture_imm_lod) {
          /* Inline UQ4.2 immediate explicit LOD (mode 0x0009, 2D only):
           * 2 coords in cr0..cr1, UQ4.2 LOD (0.00..15.75) in byte[11] bits 0..5. */
          bytes[6] = 0x09;
          bytes[7] = 0x00;
          bytes[11] = instruction->texture_imm_lod_uq4_2;
-      }
-      if (gradient) {
-         bytes[6] = 4;
-         bytes[7] = 1;
-         bytes[8] = texture_hi;
-      }
-      if (lod) {
-         bytes[6] = instruction->immediate ? 4 : 0;
-         bytes[7] = instruction->immediate ? 0 : 1;
-      }
-      bool shadow_mode_explicit = false;
-      bool offset_mode_explicit = false;
-      /* 1D (dim=5) and 1D-array (dim=6) ordinary samples. */
-      if (!gradient && instruction->texture_dimension == 5) {
-         bytes[6] = 0x80;
-         bytes[7] = 0x00;
-      } else if (!gradient && instruction->texture_dimension == 6) {
-         bytes[6] = 0xa0;
-         bytes[7] = 0x00;
-      }
-      /* Array samples share word 3: uint16 layer in the low half,
-       * signed Q6 LOD in bits 16..27. immediate == 2 selects implicit LOD
-       * on 2D-array (0x0408 / shadow 0x0420) or Cube-array shadow (0x0430). */
-      if (!gradient && instruction->texture_dimension == 2) {
-         if (instruction->immediate == 2) {
-            bytes[6] = instruction->texture_shadow ? 0x20 : 0x08;
-            bytes[7] = 0x04;
-            shadow_mode_explicit = instruction->texture_shadow;
-         } else {
-            bytes[6] = instruction->immediate ? 0x0c : 0x08;
-            bytes[7] = instruction->immediate ? 4 : 5;
-         }
-      }
-      if (!gradient && instruction->texture_dimension == 3) {
-         bytes[6] = instruction->immediate ? 0x90 : 0x88;
-         bytes[7] = instruction->immediate ? 0x01 : 0x21;
-      } else if (!gradient && instruction->texture_dimension == 1) {
-         bytes[6] = instruction->immediate ? 0x14 : 0x00;
-         bytes[7] = instruction->immediate ? 0x00 : 0x03;
-      } else if (!gradient && instruction->texture_dimension == 4) {
-         if (instruction->texture_shadow && instruction->immediate == 2) {
-            bytes[6] = 0x30;
-            bytes[7] = 0x04;
-            shadow_mode_explicit = true;
-         } else if (instruction->texture_shadow && instruction->immediate == 1 &&
-                    !instruction->texture_min_lod) {
-            bytes[6] = 0x38;
-            bytes[7] = 0x00;
-            shadow_mode_explicit = true;
-         } else {
-            /* Cube array: the cube mode with the array flag. */
-            bytes[6] = instruction->immediate ? 0x1c : 0x08;
-            bytes[7] = instruction->immediate ? 0x00 : 0x03;
-         }
-      }
-      if (instruction->texture_fetch) {
+      } else if (instruction->texture_fetch) {
          if (!lod || instruction->texture_shadow || instruction->immediate ||
-             instruction->texture_dimension == 1 ||
-             instruction->texture_dimension == 4)
+             instruction->texture_min_lod || multisampled ||
+             instruction->texture_lod_query || instruction->texture_gather ||
+             instruction->texture_has_offset)
             return false;
-         if (instruction->texture_dimension == 5) {
-            bytes[6] = 0x80;
-            bytes[7] = 0x0c;
-         } else if (instruction->texture_dimension == 6) {
-            bytes[6] = 0xa0;
-            bytes[7] = 0x0c;
-         } else {
-            bytes[6] = instruction->texture_dimension == 2 ? 0xa0 :
-                       instruction->texture_dimension == 3 ? 0x98 : 0x80;
-            bytes[7] = instruction->texture_dimension == 3 ? 1 : 0x24;
-         }
+         uint16_t mode =
+            agx_apple9_texture_fetch_modes[instruction->texture_dimension];
+         if (mode == AGX_APPLE9_TEXTURE_MODE_INVALID)
+            return false;
+         bytes[6] = mode & 0xff;
+         bytes[7] = mode >> 8;
          bytes[10] = 0;
-      }
-      if (gradient && instruction->texture_dimension == 1) {
-         bytes[6] = 0x04;
-         bytes[7] = 0x03;
-      } else if (gradient && instruction->texture_dimension == 2) {
-         bytes[6] = 0x0c;
-         bytes[7] = 5;
-      } else if (gradient && instruction->texture_dimension == 3) {
-         bytes[6] = 0x9c;
-         bytes[7] = 1;
-      } else if (gradient && instruction->texture_dimension == 4) {
-         bytes[6] = 0x0c;
-         bytes[7] = 0x03;
-      }
-      if (instruction->texture_min_lod) {
-         if (instruction->texture_fetch || multisampled ||
-             instruction->texture_lod_query || instruction->texture_gather)
-            return false;
-         if (gradient) {
-            if (instruction->texture_shadow)
-               return false;
-            if (instruction->texture_dimension == 3) {
-               /* 3D gradient + min_lod: 0x219c. */
-               bytes[6] = 0x9c;
-               bytes[7] = 0x21;
-            } else if (instruction->texture_dimension == 0 ||
-                       instruction->texture_dimension == 2) {
-               bytes[6] |= 0x10;
-            } else {
-               return false;
-            }
-         } else if (lod) {
-            if (instruction->texture_shadow) {
-               if (instruction->texture_dimension == 0) {
-                  /* Depth2D compare + min_lod: 0x0820 (implicit) / 0x0824 (bias). */
-                  bytes[6] = instruction->immediate ? 0x24 : 0x20;
-                  bytes[7] = 0x08;
-                  shadow_mode_explicit = true;
-               } else if (instruction->texture_dimension == 2 &&
-                          !instruction->immediate) {
-                  /* Depth2D-array compare + min_lod: 0x0c20 (+offset 0x0361). */
-                  bytes[6] = 0x20;
-                  bytes[7] = 0x0c;
-                  shadow_mode_explicit = true;
-               } else {
-                  return false;
-               }
-            } else if (instruction->texture_dimension == 0 &&
-                       instruction->immediate) {
-               /* 2D bias + min_lod: 0x0804 (+offset -> 0x02c1). */
-               bytes[6] = 0x04;
-               bytes[7] = 0x08;
-            } else if (instruction->texture_dimension == 2 &&
-                       instruction->immediate &&
-                       instruction->texture_has_offset) {
-               /* 2D-array bias + min_lod + offset: 0x03c1. */
-               bytes[6] = 0xc1;
-               bytes[7] = 0x03;
-               offset_mode_explicit = true;
-            } else if (instruction->texture_dimension == 3) {
-               /* 3D min_lod: 0x2180 (implicit) / 0x2190 (bias). */
-               bytes[6] = instruction->immediate ? 0x90 : 0x80;
-               bytes[7] = 0x21;
-            } else if (instruction->texture_dimension == 1) {
-               /* Cube min_lod: 0x0810 (implicit) / 0x0814 (bias). */
-               bytes[6] = instruction->immediate ? 0x14 : 0x10;
-               bytes[7] = 0x08;
-            } else if (instruction->texture_dimension == 4 &&
-                       !instruction->immediate) {
-               /* Cube-array min_lod: 0x0c10. */
-               bytes[6] = 0x10;
-               bytes[7] = 0x0c;
-            } else {
-               return false;
-            }
-         } else {
-            return false;
-         }
-      }
-      if (instruction->texture_shadow) {
-         if (!shadow_mode_explicit)
-            bytes[6] |= 0x20;
-         bytes[10] = 0;
-      }
-      if (multisampled) {
+      } else if (multisampled) {
          if (!lod || instruction->immediate || instruction->texture_shadow ||
-             instruction->texture_fetch ||
-             (instruction->texture_dimension != 0 && instruction->texture_dimension != 2))
+             instruction->texture_min_lod || instruction->texture_lod_query ||
+             instruction->texture_gather || instruction->texture_has_offset)
             return false;
          /* Integer X/Y, then a packed layer/sample word. */
-         bytes[6] = instruction->texture_dimension == 2 ? 0xa0 : 0x80;
-         bytes[7] = 0x14;
+         uint16_t mode =
+            agx_apple9_texture_ms_modes[instruction->texture_dimension];
+         if (mode == AGX_APPLE9_TEXTURE_MODE_INVALID)
+            return false;
+         bytes[6] = mode & 0xff;
+         bytes[7] = mode >> 8;
          bytes[10] = 0;
+      } else {
+         if (instruction->texture_min_lod &&
+             (instruction->texture_lod_query || instruction->texture_gather))
+            return false;
+         if (!extended && instruction->texture_dimension != 0 &&
+             instruction->texture_dimension != 5 &&
+             instruction->texture_dimension != 6)
+            return false;
+         enum agx_apple9_texture_mode_kind kind =
+            gradient ? AGX_APPLE9_TEX_MODE_GRAD
+            : (!lod || instruction->immediate == 2) ? AGX_APPLE9_TEX_MODE_IMPLICIT
+            : instruction->immediate ? AGX_APPLE9_TEX_MODE_BIAS
+                                     : AGX_APPLE9_TEX_MODE_EXPLICIT_LOD;
+         uint16_t mode =
+            agx_apple9_texture_modes[kind][instruction->texture_dimension]
+                                    [instruction->texture_shadow]
+                                    [instruction->texture_min_lod]
+                                    [instruction->texture_has_offset];
+         if (mode == AGX_APPLE9_TEXTURE_MODE_INVALID)
+            return false;
+         bytes[6] = mode & 0xff;
+         bytes[7] = mode >> 8;
       }
+      if (instruction->texture_shadow)
+         bytes[10] = 0;
       if (instruction->texture_lod_query) {
          if (gradient || multisampled || instruction->texture_shadow ||
-             instruction->texture_fetch || (mask & ~3u))
+             instruction->texture_fetch || instruction->texture_has_offset ||
+             (mask & ~3u))
             return false;
          bytes[10] = 0x20;
       }
@@ -8483,23 +8114,11 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
          bytes[10] |= 0x02;
       }
       /* A texel offset selects the offset form of the sample mode
-       * (bytes 6-7) and is encoded as signed 4-bit immediates: x in bits
-       * 75..78; y bit 0 in bit 79 and bits 1..3 in bits 105..107; z bits
-       * 0..2 in bits 108..110 and bit 3 in bit 21. Measured with our own
-       * MSL compiled for G16 (artifacts/msl-encodings-20261011): the mode
-       * values pair each form we emit with its offset form. */
+       * (bytes 6-7, already resolved from agx_apple9_texture_modes) and is
+       * encoded as signed 4-bit immediates: x in bits 75..78; y bit 0 in
+       * bit 79 and bits 1..3 in bits 105..107; z bits 0..2 in bits 108..110
+       * and bit 3 in bit 21. */
       if (instruction->texture_has_offset) {
-         uint16_t offset_mode;
-         if (instruction->texture_fetch || multisampled ||
-             instruction->texture_lod_query ||
-             (!offset_mode_explicit &&
-              !agx_apple9_texture_offset_mode(bytes[6] | (bytes[7] << 8),
-                                              &offset_mode)))
-            return false;
-         if (!offset_mode_explicit) {
-            bytes[6] = offset_mode & 0xff;
-            bytes[7] = offset_mode >> 8;
-         }
          unsigned x = instruction->texture_offset & 15;
          unsigned y = (instruction->texture_offset >> 4) & 15;
          unsigned z = (instruction->texture_offset >> 8) & 15;
@@ -8645,123 +8264,12 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       packed_init(packed, bytes, sizeof(bytes));
       return true;
    }
-   case AGX_APPLE9_VIR_HADD:
-   case AGX_APPLE9_VIR_HSUB:
-   case AGX_APPLE9_VIR_HMUL:
-   case AGX_APPLE9_VIR_HFMA:
-   case AGX_APPLE9_VIR_HMUL_MIXED:
-      return pack_half_alu(instruction, phys, packed, packed_layout);
-   case AGX_APPLE9_VIR_BIT_COUNT:
-   case AGX_APPLE9_VIR_UFIND_MSB:
-   case AGX_APPLE9_VIR_BIT_REVERSE: {
-      unsigned dst = phys[instruction->dest];
-      uint32_t source[1];
-      uint8_t live;
-      if (instruction->alu_src_immediate_mask ||
-          !apple9_alu_sources(instruction, phys, 1, source, &live))
-         return false;
-      unsigned src = source[0];
-      if (instruction->encoding != AGX_APPLE9_ENC_BIT_UNARY ||
-          instruction->immediate ||
-          dst >= AGX_APPLE9_GPR_COUNT)
-         return false;
-
-      /* T8132 integer unary probes establish the shared conversion operand
-       * layout, including zero -> -1 for UFIND_MSB, high registers, retained
-       * sources and direct pending-load consumption. Operation selection is
-       * independent of lifetime, register bits and the dependency mask. */
-      uint8_t bytes[8] = {
-         instruction->op == AGX_APPLE9_VIR_BIT_COUNT ? 0x27 : 0xa7,
-         instruction->op == AGX_APPLE9_VIR_BIT_REVERSE ? 0x04 : 0x05,
-         0x54, dst << 1, 0x02, (src & 63) << 2,
-         ((live & 1) ? 0x4e : 0x5c) | ((src >> 6) & 1),
-         0x04,
-      };
-      if (instruction->alu_src_uniform_mask) {
-         /* The population-count uniform probe validated the alternate
-          * destination format. Keep that measured form for this opcode. */
-         if (instruction->op == AGX_APPLE9_VIR_BIT_COUNT) {
-            bytes[4] = 0x03;
-            bytes[6] = 0xcc;
-         }
-         pack_integer_source(bytes, src, true, false, 42, 52, 58);
-      }
-      packed_init(packed, bytes, sizeof(bytes));
-      return true;
-   }
-   case AGX_APPLE9_VIR_U2F32:
-   case AGX_APPLE9_VIR_I2F32:
-   case AGX_APPLE9_VIR_U2F16:
-   case AGX_APPLE9_VIR_I2F16:
-   case AGX_APPLE9_VIR_U16_2F16:
-   case AGX_APPLE9_VIR_I16_2F16:
-      return pack_i2f32(instruction, phys, packed);
-   case AGX_APPLE9_VIR_F2I32:
-   case AGX_APPLE9_VIR_F2U32:
-   case AGX_APPLE9_VIR_F2I16:
-   case AGX_APPLE9_VIR_F2U16:
-   case AGX_APPLE9_VIR_F2I8:
-   case AGX_APPLE9_VIR_F2U8:
-      return pack_f2i32(instruction, phys, packed);
-   case AGX_APPLE9_VIR_HRCP_F32:
-   case AGX_APPLE9_VIR_HRCP:
-   case AGX_APPLE9_VIR_HSQRT_FACTOR:
-   case AGX_APPLE9_VIR_HRSQ:
-   case AGX_APPLE9_VIR_HEXP2:
-   case AGX_APPLE9_VIR_HLOG2:
-   case AGX_APPLE9_VIR_HFLOOR:
-   case AGX_APPLE9_VIR_HCEIL:
-   case AGX_APPLE9_VIR_HTRUNC:
-   case AGX_APPLE9_VIR_HROUND_EVEN:
-   case AGX_APPLE9_VIR_FRCP:
-   case AGX_APPLE9_VIR_FRSQ:
-   case AGX_APPLE9_VIR_FSQRT_FACTOR:
-   case AGX_APPLE9_VIR_FSIN_FACTOR:
-   case AGX_APPLE9_VIR_FEXP2:
-   case AGX_APPLE9_VIR_FLOG2:
-   case AGX_APPLE9_VIR_FFLOOR:
-   case AGX_APPLE9_VIR_FCEIL:
-   case AGX_APPLE9_VIR_FTRUNC:
-   case AGX_APPLE9_VIR_FROUND_EVEN:
-      return pack_fspecial(instruction, phys, packed);
-   case AGX_APPLE9_VIR_ISHR:
-   case AGX_APPLE9_VIR_USHR:
-   case AGX_APPLE9_VIR_ISHL:
-      return pack_shift(instruction, phys, packed);
    case AGX_APPLE9_VIR_EXTR:
       return pack_extr(instruction, phys, packed);
-   case AGX_APPLE9_VIR_IADD:
-   case AGX_APPLE9_VIR_ISUB:
-      return pack_iadd(instruction, phys, packed);
    case AGX_APPLE9_VIR_CUBE:
       return pack_cube(instruction, phys, packed);
    case AGX_APPLE9_VIR_IMAD:
       return pack_imad(instruction, phys, packed);
-   case AGX_APPLE9_VIR_IAND:
-   case AGX_APPLE9_VIR_IANDN:
-   case AGX_APPLE9_VIR_IOR:
-   case AGX_APPLE9_VIR_IXOR:
-      return pack_logic(instruction, phys, packed, packed_layout);
-   case AGX_APPLE9_VIR_IOR_UNIFORM:
-   case AGX_APPLE9_VIR_STORE_UNIFORM:
-      return pack_uniform(instruction, phys, packed, packed_layout);
-   case AGX_APPLE9_VIR_IMIN:
-   case AGX_APPLE9_VIR_IMAX:
-   case AGX_APPLE9_VIR_UMIN:
-   case AGX_APPLE9_VIR_UMAX:
-   case AGX_APPLE9_VIR_HMIN:
-   case AGX_APPLE9_VIR_HMAX:
-   case AGX_APPLE9_VIR_FMIN:
-   case AGX_APPLE9_VIR_FMAX:
-      return pack_minmax(instruction, phys, packed);
-   case AGX_APPLE9_VIR_FADD:
-   case AGX_APPLE9_VIR_FSUB:
-   case AGX_APPLE9_VIR_FMUL:
-   case AGX_APPLE9_VIR_FMUL_PROJECT:
-      return pack_float2(instruction, phys, packed);
-   case AGX_APPLE9_VIR_FADD_IMM:
-   case AGX_APPLE9_VIR_FMUL_IMM:
-      return pack_float2_immediate(instruction, phys, packed);
    case AGX_APPLE9_VIR_FSAT: {
       struct agx_apple9_vir_instr clamp = *instruction;
       clamp.op = AGX_APPLE9_VIR_FADD_IMM;
@@ -8797,44 +8305,12 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       packed_init(packed, bytes, sizeof(bytes));
       return true;
    }
-   case AGX_APPLE9_VIR_EXEC_MASK_ELSE: {
-      if (instruction->encoding != AGX_APPLE9_ENC_EXEC_MASK_ELSE ||
-          instruction->nr_srcs != 0 || instruction->immediate != 0)
-         break;
-      const uint8_t bytes[] = {0x0f, 0x04, 0x04, 0x19};
-      packed_init(packed, bytes, sizeof(bytes));
-      return true;
-   }
-   case AGX_APPLE9_VIR_EXEC_MASK_POP: {
-      if (instruction->encoding != AGX_APPLE9_ENC_EXEC_MASK_POP ||
-          instruction->nr_srcs != 0 || instruction->immediate != 0)
-         break;
-      const uint8_t bytes[] = {0x0f, 0x06, 0x04, 0x01, 0x00, 0x00};
-      packed_init(packed, bytes, sizeof(bytes));
-      return true;
-   }
-   case AGX_APPLE9_VIR_LOOP_MASK_PUSH: {
-      if (instruction->encoding != AGX_APPLE9_ENC_LOOP_MASK_PUSH ||
-          instruction->nr_srcs != 0 || instruction->immediate != 0)
-         break;
-      const uint8_t bytes[] = {0x0f, 0x05, 0x54, 0x1a};
-      packed_init(packed, bytes, sizeof(bytes));
-      return true;
-   }
    case AGX_APPLE9_VIR_LOOP_MASK_UPDATE: {
       if (instruction->encoding != AGX_APPLE9_ENC_LOOP_MASK_UPDATE ||
           instruction->nr_srcs != 0 || instruction->immediate > UINT8_MAX)
          break;
       const uint8_t bytes[] = {0x8f, 0x04, 0x54,
                                (uint8_t)instruction->immediate};
-      packed_init(packed, bytes, sizeof(bytes));
-      return true;
-   }
-   case AGX_APPLE9_VIR_LOOP_MASK_POP: {
-      if (instruction->encoding != AGX_APPLE9_ENC_LOOP_MASK_POP ||
-          instruction->nr_srcs != 0 || instruction->immediate != 0)
-         break;
-      const uint8_t bytes[] = {0x0f, 0x06, 0x04, 0x02, 0x00, 0x00};
       packed_init(packed, bytes, sizeof(bytes));
       return true;
    }
@@ -8865,15 +8341,11 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       packed_init(packed, bytes, sizeof(bytes));
       return true;
    }
-   case AGX_APPLE9_VIR_COLLECT:
-   case AGX_APPLE9_VIR_SPLIT:
-   case AGX_APPLE9_VIR_MOV:
-   case AGX_APPLE9_VIR_SWAP:
-   case AGX_APPLE9_VIR_PHI:
-   case AGX_APPLE9_VIR_PHI_SRC:
+   default:
       break;
    }
 
+fail:
    if (reason != NULL)
       *reason = "Apple9 packer cannot encode this virtual instruction";
    return false;
@@ -8899,79 +8371,14 @@ agx_apple9_pack_vir_instruction(const struct agx_apple9_vir_instr *instruction,
    if (reason != NULL)
       *reason = NULL;
 
-   if ((instruction->alu_src_uniform_mask || instruction->alu_src_immediate_mask) &&
-       instruction->op != AGX_APPLE9_VIR_FADD &&
-       instruction->op != AGX_APPLE9_VIR_FSUB &&
-       instruction->op != AGX_APPLE9_VIR_FMUL &&
-       instruction->op != AGX_APPLE9_VIR_FMA &&
-       instruction->op != AGX_APPLE9_VIR_IADD &&
-       instruction->op != AGX_APPLE9_VIR_ISUB &&
-       instruction->op != AGX_APPLE9_VIR_IMAD &&
-       instruction->op != AGX_APPLE9_VIR_IMUL_WIDE &&
-       instruction->op != AGX_APPLE9_VIR_IAND &&
-       instruction->op != AGX_APPLE9_VIR_IANDN &&
-       instruction->op != AGX_APPLE9_VIR_IOR &&
-       instruction->op != AGX_APPLE9_VIR_IXOR &&
-       instruction->op != AGX_APPLE9_VIR_IMIN &&
-       instruction->op != AGX_APPLE9_VIR_IMAX &&
-       instruction->op != AGX_APPLE9_VIR_UMIN &&
-       instruction->op != AGX_APPLE9_VIR_UMAX &&
-       instruction->op != AGX_APPLE9_VIR_FMIN &&
-       instruction->op != AGX_APPLE9_VIR_FMAX &&
-       instruction->op != AGX_APPLE9_VIR_ISHR &&
-       instruction->op != AGX_APPLE9_VIR_USHR &&
-       instruction->op != AGX_APPLE9_VIR_ISHL &&
-       instruction->op != AGX_APPLE9_VIR_EXTR &&
-       instruction->op != AGX_APPLE9_VIR_U2F32 &&
-       instruction->op != AGX_APPLE9_VIR_I2F32 &&
-       instruction->op != AGX_APPLE9_VIR_U2F16 &&
-       instruction->op != AGX_APPLE9_VIR_I2F16 &&
-       instruction->op != AGX_APPLE9_VIR_U16_2F16 &&
-       instruction->op != AGX_APPLE9_VIR_I16_2F16 &&
-       instruction->op != AGX_APPLE9_VIR_F2U32 &&
-       instruction->op != AGX_APPLE9_VIR_F2I32 &&
-       instruction->op != AGX_APPLE9_VIR_F2U16 &&
-       instruction->op != AGX_APPLE9_VIR_F2I16 &&
-       instruction->op != AGX_APPLE9_VIR_F2U8 &&
-       instruction->op != AGX_APPLE9_VIR_F2I8 &&
-       instruction->op != AGX_APPLE9_VIR_SUBGROUP_SHUFFLE &&
-       instruction->op != AGX_APPLE9_VIR_SUBGROUP_ROTATE &&
-       instruction->op != AGX_APPLE9_VIR_BIT_COUNT &&
-       instruction->op != AGX_APPLE9_VIR_UFIND_MSB &&
-       instruction->op != AGX_APPLE9_VIR_BIT_REVERSE &&
-       !agx_apple9_supports_special_uniform(instruction->op) &&
-       instruction->op != AGX_APPLE9_VIR_SELECT &&
-       instruction->op != AGX_APPLE9_VIR_PREDICATE_COMPARE) {
-      if (reason)
-         *reason = "Apple9 operation does not admit inline ALU operands";
+   if (!instruction || !packed)
       return false;
-   }
 
-   /* Integer add/subtract and multiply-add, and floating add/multiply and
-    * FMA, encode half sources. */
-   if ((instruction->src_half_mask | instruction->src_hi_mask |
-        instruction->src_sext_mask) &&
-       instruction->op != AGX_APPLE9_VIR_IADD &&
-       instruction->op != AGX_APPLE9_VIR_ISUB &&
-       instruction->op != AGX_APPLE9_VIR_IMAD &&
-       instruction->op != AGX_APPLE9_VIR_FADD &&
-       instruction->op != AGX_APPLE9_VIR_FSUB &&
-       instruction->op != AGX_APPLE9_VIR_FMUL &&
-       instruction->op != AGX_APPLE9_VIR_FMA &&
-       instruction->op != AGX_APPLE9_VIR_MESH_CONTROL) {
+   const struct agx_apple9_vir_opcode_info *info =
+      agx_apple9_vir_opcode_info(instruction->op);
+   if (!info) {
       if (reason)
-         *reason = "Apple9 operation does not take half-register sources";
-      return false;
-   }
-
-   const bool int_add_sat =
-      (instruction->op == AGX_APPLE9_VIR_IADD ||
-       instruction->op == AGX_APPLE9_VIR_ISUB) &&
-      instruction->encoding == AGX_APPLE9_ENC_INT_ADD_EXTENDED;
-   if (instruction->saturate && !agx_apple9_supports_saturate(instruction) &&
-       !int_add_sat) {
-      if (reason)
-         *reason = "Apple9 operation has no supported saturation modifier";
+         *reason = "Apple9 instruction has an out-of-range opcode";
       return false;
    }
 
@@ -8980,6 +8387,62 @@ agx_apple9_pack_vir_instruction(const struct agx_apple9_vir_instr *instruction,
       if (reason != NULL)
          *reason = "Apple9 instruction has an out-of-range encoding";
       return false;
+   }
+
+   if ((instruction->alu_src_uniform_mask & ~info->inline_uniform_mask) ||
+       (instruction->alu_src_immediate_mask & ~info->inline_immediate_mask) ||
+       (instruction->alu_src_uniform_mask & instruction->alu_src_immediate_mask)) {
+      if (reason)
+         *reason = "Apple9 operation does not admit inline ALU operands";
+      return false;
+   }
+
+   /* Integer add/subtract and multiply-add, floating add/multiply and FMA,
+    * and mesh control encode half sources; a slot cannot be both half-selected
+    * and inline uniform/immediate. */
+   if ((instruction->src_half_mask & ~info->half_src_mask) ||
+       (instruction->src_hi_mask & ~info->half_src_hi_mask) ||
+       (instruction->src_sext_mask & ~info->half_src_sext_mask) ||
+       (instruction->src_half_mask &
+        (instruction->alu_src_uniform_mask | instruction->alu_src_immediate_mask))) {
+      if (reason)
+         *reason = "Apple9 operation does not take half-register sources";
+      return false;
+   }
+
+   const bool int_add_sat =
+      (info->props & AGX_APPLE9_VIR_PROP_INT_ADD_SAT) &&
+      instruction->encoding == AGX_APPLE9_ENC_INT_ADD_EXTENDED;
+   if (instruction->saturate && !agx_apple9_supports_saturate(instruction) &&
+       !int_add_sat) {
+      if (reason)
+         *reason = "Apple9 operation has no supported saturation modifier";
+      return false;
+   }
+
+   if (info->fixed_encoding != AGX_APPLE9_ENC_PSEUDO &&
+       instruction->encoding != info->fixed_encoding) {
+      if (reason != NULL)
+         *reason = "Apple9 packer cannot encode this virtual instruction";
+      return false;
+   }
+
+   if (instruction->encoding != AGX_APPLE9_ENC_PSEUDO) {
+      const struct agx_apple9_encoding_info *enc_info =
+         agx_apple9_encoding_info(instruction->encoding);
+      if ((instruction->alu_src_uniform_mask & ~enc_info->uniform_src_mask) ||
+          (instruction->alu_src_immediate_mask & ~enc_info->immediate_src_mask)) {
+         if (reason)
+            *reason = "Apple9 operation does not admit inline ALU operands";
+         return false;
+      }
+      if ((instruction->src_half_mask & ~enc_info->half_src_mask) ||
+          (instruction->src_hi_mask & ~enc_info->half_src_hi_mask) ||
+          (instruction->src_sext_mask & ~enc_info->half_src_sext_mask)) {
+         if (reason)
+            *reason = "Apple9 operation does not take half-register sources";
+         return false;
+      }
    }
 
    const enum agx_apple9_dependency_layout layout =

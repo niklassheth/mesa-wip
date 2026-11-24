@@ -36,13 +36,21 @@ libgravity_compiler_files = files(
 
 agx_apple9_machine_table = custom_target(
   'agx_apple9_machine_table',
-  input : ['agx_apple9_isa.py', 'agx_apple9_machine.h'],
-  output : ['agx_apple9_machine_table.h', 'agx_apple9_machine_table.c'],
+  input : ['agx_apple9_isa.py', 'agx_apple9_machine.h', 'agx_apple9_ir.h'],
+  output : [
+    'agx_apple9_machine_table.h',
+    'agx_apple9_machine_table.c',
+    'agx_apple9_vir_table.h',
+    'agx_apple9_vir_table.c',
+  ],
   command : [
     prog_python, '@INPUT0@',
     '--check', '@INPUT1@',
+    '--check-ir', '@INPUT2@',
     '--out-h', '@OUTPUT0@',
     '--out-c', '@OUTPUT1@',
+    '--out-vir-h', '@OUTPUT2@',
+    '--out-vir-c', '@OUTPUT3@',
   ],
 )
 

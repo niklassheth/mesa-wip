@@ -228,6 +228,83 @@ enum agx_apple9_vir_opcode {
    AGX_APPLE9_VIR_ABI_RETURN,
 };
 
+enum agx_apple9_vir_kind {
+   AGX_APPLE9_VIR_KIND_PSEUDO = 0,
+   AGX_APPLE9_VIR_KIND_FIXED_FORM,
+   AGX_APPLE9_VIR_KIND_FAMILY,
+   AGX_APPLE9_VIR_KIND_CUSTOM,
+};
+
+enum agx_apple9_vir_family {
+   AGX_APPLE9_VIR_FAMILY_NONE = 0,
+   AGX_APPLE9_VIR_FAMILY_FIXED_BYTES,
+   AGX_APPLE9_VIR_FAMILY_I2F,
+   AGX_APPLE9_VIR_FAMILY_F2I,
+   AGX_APPLE9_VIR_FAMILY_FSPECIAL,
+   AGX_APPLE9_VIR_FAMILY_MINMAX,
+   AGX_APPLE9_VIR_FAMILY_BIT_UNARY,
+   AGX_APPLE9_VIR_FAMILY_HALF_ALU,
+   AGX_APPLE9_VIR_FAMILY_FLOAT2,
+   AGX_APPLE9_VIR_FAMILY_FLOAT2_IMM,
+   AGX_APPLE9_VIR_FAMILY_IADD,
+   AGX_APPLE9_VIR_FAMILY_LOGIC,
+   AGX_APPLE9_VIR_FAMILY_SHIFT,
+   AGX_APPLE9_VIR_FAMILY_UNIFORM,
+   AGX_APPLE9_VIR_FAMILY_MESH,
+};
+
+enum agx_apple9_vir_prop {
+   AGX_APPLE9_VIR_PROP_PURE_ALU             = 1u << 0,
+   AGX_APPLE9_VIR_PROP_PURE_ALU_MULTI_DEST  = 1u << 1,
+   AGX_APPLE9_VIR_PROP_SATURATABLE          = 1u << 2,
+   AGX_APPLE9_VIR_PROP_SPECIAL_UNIFORM      = 1u << 3,
+   AGX_APPLE9_VIR_PROP_OPT_BARRIER          = 1u << 4,
+   AGX_APPLE9_VIR_PROP_CONTROL_SIDE_EFFECT  = 1u << 5,
+   AGX_APPLE9_VIR_PROP_COMMUTATIVE          = 1u << 6,
+   AGX_APPLE9_VIR_PROP_INT_ADD_SAT          = 1u << 7,
+   AGX_APPLE9_VIR_PROP_OPT_UNIFORM_INLINE   = 1u << 8,
+   AGX_APPLE9_VIR_PROP_INLINE_DUAL_UNIFORM  = 1u << 9,
+   AGX_APPLE9_VIR_PROP_FP16_HALF_SRC        = 1u << 10,
+   AGX_APPLE9_VIR_PROP_INT_HALF_SRC         = 1u << 11,
+   AGX_APPLE9_VIR_PROP_NO_DEST              = 1u << 12,
+};
+
+#define AGX_APPLE9_VIR_ARITY_VARIABLE 0xffu
+
+struct agx_apple9_vir_opcode_info {
+   const char *name;
+   enum agx_apple9_vir_kind kind;
+   enum agx_apple9_vir_family family;
+   enum agx_apple9_encoding fixed_encoding;
+   uint8_t family_index;
+   uint8_t arity;
+   uint8_t inline_uniform_mask;
+   uint8_t inline_immediate_mask;
+   uint8_t half_src_mask;
+   uint8_t half_src_hi_mask;
+   uint8_t half_src_sext_mask;
+   uint32_t props;
+};
+
+unsigned agx_apple9_vir_opcode_count(void);
+const struct agx_apple9_vir_opcode_info *
+agx_apple9_vir_opcode_info(enum agx_apple9_vir_opcode op);
+
+static inline bool
+agx_apple9_vir_opcode_has_prop(enum agx_apple9_vir_opcode op,
+                               enum agx_apple9_vir_prop prop)
+{
+   const struct agx_apple9_vir_opcode_info *info =
+      agx_apple9_vir_opcode_info(op);
+   return info && !!(info->props & prop);
+}
+
+static inline bool
+agx_apple9_vir_is_commutative(enum agx_apple9_vir_opcode op)
+{
+   return agx_apple9_vir_opcode_has_prop(op, AGX_APPLE9_VIR_PROP_COMMUTATIVE);
+}
+
 /* Reserve r0..r7 below the linked stage ABI window so spilling (r0..r4) never
  * collides with preloaded entry registers or exported return registers. */
 #define AGX_APPLE9_ABI_REG_BASE 8
@@ -891,12 +968,8 @@ bool agx_apple9_encode_float_immediate_wide(uint32_t value, uint8_t *encoded,
 static inline bool
 agx_apple9_integer_immediate_encoding(enum agx_apple9_encoding encoding)
 {
-   return encoding == AGX_APPLE9_ENC_INT_ADD_EXTENDED ||
-          encoding == AGX_APPLE9_ENC_INT_MAD_EXTENDED ||
-          encoding == AGX_APPLE9_ENC_INT_MUL_WIDE ||
-          encoding == AGX_APPLE9_ENC_LOGIC_EXTENDED ||
-          encoding == AGX_APPLE9_ENC_SELECT_GPR_WIDE ||
-          encoding == AGX_APPLE9_ENC_SELECT_MODIFIER_EXTENDED;
+   return encoding < AGX_APPLE9_ENC_COUNT &&
+          agx_apple9_encoding_info(encoding)->integer_immediates;
 }
 
 
@@ -906,11 +979,9 @@ static inline bool
 agx_apple9_wide_float_immediate_slot(enum agx_apple9_encoding encoding,
                                      unsigned slot)
 {
-   return (encoding == AGX_APPLE9_ENC_MINMAX_COMPACT && slot == 1) ||
-          (slot == 2 && (encoding == AGX_APPLE9_ENC_FLOAT3_EXTENDED ||
-                         encoding == AGX_APPLE9_ENC_FLOAT3_COMPACT ||
-                         encoding == AGX_APPLE9_ENC_FLOAT3_MODIFIER_EXTENDED ||
-                         encoding == AGX_APPLE9_ENC_FLOAT3_SATURATE_EXTENDED));
+   return encoding < AGX_APPLE9_ENC_COUNT && slot < 4 &&
+          !!(agx_apple9_encoding_info(encoding)->wide_float_imm_mask &
+             (1u << slot));
 }
 
 /* Compare operand B of a select or predicate takes a literal in the byte
@@ -920,13 +991,10 @@ static inline bool
 agx_apple9_compare_literal_slot(const struct agx_apple9_vir_instr *I,
                                 unsigned slot)
 {
-   return slot == 1 &&
-          ((I->op == AGX_APPLE9_VIR_SELECT &&
-            (I->encoding == AGX_APPLE9_ENC_SELECT_GPR_WIDE ||
-             I->encoding == AGX_APPLE9_ENC_SELECT_MODIFIER_EXTENDED)) ||
-           (I->op == AGX_APPLE9_VIR_PREDICATE_COMPARE &&
-            (I->encoding == AGX_APPLE9_ENC_PREDICATE_COMPARE_SHORT ||
-             I->encoding == AGX_APPLE9_ENC_PREDICATE_COMPARE_EXTENDED)));
+   return slot == 1 && I->encoding < AGX_APPLE9_ENC_COUNT &&
+          agx_apple9_encoding_info(I->encoding)->compare_literal_src1 &&
+          (I->op == AGX_APPLE9_VIR_SELECT ||
+           I->op == AGX_APPLE9_VIR_PREDICATE_COMPARE);
 }
 
 static inline bool

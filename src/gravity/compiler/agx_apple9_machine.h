@@ -345,6 +345,17 @@ struct agx_apple9_encoding_info {
     * cannot share a register with a source. */
    bool split_result;
 
+   /* Per-slot operand legality bitmasks over logical ALU slots SRC0..SRC3
+    * (bit s = 1u << s), generated from agx_apple9_isa.py. */
+   uint8_t uniform_src_mask;
+   uint8_t immediate_src_mask;
+   uint8_t half_src_mask;
+   uint8_t half_src_hi_mask;
+   uint8_t half_src_sext_mask;
+   uint8_t wide_float_imm_mask;
+   bool integer_immediates;
+   bool compare_literal_src1;
+
    struct agx_apple9_operand_constraint
       operands[AGX_APPLE9_MAX_ENCODING_OPERANDS];
 };

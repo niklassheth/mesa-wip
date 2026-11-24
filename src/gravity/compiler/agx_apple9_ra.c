@@ -362,9 +362,7 @@ apple9_can_fold_pending(const struct agx_apple9_vir_instr *ins,
    if (ins->encoding == AGX_APPLE9_ENC_LOGIC_EXTENDED ||
        ins->encoding == AGX_APPLE9_ENC_LOGIC_EXPORT) {
       if (ins->nr_srcs == 2) {
-         const bool commutative = ins->op == AGX_APPLE9_VIR_IAND ||
-                                  ins->op == AGX_APPLE9_VIR_IOR ||
-                                  ins->op == AGX_APPLE9_VIR_IXOR;
+         const bool commutative = agx_apple9_vir_is_commutative(ins->op);
          bool any_only_a = false, any_only_b = false;
          for (unsigned i = 0; i < p->count; ++i) {
             bool def_a = apple9_producer_result(&p->producer[i], ins->src[0]);
