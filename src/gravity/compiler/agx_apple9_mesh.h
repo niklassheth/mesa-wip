@@ -33,6 +33,11 @@ struct agx_apple9_mesh_key {
    /* Load the per-parent hardware payload VA from GET_SR 0xe0/0xe1 instead of
     * the draw-wide AGX_APPLE9_MESH_PAYLOAD_UNIFORM pointer. */
    bool hw_payload;
+   /* Pad vertex component layouts whose mesh ring footprint hits the T8132
+    * exact power-of-two wrap divisor wg_rows == 32 (planes == 24 at quads == 1
+    * -> planes == 28 / wg_rows == 36; planes == 12 at quads == 2 -> planes ==
+    * 16 / wg_rows == 40) so they stay concurrent-safe and unbounded. */
+   bool pad_wg_rows_32;
 };
 
 #define AGX_APPLE9_MESH_KEY                                                    \

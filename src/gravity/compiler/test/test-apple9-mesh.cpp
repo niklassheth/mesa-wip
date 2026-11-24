@@ -3535,3 +3535,150 @@ TEST(Apple9MeshNativeExpand, PerVertexLayerAndViewportPreserveLayerBits)
       ralloc_free(b.shader);
    }
 }
+
+TEST(Apple9MeshNativeExpand, PadWgRows32ToUnbounded)
+{
+   /* Verify quads == 1 (V <= 4) with planes == 24 (21..24 comps) pads to
+    * vertex_components == 25 (planes == 28, wg_rows == 36), and quads == 2
+    * (V in 5..8) with planes == 12 (9..12 comps) pads to 13 (planes == 16,
+    * wg_rows == 40), and that no V <= 4 component count in 4..40 emits
+    * wg_rows == 32. */
+   for (unsigned user_comps = 0; user_comps <= 36; ++user_comps) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_MESH, &agx_nir_options, "pad_wg32_v4");
+      b.shader->info.io_lowered = true;
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.mesh.max_vertices_out = 4;
+      b.shader->info.mesh.max_primitives_out = 2;
+      b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 4),
+                                         nir_imm_int(&b, 2),
+                                         nir_imm_int(&b, 0));
+      for (unsigned v = 0; v < 4; ++v) {
+         nir_store_per_vertex_output(
+            &b, nir_imm_vec4(&b, float(v), 0.0f, 0.5f, 1.0f), nir_imm_int(&b, v),
+            nir_imm_int(&b, 0), .write_mask = 0xf, .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         for (unsigned u = 0; u < user_comps; ++u) {
+            unsigned slot = VARYING_SLOT_VAR0 + u / 4;
+            unsigned comp = u % 4;
+            nir_store_per_vertex_output(
+               &b, nir_imm_float(&b, float(u + 1)), nir_imm_int(&b, v),
+               nir_imm_int(&b, 0), .write_mask = 0x1, .component = comp,
+               .src_type = nir_type_float32,
+               .io_semantics = {.location = slot, .num_slots = 1});
+         }
+      }
+      nir_store_per_primitive_output(
+         &b, nir_imm_ivec3(&b, 0, 1, 2), nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+         .write_mask = 0x7, .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+      nir_store_per_primitive_output(
+         &b, nir_imm_ivec3(&b, 1, 2, 3), nir_imm_int(&b, 1), nir_imm_int(&b, 0),
+         .write_mask = 0x7, .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+      nir_pop_if(&b, nullptr);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+
+      agx_apple9_native_mesh_options opts = {};
+      opts.physical_threads = 32;
+      opts.packed_index_publication = true;
+      opts.publication_rounds = true;
+      opts.attributes = true;
+
+      agx_shader_part code = {};
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_native_mesh(b.shader, true, &opts, &code,
+                                                 &info, &reason))
+         << "user_comps=" << user_comps << ": " << (reason ?: "");
+      unsigned raw_vc = 4u + user_comps;
+      unsigned expected_vc =
+         ALIGN_POT(raw_vc, 4u) == 24u ? 25u : raw_vc;
+      EXPECT_EQ(info.layout.vertex_components, expected_vc);
+      EXPECT_EQ(code.info.apple9_varyings.count, expected_vc - 4u);
+      unsigned planes = ALIGN_POT(info.layout.vertex_components, 4u);
+      unsigned wg_rows = DIV_ROUND_UP(info.layout.max_vertices, 4u) * planes + 8u;
+      EXPECT_NE(wg_rows, 32u);
+      if (raw_vc >= 21u && raw_vc <= 24u) {
+         EXPECT_EQ(planes, 28u);
+         EXPECT_EQ(wg_rows, 36u);
+      }
+      EXPECT_EQ(info.layout.local_size_B,
+                info.layout.position_B +
+                   info.layout.vertex_components * info.layout.vertex_pitch_B);
+      free(code.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* Also verify quads == 2 (V=8) with planes == 12 (9..12 comps) pads to 13
+    * (planes == 16, wg_rows == 40). */
+   for (unsigned user_comps = 5; user_comps <= 8; ++user_comps) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_MESH, &agx_nir_options, "pad_wg32_v8");
+      b.shader->info.io_lowered = true;
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.mesh.max_vertices_out = 8;
+      b.shader->info.mesh.max_primitives_out = 4;
+      b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 8),
+                                         nir_imm_int(&b, 4),
+                                         nir_imm_int(&b, 0));
+      for (unsigned v = 0; v < 8; ++v) {
+         nir_store_per_vertex_output(
+            &b, nir_imm_vec4(&b, float(v), 0.0f, 0.5f, 1.0f), nir_imm_int(&b, v),
+            nir_imm_int(&b, 0), .write_mask = 0xf, .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         for (unsigned u = 0; u < user_comps; ++u) {
+            nir_store_per_vertex_output(
+               &b, nir_imm_float(&b, float(u + 1)), nir_imm_int(&b, v),
+               nir_imm_int(&b, 0), .write_mask = 0x1, .component = u % 4,
+               .src_type = nir_type_float32,
+               .io_semantics = {.location = VARYING_SLOT_VAR0 + u / 4,
+                                .num_slots = 1});
+         }
+      }
+      for (unsigned p = 0; p < 4; ++p) {
+         nir_store_per_primitive_output(
+            &b, nir_imm_ivec3(&b, 0, 1, 2), nir_imm_int(&b, p),
+            nir_imm_int(&b, 0), .write_mask = 0x7, .src_type = nir_type_uint32,
+            .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                             .num_slots = 1});
+      }
+      nir_pop_if(&b, nullptr);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+
+      agx_apple9_native_mesh_options opts = {};
+      opts.physical_threads = 32;
+      opts.packed_index_publication = true;
+      opts.publication_rounds = true;
+      opts.attributes = true;
+
+      agx_shader_part code = {};
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_native_mesh(b.shader, true, &opts, &code,
+                                                 &info, &reason))
+         << "v8 user_comps=" << user_comps << ": " << (reason ?: "");
+      EXPECT_EQ(info.layout.vertex_components, 13u);
+      EXPECT_EQ(code.info.apple9_varyings.count, 9u);
+      unsigned planes = ALIGN_POT(info.layout.vertex_components, 4u);
+      unsigned wg_rows = DIV_ROUND_UP(info.layout.max_vertices, 4u) * planes + 8u;
+      EXPECT_EQ(planes, 16u);
+      EXPECT_EQ(wg_rows, 40u);
+      free(code.binary);
+      ralloc_free(b.shader);
+   }
+}

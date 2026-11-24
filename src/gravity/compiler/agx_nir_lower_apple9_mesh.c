@@ -362,6 +362,45 @@ validate(nir_shader *nir, const struct agx_apple9_mesh_key *key,
       u_foreach_bit(c, primitive[slot])
          layout->primitive_component[slot][c] = layout->primitive_components++;
    }
+   /* T8132's 4,096-row mesh output ring hits an exact power-of-two wrap
+    * (4096 / 32 = 128) at wg_rows == 32 during mid-render TVB growth.
+    * When quads == 1 (max_vertices <= 4) and planes == 24 (21..24 vertex
+    * components), pad to 25 components (planes = 28, wg_rows = 36 <= 40,
+    * != 32), and similarly when quads == 2 (max_vertices in 5..8) and
+    * planes == 12 (9..12 components), pad to 13 (planes = 16, wg_rows = 40),
+    * using unused VAR scalar planes so the layout, VARY/channel submission,
+    * PPP output count, and CF bindings all stay 100% consistent and unbounded. */
+   if (key->pad_wg_rows_32 && !layout->primitive_components &&
+       !layout->culling && layout->max_vertices > 0) {
+      unsigned quads = DIV_ROUND_UP(layout->max_vertices, 4u);
+      unsigned planes = ALIGN_POT(layout->vertex_components, 4u);
+      unsigned target = 0;
+      if (quads == 1 && planes == 24)
+         target = 25;
+      else if (quads == 2 && planes == 12)
+         target = 13;
+      if (target > layout->vertex_components) {
+         unsigned padded_local_B =
+            layout->position_B + layout->vertex_pitch_B * target;
+         unsigned padded_shared_off = ALIGN_POT(padded_local_B, 16);
+         if (padded_local_B <= AGX_APPLE9_MAX_SHARED_BYTES &&
+             ALIGN_POT(nir->info.shared_size, 4) <=
+                AGX_APPLE9_MAX_SHARED_BYTES - padded_shared_off) {
+            for (unsigned slot = VARYING_SLOT_VAR0 + 31;
+                 layout->vertex_components < target &&
+                 slot >= VARYING_SLOT_VAR0;
+                 --slot) {
+               if (vertex[slot] || primitive[slot])
+                  continue;
+               for (unsigned c = 0;
+                    layout->vertex_components < target && c < 4; ++c) {
+                  layout->vertex_component[slot][c] =
+                     layout->vertex_components++;
+               }
+            }
+         }
+      }
+   }
    layout->primitive_stride_B = layout->primitive_components * 4;
    /* Primitive attributes have a separate device record. The local output
     * contract reserves one linking plane when such records are present. */

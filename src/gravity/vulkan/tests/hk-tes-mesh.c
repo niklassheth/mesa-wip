@@ -784,6 +784,17 @@ compile_fused_tess_pair(const nir_shader *vs, const nir_shader *tcs,
    CHECK(mesh_info.key.hw_payload);
    CHECK(hk_apple9_native_shader_valid(&mesh_part.info, &mesh_info,
                                        HK_APPLE9_NATIVE_MESH));
+   {
+      unsigned quads = DIV_ROUND_UP(mesh_info.layout.max_vertices, 4u);
+      unsigned planes = ALIGN_POT(mesh_info.layout.vertex_components, 4u);
+      unsigned wg_rows = quads * planes + AGX_APPLE9_MESH_RING_HEADER_ROWS;
+      CHECK(wg_rows != AGX_APPLE9_MESH_RING_EXACT_WRAP_ROWS);
+      if (quads == 1 && planes == 28) {
+         uint64_t ring_max = 0;
+         CHECK(agx_apple9_mesh_ring_max_groups(&mesh_info.layout, &ring_max));
+         CHECK(ring_max == UINT64_MAX);
+      }
+   }
    free(mesh_part.binary);
    ralloc_free(mesh);
 
@@ -931,6 +942,55 @@ fused_tess_suite(void)
       ralloc_free(tcs);
       ralloc_free(tes);
       compiled++;
+   }
+   {
+      /* Planes == 24 trap (21..24 live vertex components at V=4): native mesh
+       * lowering must pad to 25 components (planes = 28, wg_rows = 36,
+       * ring_max == UINT64_MAX) so zero shaders emit wg_rows == 32. */
+      for (unsigned live_user = 17; live_user <= 20; ++live_user) {
+         nir_shader *vs = make_fused_vs(5, false);
+         nir_shader *tcs = make_fused_tcs(1, 5, 1.0f, 1.0f, false, false, false,
+                                          TESS_SPACING_EQUAL, false, false);
+         nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
+                                          false, false, 1, 5, 0, 0, false, false);
+         struct hk_tess_fused_options mask_opts = base_opts;
+         mask_opts.has_fs_inputs_mask = true;
+         for (unsigned u = 0; u < live_user; ++u)
+            mask_opts.fs_var_read_mask[u / 4] |= BITFIELD_BIT(u % 4);
+         nir_shader *obj = NULL, *mesh = NULL;
+         struct hk_tess_fused_info info = {0};
+         const char *r = NULL;
+         CHECK(hk_nir_tess_fused_lower(vs, tcs, tes, &mask_opts, &obj, &mesh,
+                                       &info, &r));
+         CHECK(info.mesh_max_vertices == 4 && info.mesh_max_primitives == 2);
+         struct agx_apple9_native_mesh_options mopts = {
+            .physical_threads = AGX_APPLE9_NATIVE_SERIAL_THREADS,
+            .packed_index_publication = true,
+            .publication_rounds = true,
+            .attributes = true,
+            .native_object_payload = true,
+            .native_object_hw_payload = true,
+            .native_object_payload_stride_B = info.payload_B,
+         };
+         struct agx_shader_part part = {0};
+         struct agx_apple9_mesh_body_info body = {0};
+         CHECK(agx_compile_apple9_native_mesh(mesh, true, &mopts, &part, &body,
+                                              &r));
+         CHECK(body.layout.vertex_components == 25u);
+         CHECK(part.info.apple9_varyings.count == 21u);
+         CHECK(hk_apple9_native_shader_valid(&part.info, &body,
+                                             HK_APPLE9_NATIVE_MESH));
+         uint64_t ring_max = 0;
+         CHECK(agx_apple9_mesh_ring_max_groups(&body.layout, &ring_max));
+         CHECK(ring_max == UINT64_MAX);
+         free(part.binary);
+         ralloc_free(obj);
+         ralloc_free(mesh);
+         ralloc_free(vs);
+         ralloc_free(tcs);
+         ralloc_free(tes);
+         compiled++;
+      }
    }
 
    /* 3. Zero-child patch culling (outer == 0.0, outer == -2.0, outer == NaN). */

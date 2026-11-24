@@ -97,7 +97,8 @@ choose_meshlet_shape(unsigned vertex_components)
       };
    }
    /* planes = 12, 20, 28, 32 -> wg_rows in {20, 28, 36, 40} (unbounded);
-    * planes = 24 -> wg_rows = 32 (bounded <= 128 groups by ring guard);
+    * planes = 24 -> padded to 28 (wg_rows = 36, unbounded) by native mesh
+    * lowering so it never hits the wg_rows == 32 TVB-grow exact-wrap guard;
     * planes = 36..64 -> wg_rows = 44..72 (draw-time ring-bounded). */
    return (struct tess_meshlet_shape){
       .max_v = 4,

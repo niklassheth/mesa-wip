@@ -1060,6 +1060,7 @@ agx_nir_lower_apple9_native_mesh(
       (nir->info.outputs_written & VARYING_BIT_LAYER);
    key.physical_threads = physical_threads;
    key.hw_payload = native_object_hw_payload;
+   key.pad_wg_rows_32 = options && options->attributes;
    if (!agx_nir_lower_apple9_mesh(nir, &key, info, reason))
       return false;
    if (native_object_payload) {
