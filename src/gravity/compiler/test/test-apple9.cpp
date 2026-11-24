@@ -20722,3 +20722,88 @@ TEST(Apple9IsaTable, CheckedTextureModeTableRejectsUnmeasuredForms)
    EXPECT_FALSE(agx_apple9_pack_vir_instruction(&tex, phys, &packed, &reason));
    EXPECT_EQ(agx_apple9_texture_mode(false, false, false, 7, false, false), 0xffffu);
 }
+
+TEST(Apple9Compiler, ScaledLoadElidesShiftMaskOnlyWhenInBoundsAmul)
+{
+   /* Pointer-chasing / runtime-indexed scaled DEVICE_LOADs should elide the
+    * 32-bit wraparound BFE mask (idx & (UINT32_MAX >> shift)) when the offset
+    * is an ACCESS_IN_BOUNDS nir_op_amul, while strictly preserving the BFE
+    * mask when NOT ACCESS_IN_BOUNDS (robustness) or when scaled by a wrapping
+    * non-amul nir_op_ishl or nir_op_imul. */
+   auto count_shift_mask_bfe = [](const struct agx_shader_part *compiled) {
+      const uint8_t *bin = static_cast<const uint8_t *>(compiled->binary);
+      unsigned count = 0;
+      for (unsigned i = 0; i + 12 <= compiled->info.binary_size; ++i) {
+         if (bin[i] == 0xa7 && bin[i + 8] == 0xf0 &&
+             (bin[i + 9] & 0x0f) == 0x01) {
+            ++count;
+            i += 11;
+         }
+      }
+      return count;
+   };
+
+   for (unsigned shift : {1u, 2u, 3u, 4u}) {
+      SCOPED_TRACE(shift);
+      unsigned sizes[4] = {};
+      unsigned bfes[4] = {};
+      unsigned elem_bits = shift == 1u ? 16u : 32u;
+      unsigned elem_align = elem_bits / 8u;
+
+      /* mode 0: amul + ACCESS_IN_BOUNDS -> BFE elided
+       * mode 1: amul without ACCESS_IN_BOUNDS (robust) -> BFE preserved
+       * mode 2: ishl + ACCESS_IN_BOUNDS -> BFE preserved (ishl can wrap)
+       * mode 3: imul + ACCESS_IN_BOUNDS -> BFE preserved (imul can wrap) */
+      for (unsigned mode = 0; mode < 4; ++mode) {
+         SCOPED_TRACE(mode);
+         nir_builder b = apple9_compute_builder("scaled_load_in_bounds");
+         b.shader->info.num_ssbos = 2;
+
+         /* Load an unbounded runtime index from SSBO 0 at constant offset 0. */
+         nir_def *idx = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0),
+                                      nir_imm_int(&b, 0), .align_mul = 4);
+         nir_def *offset = nullptr;
+         if (mode == 2)
+            offset = nir_ishl_imm(&b, idx, shift);
+         else if (mode == 3)
+            offset = nir_imul(&b, idx, nir_imm_int(&b, 1u << shift));
+         else
+            offset = nir_amul(&b, idx, nir_imm_int(&b, 1u << shift));
+
+         enum gl_access_qualifier access =
+            mode == 1 ? (enum gl_access_qualifier)0 : ACCESS_IN_BOUNDS;
+         nir_def *val = nir_load_ssbo(&b, 1, elem_bits, nir_imm_int(&b, 0),
+                                      offset, .access = access,
+                                      .align_mul = elem_align);
+         nir_def *out = elem_bits == 16u ? nir_u2u32(&b, val) : val;
+         nir_store_ssbo(&b, out, nir_imm_int(&b, 1), nir_imm_int(&b, 0),
+                        .write_mask = 1, .align_mul = 4);
+
+         agx_shader_part compiled = {};
+         agx_apple9_compute_profile profile = {};
+         const char *reason = nullptr;
+         ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason))
+            << (reason ?: "");
+
+         unsigned loads[4];
+         ASSERT_EQ(apple9_binary_device_load_offsets(&compiled, loads, 4), 2u);
+         const uint8_t *load1 = static_cast<const uint8_t *>(compiled.binary) + loads[1];
+         unsigned encoded = apple9_test_bits(load1, 97, 3);
+         EXPECT_EQ(encoded ? encoded - 1 : 4, shift);
+
+         sizes[mode] = compiled.info.binary_size;
+         bfes[mode] = count_shift_mask_bfe(&compiled);
+
+         free(compiled.binary);
+         ralloc_free(b.shader);
+      }
+
+      EXPECT_EQ(bfes[0], 0u) << "ACCESS_IN_BOUNDS amul must elide BFE mask";
+      EXPECT_EQ(bfes[1], 1u) << "robust (non-IN_BOUNDS) amul must keep BFE mask";
+      EXPECT_EQ(bfes[2], 1u) << "non-amul ishl must keep BFE mask";
+      EXPECT_EQ(bfes[3], 1u) << "non-amul imul must keep BFE mask";
+      EXPECT_EQ(sizes[0] + 12u, sizes[1]);
+      EXPECT_EQ(sizes[1], sizes[2]);
+      EXPECT_EQ(sizes[1], sizes[3]);
+   }
+}

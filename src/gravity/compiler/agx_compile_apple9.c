@@ -625,7 +625,8 @@ apple9_memory_address(nir_shader *nir, nir_intrinsic_instr *intr, nir_def *offse
              * in-bounds access the 32-bit sum equals the hardware's 64-bit
              * index + displacement. Robust accesses still load out of
              * bounds before their result is discarded, so keep the proof. */
-            if ((nir_intrinsic_access(intr) & ACCESS_IN_BOUNDS) &&
+            if (nir_intrinsic_has_access(intr) &&
+                (nir_intrinsic_access(intr) & ACCESS_IN_BOUNDS) &&
                 nir_scalar_is_alu(other) &&
                 nir_scalar_alu_op(other) == nir_op_amul)
                safe = true;
@@ -648,7 +649,17 @@ apple9_memory_address(nir_shader *nir, nir_intrinsic_instr *intr, nir_def *offse
                break;
             uint32_t maximum = UINT32_MAX >> amount;
             *shift += amount;
-            if (apple9_address_upper_bound(nir, bounds, other) > maximum) {
+            /* An amul cannot overflow the variable it indexes, so for an
+             * in-bounds access the scaled 32-bit offset cannot wrap and the
+             * hardware's 64-bit (u2u64(index) << shift) matches it directly.
+             * Robust accesses still load out of bounds before their result is
+             * discarded, so keep the mask unless ACCESS_IN_BOUNDS holds. */
+            bool in_bounds_amul =
+               op == nir_op_amul &&
+               nir_intrinsic_has_access(intr) &&
+               (nir_intrinsic_access(intr) & ACCESS_IN_BOUNDS);
+            if (!in_bounds_amul &&
+                apple9_address_upper_bound(nir, bounds, other) > maximum) {
                nir_def *base = nir_channel(&b, other.def, other.comp);
                value = nir_get_scalar(nir_iand_imm(&b, base, maximum), 0);
                /* The mask must apply after the remaining arithmetic. */
