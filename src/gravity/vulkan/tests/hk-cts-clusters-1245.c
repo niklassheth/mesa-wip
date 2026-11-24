@@ -496,6 +496,38 @@ test_gpl_vertex_pipeline_robustness(struct hk_physical_device *pdev,
    struct hk_api_shader *lto_vs = container_of(lto_out, struct hk_api_shader, vk);
    CHECK(!lto_vs->variants[HK_VS_VARIANT_HW].info.apple9_vertex_unbounded);
 
+   /* Shader Object (state == NULL) must stay invariant across pipeline-only
+    * features (pipelineRobustness / graphicsPipelineLibrary) so binary shaders
+    * match across devices with differing pipeline features. */
+   struct vk_shader_compile_info eso_pr_info = {
+      .stage = MESA_SHADER_VERTEX,
+      .nir = simple_vs_with_attrib(),
+      .robustness = &vk_robustness_disabled,
+   };
+   struct vk_shader *eso_pr_out = NULL;
+   CHECK(hk_apple9_compile_graphics(dev, 1, &eso_pr_info, NULL, NULL, NULL,
+                                    NULL, &eso_pr_out) == VK_SUCCESS);
+   struct hk_api_shader *eso_pr_vs = container_of(eso_pr_out, struct hk_api_shader, vk);
+   CHECK(eso_pr_vs->variants[HK_VS_VARIANT_HW].info.apple9_vertex_unbounded);
+
+   dev->vk.enabled_features.graphicsPipelineLibrary = false;
+   dev->vk.enabled_features.pipelineRobustness = false;
+   struct vk_shader_compile_info eso_min_info = {
+      .stage = MESA_SHADER_VERTEX,
+      .nir = simple_vs_with_attrib(),
+      .robustness = &vk_robustness_disabled,
+   };
+   struct vk_shader *eso_min_out = NULL;
+   CHECK(hk_apple9_compile_graphics(dev, 1, &eso_min_info, NULL, NULL, NULL,
+                                    NULL, &eso_min_out) == VK_SUCCESS);
+   struct hk_api_shader *eso_min_vs = container_of(eso_min_out, struct hk_api_shader, vk);
+   CHECK(eso_min_vs->variants[HK_VS_VARIANT_HW].info.apple9_vertex_unbounded);
+   CHECK(eso_pr_vs->variants[HK_VS_VARIANT_HW].code_size ==
+         eso_min_vs->variants[HK_VS_VARIANT_HW].code_size);
+   CHECK(memcmp(eso_pr_vs->variants[HK_VS_VARIANT_HW].code_ptr,
+                eso_min_vs->variants[HK_VS_VARIANT_HW].code_ptr,
+                eso_pr_vs->variants[HK_VS_VARIANT_HW].code_size) == 0);
+
    /* Verify graphics state hashes separate GPL/pipelineRobustness combinations. */
    struct vk_features feats_pr_only = {.pipelineRobustness = true};
    struct vk_features feats_pr_gpl = {
@@ -516,8 +548,8 @@ test_gpl_vertex_pipeline_robustness(struct hk_physical_device *pdev,
    mono_out->ops->destroy(&dev->vk, mono_out, NULL);
    lib_out->ops->destroy(&dev->vk, lib_out, NULL);
    lto_out->ops->destroy(&dev->vk, lto_out, NULL);
-   dev->vk.enabled_features.graphicsPipelineLibrary = false;
-   dev->vk.enabled_features.pipelineRobustness = false;
+   eso_pr_out->ops->destroy(&dev->vk, eso_pr_out, NULL);
+   eso_min_out->ops->destroy(&dev->vk, eso_min_out, NULL);
 }
 
 /* Board #378: geometry shader without VARYING_SLOT_POS must not synthesize

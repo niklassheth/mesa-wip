@@ -3696,12 +3696,13 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
        * specified on the VERTEX_INPUT_INTERFACE library alone (which has no
        * shaders), so common vk_pipeline compilation leaves vertex_inputs as
        * DISABLED on the VS stage for both fast-linked and LTO GPL pipelines.
-       * Preserve vertex input bounds checks whenever pipelineRobustness is
-       * enabled alongside GPL or independent vertex compilation. */
+       * Preserve vertex input bounds checks for graphics pipelines (state !=
+       * NULL) whenever pipelineRobustness is enabled alongside GPL or missing
+       * VI state, without changing Shader Objects (state == NULL), whose
+       * binary code must stay invariant across pipeline-only device features. */
       const bool gpl_vi_robustness =
-         dev->vk.enabled_features.pipelineRobustness &&
-         (!state || !state->vi ||
-          dev->vk.enabled_features.graphicsPipelineLibrary);
+         state && dev->vk.enabled_features.pipelineRobustness &&
+         (!state->vi || dev->vk.enabled_features.graphicsPipelineLibrary);
       for (unsigned i = 0; i < count; ++i) {
          if (infos[i].stage == MESA_SHADER_VERTEX)
             key.vertex.unbounded =
