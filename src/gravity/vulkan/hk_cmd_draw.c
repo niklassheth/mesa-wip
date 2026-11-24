@@ -1786,7 +1786,8 @@ hk_apple9_native_tess_fused_chunk_plan(
                                             check_grid) &&
              (uint64_t)check_grid[0] * check_grid[1] * check_grid[2] <=
                 group_cap &&
-             DIV_ROUND_UP((uint64_t)instances, inst_cap) <= 65536) {
+             DIV_ROUND_UP((uint64_t)instances, inst_cap) <=
+                HK_APPLE9_NATIVE_TESS_MAX_CHUNKS) {
             *out = (struct hk_apple9_fused_tess_chunk_plan){
                .inst_chunk_cap = inst_cap,
                .patch_chunk_cap = patches_per_inst,
@@ -1807,7 +1808,8 @@ hk_apple9_native_tess_fused_chunk_plan(
        (uint64_t)check_grid[0] * check_grid[1] > group_cap)
       return false;
    uint64_t patch_chunks = DIV_ROUND_UP((uint64_t)patches_per_inst, patch_cap);
-   if (patch_chunks > 65536 || (uint64_t)instances > 65536 / patch_chunks)
+   if (patch_chunks > HK_APPLE9_NATIVE_TESS_MAX_CHUNKS ||
+       (uint64_t)instances > HK_APPLE9_NATIVE_TESS_MAX_CHUNKS / patch_chunks)
       return false;
    *out = (struct hk_apple9_fused_tess_chunk_plan){
       .inst_chunk_cap = 1,

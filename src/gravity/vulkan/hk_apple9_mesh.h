@@ -177,6 +177,15 @@ hk_apple9_native_object_tg_memory_bytes(
  * https://developer.apple.com/metal/capabilities/ */
 #define HK_APPLE9_NATIVE_MAX_GROUP_COUNT 65535u
 #define HK_APPLE9_NATIVE_MAX_GROUP_TOTAL ((1u << 20) - 1)
+/* Profitability cap on multi-chunk splitting for fused native tessellation
+ * draws. Ring-bounded layouts (wg_rows > 40 or wg_rows == 32) already allow at
+ * most one chunk; unbounded layouts split when estimated primitives exceed
+ * HK_APPLE9_NATIVE_RENDER_PRIMITIVES, and each chunk flushes a separate
+ * multi-parent render pass (~12 us TA setup + kernel/FW submit overhead).
+ * Capping at 4 chunks preserves small/medium draws Zero-PREGFX while sending
+ * giant multi-chunk draws (e.g. >16k-patch dynamic-tess draws with worst-case
+ * max_prims_per_patch that would split into 100+ renders) cleanly to SW tess. */
+#define HK_APPLE9_NATIVE_TESS_MAX_CHUNKS 4u
 
 /* Validate a nonempty direct child grid without overflowing the product.
  * The draw entrypoint handles zero dimensions as a no-op before calling this. */
