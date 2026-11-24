@@ -355,7 +355,7 @@ gs_source(mesa_shader_stage stage, unsigned vertices)
       nir_def *count = nir_load_global_constant(
          &b, 1, 32, nir_load_descriptor_set_agx(&b, .desc_set = 0),
          .align_mul = 4);
-      for (unsigned v = 0; v < vertices; ++v) {
+      for (unsigned v = 0; v < MIN2(vertices, 5u); ++v) {
          nir_push_if(&b, nir_ult(&b, nir_imm_int(&b, v), count));
          nir_def *pos = nir_load_per_vertex_input(
             &b, 4, 32, nir_imm_int(&b, v % 3), nir_imm_int(&b, 0),
@@ -409,9 +409,16 @@ check_gs_programs(struct hk_api_shader **api, bool native, unsigned vertices)
       CHECK(hk_native_producer_object(ng)->bo);
       CHECK(hk_native_producer_main(ng)->info.apple9_native_stage == HK_APPLE9_NATIVE_MESH);
       CHECK(hk_native_producer_object(ng)->info.apple9_native_stage == HK_APPLE9_NATIVE_OBJECT);
-      /* Packed GS publishes HK_APPLE9_NATIVE_GS_PACK triangles' fixed slots. */
-      const struct agx_apple9_mesh_layout *l = &hk_native_producer_main(ng)->info.apple9_native.layout;
-      if (hk_apple9_native_gs_pack_enabled() && (vertices == 3 || vertices == 4)) {
+      /* Packed GS publishes HK_APPLE9_NATIVE_GS_PACK triangles' fixed slots;
+       * fused GS packs automatically to ring-safe native classes. */
+      const struct hk_shader_info *gs_info = &hk_native_producer_main(ng)->info;
+      const struct agx_apple9_mesh_layout *l = &gs_info->apple9_native.layout;
+      if (gs_info->apple9_gs_fused) {
+         CHECK(gs_info->apple9_gs_pack >= 1);
+         CHECK(l->max_vertices >= gs_info->apple9_gs_pack * vertices);
+         CHECK(l->max_primitives >= gs_info->apple9_gs_pack * (vertices - 2));
+         CHECK(gs_info->apple9_gs_prims_per_run == vertices - 2);
+      } else if (hk_apple9_native_gs_pack_enabled() && (vertices == 3 || vertices == 4)) {
          CHECK(l->max_vertices == HK_APPLE9_NATIVE_GS_PACK * vertices);
          CHECK(l->max_primitives == (vertices == 3 ? 17 : 16));
       } else {
@@ -419,8 +426,13 @@ check_gs_programs(struct hk_api_shader **api, bool native, unsigned vertices)
          CHECK(l->max_primitives == vertices - 2);
       }
       struct hk_api_shader *nv = hk_api_shader_native(api[MESA_SHADER_VERTEX]);
-      CHECK(nv->variants[HK_VS_VARIANT_SW].bo && !nv->writes_memory);
-      CHECK(nv->variants[HK_VS_VARIANT_SW].b.info.outputs & VARYING_BIT_POS);
+      CHECK(!nv->writes_memory);
+      if (hk_native_producer_main(ng)->info.apple9_gs_fused) {
+         CHECK(!nv->variants[HK_VS_VARIANT_SW].bo);
+      } else {
+         CHECK(nv->variants[HK_VS_VARIANT_SW].bo);
+         CHECK(nv->variants[HK_VS_VARIANT_SW].b.info.outputs & VARYING_BIT_POS);
+      }
    } else {
       CHECK(api[MESA_SHADER_GEOMETRY]->variants[HK_GS_VARIANT_RAST].bo);
       CHECK(!api[MESA_SHADER_GEOMETRY]->variants[0].info.apple9_native_stage);
@@ -451,8 +463,20 @@ compile_gs(struct hk_device *dev, unsigned vertices, bool reject,
    VkResult result =
       hk_apple9_compile_graphics(dev, 3, infos, NULL, NULL, NULL, NULL, out);
    unsigned compiled_allocations = allocations;
-   bool native = (hk_apple9_native_gs_enabled() ||
-       (hk_apple9_native_stage_policy(hk_device_physical(dev)) & HK_APPLE9_NATIVE_GS_BIT)) && vertices <= 4 && !reject;
+   bool fused_enabled = hk_apple9_native_gs_enabled();
+   bool policy_native =
+      (hk_apple9_native_stage_policy(hk_device_physical(dev)) &
+       HK_APPLE9_NATIVE_GS_BIT) != 0;
+   bool fused_fits =
+      vertices <= 256 &&
+      (vertices > 32 ||
+       hk_apple9_packed_mesh_class_fit(hk_apple9_native_mesh_packed_shapes(),
+                                       16, vertices, vertices - 2, NULL, NULL,
+                                       NULL));
+   bool native =
+      ((fused_enabled && fused_fits) ||
+       (!fused_enabled && policy_native && vertices <= 4)) &&
+      !reject;
    if (failure) {
       CHECK(result == VK_ERROR_OUT_OF_DEVICE_MEMORY);
       CHECK(!out[0] && !out[1] && !out[2]);
@@ -710,6 +734,7 @@ main(void)
    for (unsigned v = 3; v <= 5; ++v)
       compile_gs(dev, v, false, 0);
    if (hk_apple9_native_gs_enabled()) {
+      compile_gs(dev, 257, false, 0);
       compile_gs(dev, 4, true, 0);
       unsigned count = compile_gs(dev, 4, false, 0);
       for (unsigned i = 1; i <= count; ++i)

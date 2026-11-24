@@ -235,7 +235,7 @@ if with_tests
     ),
     suite : ['gravity'],
   )
-  foreach t : ['hk-feedback', 'hk-descriptor-parts', 'hk-constant-data', 'hk-coop-matrix', 'hk-draw-state-cache', 'hk-render-merge', 'hk-empty-clear-barriers', 'hk-empty-render-timestamp', 'hk-tier2-caps', 'hk-image-limits', 'hk-stage-output-limits', 'hk-cull-output-limits', 'hk-pregfx-recording', 'hk-heap-resubmit', 'hk-heap-addresses', 'hk-native-image-store', 'hk-native-store-rw', 'hk-mesh-query', 'hk-native-mesh', 'hk-robust-bounded-vector', 'hk-gs-mesh', 'hk-tes-mesh']
+  foreach t : ['hk-feedback', 'hk-descriptor-parts', 'hk-constant-data', 'hk-coop-matrix', 'hk-draw-state-cache', 'hk-render-merge', 'hk-empty-clear-barriers', 'hk-empty-render-timestamp', 'hk-tier2-caps', 'hk-image-limits', 'hk-stage-output-limits', 'hk-cull-output-limits', 'hk-pregfx-recording', 'hk-heap-resubmit', 'hk-heap-addresses', 'hk-native-image-store', 'hk-native-store-rw', 'hk-mesh-query', 'hk-native-mesh', 'hk-robust-bounded-vector', 'hk-tes-mesh']
     gravity_contract_test = executable(
       'gravity-' + t,
       'tests/' + t + '.c',
@@ -257,6 +257,28 @@ if with_tests
         suite : ['gravity'])
     endif
   endforeach
+  gravity_gs_mesh_test = executable(
+    'gravity-hk-gs-mesh', 'tests/hk-gs-mesh.c',
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include,
+                           inc_src, inc_gravity],
+    dependencies : [gravity_vk_deps],
+    link_with : [libgravity_vk],
+    link_args : ['-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_reference',
+                 '-Wl,--wrap=agx_bo_unreference',
+                 '-Wl,--wrap=agx_bo_cache_evict_all', '-Wl,--wrap=__vk_errorf',
+                 '-Wl,--wrap=hk_dispatch_precomp'],
+  )
+  test('gravity-hk-gs-mesh', gravity_gs_mesh_test,
+    env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_GS_NATIVE=1'],
+    suite : ['gravity'])
+  test('gravity-hk-gs-mesh-disabled', gravity_gs_mesh_test,
+    args : ['gs-disabled'],
+    env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_GS_NATIVE=0'],
+    suite : ['gravity'])
+  test('gravity-hk-gs-mesh-off', gravity_gs_mesh_test,
+    args : ['mesh-disabled'],
+    env : ['HK_APPLE9_NATIVE_MESH=0'],
+    suite : ['gravity'])
   # Corpus inspection is an explicit host tool, not part of the driver.
   executable('gravity-hk-native-mesh-coverage', 'tests/hk-native-mesh-coverage.c',
     include_directories : [inc_gallium, inc_gallium_aux, inc_include,
@@ -460,6 +482,9 @@ if with_tests
   test('gravity-hk-native-gs-hybrid', gravity_hybrid_test,
     env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_GS_NATIVE=1',
            'HK_APPLE9_NATIVE_MESH_PACKED_SHAPES=T16V3P1,T16V4P2'],
+    suite : ['gravity'])
+  test('gravity-hk-native-gs-fused-hybrid', gravity_hybrid_test,
+    env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_GS_NATIVE=1'],
     suite : ['gravity'])
   test('gravity-hk-native-tess-hybrid', gravity_hybrid_test,
     env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_TESS_NATIVE=1',

@@ -441,13 +441,12 @@ broadcast_primitive(nir_builder *b, const struct agx_apple9_mesh_body_info *info
  * apple9_lower_layer_viewport_output() in the vertex path. */
 static void
 pack_layer_viewport(nir_builder *b, const struct agx_apple9_mesh_body_info *info,
-                    nir_def *lane, nir_def *vertices, unsigned physical_threads)
+                    nir_def *lane, nir_def *vertices, unsigned physical_threads,
+                    bool has_layer)
 {
    const struct agx_apple9_mesh_layout *l = &info->layout;
    unsigned root = info->key.output_root;
    unsigned layer_plane = agx_apple9_mesh_plane_offset(l, VARYING_SLOT_LAYER, 0);
-   bool has_layer =
-      (info->primitive_broadcast | info->primitive_vertices) & VARYING_BIT_LAYER;
    bool has_vp = l->vertex_component[VARYING_SLOT_VIEWPORT][0] != AGX_APPLE9_MESH_UNUSED;
    unsigned vp_plane =
       has_vp ? agx_apple9_mesh_plane_offset(l, VARYING_SLOT_VIEWPORT, 0) : 0;
@@ -1056,6 +1055,9 @@ agx_nir_lower_apple9_native_mesh(
                           &primitive_vertices, reason))
       return false;
 
+   const bool has_layer =
+      ((primitive_broadcast | primitive_vertices) & VARYING_BIT_LAYER) ||
+      (nir->info.outputs_written & VARYING_BIT_LAYER);
    key.physical_threads = physical_threads;
    key.hw_payload = native_object_hw_payload;
    if (!agx_nir_lower_apple9_mesh(nir, &key, info, reason))
@@ -1233,7 +1235,7 @@ agx_nir_lower_apple9_native_mesh(
       vertices = duplicate_primitive_vertices(&b, info, lane, vertices, primitives,
                                                physical_threads);
    if (info->writes_layer_viewport)
-      pack_layer_viewport(&b, info, lane, vertices, physical_threads);
+      pack_layer_viewport(&b, info, lane, vertices, physical_threads, has_layer);
    if (options && (options->clip_halfz || options->dynamic_clip_z)) {
       /* Convert the completed homogeneous position, after all body writes and
        * output reads. Doing this at publication also handles scalar/partial

@@ -3449,3 +3449,89 @@ TEST(Apple9MeshNativeExpand, GuardEmptyGridObjectAndMeshCompile)
    free(mesh_code.binary);
    ralloc_free(b.shader);
 }
+
+TEST(Apple9MeshNativeExpand, PerVertexLayerAndViewportPreserveLayerBits)
+{
+   for (bool with_vp : {false, true}) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_MESH, &agx_nir_options, "per_vertex_layer_vp_mesh");
+      b.shader->info.io_lowered = true;
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.mesh.max_vertices_out = 4;
+      b.shader->info.mesh.max_primitives_out = 2;
+      b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 3),
+                                         nir_imm_int(&b, 1), nir_imm_int(&b, 0));
+      for (unsigned v = 0; v < 3; ++v) {
+         nir_store_per_vertex_output(
+            &b, nir_imm_vec4(&b, float(v), 0.0f, 0.5f, 1.0f), nir_imm_int(&b, v),
+            nir_imm_int(&b, 0), .write_mask = 0xf, .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         nir_store_per_vertex_output(
+            &b, nir_imm_int(&b, 5), nir_imm_int(&b, v), nir_imm_int(&b, 0),
+            .write_mask = 0x1, .src_type = nir_type_uint32,
+            .io_semantics = {.location = VARYING_SLOT_LAYER, .num_slots = 1});
+         if (with_vp) {
+            nir_store_per_vertex_output(
+               &b, nir_imm_int(&b, 2), nir_imm_int(&b, v), nir_imm_int(&b, 0),
+               .write_mask = 0x1, .src_type = nir_type_uint32,
+               .io_semantics = {.location = VARYING_SLOT_VIEWPORT,
+                                .num_slots = 1});
+         }
+      }
+      nir_store_per_primitive_output(
+         &b, nir_imm_ivec3(&b, 0, 1, 2), nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+         .write_mask = 0x7, .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+      nir_pop_if(&b, nullptr);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+
+      agx_apple9_native_mesh_options opts = {};
+      opts.physical_threads = 32;
+      opts.packed_index_publication = true;
+      opts.publication_rounds = true;
+      opts.attributes = true;
+      opts.layer_viewport = true;
+
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_nir_lower_apple9_native_mesh(b.shader, true, &opts, &info,
+                                                   &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(info.writes_layer_viewport);
+
+      /* Verify pack_layer_viewport preserved the per-vertex layer plane via an
+       * iand(..., 0xffff) mask instead of zeroing layer bits. */
+      bool found_layer_mask = false;
+      nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op == nir_op_iand &&
+                ((nir_src_is_const(alu->src[1].src) &&
+                  nir_src_as_uint(alu->src[1].src) == 0xffffu) ||
+                 (nir_src_is_const(alu->src[0].src) &&
+                  nir_src_as_uint(alu->src[0].src) == 0xffffu)))
+               found_layer_mask = true;
+         }
+      }
+      EXPECT_TRUE(found_layer_mask);
+
+      agx_shader_part code = {};
+      ASSERT_TRUE(agx_compile_apple9_native_mesh_lowered(b.shader, &opts, &code,
+                                                         &info, &reason))
+         << (reason ?: "");
+      EXPECT_TRUE(code.binary && code.info.binary_size > 0);
+      EXPECT_TRUE(code.info.writes_layer_viewport);
+      EXPECT_EQ(code.info.apple9_varyings.count, with_vp ? 1u : 0u);
+      free(code.binary);
+      ralloc_free(b.shader);
+   }
+}

@@ -1894,8 +1894,15 @@ hk_apple9_prepare_draw_ex(struct hk_cmd_buffer *cmd, bool reads_buffers,
    uint8_t reads = reads_buffers ? HK_READS_BUFFERS : 0;
    if (cmd->in_meta)
       reads |= HK_READS_META;
+   bool fused_native_gs =
+      native_mesh && gfx->shaders[MESA_SHADER_GEOMETRY] &&
+      hk_api_shader_native(gfx->shaders[MESA_SHADER_GEOMETRY]) &&
+      hk_native_producer_main(
+         hk_api_shader_native(gfx->shaders[MESA_SHADER_GEOMETRY]))
+         ->info.apple9_gs_fused;
    if (gfx->xfb_enabled || gfx->shaders[MESA_SHADER_TESS_CTRL] ||
-       gfx->shaders[MESA_SHADER_TESS_EVAL] || gfx->shaders[MESA_SHADER_GEOMETRY] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       (gfx->shaders[MESA_SHADER_GEOMETRY] && !fused_native_gs) ||
        (native_mesh && gfx->shaders[MESA_SHADER_TASK] && !native_object))
       reads |= HK_READS_INTERNAL;
    for (unsigned s = 0; s < ARRAY_SIZE(gfx->shaders); ++s) {
@@ -3558,6 +3565,18 @@ hk_apple9_draw_native_task_bridge(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    hk_apple9_draw_impl(cmd, draw_id,
                        (struct agx_draw){.b = agx_3d(3, 1, 1)}, grid, NULL, 0,
                        secondary_bridge);
+}
+
+void
+hk_apple9_draw_native_mesh_draw(struct hk_cmd_buffer *cmd, uint32_t draw_id,
+                                struct agx_draw draw, uint64_t grid)
+{
+   struct agx_draw bind_draw = {
+      .b = agx_3d(3, 1, 1),
+      .start = draw.indexed ? (uint32_t)draw.index_bias : draw.start,
+      .start_instance = draw.start_instance,
+   };
+   hk_apple9_draw_impl(cmd, draw_id, bind_draw, grid, NULL, 0, false);
 }
 
 void

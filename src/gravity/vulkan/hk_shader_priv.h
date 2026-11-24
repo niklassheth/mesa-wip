@@ -139,6 +139,10 @@ VkResult hk_upload_shader(struct hk_device *dev, struct hk_shader *shader);
 VkResult hk_apple9_native_gs_check(const nir_shader *source,
                                    const struct hk_apple9_graphics_key *key,
                                    bool *supported, const char **reason);
+VkResult hk_apple9_native_gs_fused_check(const nir_shader *vs_source,
+                                         const nir_shader *gs_source,
+                                         const struct hk_apple9_graphics_key *key,
+                                         bool *supported, const char **reason);
 VkResult hk_apple9_native_tess_check(const nir_shader *source,
                                      const struct hk_apple9_graphics_key *key,
                                      bool *supported, const char **reason);

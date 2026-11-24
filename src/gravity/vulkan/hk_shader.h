@@ -38,6 +38,30 @@ bool hk_apple9_compile_gs_mesh_program(
    struct agx_shader_part *out, struct agx_apple9_mesh_body_info *info,
    const char **reason);
 
+struct hk_gs_fused_options {
+   struct agx_apple9_vertex_layout vertex;
+   bool fs_reads_clip_distance;
+};
+
+struct hk_gs_fused_info {
+   uint8_t pack;
+   uint8_t input_primitive;
+   uint8_t output_primitive;
+   uint8_t invocations;
+   uint16_t prims_per_run;
+};
+
+nir_shader *hk_nir_gs_fused_mesh(const nir_shader *vs_source,
+                                 const nir_shader *gs_source,
+                                 const struct hk_gs_fused_options *options,
+                                 struct hk_gs_fused_info *out_info,
+                                 const char **reason);
+bool hk_apple9_compile_gs_fused_mesh_program(
+   const nir_shader *vs_source, const nir_shader *gs_source,
+   const struct hk_apple9_graphics_key *key, struct agx_shader_part *out,
+   struct agx_apple9_mesh_body_info *info, struct hk_gs_fused_info *fused_info,
+   const char **reason);
+
 /* Position-only TES realization over the existing tessellator index stream. */
 nir_shader *hk_nir_tes_mesh(const nir_shader *source, const char **reason);
 nir_shader *hk_nir_tes_mesh_take(nir_shader *nir, const char **reason);
@@ -230,6 +254,11 @@ struct hk_shader_info {
    /* Native GS mesh bodies: GS invocations per input primitive. Each
     * (primitive, invocation) is one logical GS run (hk_nir_gs_mesh). */
    uint8_t apple9_gs_invocations;
+   /* Zero-PREGFX fused VS + GS -> native MESH metadata. */
+   bool apple9_gs_fused;
+   uint8_t apple9_gs_pack;
+   uint8_t apple9_gs_input_primitive;
+   uint16_t apple9_gs_prims_per_run;
    struct agx_apple9_mesh_body_info apple9_native;
 
    uint8_t apple9_render_targets;
@@ -791,6 +820,8 @@ struct hk_apple9_graphics_key {
    uint32_t native_object_payload_B;
    /* Generated mesh NIR from an API GS/TES stage (already guarded / own draw ABI). */
    bool native_stage_generated;
+   /* Zero-PREGFX fused VS + GS -> native MESH realization. */
+   bool native_gs_fused;
    /* Pipeline compiles for a multiview render pass (viewMask != 0). */
    bool is_multiview;
    /* Independently keyed stage admission; never implied by a native mesh. */

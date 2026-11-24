@@ -125,6 +125,41 @@ hk_apple9_packed_mesh_class_selected(uint64_t selection, unsigned threads,
    return false;
 }
 
+bool
+hk_apple9_packed_mesh_class_fit(uint64_t selection, unsigned min_threads,
+                                unsigned min_vertices, unsigned min_primitives,
+                                unsigned *out_threads, unsigned *out_vertices,
+                                unsigned *out_primitives)
+{
+   bool found = false;
+   unsigned best_t = UINT_MAX, best_v = UINT_MAX, best_p = UINT_MAX;
+   for (unsigned i = 0; i < ARRAY_SIZE(packed_shapes); ++i) {
+      if (!(selection & BITFIELD64_BIT(i)))
+         continue;
+      unsigned t = packed_shapes[i].threads;
+      unsigned v = packed_shapes[i].vertices;
+      unsigned p = packed_shapes[i].primitives;
+      if (t < min_threads || v < min_vertices || p < min_primitives)
+         continue;
+      if (!found || v < best_v || (v == best_v && p < best_p) ||
+          (v == best_v && p == best_p && t < best_t)) {
+         found = true;
+         best_t = t;
+         best_v = v;
+         best_p = p;
+      }
+   }
+   if (!found)
+      return false;
+   if (out_threads)
+      *out_threads = best_t;
+   if (out_vertices)
+      *out_vertices = best_v;
+   if (out_primitives)
+      *out_primitives = best_p;
+   return true;
+}
+
 static bool
 packed_class_enabled(unsigned threads, unsigned vertices, unsigned primitives)
 {

@@ -69,6 +69,32 @@ bool hk_apple9_native_stage_class(mesa_shader_stage stage, unsigned threads,
 bool hk_apple9_native_mesh_attributes_enabled(void);
 bool hk_apple9_native_mesh_primitive_lowering_enabled(void);
 
+/* Per-draw parameters for Zero-PREGFX fused VS + GS -> native MESH draws.
+ * Uploaded to root.draw.geometry_params (loaded via geometry_param_buffer_poly). */
+struct hk_apple9_fused_gs_params {
+   /* Index buffer GPU address pre-offset by firstIndex * index_size_B (0 if direct). */
+   uint64_t index_buffer;
+   /* Remaining index buffer byte size from index_buffer (0 if direct or OOB). */
+   uint64_t index_buffer_size;
+   /* Input API topology (enum mesa_prim: POINTS, LINES, LINE_STRIP,
+    * TRIANGLES, TRIANGLE_STRIP, TRIANGLE_FAN). */
+   uint32_t input_topology;
+   /* Index element byte size: 0 for direct draws, 1/2/4 for indexed draws. */
+   uint32_t index_size_B;
+   /* firstVertex (direct) or vertexOffset (indexed). */
+   uint32_t first_vertex;
+   /* firstInstance. */
+   uint32_t base_instance;
+   /* Input primitives in this draw (or chunk), per instance. */
+   uint32_t input_primitives;
+   /* First input primitive index (for TVB-safe chunking of very large draws). */
+   uint32_t first_primitive;
+   /* X dimension of the 2D-tiled mesh grid (group_linear = wg.y * groups_x + wg.x). */
+   uint32_t groups_x;
+   /* Zero-based instance offset for chunked multi-instance draws (added to wg.z). */
+   uint32_t first_instance_offset;
+};
+
 /* Explicit research selection, e.g. T16V3P2,T32V32P42, after qualification.
  * Empty, boolean/wildcard or malformed selections enable no new class.
  * The pure parser/predicate are shared with host tests. */
@@ -77,6 +103,13 @@ uint64_t hk_apple9_native_mesh_packed_shapes(void);
 bool hk_apple9_packed_mesh_class_selected(uint64_t selection,
                                          unsigned threads, unsigned vertices,
                                          unsigned primitives);
+bool hk_apple9_packed_mesh_class_fit(uint64_t selection,
+                                     unsigned min_threads,
+                                     unsigned min_vertices,
+                                     unsigned min_primitives,
+                                     unsigned *out_threads,
+                                     unsigned *out_vertices,
+                                     unsigned *out_primitives);
 bool hk_apple9_native_mesh_packed_shape_eligible(const nir_shader *nir);
 bool hk_apple9_native_mesh_workgroup_eligible(const nir_shader *nir);
 

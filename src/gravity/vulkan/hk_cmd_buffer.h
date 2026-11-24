@@ -1690,6 +1690,9 @@ void hk_apple9_draw_native_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
 void hk_apple9_draw_native_task_bridge(struct hk_cmd_buffer *cmd,
                                        uint32_t draw_id, uint64_t grid,
                                        bool secondary_bridge);
+void hk_apple9_draw_native_mesh_draw(struct hk_cmd_buffer *cmd,
+                                     uint32_t draw_id, struct agx_draw draw,
+                                     uint64_t grid);
 void hk_apple9_draw_native_object(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                                   const uint32_t object_groups[3],
                                   uint64_t grid, uint64_t payload);
