@@ -1883,33 +1883,29 @@ TEST_F(Apple9RaAssignTest, SplitVec4LoadDoesNotInflateAsyncDeadLaneBoundPast18)
    EXPECT_GT(verify_binary_emission(&p), 0u);
 }
 
-TEST_F(Apple9RaAssignTest, SoftFmaBankColoringAvoidsMod4Collisions)
+TEST_F(Apple9RaAssignTest, SoftFmaBankColoringAvoidsMod3Collisions)
 {
-   /* Construct a sequence of 3-source FFMA instructions whose operands would
-    * naively land on colliding (r % 4) banks under first-fit assignment
-    * (e.g. r0, r4, r8). Soft bank coloring must assign distinct (r % 4) banks
-    * for (src0, src1, src2) with zero extra copies or occupancy tier loss. */
+   /* Apple9 G16G has a 3-bank (r % 3) register file. Construct a 3-source FFMA
+    * whose operands would naively land on colliding (r % 3) banks under
+    * first-fit assignment (e.g. r3, r6). Soft bank coloring must assign
+    * distinct (r % 3) banks for (src0, src1, src2) with zero extra copies or
+    * occupancy tier loss. */
    agx_apple9_block *b0 = agx_apple9_block_create(&p);
    agx_apple9_block_begin(&p, b0);
 
-   /* Pin 4 inputs in r0..r3 and define 3 values whose naive first-fit slots
-    * would be r4 (bank 0), r5 (bank 1), r6 (bank 2), plus another pair
-    * colliding with r4 (bank 0) if assigned first-fit at r8. */
    uint32_t in0 = agx_apple9_vir_emit_entry_reg(&p, 0);
    uint32_t in1 = agx_apple9_vir_emit_entry_reg(&p, 1);
    uint32_t in2 = agx_apple9_vir_emit_entry_reg(&p, 2);
-   uint32_t in3 = agx_apple9_vir_emit_entry_reg(&p, 3);
 
-   /* Define a_bank0 (will take r4 -> bank 0), then 3 unrelated temps to advance
-    * free cursor to r8 (bank 0!), then b_peer which pairs with a_bank0 in FMA:
-    * first-fit would assign b_peer = r8 (bank 0 == r4 % 4!), whereas bank
-    * coloring must pick r9 (bank 1 != bank 0). */
+   /* Define a_peer (takes r3 -> bank 0), then 2 unrelated temps (r4, r5) to
+    * advance first-fit cursor to r6 (bank 0 == r3 % 3!), then b_peer and
+    * c_peer which pair with a_peer in FMA: first-fit would assign b_peer = r6
+    * (bank 0), whereas 3-bank coloring must pick distinct r % 3 banks. */
    uint32_t a_peer = emit_iadd(in0, in1);
    uint32_t pad0 = emit_iadd(in1, in2);
-   uint32_t pad1 = emit_iadd(in2, in3);
-   uint32_t pad2 = emit_iadd(in3, in0);
+   uint32_t pad1 = emit_iadd(in2, in0);
    uint32_t b_peer = emit_iadd(in0, in2);
-   uint32_t c_peer = emit_iadd(in1, in3);
+   uint32_t c_peer = emit_iadd(in1, in0);
 
    uint32_t fma_srcs[3] = {a_peer, b_peer, c_peer};
    uint32_t fma = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FMA,
@@ -1917,7 +1913,6 @@ TEST_F(Apple9RaAssignTest, SoftFmaBankColoringAvoidsMod4Collisions)
                                       fma_srcs, 3, 0);
    uint32_t sum = emit_iadd(fma, pad0);
    sum = emit_iadd(sum, pad1);
-   sum = emit_iadd(sum, pad2);
    p.output = sum;
    emit_halt();
    cfg_init(&p, {b0});
@@ -1929,8 +1924,8 @@ TEST_F(Apple9RaAssignTest, SoftFmaBankColoringAvoidsMod4Collisions)
    EXPECT_FALSE(res.has_spills);
    EXPECT_EQ(res.num_copies_emitted, 0u);
 
-   /* Find the lowered FMA instruction and verify zero r % 4 collisions among
-    * its three distinct GPR sources! */
+   /* Find the lowered FMA instruction and verify zero r % 3 collisions among
+    * its three distinct GPR sources. */
    bool found_fma = false;
    for (unsigned i = 0; i < p.instruction_count; ++i) {
       const auto *ins = p.instructions[i];
@@ -1941,11 +1936,162 @@ TEST_F(Apple9RaAssignTest, SoftFmaBankColoringAvoidsMod4Collisions)
       unsigned r0 = ins->src[0];
       unsigned r1 = ins->src[1];
       unsigned r2 = ins->src[2];
-      EXPECT_NE(r0 & 3u, r1 & 3u) << "src0=r" << r0 << " src1=r" << r1;
-      EXPECT_NE(r0 & 3u, r2 & 3u) << "src0=r" << r0 << " src2=r" << r2;
-      EXPECT_NE(r1 & 3u, r2 & 3u) << "src1=r" << r1 << " src2=r" << r2;
+      EXPECT_NE(r0 % 3u, r1 % 3u) << "src0=r" << r0 << " src1=r" << r1;
+      EXPECT_NE(r0 % 3u, r2 % 3u) << "src0=r" << r0 << " src2=r" << r2;
+      EXPECT_NE(r1 % 3u, r2 % 3u) << "src1=r" << r1 << " src2=r" << r2;
    }
    EXPECT_TRUE(found_fma);
+   EXPECT_GT(verify_binary_emission(&p), 0u);
+}
+
+TEST_F(Apple9RaAssignTest, FmaBankColoringPrioritizesSrc1Src2Mod3Separation)
+{
+   /* Verify that when allocating src2 of a 3-source FMA (and HFMA) with ONLY
+    * two banks available inside max_gprs (src0's bank vs src1's bank; bank 2
+    * is 100% occupied), the allocator strictly chooses src0's bank over src1's
+    * bank so src1 % 3 != src2 % 3 with zero spills and zero extra copies. */
+   for (bool half : {false, true}) {
+      agx_apple9_vir_finish(&p);
+      agx_apple9_vir_init(&p);
+
+      agx_apple9_block *b0 = agx_apple9_block_create(&p);
+      agx_apple9_block_begin(&p, b0);
+
+      /* Pin s0 in r0 (bank 0), s1 in r1 (bank 1), and live values in r2
+       * (bank 2), r3 (bank 0), r5 (bank 2). With max_gprs = 7, the ONLY free
+       * GPRs are r4 (bank 1 == s1 % 3) and r6 (bank 0 == s0 % 3); bank 2 has
+       * zero free slots. Primary (src1, src2) weighting must skip r4 and pick
+       * r6 so src1 % 3 != src2 % 3. */
+      uint32_t s0 = agx_apple9_vir_emit_entry_reg(&p, 0);
+      uint32_t s1 = agx_apple9_vir_emit_entry_reg(&p, 1);
+      uint32_t live2 = agx_apple9_vir_emit_entry_reg(&p, 2);
+      uint32_t live3 = agx_apple9_vir_emit_entry_reg(&p, 3);
+      uint32_t live5 = agx_apple9_vir_emit_entry_reg(&p, 5);
+      uint32_t s2 = emit_iadd(live3, live5);
+
+      uint32_t fma_srcs[3] = {s0, s1, s2};
+      uint32_t fma = agx_apple9_vir_emit(
+         &p, half ? AGX_APPLE9_VIR_HFMA : AGX_APPLE9_VIR_FMA,
+         half ? AGX_APPLE9_ENC_HALF3 : AGX_APPLE9_ENC_FLOAT3_EXTENDED,
+         fma_srcs, 3, 0);
+      uint32_t sum = emit_iadd(fma, live2);
+      sum = emit_iadd(sum, live3);
+      sum = emit_iadd(sum, live5);
+      p.output = sum;
+      emit_halt();
+      cfg_init(&p, {b0});
+
+      auto opts = validated_opts();
+      opts.max_gprs = 7;
+      opts.cost_register_constraints = true;
+      apple9_ra_assign_result res = {};
+      ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+         << (res.error ? res.error : "");
+      EXPECT_FALSE(res.has_spills);
+      EXPECT_EQ(res.num_copies_emitted, 0u);
+
+      bool found = false;
+      for (unsigned i = 0; i < p.instruction_count; ++i) {
+         const auto *ins = p.instructions[i];
+         if (ins->op != (half ? AGX_APPLE9_VIR_HFMA : AGX_APPLE9_VIR_FMA))
+            continue;
+         found = true;
+         ASSERT_EQ(ins->nr_srcs, 3u);
+         EXPECT_EQ(ins->src[0], 0u);
+         EXPECT_EQ(ins->src[1], 1u);
+         EXPECT_EQ(ins->src[2], 6u);
+         EXPECT_NE(ins->src[1] % 3u, ins->src[2] % 3u)
+            << (half ? "HFMA" : "FMA") << " src0=r" << ins->src[0]
+            << " src1=r" << ins->src[1] << " src2=r" << ins->src[2];
+      }
+      EXPECT_TRUE(found);
+      EXPECT_GT(verify_binary_emission(&p), 0u);
+   }
+}
+
+TEST_F(Apple9RaAssignTest, FmaBankColoringPrefersLivePhiWebMemberOverDeadHistory)
+{
+   /* Regression test: a phi web whose earlier dead member sat in bank 0 (r0)
+    * while its currently live member sits in bank 1 (r1) must color its FMA
+    * peer against the live owner (bank 1), not the stale dead member (bank 0). */
+   agx_apple9_block *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block *b1 = agx_apple9_block_create(&p);
+   agx_apple9_block *b2 = agx_apple9_block_create(&p);
+
+   /* b0: m0 in r0 (bank 0), chained through VIR_MOV into m0_copy (also r0) so
+    * {m0_copy, m0} already has web size 2 (rank 1) before b2's phi unions
+    * phi_k1 at the tail of the web. */
+   agx_apple9_block_begin(&p, b0);
+   uint32_t m0 = agx_apple9_vir_emit_entry_reg(&p, 0);
+   uint32_t m0_copy = agx_apple9_vir_emit_mov(&p, m0);
+   uint32_t live2 = agx_apple9_vir_emit_entry_reg(&p, 2);
+   uint32_t s0 = agx_apple9_vir_emit_entry_reg(&p, 3);
+   uint32_t live5 = agx_apple9_vir_emit_entry_reg(&p, 5);
+
+   /* b1: m0_copy is dead on entry to b1, so hold0 reuses r0 (bank 0) and m1
+    * takes r1 (bank 1). Both flow into b2's phis. */
+   agx_apple9_block_begin(&p, b1);
+   uint32_t hold0 = emit_iadd(live2, live5);
+   uint32_t m1 = emit_iadd(hold0, s0);
+
+   /* b2: phi_other claims r0 (occupying m0/m0_copy's old bank-0 register),
+    * while phi_k1 joins {m0_copy (r0, dead), m1 (r1)} and lives in r1 (bank 1).
+    * Because {m0_copy, m0} had rank 1 > rank 0, dead r0 members precede live
+    * phi_k1 (r1) in web_members. With max_gprs = 7, only r4 (bank 1) and r6
+    * (bank 0) are free when k2 is allocated for FMA(s0, phi_k1, k2):
+    * live-owner lookup must skip dead m0_copy/m0 (r0), find live phi_k1 (r1),
+    * and place k2 in r6 (bank 0 != bank 1). */
+   agx_apple9_block_begin(&p, b2);
+   uint32_t phi_other = agx_apple9_vir_emit_phi(&p, b2);
+   uint32_t phi_k1 = agx_apple9_vir_emit_phi(&p, b2);
+   uint32_t k2 = emit_iadd(s0, live2);
+   uint32_t fma_srcs[3] = {s0, phi_k1, k2};
+   uint32_t fma = agx_apple9_vir_emit(&p, AGX_APPLE9_VIR_FMA,
+                                      AGX_APPLE9_ENC_FLOAT3_EXTENDED,
+                                      fma_srcs, 3, 0);
+   uint32_t sum = emit_iadd(fma, phi_other);
+   sum = emit_iadd(sum, live2);
+   sum = emit_iadd(sum, live5);
+   p.output = sum;
+   emit_halt();
+
+   p.current_block = b0;
+   ASSERT_TRUE(agx_apple9_vir_emit_phi_source(&p, phi_other, live5));
+   ASSERT_TRUE(agx_apple9_vir_emit_phi_source(&p, phi_k1, m0_copy));
+   p.current_block = b1;
+   ASSERT_TRUE(agx_apple9_vir_emit_phi_source(&p, phi_other, hold0));
+   ASSERT_TRUE(agx_apple9_vir_emit_phi_source(&p, phi_k1, m1));
+
+   cfg_init(&p, {b0, b1, b2});
+   b1->loop_header = true;
+   cfg_edge(b0, b1);
+   cfg_edge(b0, b2);
+   cfg_edge(b1, b1);
+   cfg_edge(b1, b2);
+
+   auto opts = validated_opts();
+   opts.max_gprs = 7;
+   opts.cost_register_constraints = true;
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+   EXPECT_FALSE(res.has_spills);
+
+   bool found = false;
+   for (unsigned i = 0; i < p.instruction_count; ++i) {
+      const auto *ins = p.instructions[i];
+      if (ins->op != AGX_APPLE9_VIR_FMA)
+         continue;
+      found = true;
+      ASSERT_EQ(ins->nr_srcs, 3u);
+      EXPECT_EQ(ins->src[0], 3u);
+      EXPECT_EQ(ins->src[1], 1u);
+      EXPECT_EQ(ins->src[2], 6u);
+      EXPECT_NE(ins->src[1] % 3u, ins->src[2] % 3u)
+         << "src0=r" << ins->src[0] << " src1=r" << ins->src[1]
+         << " src2=r" << ins->src[2];
+   }
+   EXPECT_TRUE(found);
    EXPECT_GT(verify_binary_emission(&p), 0u);
 }
 

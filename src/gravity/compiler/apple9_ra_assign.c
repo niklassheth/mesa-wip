@@ -1257,13 +1257,14 @@ struct a9_ra_ctx {
    struct util_dynarray reg_prefs;
    int16_t reg_pref_index[AGX_APPLE9_GPR_COUNT];
    uint64_t dead_total, edge_total, affinity_total;
-   unsigned bank_conflict[4];
+   unsigned bank_conflict[3];
    unsigned bank_conflict_min;
 
    /* Soft placement constraints, bank coloring, compact r0..r63 preference,
     * and bank scarcity. */
    struct a9_gpr_constraint *preferred;
    struct a9_fma_peers *fma_peers;
+   unsigned fma_peers_count;
    BITSET_WORD *compact_alu;
    unsigned scarcity[AGX_APPLE9_GPR_COUNT];
    unsigned scarcity_floor[A9_SCARCITY_MAX_WIDTH + 1][AGX_APPLE9_GPR_COUNT + 1];
@@ -1557,27 +1558,45 @@ a9_cache_phi_prefs(struct a9_ra_ctx *rctx, uint32_t ssa)
 
    memset(rctx->bank_conflict, 0, sizeof(rctx->bank_conflict));
    rctx->bank_conflict_min = 0;
-   if (rctx->fma_peers && orig < rctx->orig_vcount &&
-       rctx->fma_peers[orig].count > 0) {
-      const struct a9_fma_peers *fp = &rctx->fma_peers[orig];
-      for (unsigned k = 0; k < fp->count; ++k) {
-         uint32_t peer = fp->peer[k];
-         unsigned pr = UINT_MAX;
-         uint32_t cur_peer = a9_resolve_cur(rctx, peer);
-         if (cur_peer < rctx->val_cap &&
-             rctx->phys[cur_peer] < AGX_APPLE9_GPR_COUNT) {
-            pr = rctx->phys[cur_peer];
-         } else if (peer < rctx->val_cap &&
-                    rctx->last_reg[peer] < AGX_APPLE9_GPR_COUNT) {
-            pr = rctx->last_reg[peer];
+   if (rctx->fma_peers && orig < rctx->orig_vcount) {
+      unsigned root = phi_web_find(rctx->phi_web, orig);
+      if (root < rctx->fma_peers_count && rctx->fma_peers[root].count > 0) {
+         const struct a9_fma_peers *fp = &rctx->fma_peers[root];
+         for (unsigned k = 0; k < fp->count; ++k) {
+            uint32_t peer_root = fp->peer[k];
+            unsigned pr = UINT_MAX;
+            unsigned fallback_pr = UINT_MAX;
+            for (uint32_t v = rctx->web_members[peer_root].head;
+                 v != UINT32_MAX; v = rctx->web_members[v].next) {
+               if (v >= rctx->orig_vcount)
+                  continue;
+               uint32_t cur_peer = a9_resolve_cur(rctx, v);
+               if (cur_peer < rctx->val_cap &&
+                   rctx->phys[cur_peer] < AGX_APPLE9_GPR_COUNT) {
+                  unsigned cand = rctx->phys[cur_peer];
+                  if (gpr_test(rctx->used_gprs, cand) &&
+                      rctx->reg_to_ssa[cand] == cur_peer) {
+                     pr = cand;
+                     break;
+                  }
+                  if (fallback_pr == UINT_MAX)
+                     fallback_pr = cand;
+               }
+               if (fallback_pr == UINT_MAX && v < rctx->val_cap &&
+                   rctx->last_reg[v] < AGX_APPLE9_GPR_COUNT) {
+                  fallback_pr = rctx->last_reg[v];
+               }
+            }
+            if (pr == UINT_MAX)
+               pr = fallback_pr;
+            if (pr < AGX_APPLE9_GPR_COUNT)
+               rctx->bank_conflict[pr % 3u] += fp->weight[k];
          }
-         if (pr < AGX_APPLE9_GPR_COUNT)
-            rctx->bank_conflict[pr & 3u] += fp->weight[k];
+         unsigned mn = rctx->bank_conflict[0];
+         for (unsigned b = 1; b < 3; ++b)
+            mn = MIN2(mn, rctx->bank_conflict[b]);
+         rctx->bank_conflict_min = mn;
       }
-      unsigned mn = rctx->bank_conflict[0];
-      for (unsigned b = 1; b < 4; ++b)
-         mn = MIN2(mn, rctx->bank_conflict[b]);
-      rctx->bank_conflict_min = mn;
    }
 
    rctx->affinity_reg = a9_collect_affinity(rctx, orig);
@@ -1617,7 +1636,7 @@ a9_placement_cost(struct a9_ra_ctx *rctx, uint32_t ssa, unsigned reg,
       cost.compact_r64 = (reg + count > 64u) ? 1u : 0u;
 
    if (count == 1)
-      cost.bank_conflict = rctx->bank_conflict[reg & 3u];
+      cost.bank_conflict = rctx->bank_conflict[reg % 3u];
 
    if (!rctx->cost_constraints)
       return cost;
@@ -1695,9 +1714,9 @@ a9_placement_cheaper(struct a9_placement_cost a, struct a9_placement_cost b)
    if (a.async_waw != b.async_waw) return a.async_waw < b.async_waw;
    if (a.compact_r64 != b.compact_r64) return a.compact_r64 < b.compact_r64;
    if (a.growth != b.growth) return a.growth < b.growth;
-   if (a.scarcity != b.scarcity) return a.scarcity < b.scarcity;
    if (a.bank_conflict != b.bank_conflict)
       return a.bank_conflict < b.bank_conflict;
+   if (a.scarcity != b.scarcity) return a.scarcity < b.scarcity;
    return a.reg < b.reg;
 }
 
@@ -2343,7 +2362,7 @@ a9_assign_dest(struct a9_ra_ctx *rctx, struct agx_apple9_vir_instr *ins,
                unsigned o2 = (s == 2) ? r1 : r2;
                if (sr == o1 || sr == o2 || !gpr_test(reusable, sr))
                   continue;
-               unsigned bc = rctx->bank_conflict[sr & 3u];
+               unsigned bc = rctx->bank_conflict[sr % 3u];
                if (best_sr == UINT_MAX || bc < best_bc) {
                   best_sr = sr;
                   best_bc = bc;
@@ -4679,21 +4698,19 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
    }
    ralloc_free(graph_ctx);
 
-   /* Build soft 4-way register-file bank-conflict peers (r % 4) for 3-source
+   /* Build soft 3-bank register-file bank-conflict peers (r % 3) for 3-source
     * FMA/HFMA operands and compact-ALU r0..r63 preferences (protecting 4B
     * compact encodings and the 16 KiB L1I cliff when bound > 64). */
-   rctx.fma_peers = rzalloc_array(memctx, struct a9_fma_peers, valloc);
+   rctx.fma_peers = rzalloc_array(memctx, struct a9_fma_peers, web_alloc);
+   rctx.fma_peers_count = rctx.fma_peers ? web_alloc : 0;
    if (rctx.bound > 64u)
       rctx.compact_alu = BITSET_RZALLOC(memctx, valloc);
    if (rctx.fma_peers || rctx.compact_alu) {
-      unsigned loop_depth = 0;
       for (unsigned bi = 0; bi < num_blocks; ++bi) {
+         unsigned mult = depth[bi] > 0 ? 2u : 1u;
          for (struct agx_apple9_vir_instr *ins =
                  agx_apple9_block_first_instr(rctx.cfg_blocks[bi]);
               ins; ins = agx_apple9_instr_next(ins)) {
-            if (ins->op == AGX_APPLE9_VIR_LOOP_MASK_POP && loop_depth > 0)
-               loop_depth--;
-
             if (rctx.fma_peers &&
                 (ins->op == AGX_APPLE9_VIR_FMA ||
                  ins->op == AGX_APPLE9_VIR_HFMA) &&
@@ -4711,28 +4728,31 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
                      continue;
                   uint32_t sv = ins->src[sidx++];
                   if (sv < orig_vcount && !a9_is_pub_val(program, sv) &&
-                      !apple9_ra_value_is_mem(&spill_state, sv))
-                     g[slot] = sv;
+                      !apple9_ra_value_is_mem(&spill_state, sv)) {
+                     unsigned root = phi_web_find(rctx.phi_web, sv);
+                     if (root < rctx.fma_peers_count)
+                        g[slot] = root;
+                  }
                }
-               unsigned mult = loop_depth > 0 ? 2u : 1u;
-               /* Primary weight on (src0, src1) cold-operand bank collision;
-                * secondary weight on accumulator pairs when all 3 are GPRs. */
+               /* Apple9 G16G has a 3-bank (r % 3) register file where
+                * (src1, src2) is the critical read-port bank-conflict pair;
+                * weight it highest and insert it first so it dominates peer
+                * slots, while still avoiding (src0, src1) and (src0, src2)
+                * collisions when a free bank is available. */
+               if (g[1] != AGX_APPLE9_VREG_INVALID &&
+                   g[2] != AGX_APPLE9_VREG_INVALID && g[1] != g[2]) {
+                  a9_add_fma_peer_dir(rctx.fma_peers, g[1], g[2], 4u * mult);
+                  a9_add_fma_peer_dir(rctx.fma_peers, g[2], g[1], 4u * mult);
+               }
                if (g[0] != AGX_APPLE9_VREG_INVALID &&
                    g[1] != AGX_APPLE9_VREG_INVALID && g[0] != g[1]) {
-                  a9_add_fma_peer_dir(rctx.fma_peers, g[0], g[1], 2u * mult);
-                  a9_add_fma_peer_dir(rctx.fma_peers, g[1], g[0], 2u * mult);
+                  a9_add_fma_peer_dir(rctx.fma_peers, g[0], g[1], 1u * mult);
+                  a9_add_fma_peer_dir(rctx.fma_peers, g[1], g[0], 1u * mult);
                }
                if (g[0] != AGX_APPLE9_VREG_INVALID &&
-                   g[1] != AGX_APPLE9_VREG_INVALID &&
-                   g[2] != AGX_APPLE9_VREG_INVALID) {
-                  if (g[0] != g[2]) {
-                     a9_add_fma_peer_dir(rctx.fma_peers, g[0], g[2], 1u * mult);
-                     a9_add_fma_peer_dir(rctx.fma_peers, g[2], g[0], 1u * mult);
-                  }
-                  if (g[1] != g[2]) {
-                     a9_add_fma_peer_dir(rctx.fma_peers, g[1], g[2], 1u * mult);
-                     a9_add_fma_peer_dir(rctx.fma_peers, g[2], g[1], 1u * mult);
-                  }
+                   g[2] != AGX_APPLE9_VREG_INVALID && g[0] != g[2]) {
+                  a9_add_fma_peer_dir(rctx.fma_peers, g[0], g[2], 1u * mult);
+                  a9_add_fma_peer_dir(rctx.fma_peers, g[2], g[0], 1u * mult);
                }
             }
 
@@ -4749,9 +4769,6 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
                      BITSET_SET(rctx.compact_alu, sv);
                }
             }
-
-            if (ins->op == AGX_APPLE9_VIR_LOOP_MASK_PUSH)
-               loop_depth++;
          }
       }
    }
