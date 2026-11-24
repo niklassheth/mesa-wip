@@ -1,6 +1,7 @@
 /* Copyright 2026 Asahi Linux Contributors
  * SPDX-License-Identifier: MIT
  */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,7 +10,9 @@
 #include "compiler/nir/nir_serialize.h"
 #include "poly/geometry.h"
 #include "poly/tessellator.h"
+#include "hk_cmd_buffer.h"
 #include "hk_shader.h"
+#include "hk_shader_priv.h"
 
 #define CHECK(x)                                                               \
    do {                                                                        \
@@ -527,6 +530,1080 @@ object_grid(void)
    ralloc_free(s);
 }
 
+/* =========================================================================
+ * Zero-PREGFX Fused OBJECT(VS+TCS) -> MESH(TES) Comprehensive Test Suite
+ * ========================================================================= */
+
+static nir_shader *
+make_fused_vs(unsigned extra_vars, bool with_vbo)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "fused_tess_vs");
+   b.shader->info.io_lowered = true;
+   nir_def *vid = nir_u2f32(&b, nir_load_vertex_id(&b));
+   nir_def *iid = nir_u2f32(&b, nir_load_instance_id(&b));
+   nir_def *pos = nir_vec4(&b, vid, iid, nir_imm_float(&b, 0.0f),
+                           nir_imm_float(&b, 1.0f));
+   if (with_vbo) {
+      nir_def *attr = nir_load_input(
+         &b, 4, 32, nir_imm_int(&b, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VERT_ATTRIB_GENERIC0, .num_slots = 1});
+      pos = nir_fadd(&b, pos, attr);
+   }
+   nir_store_output(&b, pos, nir_imm_int(&b, 0), .write_mask = 15,
+                    .src_type = nir_type_float32,
+                    .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   for (unsigned v = 0; v < extra_vars; ++v) {
+      nir_store_output(
+         &b, nir_vec4(&b, vid, iid, nir_imm_float(&b, (float)v), nir_imm_float(&b, 1.0f)),
+         nir_imm_int(&b, 0), .write_mask = 15, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0 + v, .num_slots = 1});
+   }
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   return b.shader;
+}
+
+static nir_shader *
+make_fused_tcs(unsigned out_v, unsigned extra_vars, float outer_val,
+               float inner_val, bool with_barrier, bool with_patch_const,
+               bool split_vkd3d_modes, enum gl_tess_spacing spacing, bool ccw,
+               bool dynamic_levels)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_TESS_CTRL, &agx_nir_options, "fused_tess_tcs");
+   b.shader->info.io_lowered = true;
+   b.shader->info.tess.tcs_vertices_out = out_v;
+   if (split_vkd3d_modes) {
+      /* vkd3d-proton puts Spacing/Winding on TCS and Domain on TES. */
+      b.shader->info.tess.spacing = spacing;
+      b.shader->info.tess.ccw = ccw;
+   }
+   nir_def *inv = nir_load_invocation_id(&b);
+   nir_def *pos = nir_load_per_vertex_input(
+      &b, 4, 32, inv, nir_imm_int(&b, 0), .dest_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   nir_store_per_vertex_output(
+      &b, pos, inv, nir_imm_int(&b, 0), .write_mask = 15,
+      .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   for (unsigned v = 0; v < extra_vars; ++v) {
+      nir_def *val = nir_load_per_vertex_input(
+         &b, 4, 32, inv, nir_imm_int(&b, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0 + v, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &b, val, inv, nir_imm_int(&b, 0), .write_mask = 15,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0 + v, .num_slots = 1});
+   }
+   if (with_barrier) {
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_shader_out);
+   }
+   nir_push_if(&b, nir_ieq_imm(&b, inv, 0));
+   nir_def *ov = dynamic_levels
+                    ? nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0),
+                                   nir_imm_int(&b, 0), .align_mul = 4, .range = 16)
+                    : nir_imm_float(&b, outer_val);
+   nir_def *iv = dynamic_levels
+                    ? nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0),
+                                   nir_imm_int(&b, 4), .align_mul = 4, .range = 16)
+                    : nir_imm_float(&b, inner_val);
+   nir_store_output(
+      &b, nir_vec4(&b, ov, ov, ov, ov), nir_imm_int(&b, 0), .write_mask = 15,
+      .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+   nir_store_output(
+      &b, nir_vec2(&b, iv, iv), nir_imm_int(&b, 0), .write_mask = 3,
+      .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+   if (with_patch_const) {
+      nir_store_output(
+         &b, nir_imm_vec4(&b, 1.0f, 2.0f, 3.0f, 4.0f), nir_imm_int(&b, 0),
+         .write_mask = 15, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_PATCH0, .num_slots = 1});
+   }
+   nir_pop_if(&b, NULL);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   return b.shader;
+}
+
+static nir_shader *
+make_fused_tes(enum tess_primitive_mode domain, enum gl_tess_spacing spacing,
+               bool ccw, bool split_vkd3d_modes, unsigned out_v,
+               unsigned extra_out_vars, unsigned clip_size, unsigned cull_size,
+               bool read_patch_const, bool read_raw_levels)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_TESS_EVAL, &agx_nir_options, "fused_tess_tes");
+   b.shader->info.io_lowered = true;
+   b.shader->info.tess._primitive_mode = domain;
+   if (!split_vkd3d_modes) {
+      b.shader->info.tess.spacing = spacing;
+      b.shader->info.tess.ccw = ccw;
+   }
+   nir_def *coord = nir_load_tess_coord(&b);
+   nir_def *p0 = nir_load_per_vertex_input(
+      &b, 4, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+      .dest_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   nir_def *pos = nir_fadd(&b, p0,
+                           nir_vec4(&b, nir_channel(&b, coord, 0),
+                                    nir_channel(&b, coord, 1),
+                                    nir_channel(&b, coord, 2),
+                                    nir_imm_float(&b, 0.0f)));
+   if (out_v >= 2) {
+      nir_def *p1 = nir_load_per_vertex_input(
+         &b, 4, 32, nir_imm_int(&b, out_v - 1), nir_imm_int(&b, 0),
+         .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      pos = nir_fadd(&b, pos, nir_fmul_imm(&b, p1, 0.25f));
+   }
+   if (read_patch_const) {
+      nir_def *pc = nir_load_input(
+         &b, 4, 32, nir_imm_int(&b, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_PATCH0, .num_slots = 1});
+      pos = nir_fadd(&b, pos, pc);
+   }
+   if (read_raw_levels) {
+      nir_def *lo = nir_load_tess_level_outer(&b);
+      nir_def *li = nir_load_tess_level_inner(&b);
+      pos = nir_fadd(&b, pos,
+                     nir_vec4(&b, nir_channel(&b, lo, 0), nir_channel(&b, li, 0),
+                              nir_imm_float(&b, 0.0f), nir_imm_float(&b, 0.0f)));
+   }
+   nir_store_output(&b, pos, nir_imm_int(&b, 0), .write_mask = 15,
+                    .src_type = nir_type_float32,
+                    .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   for (unsigned v = 0; v < extra_out_vars; ++v) {
+      nir_store_output(
+         &b, pos, nir_imm_int(&b, 0), .write_mask = 15,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0 + v, .num_slots = 1});
+   }
+   for (unsigned d = 0; d < clip_size; ++d) {
+      nir_store_output(
+         &b, nir_channel(&b, coord, 0), nir_imm_int(&b, 0), .component = d % 4,
+         .write_mask = 1, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_CLIP_DIST0 + d / 4,
+                          .num_slots = 1});
+   }
+   for (unsigned d = 0; d < cull_size; ++d) {
+      nir_store_output(
+         &b, nir_channel(&b, coord, 1), nir_imm_int(&b, 0), .component = d % 4,
+         .write_mask = 1, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_CULL_DIST0 + d / 4,
+                          .num_slots = 1});
+   }
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   b.shader->info.clip_distance_array_size = clip_size;
+   b.shader->info.cull_distance_array_size = cull_size;
+   return b.shader;
+}
+
+static void
+compile_fused_tess_pair(const nir_shader *vs, const nir_shader *tcs,
+                        const nir_shader *tes,
+                        const struct hk_tess_fused_options *opts,
+                        struct hk_tess_fused_info *out_info)
+{
+   struct blob b_vs, b_tcs, b_tes, a_vs, a_tcs, a_tes;
+   blob_init(&b_vs);
+   blob_init(&b_tcs);
+   blob_init(&b_tes);
+   blob_init(&a_vs);
+   blob_init(&a_tcs);
+   blob_init(&a_tes);
+   nir_serialize(&b_vs, vs, false);
+   nir_serialize(&b_tcs, tcs, false);
+   nir_serialize(&b_tes, tes, false);
+
+   nir_shader *obj = NULL, *mesh = NULL;
+   struct hk_tess_fused_info info = {0};
+   const char *reason = NULL;
+   bool ok = hk_nir_tess_fused_lower(vs, tcs, tes, opts, &obj, &mesh, &info,
+                                     &reason);
+   if (!ok)
+      fprintf(stderr, "fused tess lower failed: %s\n", reason ?: "unknown");
+   CHECK(ok && obj && mesh);
+
+   /* Immutability: original VS, TCS, TES NIR are untouched. */
+   nir_serialize(&a_vs, vs, false);
+   nir_serialize(&a_tcs, tcs, false);
+   nir_serialize(&a_tes, tes, false);
+   CHECK(b_vs.size == a_vs.size && !memcmp(b_vs.data, a_vs.data, b_vs.size));
+   CHECK(b_tcs.size == a_tcs.size && !memcmp(b_tcs.data, a_tcs.data, b_tcs.size));
+   CHECK(b_tes.size == a_tes.size && !memcmp(b_tes.data, a_tes.data, b_tes.size));
+   blob_finish(&b_vs);
+   blob_finish(&b_tcs);
+   blob_finish(&b_tes);
+   blob_finish(&a_vs);
+   blob_finish(&a_tcs);
+   blob_finish(&a_tes);
+
+   /* Compile OBJECT(VS+TCS) through Apple9 native object compiler with 0xe0/0xe1. */
+   hk_apple9_lower_prerast_sysvals(obj, MESA_SHADER_COMPUTE);
+   struct agx_apple9_mesh_key obj_key = AGX_APPLE9_MESH_KEY;
+   obj_key.physical_threads = AGX_APPLE9_NATIVE_SERIAL_THREADS;
+   struct agx_apple9_native_object_options obj_opts = {
+      .payload_stride_B = info.payload_B,
+      .write_child_grid = false,
+      .hw_payload = true,
+   };
+   struct agx_shader_part obj_part = {0};
+   struct agx_apple9_mesh_body_info obj_info = {0};
+   ok = agx_compile_apple9_native_object_ex(obj, true, &obj_key, &obj_opts,
+                                            &obj_part, &obj_info, &reason);
+   if (!ok)
+      fprintf(stderr, "fused tess OBJECT compile failed: %s\n", reason ?: "unknown");
+   CHECK(ok && obj_part.binary && obj_part.info.binary_size);
+   CHECK(obj_info.key.hw_payload);
+   CHECK(hk_apple9_native_shader_valid(&obj_part.info, &obj_info,
+                                       HK_APPLE9_NATIVE_OBJECT));
+   free(obj_part.binary);
+   ralloc_free(obj);
+
+   /* Compile MESH(TES) through Apple9 native mesh compiler with 0xe0/0xe1. */
+   hk_apple9_lower_prerast_sysvals(mesh, MESA_SHADER_COMPUTE);
+   struct hk_apple9_graphics_key mkey = {
+      .native_stage_generated = true,
+      .native_tess_fused = true,
+      .native_object = true,
+      .native_object_hw_payload = true,
+      .native_object_payload_B = info.payload_B,
+      .fs_reads_clip_distance = opts->fs_reads_clip_distance,
+   };
+   struct agx_shader_part mesh_part = {0};
+   struct agx_apple9_mesh_body_info mesh_info = {0};
+   ok = hk_apple9_compile_native_mesh_program(mesh, &mkey, &mesh_part,
+                                              &mesh_info, &reason);
+   if (!ok)
+      fprintf(stderr, "fused tess MESH compile failed: %s\n", reason ?: "unknown");
+   CHECK(ok && mesh_part.binary && mesh_part.info.binary_size);
+   CHECK(mesh_info.key.hw_payload);
+   CHECK(hk_apple9_native_shader_valid(&mesh_part.info, &mesh_info,
+                                       HK_APPLE9_NATIVE_MESH));
+   free(mesh_part.binary);
+   ralloc_free(mesh);
+
+   if (out_info)
+      *out_info = info;
+}
+
+static void
+fused_tess_suite(void)
+{
+   struct hk_tess_fused_options base_opts = {
+      .max_payload_bytes = 1024,
+   };
+   base_opts.vertex.buffer_descriptor_ubo = HK_APPLE9_VERTEX_BUFFERS_BINDING;
+   base_opts.vertex.draw_params_ubo = HK_APPLE9_DRAW_PARAMS_BINDING;
+   base_opts.vertex.dynamic_stride = true;
+   base_opts.vertex.format[0] = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   base_opts.vertex.buffer[0] = 0;
+   base_opts.vertex.offset[0] = 0;
+   base_opts.vertex.stride[0] = 16;
+
+   /* 1. Full matrix: Quads & Triangles x Equal/FracOdd/FracEven x CW/CCW x
+    * 1->1, 2->2, 3->3, 4->4 CPs, including vkd3d-proton split execution modes
+    * and TCS OpControlBarrier. */
+   const enum tess_primitive_mode domains[] = {
+      TESS_PRIMITIVE_TRIANGLES,
+      TESS_PRIMITIVE_QUADS,
+   };
+   const enum gl_tess_spacing spacings[] = {
+      TESS_SPACING_EQUAL,
+      TESS_SPACING_FRACTIONAL_ODD,
+      TESS_SPACING_FRACTIONAL_EVEN,
+   };
+   const unsigned cps[] = {1, 2, 3, 4};
+   unsigned compiled = 0;
+   for (unsigned d = 0; d < ARRAY_SIZE(domains); ++d) {
+      for (unsigned sp = 0; sp < ARRAY_SIZE(spacings); ++sp) {
+         for (unsigned ccw = 0; ccw < 2; ++ccw) {
+            unsigned out_v = cps[(d * 3 + sp + ccw) % ARRAY_SIZE(cps)];
+            bool split = (d == 1 && sp == 1); /* vkd3d-proton split mode */
+            bool barrier = out_v >= 2;
+            nir_shader *vs = make_fused_vs(0, true);
+            nir_shader *tcs = make_fused_tcs(out_v, 0, 4.0f, 4.0f, barrier,
+                                             false, split, spacings[sp], ccw,
+                                             false);
+            nir_shader *tes = make_fused_tes(domains[d], spacings[sp], ccw,
+                                             split, out_v, 0, 0, 0, false, false);
+            struct hk_tess_fused_info info = {0};
+            compile_fused_tess_pair(vs, tcs, tes, &base_opts, &info);
+            CHECK(info.domain == domains[d]);
+            CHECK(info.spacing == spacings[sp]);
+            CHECK(info.ccw == !!ccw);
+            CHECK(info.tcs_vertices_out == out_v);
+            CHECK(info.constant_tess_levels);
+            /* Position-only: Equal/FracEven at 4.0 -> n=4 (Tri V19/P24, Quad V25/P32: 1 WG);
+             * FracOdd at 4.0 -> n=5 (Tri V27/P37: 1 WG; Quad V36/P50: multi-WG). */
+            CHECK(info.mesh_max_vertices == 32 && info.mesh_max_primitives == 42);
+            if (spacings[sp] == TESS_SPACING_FRACTIONAL_ODD) {
+               if (domains[d] == TESS_PRIMITIVE_TRIANGLES) {
+                  CHECK(info.max_child_wgs_per_patch == 1);
+                  CHECK(info.max_prims_per_patch == 37);
+               } else {
+                  CHECK(info.max_child_wgs_per_patch == 5);
+                  CHECK(info.max_prims_per_patch == 50);
+               }
+            } else {
+               CHECK(info.max_child_wgs_per_patch == 1);
+               CHECK(info.max_prims_per_patch ==
+                     (domains[d] == TESS_PRIMITIVE_QUADS ? 32 : 24));
+            }
+            ralloc_free(vs);
+            ralloc_free(tcs);
+            ralloc_free(tes);
+            compiled++;
+         }
+      }
+   }
+
+   /* 2. Adaptive meshlet tiers (V16/P18, V8/P6, V4/P2) + FS-linked varying DCE
+    * + ClipDistance[2] + CullDistance[1] (Elden Ring Triangle shape) + raw
+    * tess levels + patch constants. */
+   {
+      /* 8 comps (POS + 1 vec4) -> V16/P18. */
+      nir_shader *vs = make_fused_vs(1, false);
+      nir_shader *tcs = make_fused_tcs(3, 1, 3.0f, 3.0f, true, true, false,
+                                       TESS_SPACING_EQUAL, false, false);
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                       TESS_SPACING_EQUAL, false, false, 3,
+                                       1, 0, 0, true, true);
+      struct hk_tess_fused_info info = {0};
+      compile_fused_tess_pair(vs, tcs, tes, &base_opts, &info);
+      CHECK(info.mesh_max_vertices == 16 && info.mesh_max_primitives == 18);
+      CHECK(info.max_child_wgs_per_patch == 1);
+      CHECK(info.max_prims_per_patch == 13);
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+      compiled++;
+   }
+   {
+      /* 12 comps (POS + 2 vec4) -> V8/P6; with FS mask reading 0 vars -> V32/P42! */
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_shader *tcs = make_fused_tcs(1, 0, 1.0f, 1.0f, false, false, false,
+                                       TESS_SPACING_EQUAL, false, false);
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
+                                       false, false, 1, 2, 0, 0, false, false);
+      struct hk_tess_fused_info info = {0};
+      compile_fused_tess_pair(vs, tcs, tes, &base_opts, &info);
+      CHECK(info.mesh_max_vertices == 8 && info.mesh_max_primitives == 6);
+      CHECK(info.max_child_wgs_per_patch == 1 && info.max_prims_per_patch == 2);
+
+      struct hk_tess_fused_options depth_opts = base_opts;
+      depth_opts.has_fs_inputs_mask = true; /* FS reads 0 generic vars */
+      compile_fused_tess_pair(vs, tcs, tes, &depth_opts, &info);
+      CHECK(info.mesh_max_vertices == 32 && info.mesh_max_primitives == 42);
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+      compiled += 2;
+   }
+   {
+      /* Elden Ring Triangle shape: 3->3 CPs, FracOdd, CW, Clip[2] + Cull[1] + 4 vec4
+       * (4 + 16 + 2 = 22 comps -> V4/P2, wg_rows <= 40 unbounded!). */
+      nir_shader *vs = make_fused_vs(4, true);
+      nir_shader *tcs = make_fused_tcs(3, 4, 4.0f, 4.0f, true, false, true,
+                                       TESS_SPACING_FRACTIONAL_ODD, false, true);
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                       TESS_SPACING_FRACTIONAL_ODD, false, true,
+                                       3, 4, 2, 1, false, false);
+      struct hk_tess_fused_info info = {0};
+      compile_fused_tess_pair(vs, tcs, tes, &base_opts, &info);
+      CHECK(info.mesh_max_vertices == 4 && info.mesh_max_primitives == 2);
+      CHECK(!info.constant_tess_levels);
+      CHECK(info.max_child_wgs_per_patch > 0 && info.max_child_wgs_per_patch <= 4096);
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+      compiled++;
+   }
+
+   /* 3. Zero-child patch culling (outer == 0.0, outer == -2.0, outer == NaN). */
+   const float cull_vals[] = {0.0f, -2.0f, NAN};
+   for (unsigned i = 0; i < ARRAY_SIZE(cull_vals); ++i) {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_shader *tcs = make_fused_tcs(3, 0, cull_vals[i], 4.0f, false, false,
+                                       false, TESS_SPACING_EQUAL, false, false);
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                       TESS_SPACING_EQUAL, false, false, 3,
+                                       0, 0, 0, false, false);
+      struct hk_tess_fused_info info = {0};
+      compile_fused_tess_pair(vs, tcs, tes, &base_opts, &info);
+      CHECK(info.constant_tess_levels);
+      CHECK(info.max_child_wgs_per_patch == 0 && info.max_prims_per_patch == 0);
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+      compiled++;
+   }
+
+   /* 3b. Push-constant tess levels (exact draw-time TVB/ring count evaluation). */
+   {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "fused_tess_push_tcs");
+      b.shader->info.io_lowered = true;
+      b.shader->info.tess.tcs_vertices_out = 3;
+      nir_def *inv = nir_load_invocation_id(&b);
+      nir_def *pos = nir_load_per_vertex_input(
+         &b, 4, 32, inv, nir_imm_int(&b, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &b, pos, inv, nir_imm_int(&b, 0), .write_mask = 15,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_push_if(&b, nir_ieq_imm(&b, inv, 0));
+      unsigned root_off = offsetof(struct hk_root_descriptor_table, root_desc_addr);
+      nir_def *root_ptr = nir_load_ubo(&b, 1, 64, nir_imm_int(&b, 0),
+                                       nir_imm_int(&b, root_off),
+                                       .align_mul = 8, .range_base = root_off,
+                                       .range = 8);
+      nir_def *paddr = nir_iadd(
+         &b, root_ptr,
+         nir_u2u64(&b, nir_imm_int(&b, hk_root_descriptor_offset(push) + 4)));
+      nir_def *lvl = nir_load_global_constant(&b, 1, 32, paddr, .align_mul = 4);
+      nir_store_output(
+         &b, nir_vec4(&b, lvl, lvl, lvl, lvl), nir_imm_int(&b, 0),
+         .write_mask = 15, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER,
+                          .num_slots = 1});
+      nir_store_output(
+         &b, nir_vec2(&b, lvl, lvl), nir_imm_int(&b, 0), .write_mask = 3,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER,
+                          .num_slots = 1});
+      nir_pop_if(&b, NULL);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      nir_shader *tcs = b.shader;
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                       TESS_SPACING_EQUAL, true, false, 3, 0, 0,
+                                       0, false, false);
+      struct hk_tess_fused_info info = {0};
+      compile_fused_tess_pair(vs, tcs, tes, &base_opts, &info);
+      CHECK(!info.constant_tess_levels);
+      CHECK(info.push_levels.valid);
+      struct hk_shader_info sinfo = {
+         .apple9_tess_fused = true,
+         .apple9_tess_max_child_wgs = info.max_child_wgs_per_patch,
+         .apple9_tess_max_patch_prims = info.max_prims_per_patch,
+         .apple9_tess_push_levels = info.push_levels,
+      };
+      const struct {
+         float lvl;
+         uint32_t wgs;
+         uint32_t prims;
+      } cases[] = {
+         {1.0f, 1, 1},
+         {4.0f, 1, 24},
+         {64.0f, info.max_child_wgs_per_patch, 6144},
+         {0.0f, 0, 0},
+         {NAN, 0, 0},
+      };
+      for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+         uint8_t push[HK_MAX_PUSH_SIZE] = {0};
+         memcpy(push + 4, &cases[i].lvl, sizeof(float));
+         uint32_t wgs = 999, prims = 999;
+         hk_nir_tess_fused_eval_counts(&sinfo, push, &wgs, &prims);
+         CHECK(wgs == cases[i].wgs && prims == cases[i].prims);
+      }
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+      compiled++;
+   }
+
+   /* 4. Clean rejection / fallback cases. */
+   const char *reason = NULL;
+   /* Isolines rejected */
+   {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_shader *tcs = make_fused_tcs(2, 0, 4.0f, 4.0f, false, false, false,
+                                       TESS_SPACING_EQUAL, false, false);
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_ISOLINES,
+                                       TESS_SPACING_EQUAL, false, false, 2,
+                                       0, 0, 0, false, false);
+      CHECK(!hk_nir_tess_fused_lower(vs, tcs, tes, &base_opts, NULL, NULL, NULL,
+                                     &reason));
+      CHECK(reason != NULL);
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+   }
+   /* PointMode rejected */
+   {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_shader *tcs = make_fused_tcs(3, 0, 4.0f, 4.0f, false, false, false,
+                                       TESS_SPACING_EQUAL, false, false);
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                       TESS_SPACING_EQUAL, false, false, 3,
+                                       0, 0, 0, false, false);
+      tes->info.tess.point_mode = true;
+      CHECK(!hk_nir_tess_fused_lower(vs, tcs, tes, &base_opts, NULL, NULL, NULL,
+                                     &reason));
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+   }
+   /* writes_memory in TCS rejected */
+   {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_shader *tcs = make_fused_tcs(3, 0, 4.0f, 4.0f, false, false, false,
+                                       TESS_SPACING_EQUAL, false, false);
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                       TESS_SPACING_EQUAL, false, false, 3,
+                                       0, 0, 0, false, false);
+      tcs->info.writes_memory = true;
+      CHECK(!hk_nir_tess_fused_lower(vs, tcs, tes, &base_opts, NULL, NULL, NULL,
+                                     &reason));
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+   }
+   /* Cross-invocation TCS output read (load_per_vertex_output) rejected */
+   {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_shader *tcs = make_fused_tcs(3, 0, 4.0f, 4.0f, true, false, false,
+                                       TESS_SPACING_EQUAL, false, false);
+      nir_builder b = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(tcs)));
+      nir_def *other = nir_load_per_vertex_output(
+         &b, 4, 32, nir_imm_int(&b, 1), nir_imm_int(&b, 0),
+         .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &b, other, nir_load_invocation_id(&b), nir_imm_int(&b, 0),
+         .write_mask = 15, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                       TESS_SPACING_EQUAL, false, false, 3,
+                                       0, 0, 0, false, false);
+      CHECK(!hk_nir_tess_fused_lower(vs, tcs, tes, &base_opts, NULL, NULL, NULL,
+                                     &reason));
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+   }
+   /* Payload exceeding mp_payload_bytes rejected */
+   {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_shader *tcs = make_fused_tcs(4, 0, 1.0f, 1.0f, false, false, false,
+                                       TESS_SPACING_EQUAL, false, false);
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
+                                       false, false, 4, 0, 0, 0, false, false);
+      struct hk_tess_fused_options tiny_opts = base_opts;
+      tiny_opts.max_payload_bytes = 64; /* 40 + 4*16 = 104 > 64 */
+      CHECK(!hk_nir_tess_fused_lower(vs, tcs, tes, &tiny_opts, NULL, NULL, NULL,
+                                     &reason));
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+   }
+   /* Nested TCS barrier inside if rejected */
+   {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_shader *tcs = make_fused_tcs(3, 0, 4.0f, 4.0f, false, false, false,
+                                       TESS_SPACING_EQUAL, false, false);
+      nir_builder b = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(tcs)));
+      nir_push_if(&b, nir_ieq_imm(&b, nir_load_invocation_id(&b), 0));
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_shader_out);
+      nir_pop_if(&b, NULL);
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                       TESS_SPACING_EQUAL, false, false, 3,
+                                       0, 0, 0, false, false);
+      CHECK(!hk_nir_tess_fused_lower(vs, tcs, tes, &base_opts, NULL, NULL, NULL,
+                                     &reason));
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+   }
+
+   printf("fused tessellation suite: %u OBJECT+MESH compiles + 6 fallback rejections passed\n",
+          compiled);
+}
+
+static uint32_t
+ref_stitch_i(uint32_t n_out, uint32_t n_in_seg, uint32_t t)
+{
+   uint32_t total = n_out + n_in_seg;
+   uint32_t k = n_in_seg >> 1;
+   uint32_t half_t = (n_out >> 1) + k;
+   uint32_t denom = half_t ? half_t : 1;
+   uint32_t left = (t * k) / denom;
+   uint32_t rt = t <= total ? total - t : 0;
+   uint32_t right = n_in_seg - (rt * k) / denom;
+   return t <= half_t ? left : (rt <= half_t ? right : k + 1);
+}
+
+static uint32_t
+ref_float_to_fxp(float val)
+{
+   return (uint32_t)(val * 65536.0f + 0.5f);
+}
+
+static uint32_t
+ref_remove_msb(uint32_t val)
+{
+   if (!val)
+      return 0;
+   return val & ~(1u << (31u - __builtin_clz(val)));
+}
+
+static uint32_t
+ref_eval_1d_fxp(enum gl_tess_spacing spacing, uint32_t n, float f, uint32_t k)
+{
+   bool flip = 2u * k > n;
+   uint32_t j = flip ? n - k : k;
+   uint32_t q_half;
+   if (j == 0) {
+      q_half = 0;
+   } else if (2u * j == n) {
+      q_half = 32768u;
+   } else if (spacing == TESS_SPACING_EQUAL) {
+      q_half = j * ref_float_to_fxp(1.0f / (float)n);
+   } else {
+      bool odd = spacing == TESS_SPACING_FRACTIONAL_ODD;
+      uint32_t fxp_tess = ref_float_to_fxp(f);
+      uint32_t fxp_half = (fxp_tess + 1u) >> 1;
+      if (odd || fxp_half == 32768u)
+         fxp_half += 32768u;
+      uint32_t fxp_floor = fxp_half & ~0xffffu;
+      uint32_t fxp_ceil = (fxp_half + 0xffffu) & ~0xffffu;
+      uint32_t frac = fxp_half - fxp_floor;
+      uint32_t floor_int = fxp_floor >> 16;
+      uint32_t ceil_int = fxp_ceil >> 16;
+      uint32_t split;
+      if (fxp_ceil == fxp_floor)
+         split = ceil_int + 1u;
+      else if (odd)
+         split = floor_int == 1u ? 0u : (ref_remove_msb(floor_int - 1u) << 1) + 1u;
+      else
+         split = (ref_remove_msb(floor_int) << 1) + 1u;
+      uint32_t floor_segs = MAX2((floor_int << 1) - (odd ? 1u : 0u), 1u);
+      uint32_t ceil_segs = MAX2((ceil_int << 1) - (odd ? 1u : 0u), 1u);
+      uint32_t inv_floor = ref_float_to_fxp(1.0f / (float)floor_segs);
+      uint32_t inv_ceil = ref_float_to_fxp(1.0f / (float)ceil_segs);
+      uint32_t idx_floor = j > split ? j - 1u : j;
+      uint32_t loc_floor = idx_floor * inv_floor;
+      uint32_t loc_ceil = j * inv_ceil;
+      q_half = (loc_floor * (65536u - frac) + loc_ceil * frac + 32768u) >> 16;
+   }
+   return flip ? 65536u - q_half : q_half;
+}
+
+static float
+ref_eval_1d(enum gl_tess_spacing spacing, uint32_t n, float f, uint32_t k)
+{
+   float t = (float)ref_eval_1d_fxp(spacing, n, f, k) * (1.0f / 65536.0f);
+   /* Verify exact-complement invariance (Vulkan tessellation invariance rules 3-4). */
+   CHECK(1.0f - (1.0f - t) == t);
+   return t;
+}
+
+static void
+ref_quad_outer_uv(enum gl_tess_spacing spacing, uint32_t e, uint32_t k,
+                  const uint32_t n_out[4], const float f_out[4], float uv[2])
+{
+   uint32_t n_e = n_out[e];
+   float f_e = f_out[e];
+   uint32_t q = (e == 0 || e == 3) ? (n_e > k ? n_e - k : 0) : k;
+   float t = ref_eval_1d(spacing, n_e, f_e, q);
+   bool odd = (e & 1) != 0;
+   uv[0] = odd ? t : (e == 2 ? 1.0f : 0.0f);
+   uv[1] = odd ? (e == 3 ? 1.0f : 0.0f) : t;
+}
+
+static void
+ref_quad_inner_uv(enum gl_tess_spacing spacing, uint32_t e, uint32_t k,
+                  uint32_t niu, uint32_t niv, float fiu, float fiv, float uv[2])
+{
+   uint32_t iu = e == 0 ? 1 : (e == 1 ? k + 1 : (e == 2 ? niu - 1 : niu - 1 - k));
+   uint32_t iv = e == 0 ? niv - 1 - k : (e == 1 ? 1 : (e == 2 ? k + 1 : niv - 1));
+   uv[0] = ref_eval_1d(spacing, niu, fiu, iu);
+   uv[1] = ref_eval_1d(spacing, niv, fiv, iv);
+}
+
+static void
+ref_tri_ring_uv(enum gl_tess_spacing spacing, uint32_t r, uint32_t e, uint32_t k,
+                const uint32_t n_out[3], const float f_out[3], uint32_t ni,
+                float fi, float uv[2])
+{
+   if (r == 0) {
+      uint32_t n_e = n_out[e];
+      float f_e = f_out[e];
+      uint32_t q = e == 1 ? k : (n_e > k ? n_e - k : 0);
+      uint32_t t_fxp = ref_eval_1d_fxp(spacing, n_e, f_e, q);
+      uint32_t u_fxp = e == 0 ? 0 : t_fxp;
+      uint32_t v_fxp = e == 0 ? t_fxp : (e == 1 ? 0 : 65536u - t_fxp);
+      uv[0] = (float)u_fxp * (1.0f / 65536.0f);
+      uv[1] = (float)v_fxp * (1.0f / 65536.0f);
+      /* Verify exact w == 0.0f on edge 2 (u + v == 1.0f bit-for-bit). */
+      if (e == 2)
+         CHECK(1.0f - uv[0] - uv[1] == 0.0f);
+      return;
+   }
+   uint32_t r2 = r << 1;
+   if (r2 == ni) {
+      uv[0] = 21845.0f * (1.0f / 65536.0f);
+      uv[1] = 21845.0f * (1.0f / 65536.0f);
+      return;
+   }
+   uint32_t s_r = ni - r2;
+   uint32_t perp_raw = ref_eval_1d_fxp(spacing, ni, fi, r);
+   uint32_t perp_fxp = (perp_raw * 0xaaaau + 32768u) >> 16;
+   uint32_t one_m_2p_fxp = 65536u - 2u * perp_fxp;
+   uint32_t u_fxp, v_fxp;
+   if (k == 0 || k == s_r) {
+      uint32_t c_id = k == 0 ? e : (e == 2 ? 0 : e + 1);
+      u_fxp = c_id == 2 ? one_m_2p_fxp : perp_fxp;
+      v_fxp = c_id == 0 ? one_m_2p_fxp : perp_fxp;
+   } else {
+      uint32_t q = e == 1 ? r + k : (ni - r - k);
+      uint32_t param_fxp = ref_eval_1d_fxp(spacing, ni, fi, q);
+      uint32_t tmp_fxp = param_fxp - ((perp_fxp + 1u) >> 1);
+      u_fxp = e == 0 ? perp_fxp : tmp_fxp;
+      v_fxp = e == 0 ? tmp_fxp : (e == 1 ? perp_fxp : 65536u - tmp_fxp - perp_fxp);
+   }
+   uv[0] = (float)u_fxp * (1.0f / 65536.0f);
+   uv[1] = (float)v_fxp * (1.0f / 65536.0f);
+   CHECK(1.0f - (1.0f - uv[0]) == uv[0]);
+   CHECK(1.0f - (1.0f - uv[1]) == uv[1]);
+}
+
+static uint32_t
+ref_seg_count(enum gl_tess_spacing spacing, float clamped)
+{
+   if (spacing == TESS_SPACING_EQUAL)
+      return (uint32_t)clamped;
+   bool odd = spacing == TESS_SPACING_FRACTIONAL_ODD;
+   uint32_t fxp = ref_float_to_fxp(clamped);
+   uint32_t half = (fxp + (odd ? 65537u : 1u)) >> 1;
+   uint32_t ceil_half = (half + 0xffffu) & ~0xffffu;
+   uint32_t r = ceil_half >> 15;
+   return odd ? r - 1u : r;
+}
+
+static void
+fused_tess_topology_suite(void)
+{
+   /* 0. Spot-check bit-exact match with poly_tessellator.h PlacePointIn1D &
+    * NumPointsForTessFactor across sub-1/65536 float boundaries. */
+   CHECK(ref_eval_1d_fxp(TESS_SPACING_EQUAL, 7, 7.0f, 2) == 18724u);
+   CHECK(ref_eval_1d_fxp(TESS_SPACING_FRACTIONAL_EVEN, 4, 2.5f, 1) == 28672u);
+   CHECK(ref_eval_1d_fxp(TESS_SPACING_FRACTIONAL_EVEN, 4, 2.5f, 3) == 65536u - 28672u);
+   CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_ODD, 3.000000476837158f) == 3u);
+   {
+      uint32_t prev = 0;
+      for (uint32_t k = 0; k <= 3; ++k) {
+         uint32_t q = ref_eval_1d_fxp(TESS_SPACING_FRACTIONAL_ODD, 3,
+                                      3.000000476837158f, k);
+         CHECK(q >= prev);
+         prev = q;
+      }
+      CHECK(prev == 65536u);
+   }
+
+   /* 1. Exhaustively verify stitcher monotonicity, endpoints, and symmetry
+    * over all 64 * 65 = 4,160 (n_out, n_in_seg) pairs. */
+   for (uint32_t no = 1; no <= 64; ++no) {
+      for (uint32_t ni = 0; ni <= 64; ++ni) {
+         uint32_t total = no + ni;
+         CHECK(ref_stitch_i(no, ni, 0) == 0);
+         CHECK(ref_stitch_i(no, ni, total) == ni);
+         for (uint32_t t = 0; t < total; ++t) {
+            uint32_t a = ref_stitch_i(no, ni, t);
+            uint32_t b = ref_stitch_i(no, ni, t + 1);
+            CHECK(b == a || b == a + 1);
+            uint32_t oa = t - a, ob = (t + 1) - b;
+            CHECK(oa <= no && ob <= no && a <= ni && b <= ni);
+         }
+      }
+   }
+
+   /* 2. Verify exact area sum, strictly non-negative CW (+1 cross) winding,
+    * and meshlet V/P bounds for Quads and Triangles across all 3 spacings and
+    * all 4 meshlet shapes (including asymmetric levels and 63/64 max). */
+   struct shape_cfg {
+      uint32_t max_v, max_p, tw, th, ps;
+      bool whole;
+   };
+   const struct shape_cfg shapes[] = {
+      {32, 42, 5, 4, 30, true},
+      {16, 18, 3, 3, 14, true},
+      {8, 6, 3, 1, 6, true},
+      {4, 2, 1, 1, 2, false},
+   };
+   const enum gl_tess_spacing spacings[] = {
+      TESS_SPACING_EQUAL,
+      TESS_SPACING_FRACTIONAL_ODD,
+      TESS_SPACING_FRACTIONAL_EVEN,
+   };
+   const float cases[][6] = {
+      {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f},
+      {2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f},
+      {3.0f, 3.0f, 3.0f, 3.0f, 3.0f, 3.0f},
+      {4.0f, 4.0f, 4.0f, 4.0f, 4.0f, 4.0f},
+      {1.0f, 4.0f, 1.0f, 4.0f, 1.0f, 1.0f},
+      {2.25f, 3.75f, 5.1f, 6.9f, 3.3f, 5.8f},
+      {1.0f, 17.5f, 9.25f, 32.0f, 2.5f, 15.0f},
+      {3.000000476837158f, 3.000000476837158f, 3.000000476837158f,
+       3.000000476837158f, 3.000000476837158f, 3.000000476837158f},
+      {63.0f, 63.0f, 63.0f, 63.0f, 63.0f, 63.0f},
+      {64.0f, 64.0f, 64.0f, 64.0f, 64.0f, 64.0f},
+   };
+
+   unsigned verified = 0;
+   for (unsigned si = 0; si < ARRAY_SIZE(spacings); ++si) {
+      enum gl_tess_spacing sp = spacings[si];
+      for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ++ci) {
+         for (unsigned shi = 0; shi < ARRAY_SIZE(shapes); ++shi) {
+            const struct shape_cfg *sh = &shapes[shi];
+            /* Quad verification */
+            {
+               float f_out[4], f_in[2], maxf = 0.0f;
+               float lo = sp == TESS_SPACING_FRACTIONAL_EVEN ? 2.0f : 1.0f;
+               float hi = sp == TESS_SPACING_FRACTIONAL_ODD ? 63.0f : 64.0f;
+               for (unsigned e = 0; e < 4; ++e) {
+                  float f = cases[ci][e];
+                  f = !(f >= lo) ? lo : (f > hi ? hi : f);
+                  if (sp == TESS_SPACING_EQUAL)
+                     f = ceilf(f);
+                  f_out[e] = f;
+                  if (f > maxf)
+                     maxf = f;
+               }
+               for (unsigned a = 0; a < 2; ++a)
+                  if (cases[ci][4 + a] > maxf)
+                     maxf = cases[ci][4 + a];
+               float in_lo = (sp == TESS_SPACING_FRACTIONAL_ODD &&
+                              maxf > 1.0f + 0.5f / 65536.0f)
+                                ? 1.0f + 1.0f / 65536.0f
+                                : lo;
+               for (unsigned a = 0; a < 2; ++a) {
+                  float f = cases[ci][4 + a];
+                  f = !(f >= in_lo) ? in_lo : (f > hi ? hi : f);
+                  if (sp == TESS_SPACING_EQUAL)
+                     f = ceilf(f);
+                  f_in[a] = f;
+               }
+               uint32_t n_out[4], n_in[2];
+               bool all_ones = sp != TESS_SPACING_FRACTIONAL_EVEN;
+               for (unsigned e = 0; e < 4; ++e) {
+                  n_out[e] = ref_seg_count(sp, f_out[e]);
+                  if (n_out[e] != 1)
+                     all_ones = false;
+               }
+               for (unsigned a = 0; a < 2; ++a) {
+                  n_in[a] = ref_seg_count(sp, f_in[a]);
+                  if (n_in[a] != 1)
+                     all_ones = false;
+               }
+               double area = 0.0;
+               if (all_ones) {
+                  area = 1.0;
+               } else {
+                  uint32_t min_in = sp == TESS_SPACING_FRACTIONAL_ODD ? 3 : 2;
+                  for (unsigned a = 0; a < 2; ++a) {
+                     if (n_in[a] < min_in) {
+                        n_in[a] = min_in;
+                        if (sp == TESS_SPACING_EQUAL)
+                           f_in[a] = (float)n_in[a];
+                     }
+                  }
+                  uint32_t qu = n_in[0] - 2, qv = n_in[1] - 2;
+                  for (unsigned e = 0; e < 4; ++e) {
+                     uint32_t n_is = (e & 1) ? qu : qv;
+                     uint32_t t_tot = n_out[e] + n_is;
+                     uint32_t chunks = DIV_ROUND_UP(t_tot, sh->ps);
+                     for (uint32_t c = 0; c < chunks; ++c) {
+                        uint32_t t0 = c * sh->ps;
+                        uint32_t t1 = MIN2(t0 + sh->ps, t_tot);
+                        uint32_t i0 = ref_stitch_i(n_out[e], n_is, t0);
+                        uint32_t o0 = t0 - i0;
+                        uint32_t i1 = ref_stitch_i(n_out[e], n_is, t1);
+                        uint32_t o1 = t1 - i1;
+                        uint32_t no = (o1 - o0) + 1;
+                        uint32_t ni_v = (i1 - i0) + 1;
+                        CHECK(no + ni_v <= sh->max_v);
+                        CHECK(t1 - t0 <= sh->max_p);
+                        float vbuf[64][2];
+                        for (uint32_t l = 0; l < no; ++l)
+                           ref_quad_outer_uv(sp, e, o0 + l, n_out, f_out, vbuf[l]);
+                        for (uint32_t l = 0; l < ni_v; ++l)
+                           ref_quad_inner_uv(sp, e, i0 + l, n_in[0], n_in[1],
+                                             f_in[0], f_in[1], vbuf[no + l]);
+                        for (uint32_t p = 0; p < t1 - t0; ++p) {
+                           uint32_t t = t0 + p;
+                           uint32_t ia = ref_stitch_i(n_out[e], n_is, t);
+                           uint32_t oi = (t - ia) - o0;
+                           uint32_t ii = ia - i0;
+                           bool step_i =
+                              ref_stitch_i(n_out[e], n_is, t + 1) != ia;
+                           uint32_t a = step_i ? no + ii : oi;
+                           uint32_t b = step_i ? oi : oi + 1;
+                           uint32_t d = step_i ? no + ii + 1 : no + ii;
+                           CHECK(a < no + ni_v && b < no + ni_v && d < no + ni_v);
+                           double cr =
+                              ((double)vbuf[b][0] - vbuf[a][0]) *
+                                 ((double)vbuf[d][1] - vbuf[a][1]) -
+                              ((double)vbuf[b][1] - vbuf[a][1]) *
+                                 ((double)vbuf[d][0] - vbuf[a][0]);
+                           CHECK(cr >= -1e-6);
+                           area += 0.5 * cr;
+                        }
+                     }
+                  }
+                  if (qu && qv) {
+                     uint32_t tu = DIV_ROUND_UP(qu, sh->tw);
+                     uint32_t tv = DIV_ROUND_UP(qv, sh->th);
+                     for (uint32_t ty = 0; ty < tv; ++ty) {
+                        for (uint32_t tx = 0; tx < tu; ++tx) {
+                           uint32_t ox = tx * sh->tw, oy = ty * sh->th;
+                           uint32_t cw = MIN2(sh->tw, qu - ox);
+                           uint32_t ch = MIN2(sh->th, qv - oy);
+                           CHECK((cw + 1) * (ch + 1) <= sh->max_v);
+                           CHECK(2 * cw * ch <= sh->max_p);
+                           for (uint32_t qy = 0; qy < ch; ++qy) {
+                              for (uint32_t qx = 0; qx < cw; ++qx) {
+                                 float u0 = ref_eval_1d(sp, n_in[0], f_in[0], ox + 1 + qx);
+                                 float u1 = ref_eval_1d(sp, n_in[0], f_in[0], ox + 2 + qx);
+                                 float v0 = ref_eval_1d(sp, n_in[1], f_in[1], oy + 1 + qy);
+                                 float v1 = ref_eval_1d(sp, n_in[1], f_in[1], oy + 2 + qy);
+                                 double cr = (double)(u1 - u0) * (double)(v1 - v0);
+                                 CHECK(cr >= -1e-6);
+                                 area += cr;
+                              }
+                           }
+                        }
+                     }
+                  }
+               }
+               CHECK(fabs(area - 1.0) < 1e-4);
+               verified++;
+            }
+
+            /* Triangle verification */
+            {
+               float f_out[3], f_in, maxf = 0.0f;
+               float lo = sp == TESS_SPACING_FRACTIONAL_EVEN ? 2.0f : 1.0f;
+               float hi = sp == TESS_SPACING_FRACTIONAL_ODD ? 63.0f : 64.0f;
+               for (unsigned e = 0; e < 3; ++e) {
+                  float f = cases[ci][e];
+                  f = !(f >= lo) ? lo : (f > hi ? hi : f);
+                  if (sp == TESS_SPACING_EQUAL)
+                     f = ceilf(f);
+                  f_out[e] = f;
+                  if (f > maxf)
+                     maxf = f;
+               }
+               if (cases[ci][4] > maxf)
+                  maxf = cases[ci][4];
+               float in_lo = (sp == TESS_SPACING_FRACTIONAL_ODD &&
+                              maxf > 1.0f + 0.5f / 65536.0f)
+                                ? 1.0f + 1.0f / 65536.0f
+                                : lo;
+               f_in = cases[ci][4];
+               f_in = !(f_in >= in_lo) ? in_lo : (f_in > hi ? hi : f_in);
+               if (sp == TESS_SPACING_EQUAL)
+                  f_in = ceilf(f_in);
+               uint32_t n_out[3], ni;
+               bool all_ones = sp != TESS_SPACING_FRACTIONAL_EVEN;
+               for (unsigned e = 0; e < 3; ++e) {
+                  n_out[e] = ref_seg_count(sp, f_out[e]);
+                  if (n_out[e] != 1)
+                     all_ones = false;
+               }
+               ni = ref_seg_count(sp, f_in);
+               if (ni != 1)
+                  all_ones = false;
+               double area = 0.0;
+               if (all_ones) {
+                  area = 0.5;
+               } else {
+                  uint32_t min_in = sp == TESS_SPACING_FRACTIONAL_ODD ? 3 : 2;
+                  if (ni < min_in) {
+                     ni = min_in;
+                     if (sp == TESS_SPACING_EQUAL)
+                        f_in = (float)ni;
+                  }
+                  uint32_t rings = ni >> 1;
+                  for (uint32_t r = 0; r < rings; ++r) {
+                     uint32_t s_o_ring = ni - 2u * r;
+                     uint32_t s_i = s_o_ring > 2 ? s_o_ring - 2 : 0;
+                     for (uint32_t e = 0; e < 3; ++e) {
+                        uint32_t s_o = r == 0 ? n_out[e] : s_o_ring;
+                        uint32_t t_tot = s_o + s_i;
+                        uint32_t chunks = DIV_ROUND_UP(t_tot, sh->ps);
+                        for (uint32_t c = 0; c < chunks; ++c) {
+                           uint32_t t0 = c * sh->ps;
+                           uint32_t t1 = MIN2(t0 + sh->ps, t_tot);
+                           uint32_t i0 = ref_stitch_i(s_o, s_i, t0);
+                           uint32_t o0 = t0 - i0;
+                           uint32_t i1 = ref_stitch_i(s_o, s_i, t1);
+                           uint32_t o1 = t1 - i1;
+                           uint32_t no = (o1 - o0) + 1;
+                           uint32_t ni_v = (i1 - i0) + 1;
+                           CHECK(no + ni_v <= sh->max_v);
+                           CHECK(t1 - t0 <= sh->max_p);
+                           float vbuf[64][2];
+                           for (uint32_t l = 0; l < no; ++l)
+                              ref_tri_ring_uv(sp, r, e, o0 + l, n_out, f_out,
+                                              ni, f_in, vbuf[l]);
+                           for (uint32_t l = 0; l < ni_v; ++l)
+                              ref_tri_ring_uv(sp, r + 1, e, i0 + l, n_out, f_out,
+                                              ni, f_in, vbuf[no + l]);
+                           for (uint32_t p = 0; p < t1 - t0; ++p) {
+                              uint32_t t = t0 + p;
+                              uint32_t ia = ref_stitch_i(s_o, s_i, t);
+                              uint32_t oi = (t - ia) - o0;
+                              uint32_t ii = ia - i0;
+                              bool step_i = ref_stitch_i(s_o, s_i, t + 1) != ia;
+                              uint32_t a = step_i ? no + ii : oi;
+                              uint32_t b = step_i ? oi : oi + 1;
+                              uint32_t d = step_i ? no + ii + 1 : no + ii;
+                              CHECK(a < no + ni_v && b < no + ni_v && d < no + ni_v);
+                              double cr =
+                                 ((double)vbuf[b][0] - vbuf[a][0]) *
+                                    ((double)vbuf[d][1] - vbuf[a][1]) -
+                                 ((double)vbuf[b][1] - vbuf[a][1]) *
+                                    ((double)vbuf[d][0] - vbuf[a][0]);
+                              CHECK(cr >= -1e-6);
+                              area += 0.5 * cr;
+                           }
+                        }
+                     }
+                  }
+                  if (ni & 1) {
+                     float cbuf[3][2];
+                     for (uint32_t e = 0; e < 3; ++e)
+                        ref_tri_ring_uv(sp, rings, e, 0, n_out, f_out, ni, f_in,
+                                        cbuf[e]);
+                     double cr =
+                        ((double)cbuf[1][0] - cbuf[0][0]) *
+                           ((double)cbuf[2][1] - cbuf[0][1]) -
+                        ((double)cbuf[1][1] - cbuf[0][1]) *
+                           ((double)cbuf[2][0] - cbuf[0][0]);
+                     CHECK(cr >= -1e-6);
+                     area += 0.5 * cr;
+                  }
+               }
+               CHECK(fabs(area - 0.5) < 1e-4);
+               verified++;
+            }
+         }
+      }
+   }
+   printf("fused tessellation topology suite: 4160 stitch pairs + %u domain/spacing/shape area & winding checks passed\n",
+          verified);
+}
+
 int
 main(void)
 {
@@ -580,6 +1657,8 @@ main(void)
    object_grid();
    rejections();
    levels();
+   fused_tess_suite();
+   fused_tess_topology_suite();
    /* Consuming entrypoint lowers in place without a second clone and frees on reject. */
    {
       nir_shader *owned = source(false, false, false);

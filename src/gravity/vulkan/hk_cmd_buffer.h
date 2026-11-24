@@ -1696,6 +1696,10 @@ void hk_apple9_draw_native_mesh_draw(struct hk_cmd_buffer *cmd,
 void hk_apple9_draw_native_object(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                                   const uint32_t object_groups[3],
                                   uint64_t grid, uint64_t payload);
+void hk_apple9_draw_native_tess_object(struct hk_cmd_buffer *cmd,
+                                       uint32_t draw_id, struct agx_draw draw,
+                                       const uint32_t object_groups[3],
+                                       uint64_t grid);
 /* Software-stage outputs, queries and multiview have additional per-draw
  * state. Keep their existing preparation path. A null/out-of-range index
  * binding allocates a fresh zero range, so it must also use that path. */

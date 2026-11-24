@@ -146,6 +146,12 @@ VkResult hk_apple9_native_gs_fused_check(const nir_shader *vs_source,
 VkResult hk_apple9_native_tess_check(const nir_shader *source,
                                      const struct hk_apple9_graphics_key *key,
                                      bool *supported, const char **reason);
+VkResult hk_apple9_native_tess_fused_check(
+   struct hk_device *dev, const nir_shader *vs_source,
+   const nir_shader *tcs_source, const nir_shader *tes_source,
+   const nir_shader *fs_source, bool has_fs_mask,
+   const struct hk_apple9_graphics_key *key, bool *supported,
+   const char **reason);
 VkResult hk_apple9_compile_graphics_path(
    struct hk_device *dev, uint32_t count, struct vk_shader_compile_info *infos,
    const struct vk_graphics_pipeline_state *state,

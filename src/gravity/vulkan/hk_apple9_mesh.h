@@ -95,6 +95,34 @@ struct hk_apple9_fused_gs_params {
    uint32_t first_instance_offset;
 };
 
+/* Per-draw parameters for Zero-PREGFX fused OBJECT(VS+TCS) -> MESH(TES) draws.
+ * Uploaded to root.draw.tess_params (loaded via tess_param_buffer_poly). */
+struct hk_apple9_fused_tess_params {
+   /* Index buffer GPU address pre-offset by firstIndex * index_size_B (0 if direct). */
+   uint64_t index_buffer;
+   /* Remaining index buffer byte size from index_buffer (0 if direct or OOB). */
+   uint64_t index_buffer_size;
+   /* Index element byte size: 0 for direct draws, 1/2/4 for indexed draws. */
+   uint32_t index_size_B;
+   /* Dynamic patchControlPoints (1..32). */
+   uint32_t input_patch_size;
+   /* firstVertex (direct) or vertexOffset (indexed). */
+   uint32_t first_vertex;
+   /* firstInstance. */
+   uint32_t base_instance;
+   /* Patches in this draw (or chunk), per instance. */
+   uint32_t patches_per_instance;
+   /* First patch index in this chunk (for >max_groups patch chunking). */
+   uint32_t first_patch;
+   /* X dimension of the 2D-tiled parent object grid (patch_linear = wg.y * groups_x + wg.x). */
+   uint32_t groups_x;
+   /* Zero-based instance offset for chunked multi-instance draws (added to wg.z). */
+   uint32_t first_instance_offset;
+   /* Non-zero if emitted triangle winding must be flipped (ccw ^ lower_left). */
+   uint32_t flip_winding;
+   uint32_t _pad;
+};
+
 /* Explicit research selection, e.g. T16V3P2,T32V32P42, after qualification.
  * Empty, boolean/wildcard or malformed selections enable no new class.
  * The pure parser/predicate are shared with host tests. */

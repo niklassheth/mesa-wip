@@ -655,6 +655,158 @@ tess_routes(struct hk_cmd_buffer *cmd)
 }
 
 static void
+tess_fused_routes(struct hk_cmd_buffer *cmd)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct agx_native_object_support saved_obj = dev->dev.native_object;
+   bool saved_qual = dev->dev.native_mesh_qualified;
+   dev->dev.native_mesh_qualified = true;
+   dev->dev.native_object = (struct agx_native_object_support){
+      .profile = AGX_NATIVE_MESH_PROFILE_QUALIFIED,
+      .generation = 1,
+      .multi_parent = true,
+      .payload_bytes = 16384,
+      .mp_payload_bytes = 1024,
+      .max_threads = 32,
+      .max_shared = 32768,
+      .max_groups = 1048575,
+   };
+
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   struct hk_api_shader *tes = shader(MESA_SHADER_TESS_EVAL);
+   struct hk_api_shader *tcs = shader(MESA_SHADER_TESS_CTRL);
+   struct hk_api_shader *vs = shader(MESA_SHADER_VERTEX);
+   struct hk_api_shader *fs = shader(MESA_SHADER_FRAGMENT);
+   struct hk_api_shader *ntes = shader(MESA_SHADER_TESS_EVAL);
+   struct hk_api_shader *ntcs = shader(MESA_SHADER_TESS_CTRL);
+   struct hk_api_shader *nvs = shader(MESA_SHADER_VERTEX);
+   struct hk_api_shader *nfs = shader(MESA_SHADER_FRAGMENT);
+   tes->apple9_native = ntes;
+   tcs->apple9_native = ntcs;
+   vs->apple9_native = nvs;
+   fs->apple9_native = nfs;
+   ntes->apple9_native_leaf = ntcs->apple9_native_leaf =
+      nvs->apple9_native_leaf = nfs->apple9_native_leaf = true;
+   memset(ntes->apple9_native_pair_id, 0x83, sizeof(ntes->apple9_native_pair_id));
+   memcpy(ntcs->apple9_native_pair_id, ntes->apple9_native_pair_id,
+          sizeof(ntes->apple9_native_pair_id));
+   memcpy(nvs->apple9_native_pair_id, ntes->apple9_native_pair_id,
+          sizeof(ntes->apple9_native_pair_id));
+   memcpy(nfs->apple9_native_pair_id, ntes->apple9_native_pair_id,
+          sizeof(ntes->apple9_native_pair_id));
+
+   struct hk_shader *main = hk_native_producer_main(ntes);
+   struct hk_shader *obj = hk_native_producer_object(ntes);
+   main->info.apple9_native_stage = HK_APPLE9_NATIVE_MESH;
+   obj->info.apple9_native_stage = HK_APPLE9_NATIVE_OBJECT;
+   main->info.apple9_tess_fused = true;
+   main->info.apple9_tess_const_levels = true;
+   main->info.apple9_tess_payload_B = 192;
+   main->info.apple9_tess_max_child_wgs = 1;
+   main->info.apple9_tess_max_patch_prims = 32;
+   main->info.apple9_native.key.physical_threads = 32;
+   main->info.apple9_native.layout.max_vertices = 32;
+   main->info.apple9_native.layout.max_primitives = 42;
+   main->info.apple9_native.layout.vertex_components = 4;
+   obj->b.info.workgroup_size[0] = 32;
+   obj->info.apple9_native.shared_size_B = 256;
+
+   gfx->shaders[MESA_SHADER_TESS_EVAL] = tes;
+   gfx->shaders[MESA_SHADER_TESS_CTRL] = tcs;
+   gfx->shaders[MESA_SHADER_VERTEX] = vs;
+   gfx->shaders[MESA_SHADER_FRAGMENT] = fs;
+   gfx->render.layer_count = 1;
+   dyn->rs.polygon_mode = VK_POLYGON_MODE_FILL;
+   dyn->ia.primitive_topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+   dyn->ts.patch_control_points = 4;
+   struct agx_draw draw = {.b = agx_3d(4 * 1024, 1, 1)};
+
+   bool enabled = hk_apple9_native_tess_enabled();
+   CHECK(hk_apple9_use_native_tess(cmd, draw) == enabled);
+   if (enabled) {
+      /* Multi-patch, multi-instance, firstVertex, firstInstance, dynamic domain
+       * origin, and U8/U16/U32 indexed draws are all admitted directly. */
+      draw.start = 12;
+      draw.start_instance = 7;
+      draw.b.count[0] = 4 * 524288;
+      draw.b.count[1] = 2;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      dyn->ts.domain_origin = VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      dyn->ts.domain_origin = VK_TESSELLATION_DOMAIN_ORIGIN_UPPER_LEFT;
+
+      draw.b.count[0] = 4 * 64;
+      draw.b.count[1] = 3;
+      draw.indexed = true;
+      draw.index_size = AGX_INDEX_SIZE_U8;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      draw.index_size = AGX_INDEX_SIZE_U16;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      draw.index_size = AGX_INDEX_SIZE_U32;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      draw.indexed = false;
+
+      /* Zero-PREGFX prepare_draw omits HK_READS_INTERNAL and creates no PREGFX CS. */
+      uint8_t *pool = calloc(2, HK_CMD_BO_SIZE);
+      CHECK(pool);
+      cmd->uploader[HK_CMD_POOL_MAIN].chunks[0].map = pool;
+      cmd->uploader[HK_CMD_POOL_MAIN].chunks[0].base = 0x1400000000ull;
+      cmd->uploader[HK_CMD_POOL_CONTEXT].chunks[0].map = pool + HK_CMD_BO_SIZE;
+      cmd->uploader[HK_CMD_POOL_CONTEXT].chunks[0].base = 0x1500000000ull;
+      cmd->sync_events = UTIL_DYNARRAY_INIT;
+      cmd->sync_remap = UTIL_DYNARRAY_INIT;
+      cmd->sync_first_event = UTIL_DYNARRAY_INIT;
+      list_inithead(&cmd->control_streams);
+      CHECK(hk_apple9_prepare_draw_ex(cmd, false, true, true));
+      CHECK(cmd->current_cs.gfx != NULL);
+      CHECK(!(cmd->current_cs.gfx->pre_raster_reads & HK_READS_INTERNAL));
+      CHECK(cmd->current_cs.pre_gfx == NULL);
+      list_for_each_entry_safe(struct hk_cs, cs, &cmd->control_streams, node) {
+         list_del(&cs->node);
+         hk_cs_destroy(cs);
+      }
+      cmd->current_cs.gfx = NULL;
+      cmd->current_cs.pre_gfx = NULL;
+      util_dynarray_fini(&cmd->sync_events);
+      util_dynarray_fini(&cmd->sync_remap);
+      util_dynarray_fini(&cmd->sync_first_event);
+      free(pool);
+
+      /* Payload, multi-parent, shared memory, indirect, and ring-limit gates. */
+      CHECK(!hk_apple9_use_native_tess(cmd, agx_draw_indirect(0x1000)));
+      main->info.apple9_tess_payload_B = 1025;
+      CHECK(!hk_apple9_use_native_tess(cmd, draw));
+      main->info.apple9_tess_payload_B = 192;
+      dev->dev.native_object.mp_payload_bytes = 0;
+      CHECK(!hk_apple9_use_native_tess(cmd, draw));
+      dev->dev.native_object.mp_payload_bytes = 1024;
+
+      /* Ring-limited high-varying tier (V=4, n=40 -> 48 rows -> 85 safe WGs). */
+      main->info.apple9_native.layout.max_vertices = 4;
+      main->info.apple9_native.layout.max_primitives = 2;
+      main->info.apple9_native.layout.vertex_components = 40;
+      draw.b.count[1] = 1;
+      draw.b.count[0] = 4 * 85;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      draw.b.count[0] = 4 * 86;
+      CHECK(!hk_apple9_use_native_tess(cmd, draw));
+   }
+
+   memset(gfx->shaders, 0, sizeof(gfx->shaders));
+   dev->dev.native_object = saved_obj;
+   dev->dev.native_mesh_qualified = saved_qual;
+   free(tes);
+   free(tcs);
+   free(vs);
+   free(fs);
+   free(ntes);
+   free(ntcs);
+   free(nvs);
+   free(nfs);
+}
+
+static void
 mark_draw(struct hk_cs *cs, bool native)
 {
    /* The classification/transition test owns CPU storage, not GPU execution.
@@ -739,6 +891,7 @@ main(void)
    task_routes(cmd);
    gs_routes(cmd);
    tess_routes(cmd);
+   tess_fused_routes(cmd);
    transitions(cmd);
    free(cmd);
    free(dev);

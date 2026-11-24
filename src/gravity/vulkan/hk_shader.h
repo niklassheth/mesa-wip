@@ -71,6 +71,76 @@ bool hk_apple9_compile_tes_mesh_program(
    struct agx_shader_part *out, struct agx_apple9_mesh_body_info *info,
    const char **reason);
 
+struct hk_tess_fused_options {
+   struct agx_apple9_vertex_layout vertex;
+   uint32_t max_payload_bytes;
+   bool fs_reads_clip_distance;
+   bool has_fs_inputs_mask;
+   /* Per-VAR0..31 4-bit component mask read by the linked FS (all 0 for depth-only). */
+   uint8_t fs_var_read_mask[32];
+};
+
+enum hk_apple9_tess_level_kind {
+   HK_APPLE9_TESS_LEVEL_DYNAMIC = 0,
+   HK_APPLE9_TESS_LEVEL_CONST = 1,
+   HK_APPLE9_TESS_LEVEL_PUSH = 2,
+};
+
+struct hk_apple9_tess_level_src {
+   uint8_t kind;
+   uint8_t _pad;
+   uint16_t push_offset;
+   float const_value;
+};
+
+struct hk_apple9_tess_push_levels {
+   bool valid;
+   uint8_t domain;
+   uint8_t spacing;
+   uint8_t shape_max_v;
+   uint8_t shape_max_p;
+   uint8_t shape_p_strip;
+   uint8_t shape_tile_w;
+   uint8_t shape_tile_h;
+   bool shape_allow_whole;
+   struct hk_apple9_tess_level_src levels[6]; /* 0..3 outer, 4..5 inner */
+};
+
+struct hk_tess_fused_info {
+   uint8_t domain;
+   uint8_t spacing;
+   bool ccw;
+   uint8_t tcs_vertices_out;
+   uint16_t payload_B;
+   uint16_t max_child_wgs_per_patch;
+   uint16_t max_prims_per_patch;
+   uint8_t mesh_max_vertices;
+   uint8_t mesh_max_primitives;
+   bool constant_tess_levels;
+   struct hk_apple9_tess_push_levels push_levels;
+};
+
+struct hk_shader_info;
+
+/* Evaluate exact per-patch child mesh WG and primitive counts for a fused
+ * tessellation shader using its compile-time bounds or draw-time push
+ * constants when all active tess levels come from constants / push constants. */
+void hk_nir_tess_fused_eval_counts(const struct hk_shader_info *info,
+                                   const uint8_t *push_data,
+                                   uint32_t *out_max_child_wgs,
+                                   uint32_t *out_max_patch_prims);
+
+/* Zero-PREGFX fused OBJECT(VS+TCS) -> MESH(TES) lowering over per-parent
+ * GET_SR 0xe0/0xe1 task payload. Clones all inputs without mutating them. */
+bool hk_nir_tess_fused_lower(const nir_shader *vs_source,
+                             const nir_shader *tcs_source,
+                             const nir_shader *tes_source,
+                             const struct hk_tess_fused_options *options,
+                             nir_shader **out_object,
+                             nir_shader **out_mesh,
+                             struct hk_tess_fused_info *out_info,
+                             const char **reason);
+
 struct hk_physical_device;
 struct hk_pipeline_compilation_ctx;
 struct vk_descriptor_set_layout;
@@ -259,6 +329,13 @@ struct hk_shader_info {
    uint8_t apple9_gs_pack;
    uint8_t apple9_gs_input_primitive;
    uint16_t apple9_gs_prims_per_run;
+   /* Zero-PREGFX fused OBJECT(VS+TCS) -> MESH(TES) metadata. */
+   bool apple9_tess_fused;
+   bool apple9_tess_const_levels;
+   uint16_t apple9_tess_payload_B;
+   uint16_t apple9_tess_max_child_wgs;
+   uint16_t apple9_tess_max_patch_prims;
+   struct hk_apple9_tess_push_levels apple9_tess_push_levels;
    struct agx_apple9_mesh_body_info apple9_native;
 
    uint8_t apple9_render_targets;
@@ -822,6 +899,8 @@ struct hk_apple9_graphics_key {
    bool native_stage_generated;
    /* Zero-PREGFX fused VS + GS -> native MESH realization. */
    bool native_gs_fused;
+   /* Zero-PREGFX fused OBJECT(VS+TCS) -> MESH(TES) realization. */
+   bool native_tess_fused;
    /* Pipeline compiles for a multiview render pass (viewMask != 0). */
    bool is_multiview;
    /* Independently keyed stage admission; never implied by a native mesh. */

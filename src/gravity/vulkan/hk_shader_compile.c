@@ -1896,6 +1896,155 @@ hk_apple9_native_gs_fused_check(const nir_shader *vs_source,
 
 DEBUG_GET_ONCE_BOOL_OPTION(tess_native_log, "HK_APPLE9_TESS_ROUTE_LOG", false)
 
+static void
+hk_apple9_gather_fs_var_read_mask(const nir_shader *fs, uint8_t mask[32])
+{
+   memset(mask, 0, 32);
+   if (!fs)
+      return;
+   nir_foreach_function_impl(impl, (nir_shader *)fs) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_input &&
+                intr->intrinsic != nir_intrinsic_load_interpolated_input)
+               continue;
+            nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+            nir_src *off = nir_get_io_offset_src(intr);
+            if (!off || !nir_src_is_const(*off)) {
+               for (unsigned s = 0; s < sem.num_slots; ++s) {
+                  unsigned loc = sem.location + s;
+                  if (loc >= VARYING_SLOT_VAR0 && loc < VARYING_SLOT_VAR0 + 32)
+                     mask[loc - VARYING_SLOT_VAR0] = 0xf;
+               }
+               continue;
+            }
+            unsigned loc = sem.location + nir_src_as_uint(*off);
+            if (loc >= VARYING_SLOT_VAR0 && loc < VARYING_SLOT_VAR0 + 32) {
+               unsigned comp = nir_intrinsic_component(intr);
+               mask[loc - VARYING_SLOT_VAR0] |=
+                  BITFIELD_MASK(intr->def.num_components) << comp;
+            }
+         }
+      }
+   }
+}
+
+VkResult
+hk_apple9_native_tess_fused_check(struct hk_device *dev,
+                                  const nir_shader *vs_source,
+                                  const nir_shader *tcs_source,
+                                  const nir_shader *tes_source,
+                                  const nir_shader *fs_source, bool has_fs_mask,
+                                  const struct hk_apple9_graphics_key *key,
+                                  bool *supported, const char **reason)
+{
+   *supported = false;
+   if (!hk_apple9_native_tess_enabled() ||
+       !hk_apple9_native_object_available_device(dev) ||
+       !dev->dev.native_object.mp_payload_bytes ||
+       dev->dev.native_object.max_threads < AGX_APPLE9_NATIVE_SERIAL_THREADS ||
+       !vs_source || !tcs_source || !tes_source)
+      return VK_SUCCESS;
+   const char *local_reason = NULL;
+   if (!reason)
+      reason = &local_reason;
+
+   nir_shader *vs_norm = nir_shader_clone(NULL, vs_source);
+   nir_shader *tcs_norm = nir_shader_clone(NULL, tcs_source);
+   nir_shader *tes_norm = nir_shader_clone(NULL, tes_source);
+   if (!vs_norm || !tcs_norm || !tes_norm) {
+      ralloc_free(vs_norm);
+      ralloc_free(tcs_norm);
+      ralloc_free(tes_norm);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   if (!hk_apple9_texture_bindings(vs_norm) ||
+       !agx_nir_lower_apple9_runtime_sampler_state(vs_norm, reason) ||
+       !hk_apple9_texture_bindings(tcs_norm) ||
+       !agx_nir_lower_apple9_runtime_sampler_state(tcs_norm, reason) ||
+       !hk_apple9_texture_bindings(tes_norm) ||
+       !agx_nir_lower_apple9_runtime_sampler_state(tes_norm, reason)) {
+      ralloc_free(vs_norm);
+      ralloc_free(tcs_norm);
+      ralloc_free(tes_norm);
+      return VK_SUCCESS;
+   }
+   NIR_PASS(_, vs_norm, nir_shader_intrinsics_pass, hk_apple9_lower_roots,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(_, tcs_norm, nir_shader_intrinsics_pass, hk_apple9_lower_roots,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(_, tes_norm, nir_shader_intrinsics_pass, hk_apple9_lower_roots,
+            nir_metadata_control_flow, NULL);
+
+   struct hk_tess_fused_options opts = {
+      .vertex = key->vertex,
+      .max_payload_bytes = dev->dev.native_object.mp_payload_bytes,
+      .fs_reads_clip_distance = key->fs_reads_clip_distance,
+      .has_fs_inputs_mask = has_fs_mask,
+   };
+   if (has_fs_mask)
+      hk_apple9_gather_fs_var_read_mask(fs_source, opts.fs_var_read_mask);
+
+   nir_shader *obj_nir = NULL, *mesh_nir = NULL;
+   struct hk_tess_fused_info fused_info = {0};
+   bool lowered = hk_nir_tess_fused_lower(
+      vs_norm, tcs_norm, tes_norm, &opts, &obj_nir, &mesh_nir, &fused_info,
+      reason);
+   ralloc_free(vs_norm);
+   ralloc_free(tcs_norm);
+   ralloc_free(tes_norm);
+   if (!lowered) {
+      if (debug_get_option_tess_native_log())
+         fprintf(stderr, "HK_TESS_FUSED_CAP accepted=0 reason=%s\n",
+                 *reason ?: "lowering");
+      return VK_SUCCESS;
+   }
+
+   hk_apple9_lower_prerast_sysvals(obj_nir, MESA_SHADER_COMPUTE);
+   hk_apple9_lower_prerast_sysvals(mesh_nir, MESA_SHADER_COMPUTE);
+
+   struct agx_apple9_mesh_key obj_k = AGX_APPLE9_MESH_KEY;
+   obj_k.physical_threads = AGX_APPLE9_NATIVE_SERIAL_THREADS;
+   struct agx_apple9_native_object_options obj_opts = {
+      .payload_stride_B = fused_info.payload_B,
+      .write_child_grid = false,
+      .hw_payload = true,
+   };
+   struct agx_apple9_mesh_body_info obj_info;
+   bool obj_ok = agx_nir_lower_apple9_native_object_ex(
+      obj_nir, true, &obj_k, &obj_opts, &obj_info, reason);
+   ralloc_free(obj_nir);
+   if (!obj_ok || hk_apple9_native_object_tg_memory_bytes(&obj_info) >
+                     dev->dev.native_object.max_shared) {
+      if (obj_ok)
+         *reason = "fused tess object shared allocation exceeds kernel limit";
+      if (debug_get_option_tess_native_log())
+         fprintf(stderr, "HK_TESS_FUSED_CAP accepted=0 reason=%s\n",
+                 *reason ?: "object");
+      ralloc_free(mesh_nir);
+      return VK_SUCCESS;
+   }
+
+   struct hk_apple9_graphics_key stage_key = *key;
+   stage_key.native_stage_generated = true;
+   stage_key.native_tess_fused = true;
+   stage_key.native_object = true;
+   stage_key.native_object_hw_payload = true;
+   stage_key.native_object_write_child_grid = false;
+   stage_key.native_object_payload_B = fused_info.payload_B;
+   VkResult result =
+      hk_apple9_native_mesh_check(mesh_nir, &stage_key, supported, reason);
+   if (debug_get_option_tess_native_log())
+      fprintf(stderr, "HK_TESS_FUSED_CAP accepted=%u payload=%u V=%u P=%u reason=%s\n",
+              *supported, fused_info.payload_B, fused_info.mesh_max_vertices,
+              fused_info.mesh_max_primitives, *reason ?: "supported");
+   ralloc_free(mesh_nir);
+   return result;
+}
+
 VkResult
 hk_apple9_native_tess_check(const nir_shader *source,
                             const struct hk_apple9_graphics_key *key,
@@ -2487,6 +2636,10 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
    nir_shader *native_pv_nir = NULL;
    nir_shader *fused_vs_nir = NULL;
    struct hk_api_shader *fused_vs_obj = NULL;
+   nir_shader *fused_tcs_nir = NULL;
+   struct hk_api_shader *fused_tcs_obj = NULL;
+   uint8_t fs_var_read_mask[32] = {0};
+   bool has_fs_var_read_mask = false;
    const char *reason = NULL;
    simple_mtx_t *lock = agx_get_compiler_debug()
                            ? &hk_device_physical(dev)->debug_compile_lock
@@ -2746,8 +2899,24 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
    }
 
    bool has_fragment = false;
-   for (unsigned i = 0; i < count; ++i)
-      has_fragment |= infos[i].stage == MESA_SHADER_FRAGMENT;
+   nir_shader *fs_stage_nir = NULL;
+   uint32_t tes_next_stage_mask = 0;
+   for (unsigned i = 0; i < count; ++i) {
+      if (infos[i].stage == MESA_SHADER_FRAGMENT) {
+         has_fragment = true;
+         fs_stage_nir = infos[i].nir;
+      } else if (infos[i].stage == MESA_SHADER_TESS_EVAL) {
+         tes_next_stage_mask = infos[i].next_stage_mask;
+      }
+   }
+   if (has_fragment) {
+      hk_apple9_gather_fs_var_read_mask(fs_stage_nir, fs_var_read_mask);
+      has_fs_var_read_mask = true;
+   } else if (!fs_interp && !key.is_library && !key.has_passthrough_fs &&
+              !(tes_next_stage_mask & VK_SHADER_STAGE_FRAGMENT_BIT) && state &&
+              !(state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR)) {
+      has_fs_var_read_mask = true;
+   }
 
    /* The last pre-rasterization stage maps [-w, w] depth to [0, w]. */
    mesa_shader_stage last_prerast = MESA_SHADER_NONE;
@@ -2882,7 +3051,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                (dev->vk.enabled_features.geometryShader ||
                 dev->vk.enabled_features.tessellationShader ||
                 dev->vk.enabled_features.transformFeedback);
-            if (native_mesh && key.native_gs_fused) {
+            if (native_mesh && (key.native_gs_fused || key.native_tess_fused)) {
                fused_vs_nir = nir_shader_clone(NULL, nir);
                if (!fused_vs_nir) {
                   result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -2891,7 +3060,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                fused_vs_obj = obj;
             }
             bool sw_needed =
-               !(native_mesh && key.native_gs_fused) &&
+               !(native_mesh && (key.native_gs_fused || key.native_tess_fused)) &&
                ((infos[i].next_stage_mask &
                  (VK_SHADER_STAGE_GEOMETRY_BIT |
                   VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)) ||
@@ -2904,7 +3073,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                 dev->vk.enabled_features.primitivesGeneratedQuery);
             struct hk_shader *sw = &obj->variants[HK_VS_VARIANT_SW];
             nir_shader *sw_nir = NULL;
-            if (!(native_mesh && key.native_gs_fused) &&
+            if (!(native_mesh && (key.native_gs_fused || key.native_tess_fused)) &&
                 (sw_needed || nir->info.cull_distance_array_size)) {
                sw->info.set_count = shader->info.set_count;
                sw->info.clip_distance_array_size =
@@ -2957,12 +3126,94 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                goto done;
             varyings = shader->b.info.apple9_varyings;
          } else if (stage == MESA_SHADER_TESS_CTRL) {
+            if (native_mesh && key.native_tess_fused) {
+               fused_tcs_nir = nir_shader_clone(NULL, nir);
+               if (!fused_tcs_nir) {
+                  result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+                  goto done;
+               }
+               fused_tcs_obj = obj;
+            }
             result = hk_apple9_compile_tcs(dev, nir, shader, &reason);
             if (result != VK_SUCCESS)
                goto done;
             continue;
          } else if (stage == MESA_SHADER_TESS_EVAL) {
             if (native_mesh) {
+               if (key.native_tess_fused && fused_vs_nir && fused_vs_obj &&
+                   fused_tcs_nir && fused_tcs_obj) {
+                  struct hk_tess_fused_options tess_opts = {
+                     .vertex = key.vertex,
+                     .max_payload_bytes = dev->dev.native_object.mp_payload_bytes,
+                     .fs_reads_clip_distance = key.fs_reads_clip_distance,
+                     .has_fs_inputs_mask = has_fs_var_read_mask,
+                  };
+                  if (has_fs_var_read_mask)
+                     memcpy(tess_opts.fs_var_read_mask, fs_var_read_mask,
+                            sizeof(fs_var_read_mask));
+                  nir_shader *obj_nir = NULL, *mesh_nir = NULL;
+                  struct hk_tess_fused_info fused_info = {0};
+                  if (!hk_nir_tess_fused_lower(fused_vs_nir, fused_tcs_nir, nir,
+                                               &tess_opts, &obj_nir, &mesh_nir,
+                                               &fused_info, &reason)) {
+                     *native_unsupported = true;
+                     result = VK_ERROR_FEATURE_NOT_PRESENT;
+                     goto done;
+                  }
+                  obj->apple9_native_tess = (struct hk_tess_info){
+                     .mode = fused_info.domain,
+                     .spacing = fused_info.spacing,
+                     .ccw = fused_info.ccw,
+                     .points = false,
+                  };
+                  obj->apple9_native_cull_primitive =
+                     nir->info.cull_distance_array_size > 0;
+                  obj->push_constant_mask |= fused_vs_obj->push_constant_mask |
+                                             fused_tcs_obj->push_constant_mask;
+                  obj->reads_draw_id |= fused_vs_obj->reads_draw_id |
+                                        fused_tcs_obj->reads_draw_id;
+                  obj->pre_raster_reads |= fused_vs_obj->pre_raster_reads |
+                                           fused_tcs_obj->pre_raster_reads;
+                  unsigned merged_sets = MAX3(
+                     shader->info.set_count,
+                     fused_vs_obj->variants[0].info.set_count,
+                     fused_tcs_obj->variants[0].info.set_count);
+                  hk_native_producer_main(obj)->info.set_count = merged_sets;
+                  hk_native_producer_object(obj)->info.set_count = merged_sets;
+
+                  struct hk_apple9_graphics_key tess_key = key;
+                  tess_key.native_object = true;
+                  tess_key.native_object_hw_payload = true;
+                  tess_key.native_object_write_child_grid = false;
+                  tess_key.native_object_payload_B = fused_info.payload_B;
+
+                  hk_apple9_lower_prerast_sysvals(mesh_nir, MESA_SHADER_COMPUTE);
+                  result = hk_apple9_compile_native_mesh(
+                     dev, mesh_nir, obj, &tess_key, &reason, native_unsupported);
+                  ralloc_free(mesh_nir);
+                  if (result != VK_SUCCESS) {
+                     ralloc_free(obj_nir);
+                     goto done;
+                  }
+                  result = hk_apple9_compile_native_object(
+                     dev, obj_nir, hk_native_producer_object(obj), &tess_key,
+                     &reason, native_unsupported);
+                  ralloc_free(obj_nir);
+                  if (result != VK_SUCCESS)
+                     goto done;
+                  struct hk_shader *main = hk_native_producer_main(obj);
+                  main->info.apple9_tess_fused = true;
+                  main->info.apple9_tess_const_levels =
+                     fused_info.constant_tess_levels;
+                  main->info.apple9_tess_payload_B = fused_info.payload_B;
+                  main->info.apple9_tess_max_child_wgs =
+                     fused_info.max_child_wgs_per_patch;
+                  main->info.apple9_tess_max_patch_prims =
+                     fused_info.max_prims_per_patch;
+                  main->info.apple9_tess_push_levels = fused_info.push_levels;
+                  varyings = main->b.info.apple9_varyings;
+                  continue;
+               }
                obj->apple9_native_tess = (struct hk_tess_info){
                   .mode = nir->info.tess._primitive_mode,
                   .spacing = nir->info.tess.spacing,
@@ -3332,6 +3583,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
 done:
    ralloc_free(native_pv_nir);
    ralloc_free(fused_vs_nir);
+   ralloc_free(fused_tcs_nir);
    if (result != VK_SUCCESS && agx_get_compiler_debug())
       fprintf(stderr, "Apple9 graphics compilation failed: %s\n",
               reason ?: vk_Result_to_str(result));
@@ -3457,7 +3709,9 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
       }
    }
 
-   nir_shader *vs = NULL, *mesh = NULL, *task_nir = NULL, *gs = NULL, *tes = NULL;
+   nir_shader *vs = NULL, *mesh = NULL, *task_nir = NULL, *gs = NULL,
+              *tcs = NULL, *tes = NULL, *fs_nir = NULL;
+   uint32_t tes_next_stage_mask = 0;
    bool task = false, tess = false, per_vertex = false, fs_inputs = false;
    bool producer_effects = false;
    for (unsigned i = 0; i < count; ++i) {
@@ -3471,8 +3725,14 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
          task_nir = infos[i].nir;
       if (infos[i].stage == MESA_SHADER_GEOMETRY)
          gs = infos[i].nir;
-      if (infos[i].stage == MESA_SHADER_TESS_EVAL)
+      if (infos[i].stage == MESA_SHADER_TESS_CTRL)
+         tcs = infos[i].nir;
+      if (infos[i].stage == MESA_SHADER_TESS_EVAL) {
          tes = infos[i].nir;
+         tes_next_stage_mask = infos[i].next_stage_mask;
+      }
+      if (infos[i].stage == MESA_SHADER_FRAGMENT)
+         fs_nir = infos[i].nir;
       tess |= infos[i].stage == MESA_SHADER_TESS_CTRL ||
               infos[i].stage == MESA_SHADER_TESS_EVAL;
       task |= infos[i].stage == MESA_SHADER_TASK;
@@ -3554,7 +3814,24 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
             (!fs_inputs || hk_apple9_native_tess_enabled()) &&
             !producer_effects &&
             !key.polygon_points && !key.line_stipple) {
-      result = hk_apple9_native_tess_check(tes, &key, &native, &reason);
+      bool has_fs_mask =
+         fs_nir != NULL ||
+         (!fs_interp && !key.is_library && !key.has_passthrough_fs &&
+          !(tes_next_stage_mask & VK_SHADER_STAGE_FRAGMENT_BIT) && state &&
+          !(state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR));
+      if (vs && tcs && hk_apple9_native_tess_enabled() &&
+          hk_apple9_native_object_available_device(dev) &&
+          dev->dev.native_object.mp_payload_bytes) {
+         result = hk_apple9_native_tess_fused_check(
+            dev, vs, tcs, tes, fs_nir, has_fs_mask, &key, &native, &reason);
+         if (result == VK_SUCCESS && native) {
+            key.native_tess_fused = true;
+            key.native_object = true;
+            key.native_object_hw_payload = true;
+         }
+      } else {
+         result = hk_apple9_native_tess_check(tes, &key, &native, &reason);
+      }
    }
 
    struct vk_shader_compile_info native_infos[HK_APPLE9_GFX_STAGES] = {0};

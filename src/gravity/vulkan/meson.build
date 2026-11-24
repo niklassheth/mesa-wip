@@ -50,8 +50,10 @@ gravity_vk_files = files(
   'hk_nir_lower_cooperative_matrix.c',
   'hk_nir_lower_descriptors.c',
   'hk_nir_lower_mesh.c',
+  'hk_nir_fused_vs.c',
   'hk_nir_gs_mesh.c',
   'hk_nir_tes_mesh.c',
+  'hk_nir_tess_fused.c',
   'hk_physical_device.c',
   'hk_physical_device.h',
   'hk_private.h',
@@ -489,6 +491,10 @@ if with_tests
   test('gravity-hk-native-tess-hybrid', gravity_hybrid_test,
     env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_TESS_NATIVE=1',
            'HK_APPLE9_NATIVE_MESH_PACKED_SHAPES=T16V3P1,T16V4P2'],
+    suite : ['gravity'])
+  test('gravity-hk-native-tess-fused-hybrid', gravity_hybrid_test,
+    env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_TESS_NATIVE=1',
+           'HK_TEST_NATIVE_OBJECT_MP=1'],
     suite : ['gravity'])
   test('gravity-hk-native-mesh-hybrid', gravity_hybrid_test,
     env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_NATIVE_MESH_ATTRIBUTES=1',

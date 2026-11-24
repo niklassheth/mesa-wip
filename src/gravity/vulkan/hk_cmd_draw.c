@@ -1674,25 +1674,23 @@ hk_apple9_native_gs_state_eligible(struct hk_cmd_buffer *cmd,
    return true;
 }
 
-/* Stage 2 admits one direct patch and one instance only. As for GS, native
- * block words stay CPU-written (hk_apple9_native_gs_state_eligible); the TES
- * mesh grid itself is GPU-written, but only the object shader reads it. */
 static bool
-hk_apple9_native_tess_state_eligible(struct hk_cmd_buffer *cmd,
-                                     struct agx_draw draw)
+hk_apple9_native_tess_common_state_eligible(struct hk_cmd_buffer *cmd,
+                                            struct agx_draw draw)
 {
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
    if (!hk_apple9_native_stage_available_device(hk_cmd_buffer_device(cmd),
-                                                MESA_SHADER_TESS_EVAL) || cmd->in_meta ||
-       agx_is_indirect(draw.b) || draw.indexed || draw.restart || draw.start ||
-       draw.start_instance || !dyn->ts.patch_control_points ||
-       dyn->ts.patch_control_points > 32 ||
-       draw.b.count[0] != dyn->ts.patch_control_points ||
-       draw.b.count[1] != 1 || draw.b.count[2] != 1 ||
+                                                MESA_SHADER_TESS_EVAL) ||
+       cmd->in_meta || agx_is_indirect(draw.b) || draw.restart ||
+       !dyn->ts.patch_control_points || dyn->ts.patch_control_points > 32 ||
+       draw.b.count[0] < dyn->ts.patch_control_points || !draw.b.count[1] ||
+       draw.b.count[1] > HK_APPLE9_NATIVE_MAX_GROUP_COUNT ||
+       draw.b.count[2] != 1 ||
        dyn->ia.primitive_topology != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST ||
        dyn->ia.primitive_restart_enable ||
+       !gfx->shaders[MESA_SHADER_VERTEX] ||
        !gfx->shaders[MESA_SHADER_TESS_CTRL] ||
        !gfx->shaders[MESA_SHADER_TESS_EVAL] ||
        gfx->shaders[MESA_SHADER_GEOMETRY] || gfx->shaders[MESA_SHADER_TASK] ||
@@ -1714,12 +1712,115 @@ hk_apple9_native_tess_state_eligible(struct hk_cmd_buffer *cmd,
    return true;
 }
 
+/* Stage 2 admits one direct patch and one instance only. As for GS, native
+ * block words stay CPU-written (hk_apple9_native_gs_state_eligible); the TES
+ * mesh grid itself is GPU-written, but only the object shader reads it. */
+static bool
+hk_apple9_native_tess_state_eligible(struct hk_cmd_buffer *cmd,
+                                     struct agx_draw draw)
+{
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+   return hk_apple9_native_tess_common_state_eligible(cmd, draw) &&
+          !draw.indexed && !draw.start && !draw.start_instance &&
+          draw.b.count[0] == dyn->ts.patch_control_points &&
+          draw.b.count[1] == 1;
+}
+
+struct hk_apple9_fused_tess_chunk_plan {
+   uint32_t inst_chunk_cap;
+   uint32_t patch_chunk_cap;
+};
+
+static bool
+hk_apple9_native_tess_fused_chunk_plan(
+   uint32_t patches_per_inst, uint32_t instances, uint32_t max_groups,
+   uint32_t max_child_wgs_per_patch, uint32_t max_prims_per_patch,
+   uint64_t ring_max, uint64_t render_prim_cap,
+   struct hk_apple9_fused_tess_chunk_plan *out)
+{
+   if (!patches_per_inst || !instances || !max_groups ||
+       instances > HK_APPLE9_NATIVE_MAX_GROUP_COUNT)
+      return false;
+   const uint32_t group_cap =
+      MIN2(max_groups, HK_APPLE9_NATIVE_MAX_GROUP_TOTAL);
+   const uint64_t patch_prims = MAX2(max_prims_per_patch, 1u);
+   if (render_prim_cap && patch_prims > render_prim_cap)
+      return false;
+   const uint64_t tvb_patch_cap =
+      render_prim_cap ? render_prim_cap / patch_prims : UINT64_MAX;
+
+   if (ring_max != UINT64_MAX) {
+      uint32_t grid[3];
+      if (!hk_apple9_native_gs_fused_grid(patches_per_inst, instances, grid))
+         return false;
+      uint64_t total_parents = (uint64_t)grid[0] * grid[1] * grid[2];
+      if (total_parents > group_cap)
+         return false;
+      uint64_t total_patches = (uint64_t)patches_per_inst * instances;
+      if (max_child_wgs_per_patch &&
+          total_patches > ring_max / max_child_wgs_per_patch)
+         return false;
+      if (total_patches > tvb_patch_cap)
+         return false;
+      *out = (struct hk_apple9_fused_tess_chunk_plan){
+         .inst_chunk_cap = instances,
+         .patch_chunk_cap = patches_per_inst,
+      };
+      return true;
+   }
+
+   uint32_t single_grid[3];
+   if (patches_per_inst <= group_cap && patches_per_inst <= tvb_patch_cap &&
+       hk_apple9_native_gs_fused_grid(patches_per_inst, 1, single_grid)) {
+      uint64_t grid_xy = (uint64_t)single_grid[0] * single_grid[1];
+      if (grid_xy <= group_cap) {
+         uint64_t by_prims = tvb_patch_cap / patches_per_inst;
+         uint64_t by_grid = group_cap / grid_xy;
+         uint32_t inst_cap = (uint32_t)MIN3(
+            (uint64_t)instances, MIN2(by_prims, by_grid),
+            (uint64_t)HK_APPLE9_NATIVE_MAX_GROUP_COUNT);
+         uint32_t check_grid[3];
+         if (inst_cap &&
+             hk_apple9_native_gs_fused_grid(patches_per_inst, inst_cap,
+                                            check_grid) &&
+             (uint64_t)check_grid[0] * check_grid[1] * check_grid[2] <=
+                group_cap &&
+             DIV_ROUND_UP((uint64_t)instances, inst_cap) <= 65536) {
+            *out = (struct hk_apple9_fused_tess_chunk_plan){
+               .inst_chunk_cap = inst_cap,
+               .patch_chunk_cap = patches_per_inst,
+            };
+            return true;
+         }
+      }
+   }
+
+   const uint64_t safe_group_cap =
+      group_cap > 16 ? (uint64_t)group_cap - 16 : (uint64_t)group_cap;
+   const uint32_t patch_cap = (uint32_t)MIN3(
+      (uint64_t)patches_per_inst, safe_group_cap, tvb_patch_cap);
+   if (!patch_cap)
+      return false;
+   uint32_t check_grid[3];
+   if (!hk_apple9_native_gs_fused_grid(patch_cap, 1, check_grid) ||
+       (uint64_t)check_grid[0] * check_grid[1] > group_cap)
+      return false;
+   uint64_t patch_chunks = DIV_ROUND_UP((uint64_t)patches_per_inst, patch_cap);
+   if (patch_chunks > 65536 || (uint64_t)instances > 65536 / patch_chunks)
+      return false;
+   *out = (struct hk_apple9_fused_tess_chunk_plan){
+      .inst_chunk_cap = 1,
+      .patch_chunk_cap = patch_cap,
+   };
+   return true;
+}
+
 bool
 hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
-   if (!hk_apple9_native_tess_state_eligible(cmd, draw))
-      return false;
    struct hk_api_shader *tes =
       hk_api_shader_native(gfx->shaders[MESA_SHADER_TESS_EVAL]);
    if (!tes || !tes->apple9_native_leaf ||
@@ -1734,7 +1835,7 @@ hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    for (unsigned i = 0; i < ARRAY_SIZE(stages); ++i) {
       struct hk_api_shader *api = gfx->shaders[stages[i]];
       if (stages[i] == MESA_SHADER_FRAGMENT &&
-          (!api || api == hk_cmd_buffer_device(cmd)->null_fs))
+          (!api || api == dev->null_fs))
          continue;
       api = hk_api_shader_native(api);
       if (!api || !api->apple9_native_leaf ||
@@ -1745,17 +1846,54 @@ hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw)
          return false;
    }
    const struct hk_shader *main = hk_native_producer_main(tes);
+   const struct hk_shader *object = hk_native_producer_object(tes);
    const struct agx_apple9_mesh_body_info *body = &main->info.apple9_native;
+   if (main->info.apple9_native_stage != HK_APPLE9_NATIVE_MESH ||
+       object->info.apple9_native_stage != HK_APPLE9_NATIVE_OBJECT)
+      return false;
+
+   if (main->info.apple9_tess_fused) {
+      if (!hk_apple9_native_tess_enabled() ||
+          !hk_apple9_native_object_available_device(dev) ||
+          !hk_apple9_native_tess_common_state_eligible(cmd, draw) ||
+          !dev->dev.native_object.mp_payload_bytes ||
+          main->info.apple9_tess_payload_B >
+             dev->dev.native_object.mp_payload_bytes ||
+          object->b.info.workgroup_size[0] >
+             dev->dev.native_object.max_threads ||
+          hk_apple9_native_object_tg_memory_bytes(&object->info.apple9_native) >
+             dev->dev.native_object.max_shared)
+         return false;
+      if (draw.indexed) {
+         unsigned isz = agx_index_size_to_B(draw.index_size);
+         if (isz != 1 && isz != 2 && isz != 4)
+            return false;
+      }
+      uint64_t ring_max = 0;
+      if (!agx_apple9_mesh_ring_max_groups(&body->layout, &ring_max))
+         return false;
+      const uint32_t pcp = cmd->vk.dynamic_graphics_state.ts.patch_control_points;
+      const uint32_t patches = draw.b.count[0] / pcp;
+      uint32_t max_child_wgs = 0, max_patch_prims = 0;
+      hk_nir_tess_fused_eval_counts(&main->info,
+                                    cmd->state.gfx.descriptors.root.push,
+                                    &max_child_wgs, &max_patch_prims);
+      struct hk_apple9_fused_tess_chunk_plan plan;
+      return hk_apple9_native_tess_fused_chunk_plan(
+         patches, draw.b.count[1], dev->dev.native_object.max_groups,
+         max_child_wgs, max_patch_prims, ring_max,
+         hk_apple9_native_render_primitives(), &plan);
+   }
+
+   if (!hk_apple9_native_tess_state_eligible(cmd, draw))
+      return false;
    /* One patch produces at most 2 * 64 * 64 triangles (packed TES launches
     * one group per HK_APPLE9_NATIVE_GS_PACK triangles). */
    const uint64_t max_tes_groups =
       body->layout.max_vertices == 3 * HK_APPLE9_NATIVE_GS_PACK
          ? DIV_ROUND_UP(2u * 64u * 64u, HK_APPLE9_NATIVE_GS_PACK)
          : 2u * 64u * 64u;
-   return main->info.apple9_native_stage == HK_APPLE9_NATIVE_MESH &&
-          hk_native_producer_object(tes)->info.apple9_native_stage ==
-             HK_APPLE9_NATIVE_OBJECT &&
-          hk_apple9_native_stage_class(
+   return hk_apple9_native_stage_class(
              MESA_SHADER_TESS_EVAL, body->key.physical_threads,
              body->layout.max_vertices, body->layout.max_primitives) &&
           hk_apple9_packed_mesh_class_selected(
@@ -1768,6 +1906,129 @@ hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw)
 }
 
 DEBUG_GET_ONCE_BOOL_OPTION(tess_route_log, "HK_APPLE9_TESS_ROUTE_LOG", false)
+
+/* Zero-PREGFX fused OBJECT(VS+TCS) -> MESH(TES) launch: executes 100% inside
+ * the active render pass with zero CDM dispatches, zero tessellation heap
+ * round-trip, and zero HK_READS_INTERNAL tiling barrier. */
+static void
+hk_apple9_launch_native_tess_fused(struct hk_cmd_buffer *cmd, uint32_t draw_id,
+                                   struct agx_draw draw)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_descriptor_state *desc = &gfx->descriptors;
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+   struct hk_api_shader *tes_api =
+      hk_api_shader_native(gfx->shaders[MESA_SHADER_TESS_EVAL]);
+   const struct hk_shader *main = hk_native_producer_main(tes_api);
+   const struct agx_apple9_mesh_layout *layout = &main->info.apple9_native.layout;
+
+   if (cmd->tess_batch.draws)
+      hk_tess_batch_flush(cmd);
+
+   const uint32_t pcp = dyn->ts.patch_control_points;
+   const uint32_t patches = draw.b.count[0] / pcp;
+   const uint32_t instances = draw.b.count[1];
+   uint64_t ring_max = 0;
+   bool ring_ok = agx_apple9_mesh_ring_max_groups(layout, &ring_max);
+   assert(ring_ok);
+   (void)ring_ok;
+   uint32_t max_child_wgs = 0, max_patch_prims = 0;
+   hk_nir_tess_fused_eval_counts(&main->info, desc->root.push, &max_child_wgs,
+                                 &max_patch_prims);
+   struct hk_apple9_fused_tess_chunk_plan plan = {0};
+   bool plan_ok = hk_apple9_native_tess_fused_chunk_plan(
+      patches, instances, dev->dev.native_object.max_groups, max_child_wgs,
+      max_patch_prims, ring_max, hk_apple9_native_render_primitives(), &plan);
+   assert(plan_ok);
+   if (!plan_ok)
+      return;
+
+   const uint32_t index_size_B =
+      draw.indexed ? agx_index_size_to_B(draw.index_size) : 0;
+   uint64_t index_buffer = 0, index_buffer_size = 0;
+   if (draw.indexed) {
+      uint64_t byte_offset = (uint64_t)draw.start * index_size_B;
+      if (byte_offset < draw.index_buffer_range_B) {
+         index_buffer = draw.index_buffer + byte_offset;
+         index_buffer_size = draw.index_buffer_range_B - byte_offset;
+      }
+   }
+   const uint32_t first_vertex =
+      draw.indexed ? (uint32_t)draw.index_bias : draw.start;
+   const uint32_t flip_winding =
+      (tes_api->apple9_native_tess.ccw ^
+       (dyn->ts.domain_origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT))
+         ? 1u
+         : 0u;
+   const uint64_t est_patch_prims = max_patch_prims;
+   const uint64_t est_child_wgs = max_child_wgs;
+
+   for (uint64_t first_inst = 0; first_inst < instances;) {
+      const uint32_t chunk_insts =
+         (uint32_t)MIN2((uint64_t)plan.inst_chunk_cap, instances - first_inst);
+      for (uint64_t first_patch = 0; first_patch < patches;) {
+         const uint32_t chunk_patches = (uint32_t)MIN2(
+            (uint64_t)plan.patch_chunk_cap, patches - first_patch);
+         uint32_t obj_groups[3];
+         bool ok = hk_apple9_native_gs_fused_grid(chunk_patches, chunk_insts,
+                                                  obj_groups);
+         assert(ok);
+         (void)ok;
+
+         const uint64_t chunk_total_patches =
+            (uint64_t)chunk_patches * chunk_insts;
+         cmd->apple9_draw_primitives =
+            est_patch_prims &&
+                  chunk_total_patches > UINT64_MAX / est_patch_prims
+               ? UINT64_MAX
+               : chunk_total_patches * est_patch_prims;
+         uint64_t chunk_child_wgs =
+            est_child_wgs && chunk_total_patches > UINT64_MAX / est_child_wgs
+               ? UINT64_MAX
+               : chunk_total_patches * est_child_wgs;
+         if (!agx_apple9_mesh_ring_usage(layout, chunk_child_wgs,
+                                         &cmd->apple9_draw_ring_rows,
+                                         &cmd->apple9_draw_ring_limited)) {
+            cmd->apple9_draw_ring_rows = UINT64_MAX;
+            cmd->apple9_draw_ring_limited = true;
+         }
+         if (!hk_apple9_prepare_draw_ex(cmd, draw.indexed, true, true))
+            return;
+
+         const struct hk_apple9_fused_tess_params tp = {
+            .index_buffer = index_buffer,
+            .index_buffer_size = index_buffer_size,
+            .index_size_B = index_size_B,
+            .input_patch_size = pcp,
+            .first_vertex = first_vertex,
+            .base_instance = draw.start_instance,
+            .patches_per_instance = chunk_patches,
+            .first_patch = (uint32_t)first_patch,
+            .groups_x = obj_groups[0],
+            .first_instance_offset = (uint32_t)first_inst,
+            .flip_winding = flip_winding,
+         };
+         uint64_t tp_gpu = hk_pool_upload(cmd, &tp, sizeof(tp), 8);
+         if (!tp_gpu)
+            return;
+         gfx->tess.prim = MESA_PRIM_TRIANGLES;
+         desc->root.draw.tess_params = tp_gpu;
+         desc->root.draw.geometry_params = 0;
+         desc->root.draw.api_gs = false;
+         desc->root.draw.rasterization_stream = 0;
+         desc->root.draw.draw_id = draw_id;
+         desc->root_dirty = true;
+         hk_apple9_draw_native_tess_object(cmd, draw_id, draw, obj_groups,
+                                           tp_gpu);
+         if (vk_command_buffer_has_error(&cmd->vk))
+            return;
+         first_patch += chunk_patches;
+      }
+      first_inst += chunk_insts;
+   }
+}
 
 static void
 hk_apple9_launch_native_tess(struct hk_cmd_buffer *cmd, uint32_t draw_id,
@@ -2182,10 +2443,11 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
     * a fused native GS draw is eligible so prepare_draw is never called with
     * native_mesh=false (which would tag the graphics CS with HK_READS_INTERNAL). */
    bool native_gs = hk_apple9_use_native_gs(cmd, draw_);
+   bool native_tess = hk_apple9_use_native_tess(cmd, draw_);
    bool defer_prepare =
       (hk_apple9_native_blocks_enabled(hk_cmd_buffer_device(cmd)) &&
        cmd->current_cs.gfx && cmd->current_cs.gfx->apple9_native_mesh) ||
-      native_gs;
+      native_gs || native_tess;
    /* Index fetch and indirect arguments are buffer reads of tiling. */
    if (!defer_prepare &&
        !hk_apple9_prepare_draw(cmd, agx_is_indirect(draw_.b) || draw_.indexed, false))
@@ -2200,7 +2462,7 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
       p_atomic_read(&source->apple9_native_candidate) &&
       (producer == MESA_SHADER_GEOMETRY
           ? hk_apple9_native_gs_common_state_eligible(cmd, draw_)
-          : hk_apple9_native_tess_state_eligible(cmd, draw_));
+          : hk_apple9_native_tess_common_state_eligible(cmd, draw_));
    if (cmd->feedback_raw.size) {
       for (unsigned stage = 0; stage <= MESA_SHADER_MESH; stage++) {
          if (cmd->state.gfx.shaders[stage] &&
@@ -2210,7 +2472,6 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
          }
       }
    }
-   bool native_tess = hk_apple9_use_native_tess(cmd, draw_);
    if (producer == MESA_SHADER_GEOMETRY && source &&
        debug_get_option_gs_route_log()) {
       fprintf(stderr, "HK_GS_SELECT candidate=%u prefer=%u state=%u leaf=%u vs_leaf=%u vs_writes=%u\n",
@@ -2265,12 +2526,16 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
               native_tess, p_atomic_read(&source->apple9_native_candidate),
               prefer_native);
    if (native_tess) {
+      const struct hk_shader *tes_main = hk_native_producer_main(
+         hk_api_shader_native(gfx->shaders[MESA_SHADER_TESS_EVAL]));
+      if (tes_main->info.apple9_tess_fused) {
+         hk_apple9_launch_native_tess_fused(cmd, draw_id, draw_);
+         return;
+      }
       /* One patch (hk_apple9_native_tess_state_eligible), at most a
        * fully tessellated triangle domain: 2 * 64 * 64 triangles. */
       const struct agx_apple9_mesh_body_info *tes_body =
-         &hk_native_producer_main(
-             hk_api_shader_native(gfx->shaders[MESA_SHADER_TESS_EVAL]))
-             ->info.apple9_native;
+         &tes_main->info.apple9_native;
       uint64_t max_tes_groups =
          tes_body->key.physical_threads == 32
             ? DIV_ROUND_UP(2u * 64u * 64u, HK_APPLE9_NATIVE_GS_PACK)

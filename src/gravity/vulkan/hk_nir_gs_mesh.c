@@ -8,6 +8,7 @@
 #include "poly/geometry.h"
 #include "util/hash_table.h"
 #include "hk_apple9_mesh.h"
+#include "hk_nir_fused_vs.h"
 #include "hk_shader.h"
 
 /* One triangle-class input primitive per GS invocation, with Position and
@@ -575,70 +576,9 @@ fused_supported(const nir_shader *vs, const nir_shader *gs,
    if (!(gs->info.outputs_written & VARYING_BIT_POS))
       REJECT("fused GS requires Position output");
 
-   /* Validate VS instructions. */
-   unsigned vs_impls = 0;
-   nir_foreach_function_impl(impl, vs) {
-      if (++vs_impls > 1)
-         REJECT("fused GS requires single-entrypoint VS");
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_call)
-               REJECT("fused GS requires inlined VS calls");
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            switch (intr->intrinsic) {
-            case nir_intrinsic_load_input: {
-               if (opts && opts->vertex.use_prolog)
-                  REJECT("fused GS does not support dynamic vertex input prologs");
-               unsigned loc = nir_intrinsic_io_semantics(intr).location;
-               if (loc < VERT_ATTRIB_GENERIC0 ||
-                   loc - VERT_ATTRIB_GENERIC0 >= 16 ||
-                   !nir_src_is_const(intr->src[0]) ||
-                   nir_src_as_uint(intr->src[0]) || intr->def.bit_size != 32 ||
-                   nir_intrinsic_component(intr) + intr->def.num_components > 4)
-                  REJECT("unsupported VS vertex input");
-               break;
-            }
-            case nir_intrinsic_store_output: {
-               if (!nir_src_is_const(intr->src[1]))
-                  REJECT("fused GS requires constant VS output slot offsets");
-               uint64_t loc = (uint64_t)nir_intrinsic_io_semantics(intr).location +
-                              nir_src_as_uint(intr->src[1]);
-               if (loc >= VARYING_SLOT_MAX || intr->src[0].ssa->bit_size != 32 ||
-                   nir_intrinsic_component(intr) +
-                         intr->src[0].ssa->num_components >
-                      4)
-                  REJECT("unsupported VS output store");
-               break;
-            }
-            case nir_intrinsic_load_deref:
-            case nir_intrinsic_store_deref:
-               if (!nir_deref_mode_is_one_of(
-                      nir_src_as_deref(intr->src[0]),
-                      nir_var_function_temp | nir_var_shader_temp))
-                  REJECT("fused GS requires lowered external VS dereferences");
-               break;
-            case nir_intrinsic_load_ubo:
-            case nir_intrinsic_load_global:
-            case nir_intrinsic_load_global_constant:
-            case nir_intrinsic_load_ro_sink_address_poly:
-            case nir_intrinsic_load_vertex_id:
-            case nir_intrinsic_load_vertex_id_zero_base:
-            case nir_intrinsic_load_instance_id:
-            case nir_intrinsic_load_base_vertex:
-            case nir_intrinsic_load_first_vertex:
-            case nir_intrinsic_load_base_instance:
-            case nir_intrinsic_load_draw_id:
-            case nir_intrinsic_load_constant:
-            case nir_intrinsic_image_load_apple9_agx:
-               break;
-            default:
-               REJECT("unsupported VS intrinsic in fused GS");
-            }
-         }
-      }
-   }
+   /* Validate VS instructions via shared fused-VS validator. */
+   if (!hk_nir_fused_validate_vs(vs, opts ? &opts->vertex : NULL, reason))
+      return false;
 
    /* Validate GS instructions. */
    unsigned gs_impls = 0;
@@ -713,20 +653,6 @@ fused_supported(const nir_shader *vs, const nir_shader *gs,
 #undef REJECT
 }
 
-static nir_def *
-fused_param_u32(nir_builder *b, nir_def *gp, unsigned offset)
-{
-   return nir_load_global_constant(
-      b, 1, 32, nir_iadd_imm(b, gp, offset), .align_mul = 4);
-}
-
-static nir_def *
-fused_param_u64(nir_builder *b, nir_def *gp, unsigned offset)
-{
-   return nir_load_global_constant(
-      b, 1, 64, nir_iadd_imm(b, gp, offset), .align_mul = 8);
-}
-
 /* Assemble the draw-relative vertex/index position for corner `vert` (0..K-1)
  * of input primitive `prim` under the draw's runtime input_topology. */
 static nir_def *
@@ -759,108 +685,6 @@ fused_vertex_pos(nir_builder *b, enum mesa_prim input_prim, nir_def *topology,
                     strip,
                     nir_bcsel(b, nir_ieq_imm(b, topology, MESA_PRIM_TRIANGLE_FAN),
                               fan, list));
-}
-
-/* Convert a draw-relative vertex/index position into a zero-base vertex index
- * (fetched index for indexed draws, draw-relative vertex position for direct
- * draws), with robust bounds checking when index_size_B != 0. */
-static nir_def *
-fused_fetch_vertex_id_zero_base(nir_builder *b, nir_def *vertex_pos,
-                                nir_def *index_buffer,
-                                nir_def *index_buffer_size,
-                                nir_def *index_size_B)
-{
-   nir_def *indexed_id = NULL;
-   nir_push_if(b, nir_ine_imm(b, index_size_B, 0));
-   {
-      nir_def *byte_off =
-         nir_imul(b, nir_u2u64(b, vertex_pos), nir_u2u64(b, index_size_B));
-      nir_def *size_m1 = nir_u2u64(b, nir_iadd_imm(b, index_size_B, -1));
-      nir_def *limit = nir_bcsel(b, nir_uge(b, index_buffer_size, size_m1),
-                                 nir_isub(b, index_buffer_size, size_m1),
-                                 nir_imm_int64(b, 0));
-      nir_def *in_bounds = nir_ult(b, byte_off, limit);
-      nir_def *ro_sink = nir_load_ro_sink_address_poly(b);
-      nir_def *addr =
-         nir_bcsel(b, in_bounds, nir_iadd(b, index_buffer, byte_off), ro_sink);
-      nir_def *idx32 = NULL, *idx16 = NULL, *idx8 = NULL, *idx_small = NULL;
-      nir_push_if(b, nir_ieq_imm(b, index_size_B, 4));
-      {
-         idx32 = nir_load_global_constant(b, 1, 32, addr, .align_mul = 4);
-      }
-      nir_push_else(b, NULL);
-      {
-         nir_push_if(b, nir_ieq_imm(b, index_size_B, 2));
-         {
-            idx16 = nir_u2u32(
-               b, nir_load_global_constant(b, 1, 16, addr, .align_mul = 2));
-         }
-         nir_push_else(b, NULL);
-         {
-            idx8 = nir_u2u32(
-               b, nir_load_global_constant(b, 1, 8, addr, .align_mul = 1));
-         }
-         nir_pop_if(b, NULL);
-         idx_small = nir_if_phi(b, idx16, idx8);
-      }
-      nir_pop_if(b, NULL);
-      nir_def *loaded = nir_if_phi(b, idx32, idx_small);
-      indexed_id = nir_bcsel(b, in_bounds, loaded, nir_imm_int(b, 0));
-   }
-   nir_pop_if(b, NULL);
-   return nir_if_phi(b, indexed_id, vertex_pos);
-}
-
-struct fused_vs_lower {
-   const uint8_t *vs_read_mask;
-   nir_variable **vs_slot_vars;
-   nir_variable *in_vertex_id;
-   nir_variable *in_vertex_pos;
-   nir_variable *in_instance_id;
-   nir_variable *in_first_vertex;
-   nir_variable *in_base_instance;
-};
-
-static bool
-fused_lower_vs_intr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
-{
-   struct fused_vs_lower *v = data;
-   b->cursor = nir_before_instr(&intr->instr);
-   switch (intr->intrinsic) {
-   case nir_intrinsic_store_output: {
-      unsigned loc = nir_intrinsic_io_semantics(intr).location +
-                     nir_src_as_uint(intr->src[1]);
-      if (loc < VARYING_SLOT_MAX && v->vs_read_mask[loc] && v->vs_slot_vars[loc]) {
-         nir_def *val = nir_undef(b, 4, 32);
-         unsigned comp = nir_intrinsic_component(intr);
-         for (unsigned i = 0; i < intr->src[0].ssa->num_components; ++i)
-            val = nir_vector_insert_imm(
-               b, val, nir_channel(b, intr->src[0].ssa, i), comp + i);
-         nir_store_var(b, v->vs_slot_vars[loc], val,
-                       nir_intrinsic_write_mask(intr) << comp);
-      }
-      nir_instr_remove(&intr->instr);
-      return true;
-   }
-   case nir_intrinsic_load_vertex_id:
-      nir_def_replace(&intr->def, nir_load_var(b, v->in_vertex_id));
-      return true;
-   case nir_intrinsic_load_vertex_id_zero_base:
-      nir_def_replace(&intr->def, nir_load_var(b, v->in_vertex_pos));
-      return true;
-   case nir_intrinsic_load_instance_id:
-      nir_def_replace(&intr->def, nir_load_var(b, v->in_instance_id));
-      return true;
-   case nir_intrinsic_load_base_vertex:
-   case nir_intrinsic_load_first_vertex:
-      nir_def_replace(&intr->def, nir_load_var(b, v->in_first_vertex));
-      return true;
-   case nir_intrinsic_load_base_instance:
-      nir_def_replace(&intr->def, nir_load_var(b, v->in_base_instance));
-      return true;
-   default:
-      return false;
-   }
 }
 
 struct fused_gs_state {
@@ -1111,33 +935,12 @@ hk_nir_gs_fused_mesh(const nir_shader *vs_source, const nir_shader *gs_source,
    }
 
    /* Normalize VS load_input base and lower vertex attribute pulls. */
-   bool vs_has_inputs = false;
-   nir_foreach_function_impl(vimpl, vs) {
-      nir_foreach_block(block, vimpl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            if (intr->intrinsic == nir_intrinsic_load_input) {
-               unsigned loc = nir_intrinsic_io_semantics(intr).location;
-               nir_intrinsic_set_base(intr, loc - VERT_ATTRIB_GENERIC0);
-               vs_has_inputs = true;
-            }
-         }
-      }
-   }
-   if (vs_has_inputs) {
-      if (!options ||
-          !agx_nir_lower_apple9_vertex_inputs(vs, &options->vertex, true)) {
-         ralloc_free(nir);
-         ralloc_free(vs);
-         if (reason)
-            *reason = "unsupported VS vertex input format in fused GS";
-         return NULL;
-      }
+   if (!hk_nir_fused_prepare_vs(vs, options ? &options->vertex : NULL, reason)) {
+      ralloc_free(nir);
+      ralloc_free(vs);
+      return NULL;
    }
 
-   NIR_PASS(_, vs, nir_lower_returns);
    NIR_PASS(_, nir, nir_lower_returns);
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
@@ -1283,7 +1086,7 @@ hk_nir_gs_fused_mesh(const nir_shader *vs_source, const nir_shader *gs_source,
 
    /* Prepare VS template for inlining (only if GS reads at least one VS output). */
    nir_variable *vs_slot_vars[VARYING_SLOT_MAX] = {NULL};
-   struct fused_vs_lower vs_lower = {
+   struct hk_nir_fused_vs_lower vs_lower = {
       .vs_read_mask = vs_read_mask,
       .vs_slot_vars = vs_slot_vars,
    };
@@ -1305,7 +1108,7 @@ hk_nir_gs_fused_mesh(const nir_shader *vs_source, const nir_shader *gs_source,
                vs, nir_var_shader_temp, glsl_vec4_type(), "fgs_vs_slot");
          }
       }
-      NIR_PASS(_, vs, nir_shader_intrinsics_pass, fused_lower_vs_intr,
+      NIR_PASS(_, vs, nir_shader_intrinsics_pass, hk_nir_fused_lower_vs_intr,
                nir_metadata_none, &vs_lower);
       NIR_PASS(_, vs, nir_opt_dce);
       NIR_PASS(_, vs, nir_opt_dead_cf);
@@ -1326,24 +1129,24 @@ hk_nir_gs_fused_mesh(const nir_shader *vs_source, const nir_shader *gs_source,
    nir_def *gp = nir_load_geometry_param_buffer_poly(&b);
 
    nir_def *index_buffer =
-      fused_param_u64(&b, gp, offsetof(struct hk_apple9_fused_gs_params, index_buffer));
+      hk_nir_fused_param_u64(&b, gp, offsetof(struct hk_apple9_fused_gs_params, index_buffer));
    nir_def *index_buffer_size =
-      fused_param_u64(&b, gp, offsetof(struct hk_apple9_fused_gs_params, index_buffer_size));
+      hk_nir_fused_param_u64(&b, gp, offsetof(struct hk_apple9_fused_gs_params, index_buffer_size));
    nir_def *topology =
-      fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, input_topology));
+      hk_nir_fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, input_topology));
    nir_def *index_size_B =
-      fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, index_size_B));
+      hk_nir_fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, index_size_B));
    nir_def *first_vertex =
-      fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, first_vertex));
+      hk_nir_fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, first_vertex));
    nir_def *base_instance =
-      fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, base_instance));
+      hk_nir_fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, base_instance));
    nir_def *input_prims =
-      fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, input_primitives));
+      hk_nir_fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, input_primitives));
    nir_def *first_prim =
-      fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, first_primitive));
+      hk_nir_fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, first_primitive));
    nir_def *groups_x =
-      fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, groups_x));
-   nir_def *first_instance_offset = fused_param_u32(
+      hk_nir_fused_param_u32(&b, gp, offsetof(struct hk_apple9_fused_gs_params, groups_x));
+   nir_def *first_instance_offset = hk_nir_fused_param_u32(
       &b, gp, offsetof(struct hk_apple9_fused_gs_params, first_instance_offset));
 
    nir_def *group_linear =
@@ -1468,7 +1271,7 @@ hk_nir_gs_fused_mesh(const nir_shader *vs_source, const nir_shader *gs_source,
                nir_def *vpos = fused_vertex_pos(
                   &b, gs_source->info.gs.input_primitive, topology,
                   flatshade_first, prim_id, nir_imm_int(&b, c));
-               nir_def *vid_zb = fused_fetch_vertex_id_zero_base(
+               nir_def *vid_zb = hk_nir_fused_fetch_vertex_id_zero_base(
                   &b, vpos, index_buffer, index_buffer_size, index_size_B);
                nir_def *vid = nir_iadd(&b, vid_zb, first_vertex);
                nir_store_var(&b, mesh_in_vpos, vid_zb, 1);
@@ -1517,7 +1320,7 @@ hk_nir_gs_fused_mesh(const nir_shader *vs_source, const nir_shader *gs_source,
                nir_def *vpos = fused_vertex_pos(
                   &b, gs_source->info.gs.input_primitive, topology,
                   flatshade_first, prim_id, c_val);
-               nir_def *vid_zb = fused_fetch_vertex_id_zero_base(
+               nir_def *vid_zb = hk_nir_fused_fetch_vertex_id_zero_base(
                   &b, vpos, index_buffer, index_buffer_size, index_size_B);
                nir_def *vid = nir_iadd(&b, vid_zb, first_vertex);
                nir_store_var(&b, mesh_in_vpos, vid_zb, 1);

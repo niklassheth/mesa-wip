@@ -584,16 +584,30 @@ check_tess_programs(struct hk_api_shader **api, bool native, unsigned vertices)
             HK_APPLE9_NATIVE_MESH);
       CHECK(hk_native_producer_object(ng)->info.apple9_native_stage ==
             HK_APPLE9_NATIVE_OBJECT);
-      /* Packed TES evaluates HK_APPLE9_NATIVE_GS_PACK triangles per group. */
-      const bool tes_pack = hk_apple9_native_tes_pack_enabled();
-      CHECK(
-         hk_native_producer_main(ng)->info.apple9_native.layout.max_vertices ==
-         (tes_pack ? 3 * HK_APPLE9_NATIVE_GS_PACK : 3));
-      CHECK(hk_native_producer_main(ng)
-               ->info.apple9_native.layout.max_primitives == (tes_pack ? 17 : 1));
-      struct hk_api_shader *nv = hk_api_shader_native(api[MESA_SHADER_VERTEX]);
-      CHECK(nv->variants[HK_VS_VARIANT_SW].bo && !nv->writes_memory);
-      CHECK(nv->variants[HK_VS_VARIANT_SW].b.info.outputs & VARYING_BIT_POS);
+      const bool fused = hk_native_producer_main(ng)->info.apple9_tess_fused;
+      if (fused) {
+         CHECK(hk_native_producer_main(ng)->info.apple9_native.key.hw_payload);
+         CHECK(hk_native_producer_object(ng)->info.apple9_native.key.hw_payload);
+         CHECK(hk_native_producer_main(ng)->info.apple9_native.layout.max_vertices == 32);
+         CHECK(hk_native_producer_main(ng)->info.apple9_native.layout.max_primitives == 42);
+         CHECK(hk_native_producer_main(ng)->info.apple9_tess_payload_B > 0 &&
+               hk_native_producer_main(ng)->info.apple9_tess_payload_B <= 1024);
+         CHECK(hk_native_producer_main(ng)->info.apple9_tess_const_levels);
+         CHECK(hk_native_producer_main(ng)->info.apple9_tess_max_child_wgs == 1);
+         struct hk_api_shader *nv = hk_api_shader_native(api[MESA_SHADER_VERTEX]);
+         CHECK(!nv->variants[HK_VS_VARIANT_SW].bo && !nv->writes_memory);
+      } else {
+         /* Packed TES evaluates HK_APPLE9_NATIVE_GS_PACK triangles per group. */
+         const bool tes_pack = hk_apple9_native_tes_pack_enabled();
+         CHECK(
+            hk_native_producer_main(ng)->info.apple9_native.layout.max_vertices ==
+            (tes_pack ? 3 * HK_APPLE9_NATIVE_GS_PACK : 3));
+         CHECK(hk_native_producer_main(ng)
+                  ->info.apple9_native.layout.max_primitives == (tes_pack ? 17 : 1));
+         struct hk_api_shader *nv = hk_api_shader_native(api[MESA_SHADER_VERTEX]);
+         CHECK(nv->variants[HK_VS_VARIANT_SW].bo && !nv->writes_memory);
+         CHECK(nv->variants[HK_VS_VARIANT_SW].b.info.outputs & VARYING_BIT_POS);
+      }
       struct hk_api_shader *nc =
          hk_api_shader_native(api[MESA_SHADER_TESS_CTRL]);
       CHECK(nc->variants[0].bo && !nc->writes_memory);
@@ -716,6 +730,22 @@ main(void)
    CHECK(dev && pdev);
    dev->dev.chip = AGX_CHIP_G16G;
    dev->dev.shader_base = 0x1200000000ull;
+   if (getenv("HK_TEST_NATIVE_OBJECT_MP")) {
+      dev->dev.native_mesh_qualified = true;
+      dev->dev.native_object = (struct agx_native_object_support){
+         .profile = AGX_NATIVE_MESH_PROFILE_QUALIFIED,
+         .generation = 1,
+         .multi_parent = true,
+         .payload_bytes = 16384,
+         .mp_payload_bytes = 1024,
+         .max_threads = 32,
+         .max_shared = 32768,
+         .max_groups = 1048575,
+      };
+      pdev->dev.chip = AGX_CHIP_G16G;
+      pdev->dev.native_mesh_qualified = true;
+      pdev->dev.native_object = dev->dev.native_object;
+   }
    dev->vk.alloc = *vk_default_allocator();
    dev->vk.physical = &pdev->vk;
    hk_device_init_usc_heap(dev);
