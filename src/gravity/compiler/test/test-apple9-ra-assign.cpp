@@ -2199,3 +2199,136 @@ TEST_F(Apple9RaAssignTest, CompactFmaCollectAffinityRefreshesAfterReleasingReusa
    EXPECT_TRUE(found_4b_fma);
    EXPECT_GT(verify_binary_emission(&p), 0u);
 }
+
+TEST_F(Apple9RaAssignTest, CollectBypassAfterEvictionPreservesLiveSource)
+{
+   /* Regression test for VIR_COLLECT zero-copy bypass when a source was
+    * previously evicted (cur_ssa[orig_sv] != orig_sv):
+    * 1) A later kill on orig_sv before the bypassed tuple's last use must be
+    *    resolved through cur_ssa, cleared, and transferred to the tuple's last
+    *    use so intervening instructions cannot steal the live GPR.
+    * 2) Rewriting bypassed consumers must write orig_sv (not the already-split
+    *    cur_ssa copy) so a subsequent re-eviction before the consumer still
+    *    resolves to the newest physical GPR. */
+   auto *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block_begin(&p, b0);
+
+   /* Preload v_ptr in r0 and occupants in r1..r3 so evicting r0 moves v_ptr
+    * to r4 (creating a split SSA copy cur_ssa[v_ptr] != v_ptr). */
+   uint32_t v_ptr = agx_apple9_vir_emit_entry_reg(&p, 0);
+   uint32_t v_k1 = agx_apple9_vir_emit_entry_reg(&p, 1);
+   uint32_t v_k2 = agx_apple9_vir_emit_entry_reg(&p, 2);
+   uint32_t v_k3 = agx_apple9_vir_emit_entry_reg(&p, 3);
+
+   /* Force eviction of v_ptr from r0 -> r4. */
+   uint32_t v_evict1 = emit_imm(111);
+   p.fixed_phys[v_evict1] = 0;
+
+   /* Place sibling at r5, immediately contiguous with evicted v_ptr in r4. */
+   uint32_t v_sib = emit_imm(222);
+   p.fixed_phys[v_sib] = 5;
+
+   /* Zero-copy bypass: (v_ptr@r4, v_sib@r5) are contiguous. */
+   uint32_t col_srcs[2] = {v_ptr, v_sib};
+   uint32_t col = agx_apple9_vir_emit_collect(&p, col_srcs, 2);
+   ASSERT_NE(col, AGX_APPLE9_VREG_INVALID);
+
+   /* Last original use of v_ptr (kills v_ptr BEFORE col is consumed!). */
+   uint32_t use_orig = emit_iadd(v_ptr, v_k1);
+
+   /* Force a second eviction of v_ptr from r4 -> another GPR, AND allocate
+    * intervening values that would steal r4 if use_orig prematurely freed it. */
+   uint32_t v_evict2 = emit_imm(333);
+   p.fixed_phys[v_evict2] = 4;
+   uint32_t clob1 = emit_iadd(v_evict1, v_k2);
+   uint32_t clob2 = emit_iadd(v_evict2, v_k3);
+
+   /* Consume bypassed tuple lanes after both the original kill and re-eviction. */
+   uint32_t col_sum = emit_iadd(col, col + 1);
+   uint32_t total = emit_iadd(emit_iadd(use_orig, col_sum), emit_iadd(clob1, clob2));
+
+   ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, col_sum, 8));
+   ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, total, 9));
+   ASSERT_TRUE(agx_apple9_vir_emit_abi_return(&p));
+   cfg_init(&p, {b0});
+
+   auto opts = validated_opts();
+   opts.skip_schedule = true;
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+   EXPECT_FALSE(res.has_spills);
+
+   PhysVirSim sim;
+   sim.gpr[0] = 1000u; /* v_ptr */
+   sim.gpr[1] = 10u;   /* v_k1 */
+   sim.gpr[2] = 20u;   /* v_k2 */
+   sim.gpr[3] = 30u;   /* v_k3 */
+   sim.exec_block(p.blocks);
+   /* col_sum = v_ptr(1000) + v_sib(222) = 1222 */
+   EXPECT_EQ(sim.gpr[8], 1222u);
+   /* total = (1000+10) + 1222 + (111+20) + (333+30) = 2726 */
+   EXPECT_EQ(sim.gpr[9], 2726u);
+
+   EXPECT_GT(verify_binary_emission(&p), 0u);
+}
+
+TEST_F(Apple9RaAssignTest, CollectBypassVetoedWhenLaterSplitKillsSourceTuple)
+{
+   /* Regression test for the VIR_SPLIT guard in VIR_COLLECT zero-copy bypass:
+    * when a collected lane is a non-base lane (tup + 1) of a multi-word tuple
+    * that is later killed by VIR_SPLIT(tup) (which transfers all lanes' GPRs
+    * in-place while only naming tup in src[0]), the collect must not bypass
+    * and alias tup + 1 past the split. */
+   auto *b0 = agx_apple9_block_create(&p);
+   agx_apple9_block_begin(&p, b0);
+
+   /* Build a 2-word tuple tup=(r0, r1) with a contiguous scalar c in r2. */
+   uint32_t a = agx_apple9_vir_emit_entry_reg(&p, 0);
+   uint32_t b = agx_apple9_vir_emit_entry_reg(&p, 1);
+   uint32_t c = agx_apple9_vir_emit_entry_reg(&p, 2);
+
+   uint32_t t_srcs[2] = {a, b};
+   uint32_t tup = agx_apple9_vir_emit_collect(&p, t_srcs, 2);
+   ASSERT_NE(tup, AGX_APPLE9_VREG_INVALID);
+
+   /* Alias the non-base tuple lane tup + 1 (r1) with contiguous c (r2). */
+   uint32_t alias_srcs[2] = {tup + 1, c};
+   uint32_t alias = agx_apple9_vir_emit_collect(&p, alias_srcs, 2);
+   ASSERT_NE(alias, AGX_APPLE9_VREG_INVALID);
+
+   /* Split tup (killing tup at VIR_SPLIT!) and overwrite sp + 1's GPR (r1)
+    * via killed reuse + fixed_phys before alias is consumed. */
+   uint32_t sp = agx_apple9_vir_emit_split(&p, tup, 2);
+   ASSERT_NE(sp, AGX_APPLE9_VREG_INVALID);
+   uint32_t s0_use = emit_iadd(sp, c);
+   uint32_t s1_use = emit_iadd(sp + 1, c);
+   uint32_t clob_r1 = emit_imm(777);
+   p.fixed_phys[clob_r1] = 1;
+
+   /* Consume alias after tup was killed by VIR_SPLIT and r1 was overwritten. */
+   uint32_t alias_sum = emit_iadd(alias, alias + 1);
+   uint32_t combined = emit_iadd(emit_iadd(s0_use, s1_use), clob_r1);
+
+   ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, alias_sum, 8));
+   ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, combined, 9));
+   ASSERT_TRUE(agx_apple9_vir_emit_abi_return(&p));
+   cfg_init(&p, {b0});
+
+   auto opts = validated_opts();
+   opts.skip_schedule = true;
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+   EXPECT_FALSE(res.has_spills);
+
+   PhysVirSim sim;
+   sim.gpr[0] = 100u; /* a (tup) */
+   sim.gpr[1] = 200u; /* b (tup + 1) */
+   sim.gpr[2] = 5u;   /* c */
+   sim.exec_block(p.blocks);
+   EXPECT_EQ(sim.gpr[8], 205u);
+   EXPECT_EQ(sim.gpr[9], 105u + 205u + 777u);
+
+   EXPECT_GT(verify_binary_emission(&p), 0u);
+}

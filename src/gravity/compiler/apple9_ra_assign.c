@@ -2928,6 +2928,17 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                         break;
                      }
                   }
+                  if (can_bypass && u->op == AGX_APPLE9_VIR_SPLIT && uns >= 1) {
+                     uint32_t base = agx_apple9_vir_src(u, 0);
+                     for (unsigned k = 0; k < w; ++k) {
+                        uint32_t orig_sv = rctx->orig_ssa[ins->src[k]];
+                        if (orig_sv >= base &&
+                            orig_sv < base + u->dest_components) {
+                           can_bypass = false;
+                           break;
+                        }
+                     }
+                  }
                   continue;
                }
                for (unsigned s = 0; s < uns && can_bypass; ) {
@@ -2953,6 +2964,10 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
          if (can_bypass) {
             for (unsigned k = 0; k < w; ++k) {
                uint32_t sv = ins->src[k];
+               uint32_t orig_sv = rctx->orig_ssa[sv];
+               uint32_t repl_sv =
+                  (orig_sv < rctx->orig_vcount &&
+                   a9_resolve_cur(rctx, orig_sv) == sv) ? orig_sv : sv;
                uint32_t dv = ins->dest + k;
                bool src_killed_here = agx_apple9_vir_src_killed(ins, k);
                struct agx_apple9_vir_instr *orig_kill_ins = NULL;
@@ -2966,7 +2981,8 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                   bool u_used_dest = false;
                   for (unsigned s = 0; s < uns && s < AGX_APPLE9_MAX_VIR_SRCS; ++s) {
                      uint32_t usv = agx_apple9_vir_src(u, s);
-                     if (usv == sv && agx_apple9_vir_src_killed(u, s))
+                     if (a9_resolve_cur(rctx, usv) == sv &&
+                         agx_apple9_vir_src_killed(u, s))
                         u_had_orig_kill = true;
                      if (usv == dv)
                         u_used_dest = true;
@@ -2986,7 +3002,7 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                    orig_kill_ins) {
                   unsigned uns = agx_apple9_vir_nr_srcs(orig_kill_ins);
                   for (unsigned s = 0; s < uns && s < AGX_APPLE9_MAX_VIR_SRCS; ++s) {
-                     if (agx_apple9_vir_src(orig_kill_ins, s) == sv)
+                     if (a9_resolve_cur(rctx, agx_apple9_vir_src(orig_kill_ins, s)) == sv)
                         agx_apple9_vir_set_src_killed(orig_kill_ins, s, false);
                   }
                }
@@ -2999,7 +3015,7 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                      u->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_POINTER;
                   for (unsigned s = 0; s < uns && s < AGX_APPLE9_MAX_VIR_SRCS; ++s) {
                      if (agx_apple9_vir_src(u, s) == dv) {
-                        *agx_apple9_vir_src_ptr(u, s) = sv;
+                        *agx_apple9_vir_src_ptr(u, s) = repl_sv;
                         if (u_is_load)
                            u->retain_mask |= (uint16_t)BITFIELD_BIT(s);
                         if (!transfer_kill_to_last_dest || u != last_dest_use)
@@ -3008,7 +3024,7 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                   }
                   if (transfer_kill_to_last_dest && u == last_dest_use) {
                      for (unsigned s = 0; s < uns && s < AGX_APPLE9_MAX_VIR_SRCS; ++s) {
-                        if (agx_apple9_vir_src(u, s) == sv)
+                        if (a9_resolve_cur(rctx, agx_apple9_vir_src(u, s)) == sv)
                            agx_apple9_vir_set_src_killed(u, s, true);
                      }
                   }
