@@ -62,10 +62,13 @@ agx_apple9_mesh_state_build(uint32_t out[AGX_APPLE9_MESH_STATE_WORDS],
  * When a draw's total ring usage exceeds 4,096 rows, hardware can admit extra
  * workgroups before draining earlier ones, wrapping onto live workgroup data
  * (reproduced on T8132 with T32 V24 P30 K=1 at 56 rows/WG). Footprints <= 40
- * rows (covering all 31 qualified native-index classes up to V=32, planes=4)
- * stay safe concurrently; larger footprints are admitted only when the entire
- * draw fits in 4,096 rows. Because the bound is monotone in max_vertices, any
- * smaller runtime SetMeshOutputsEXT count is also safe. */
+ * rows stay safe concurrently, except wg_rows == 32 (exact power-of-two ring
+ * divisor 4096 / 32 = 128), which reproduced 3/3 corruption on T8132 silicon
+ * during mid-render TVB growth (V=4 planes=24 and V=8 planes=12; wg_rows =
+ * 16, 20, 24, 28, 36, 40 all passed 0/3). Larger footprints and wg_rows == 32
+ * are admitted only when the entire draw fits in 4,096 rows. Generated GS/TES
+ * mesh shaders also pad runtime SetMeshOutputsEXT counts out of the wg_rows ==
+ * 32 quad band so runtime counts cannot hit it under an unbounded layout. */
 static bool
 agx_apple9_mesh_wg_rows(const struct agx_apple9_mesh_layout *layout,
                         uint64_t *wg_rows)
@@ -82,6 +85,13 @@ agx_apple9_mesh_wg_rows(const struct agx_apple9_mesh_layout *layout,
    return true;
 }
 
+static bool
+agx_apple9_mesh_wg_rows_concurrent_safe(uint64_t wg_rows)
+{
+   return wg_rows <= AGX_APPLE9_MESH_RING_CONCURRENT_SAFE_ROWS &&
+          wg_rows != AGX_APPLE9_MESH_RING_EXACT_WRAP_ROWS;
+}
+
 bool
 agx_apple9_mesh_ring_max_groups(const struct agx_apple9_mesh_layout *layout,
                                 uint64_t *max_groups)
@@ -89,7 +99,7 @@ agx_apple9_mesh_ring_max_groups(const struct agx_apple9_mesh_layout *layout,
    uint64_t wg_rows;
    if (!max_groups || !agx_apple9_mesh_wg_rows(layout, &wg_rows))
       return false;
-   *max_groups = wg_rows <= AGX_APPLE9_MESH_RING_CONCURRENT_SAFE_ROWS
+   *max_groups = agx_apple9_mesh_wg_rows_concurrent_safe(wg_rows)
                     ? UINT64_MAX
                     : AGX_APPLE9_MESH_RING_ROWS / wg_rows;
    return true;
@@ -102,7 +112,7 @@ agx_apple9_mesh_ring_usage(const struct agx_apple9_mesh_layout *layout,
    uint64_t wg_rows;
    if (!rows || !limited || !agx_apple9_mesh_wg_rows(layout, &wg_rows))
       return false;
-   *limited = wg_rows > AGX_APPLE9_MESH_RING_CONCURRENT_SAFE_ROWS;
+   *limited = !agx_apple9_mesh_wg_rows_concurrent_safe(wg_rows);
    *rows = groups > UINT64_MAX / wg_rows ? UINT64_MAX : groups * wg_rows;
    return true;
 }

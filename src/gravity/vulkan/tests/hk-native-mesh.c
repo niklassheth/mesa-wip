@@ -335,13 +335,18 @@ check_mesh_ring_fits(void)
    }
 
    /* Footprints > 40 rows (including T32 V24 P30 K=1 at 56 rows, which
-    * reproduced concurrent ring overwrite corruption on T8132 silicon) are
-    * admitted only when groups * wg_rows <= 4096. Planes align up to
-    * multiples of 4 (e.g. n=10 -> 12). */
+    * reproduced concurrent ring overwrite corruption on T8132 silicon) AND
+    * wg_rows == 32 (4096 / 32 = 128 exact power-of-two ring divisor, which
+    * reproduced 3/3 TVB-grow corruption on T8132 silicon) are admitted only
+    * when groups * wg_rows <= 4096. Planes align up to multiples of 4. */
    const struct {
       unsigned max_vertices, vertex_components;
       uint64_t max_safe_groups;
    } ring_cases[] = {
+      { 4, 24, 128}, /* wg_rows = 1*24 + 8 = 32 (TVB-grow exact-wrap guard); 4096 / 32 = 128 */
+      { 8, 12, 128}, /* wg_rows = 2*12 + 8 = 32; 4096 / 32 = 128 */
+      {12,  8, 128}, /* wg_rows = 3*8  + 8 = 32; 4096 / 32 = 128 */
+      {24,  4, 128}, /* wg_rows = 6*4  + 8 = 32; 4096 / 32 = 128 */
       {24,  8, 73},  /* T32 V24 P30 K=1 regression: 6*8 + 8 = 56; 4096 / 56 = 73 */
       {48,  4, 73},  /* V48 pos-only: 12*4 + 8 = 56; 4096 / 56 = 73 */
       {28,  8, 64},  /* 7*8 + 8 = 64; 4096 / 64 = 64 */

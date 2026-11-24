@@ -856,8 +856,8 @@ test_fused_nir_topologies_and_indices(void)
       struct hk_gs_fused_options opts = make_vbo_opts(true);
       struct hk_gs_fused_info info = {0};
       nir_shader *mesh = fused_lower_immutable(vs, gs, &opts, &info, true);
-      CHECK(info.pack == 8 && mesh->info.mesh.max_vertices_out == 24 &&
-            mesh->info.mesh.max_primitives_out == 17);
+      CHECK(info.pack == 8 && mesh->info.mesh.max_vertices_out == 32 &&
+            mesh->info.mesh.max_primitives_out == 16);
 
       uint32_t u32_idx[5] = {1, 3, 6, 9, 12};
       uint8_t u8_idx[3] = {2, 4, 7}; /* short buffer: pos 3 is OOB -> clamps to 0 */
@@ -900,6 +900,16 @@ test_fused_nir_topologies_and_indices(void)
          CHECK(pos[3][0] == 16.0f && pos[4][0] == 13.0f && pos[5][0] == 19.0f);
       }
       CHECK(idx[1][0] == 3 && idx[1][1] == 4 && idx[1][2] == 5);
+      if (pass == 0) {
+         /* Full pack=8 (8*3=24 vertices) must pad runtime SetMeshOutputsEXT
+          * vertex count to 25 (<= 32) so runtime quad allocation avoids
+          * wg_rows == 32 (TVB-grow exact-wrap divisor). */
+         gp.input_primitives = 8;
+         ctx.lane = 0;
+         sv = sp = 0;
+         eval_fused_shader(mesh, &ctx, pos, &vc, idx, &pc, &sv, &sp);
+         CHECK(sv == 25 && sp == 8);
+      }
       ralloc_free(mesh);
       ralloc_free(vs);
       ralloc_free(gs);
@@ -1075,7 +1085,7 @@ test_fused_outputs_and_compile(void)
    struct hk_apple9_graphics_key key = {0};
    key.vertex = make_vbo_opts(true).vertex;
 
-   /* 1. gs passthrough (V=3, pos-only) -> pack=8, T32 V24 P17, concurrent-safe ring. */
+   /* 1. gs passthrough (V=3, pos-only) -> pack=8, T32 V32 P16 (avoids wg_rows=32), concurrent-safe ring. */
    {
       nir_shader *vs = make_vs_vbo(false, true, 0);
       nir_shader *gs = make_gs_passthrough(
@@ -1088,8 +1098,8 @@ test_fused_outputs_and_compile(void)
       CHECK(hk_apple9_compile_gs_fused_mesh_program(vs, gs, &key, &part, &info,
                                                     &finfo, &reason));
       CHECK(part.binary && part.info.binary_size > 0);
-      CHECK(finfo.pack == 8 && info.layout.max_vertices == 24 &&
-            info.layout.max_primitives == 17);
+      CHECK(finfo.pack == 8 && info.layout.max_vertices == 32 &&
+            info.layout.max_primitives == 16);
       uint64_t ring_max = 0;
       CHECK(agx_apple9_mesh_ring_max_groups(&info.layout, &ring_max) &&
             ring_max == UINT64_MAX);
@@ -1100,7 +1110,7 @@ test_fused_outputs_and_compile(void)
       ralloc_free(gs);
    }
 
-   /* 2. gs4 (1->4 split, V=12, pos-only) -> pack=2, T32 V24 P31, concurrent-safe ring. */
+   /* 2. gs4 (1->4 split, V=12, pos-only) -> pack=2, T32 V32 P32 (avoids wg_rows=32), concurrent-safe ring. */
    {
       nir_shader *vs = make_vs_vbo(false, false, 0);
       nir_shader *gs = make_gs_split4();
@@ -1111,8 +1121,8 @@ test_fused_outputs_and_compile(void)
       CHECK(hk_apple9_compile_gs_fused_mesh_program(vs, gs, &key, &part, &info,
                                                     &finfo, &reason));
       CHECK(part.binary && part.info.binary_size > 0);
-      CHECK(finfo.pack == 2 && info.layout.max_vertices == 24 &&
-            info.layout.max_primitives == 31);
+      CHECK(finfo.pack == 2 && info.layout.max_vertices == 32 &&
+            info.layout.max_primitives == 32);
       uint64_t ring_max = 0;
       CHECK(agx_apple9_mesh_ring_max_groups(&info.layout, &ring_max) &&
             ring_max == UINT64_MAX);

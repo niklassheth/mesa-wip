@@ -317,7 +317,7 @@ hk_apple9_native_stage_class(mesa_shader_stage stage, unsigned threads,
       return hk_apple9_native_gs_packed_class(threads, vertices, primitives);
    if (stage == MESA_SHADER_TESS_EVAL && threads == 32 &&
        hk_apple9_native_tes_pack_enabled())
-      return vertices == 3 * HK_APPLE9_NATIVE_GS_PACK && primitives == 17;
+      return vertices == 32 && primitives == 16;
    if (threads != 16)
       return false;
    if (stage == MESA_SHADER_GEOMETRY)

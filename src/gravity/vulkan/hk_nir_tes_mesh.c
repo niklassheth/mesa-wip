@@ -240,8 +240,13 @@ hk_nir_tes_mesh_lower(nir_shader *nir, unsigned vertices_in)
    nir_pop_if(&b, NULL);
    nir_pop_if(&b, NULL);
    nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
-   nir_set_vertex_and_primitive_count(&b, nir_imul_imm(&b, live, 3), live,
-                                      nir_imm_int(&b, 0));
+   nir_def *v_pub = nir_imul_imm(&b, live, 3);
+   if (pack > 1) {
+      /* Avoid runtime V=21..24 (wg_rows == 32 at planes=4); pad to 25 <= 32. */
+      nir_def *bad = nir_ult_imm(&b, nir_iadd_imm(&b, v_pub, -21), 4);
+      v_pub = nir_bcsel(&b, bad, nir_imm_int(&b, 25), v_pub);
+   }
+   nir_set_vertex_and_primitive_count(&b, v_pub, live, nir_imm_int(&b, 0));
    nir_pop_if(&b, NULL);
    nir_pop_if(&b, NULL);
    /* Out-of-grid workgroups publish an empty mesh from lane zero. */
@@ -255,9 +260,9 @@ hk_nir_tes_mesh_lower(nir_shader *nir, unsigned vertices_in)
    memset(&nir->info.mesh, 0, sizeof(nir->info.mesh));
    nir->info.stage = MESA_SHADER_MESH;
    nir->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
-   /* Unpacked T16 V3/P1; packed the qualified T32 V24/P17. */
-   nir->info.mesh.max_vertices_out = corners;
-   nir->info.mesh.max_primitives_out = pack > 1 ? 17 : 1;
+   /* Unpacked T16 V3/P1; packed the qualified T32 V32/P16 (avoids wg_rows=32). */
+   nir->info.mesh.max_vertices_out = pack > 1 ? 32 : corners;
+   nir->info.mesh.max_primitives_out = pack > 1 ? 16 : 1;
    nir->info.workgroup_size_variable = false;
    nir->info.workgroup_size[0] = pack > 1 ? 32 : 16;
    nir->info.workgroup_size[1] = nir->info.workgroup_size[2] = 1;

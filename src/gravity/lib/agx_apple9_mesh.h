@@ -38,6 +38,7 @@ agx_apple9_mesh_state_build(uint32_t out[AGX_APPLE9_MESH_STATE_WORDS],
 #define AGX_APPLE9_MESH_RING_ROWS 4096u
 #define AGX_APPLE9_MESH_RING_HEADER_ROWS 8u
 #define AGX_APPLE9_MESH_RING_CONCURRENT_SAFE_ROWS 40u
+#define AGX_APPLE9_MESH_RING_EXACT_WRAP_ROWS 32u
 
 bool agx_apple9_mesh_ring_max_groups(const struct agx_apple9_mesh_layout *layout,
                                      uint64_t *max_groups);

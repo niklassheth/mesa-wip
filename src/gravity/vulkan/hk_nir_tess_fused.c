@@ -82,8 +82,11 @@ choose_meshlet_shape(unsigned vertex_components)
          .allow_whole_patch = true,
       };
    }
-   if (planes <= 16) {
-      /* wg_rows = 2 * 16 + 8 = 40 <= 40 (unbounded). */
+   if (planes == 16) {
+      /* wg_rows = 2 * 16 + 8 = 40 <= 40 (unbounded).
+       * Note: planes == 12 with V=8 would hit wg_rows = 2 * 12 + 8 = 32
+       * (TVB-grow exact-wrap divisor), so planes == 12 uses V=4 below
+       * (wg_rows = 1 * 12 + 8 = 20, unbounded and safe). */
       return (struct tess_meshlet_shape){
          .max_v = 8,
          .max_p = 6,
@@ -93,7 +96,8 @@ choose_meshlet_shape(unsigned vertex_components)
          .allow_whole_patch = true,
       };
    }
-   /* planes = 20..32 -> wg_rows <= 40 (unbounded);
+   /* planes = 12, 20, 28, 32 -> wg_rows in {20, 28, 36, 40} (unbounded);
+    * planes = 24 -> wg_rows = 32 (bounded <= 128 groups by ring guard);
     * planes = 36..64 -> wg_rows = 44..72 (draw-time ring-bounded). */
    return (struct tess_meshlet_shape){
       .max_v = 4,
@@ -1540,6 +1544,19 @@ build_object_shader(nir_shader *vs, nir_shader *tcs,
          emit_workgroup_shm_barrier(&b);
    }
    free(tcs_segs);
+   /* Hoist load_const and undef out of guarded TCS segments into the entry
+    * block so nir_repair_ssa_impl never wraps constant IO slot offsets in
+    * phi(const, undef) across top-level barrier splits. */
+   nir_block *start_block = nir_start_block(impl);
+   nir_foreach_block(block, impl) {
+      if (block == start_block)
+         continue;
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type == nir_instr_type_load_const ||
+             instr->type == nir_instr_type_undef)
+            nir_instr_move(nir_before_block(start_block), instr);
+      }
+   }
    /* Repair any SSA defs defined in an earlier TCS segment and used after a
     * top-level control barrier before running nir_shader_intrinsics_pass. */
    nir_progress(true, impl, nir_metadata_none);
@@ -2679,7 +2696,18 @@ build_mesh_shader(nir_shader *tes, enum tess_primitive_mode domain,
    nir_def *uv_val = nir_load_var(&b, uv_var);
 
    nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
-   nir_set_vertex_and_primitive_count(&b, v_live, p_live, nir_imm_int(&b, 0));
+   nir_def *v_pub = v_live;
+   /* Avoid publishing a runtime vertex count whose quad-aligned footprint hits
+    * wg_rows == 32 (4096 / 32 = 128 exact wrap: V=21..24 at planes=4, V=9..12
+    * at planes=8). Extra slots stay <= shape->max_v and unreferenced. */
+   if (shape->max_v == 32) {
+      nir_def *bad = nir_ult_imm(&b, nir_iadd_imm(&b, v_pub, -21), 4);
+      v_pub = nir_bcsel(&b, bad, nir_imm_int(&b, 25), v_pub);
+   } else if (shape->max_v == 16) {
+      nir_def *bad = nir_ult_imm(&b, nir_iadd_imm(&b, v_pub, -9), 4);
+      v_pub = nir_bcsel(&b, bad, nir_imm_int(&b, 13), v_pub);
+   }
+   nir_set_vertex_and_primitive_count(&b, v_pub, p_live, nir_imm_int(&b, 0));
    nir_pop_if(&b, NULL);
 
    nir_def *mode = nir_load_var(&b, mode_var);
@@ -3116,6 +3144,13 @@ same_tcs_vertex_index(nir_def *a, nir_def *b)
       return true;
    nir_instr *ia = nir_def_instr(a);
    nir_instr *ib = nir_def_instr(b);
+   if (ia->type == nir_instr_type_load_const &&
+       ib->type == nir_instr_type_load_const) {
+      nir_load_const_instr *ca = nir_instr_as_load_const(ia);
+      nir_load_const_instr *cb = nir_instr_as_load_const(ib);
+      return ca->def.bit_size == cb->def.bit_size &&
+             ca->value[0].u64 == cb->value[0].u64;
+   }
    if (ia->type == nir_instr_type_intrinsic &&
        ib->type == nir_instr_type_intrinsic &&
        nir_instr_as_intrinsic(ia)->intrinsic == nir_intrinsic_load_invocation_id &&
@@ -3124,33 +3159,75 @@ same_tcs_vertex_index(nir_def *a, nir_def *b)
    return false;
 }
 
+static void
+resolve_tcs_store_channel(nir_def *val, unsigned ch, nir_def **out_def,
+                          unsigned *out_comp)
+{
+   for (unsigned depth = 0; depth < 8; ++depth) {
+      nir_instr *instr = nir_def_instr(val);
+      if (instr->type != nir_instr_type_alu)
+         break;
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (nir_op_is_vec(alu->op) && ch < nir_op_infos[alu->op].num_inputs) {
+         val = alu->src[ch].src.ssa;
+         ch = alu->src[ch].swizzle[0];
+      } else if (alu->op == nir_op_mov && ch < alu->def.num_components) {
+         val = alu->src[0].src.ssa;
+         ch = alu->src[0].swizzle[ch];
+      } else {
+         break;
+      }
+   }
+   *out_def = val;
+   *out_comp = ch;
+}
+
 static bool
 no_intervening_tcs_write(nir_instr *from, nir_instr *to, unsigned loc,
-                         bool per_vertex)
+                         unsigned channel, bool per_vertex)
 {
    if (from->block != to->block)
       return false;
+   unsigned ch_bit = BITFIELD_BIT(channel);
    for (nir_instr *cur = nir_instr_next(from); cur && cur != to;
         cur = nir_instr_next(cur)) {
+      if (cur->type == nir_instr_type_call)
+         return false;
       if (cur->type != nir_instr_type_intrinsic)
          continue;
       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(cur);
       if (intr->intrinsic == nir_intrinsic_barrier)
+         return false;
+      if (intr->intrinsic == nir_intrinsic_store_deref &&
+          nir_deref_mode_may_be(nir_src_as_deref(intr->src[0]),
+                                nir_var_shader_out))
          return false;
       if (per_vertex && intr->intrinsic == nir_intrinsic_store_per_vertex_output) {
          if (!nir_src_is_const(intr->src[2]))
             return false;
          unsigned sloc = nir_intrinsic_io_semantics(intr).location +
                          nir_src_as_uint(intr->src[2]);
-         if (sloc == loc)
-            return false;
+         if (sloc == loc) {
+            unsigned smask =
+               (nir_intrinsic_write_mask(intr) &
+                nir_component_mask(intr->num_components))
+               << nir_intrinsic_component(intr);
+            if (smask & ch_bit)
+               return false;
+         }
       } else if (!per_vertex && intr->intrinsic == nir_intrinsic_store_output) {
          if (!nir_src_is_const(intr->src[1]))
             return false;
          unsigned sloc = nir_intrinsic_io_semantics(intr).location +
                          nir_src_as_uint(intr->src[1]);
-         if (sloc == loc)
-            return false;
+         if (sloc == loc) {
+            unsigned smask =
+               (nir_intrinsic_write_mask(intr) &
+                nir_component_mask(intr->num_components))
+               << nir_intrinsic_component(intr);
+            if (smask & ch_bit)
+               return false;
+         }
       }
    }
    return true;
@@ -3182,20 +3259,15 @@ narrow_tcs_rmw_stores(nir_shader *tcs)
          unsigned loc = nir_intrinsic_io_semantics(st).location +
                         nir_src_as_uint(st->src[off_src]);
          unsigned comp = nir_intrinsic_component(st);
-         unsigned wmask = nir_intrinsic_write_mask(st);
-         nir_instr *val_instr = nir_def_instr(st->src[0].ssa);
-         if (val_instr->type != nir_instr_type_alu)
-            continue;
-         nir_alu_instr *vec = nir_instr_as_alu(val_instr);
-         if (!nir_op_is_vec(vec->op))
-            continue;
+         unsigned ncomps = st->num_components;
+         unsigned full_mask = nir_component_mask(ncomps);
+         unsigned wmask = nir_intrinsic_write_mask(st) & full_mask;
 
          unsigned new_mask = wmask;
          u_foreach_bit(i, wmask) {
-            if (i >= nir_op_infos[vec->op].num_inputs)
-               continue;
-            nir_def *ch = vec->src[i].src.ssa;
-            unsigned swiz = vec->src[i].swizzle[0];
+            nir_def *ch = NULL;
+            unsigned swiz = 0;
+            resolve_tcs_store_channel(st->src[0].ssa, i, &ch, &swiz);
             nir_instr *ch_instr = nir_def_instr(ch);
             if (ch_instr->type != nir_instr_type_intrinsic)
                continue;
@@ -3220,28 +3292,66 @@ narrow_tcs_rmw_stores(nir_shader *tcs)
                    nir_intrinsic_component(ld) + swiz != comp + i)
                   continue;
             }
-            if (no_intervening_tcs_write(&ld->instr, &st->instr, loc, pv))
+            if (no_intervening_tcs_write(&ld->instr, &st->instr, loc, comp + i,
+                                         pv))
                new_mask &= ~BITFIELD_BIT(i);
          }
-         if (new_mask != wmask) {
-            if (!new_mask) {
-               nir_instr_remove(&st->instr);
-            } else {
-               /* If narrowed to a single scalar channel, rewrite directly to
-                * that scalar channel with adjusted component so constant
-                * tess-level detection and scalar DCE see the scalar value. */
-               if (util_bitcount(new_mask) == 1) {
-                  unsigned i = ffs(new_mask) - 1;
-                  nir_builder b = nir_builder_at(nir_before_instr(&st->instr));
-                  nir_def *scalar =
-                     nir_channel(&b, vec->src[i].src.ssa, vec->src[i].swizzle[0]);
-                  nir_src_rewrite(&st->src[0], scalar);
-                  st->num_components = 1;
-                  nir_intrinsic_set_component(st, comp + i);
-                  nir_intrinsic_set_write_mask(st, 1);
-               } else {
-                  nir_intrinsic_set_write_mask(st, new_mask);
+
+         if (!new_mask) {
+            nir_instr_remove(&st->instr);
+            progress = true;
+            continue;
+         }
+
+         unsigned first = ffs(new_mask) - 1;
+         unsigned last = util_last_bit(new_mask) - 1;
+         unsigned span = last - first + 1;
+         bool need_rewrite =
+            (new_mask != wmask) || (first > 0) || (span < ncomps);
+         if (!need_rewrite && new_mask != full_mask) {
+            /* Strip masked-off lanes that still keep dead RMW loads alive in
+             * the store's source vector (e.g. wrmask=xz with load in .y). */
+            unsigned dead_mask = full_mask & ~new_mask;
+            u_foreach_bit(i, dead_mask) {
+               nir_def *ch = NULL;
+               unsigned swiz = 0;
+               resolve_tcs_store_channel(st->src[0].ssa, i, &ch, &swiz);
+               if (nir_def_instr(ch)->type != nir_instr_type_undef) {
+                  need_rewrite = true;
+                  break;
                }
+            }
+         }
+         if (need_rewrite) {
+            nir_builder b = nir_builder_at(nir_before_instr(&st->instr));
+            if (util_bitcount(new_mask) == 1) {
+               nir_def *ch = NULL;
+               unsigned swiz = 0;
+               resolve_tcs_store_channel(st->src[0].ssa, first, &ch, &swiz);
+               nir_def *scalar = nir_channel(&b, ch, swiz);
+               nir_src_rewrite(&st->src[0], scalar);
+               st->num_components = 1;
+               nir_intrinsic_set_component(st, comp + first);
+               nir_intrinsic_set_write_mask(st, 1);
+            } else {
+               nir_def *elems[4];
+               unsigned bit_size = st->src[0].ssa->bit_size;
+               for (unsigned j = 0; j < span; ++j) {
+                  if (new_mask & BITFIELD_BIT(first + j)) {
+                     nir_def *ch = NULL;
+                     unsigned swiz = 0;
+                     resolve_tcs_store_channel(st->src[0].ssa, first + j, &ch,
+                                               &swiz);
+                     elems[j] = nir_channel(&b, ch, swiz);
+                  } else {
+                     elems[j] = nir_undef(&b, 1, bit_size);
+                  }
+               }
+               nir_def *packed = nir_vec(&b, elems, span);
+               nir_src_rewrite(&st->src[0], packed);
+               st->num_components = span;
+               nir_intrinsic_set_component(st, comp + first);
+               nir_intrinsic_set_write_mask(st, new_mask >> first);
             }
             progress = true;
          }

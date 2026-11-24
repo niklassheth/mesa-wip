@@ -900,6 +900,25 @@ fused_lower_gs_intr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 }
 
+static nir_def *
+avoid_wg_rows_32_vcount(nir_builder *b, nir_def *v, unsigned planes,
+                        unsigned max_v)
+{
+   unsigned body = AGX_APPLE9_MESH_RING_EXACT_WRAP_ROWS -
+                   AGX_APPLE9_MESH_RING_HEADER_ROWS;
+   if (!planes || body % planes != 0)
+      return v;
+   unsigned bad_quads = body / planes;
+   unsigned pad_v = bad_quads * 4 + 1;
+   if (pad_v > max_v ||
+       (bad_quads + 1) * planes + AGX_APPLE9_MESH_RING_HEADER_ROWS >
+          AGX_APPLE9_MESH_RING_CONCURRENT_SAFE_ROWS)
+      return v;
+   nir_def *is_bad =
+      nir_ult_imm(b, nir_iadd_imm(b, v, -(int)((bad_quads - 1) * 4 + 1)), 4);
+   return nir_bcsel(b, is_bad, nir_imm_int(b, pad_v), v);
+}
+
 nir_shader *
 hk_nir_gs_fused_mesh(const nir_shader *vs_source, const nir_shader *gs_source,
                      const struct hk_gs_fused_options *options,
@@ -1044,17 +1063,37 @@ hk_nir_gs_fused_mesh(const nir_shader *vs_source, const nir_shader *gs_source,
          uint64_t shapes = hk_apple9_native_mesh_packed_shapes();
          bool fitted = false;
          if (pack > 1) {
-            fitted = hk_apple9_packed_mesh_class_fit(
-               shapes, 32, pack * v_out, pack * p_per_run, &mesh_threads,
-               &mesh_max_v, &mesh_max_p);
+            unsigned min_v = pack * v_out;
+            if (DIV_ROUND_UP(min_v, 4) * planes +
+                   AGX_APPLE9_MESH_RING_HEADER_ROWS ==
+                AGX_APPLE9_MESH_RING_EXACT_WRAP_ROWS) {
+               /* Avoid wg_rows == 32 (V=21..24, planes=4) so packed GS stays
+                * concurrent-safe during TVB growth (fits V=32, wg_rows=40). */
+               fitted = hk_apple9_packed_mesh_class_fit(
+                  shapes, 32, DIV_ROUND_UP(min_v, 4) * 4 + 1, pack * p_per_run,
+                  &mesh_threads, &mesh_max_v, &mesh_max_p);
+            }
+            if (!fitted) {
+               fitted = hk_apple9_packed_mesh_class_fit(
+                  shapes, 32, min_v, pack * p_per_run, &mesh_threads,
+                  &mesh_max_v, &mesh_max_p);
+            }
             if (!fitted)
                pack = 1;
          }
          if (!fitted) {
             if (v_out <= 32) {
-               if (!hk_apple9_packed_mesh_class_fit(
-                      shapes, 16, v_out, p_per_run, &mesh_threads, &mesh_max_v,
-                      &mesh_max_p)) {
+               bool ok = false;
+               if (DIV_ROUND_UP(v_out, 4) * planes +
+                      AGX_APPLE9_MESH_RING_HEADER_ROWS ==
+                   AGX_APPLE9_MESH_RING_EXACT_WRAP_ROWS) {
+                  ok = hk_apple9_packed_mesh_class_fit(
+                     shapes, 32, DIV_ROUND_UP(v_out, 4) * 4 + 1, p_per_run,
+                     &mesh_threads, &mesh_max_v, &mesh_max_p);
+               }
+               if (!ok && !hk_apple9_packed_mesh_class_fit(
+                             shapes, 16, v_out, p_per_run, &mesh_threads,
+                             &mesh_max_v, &mesh_max_p)) {
                   ralloc_free(nir);
                   ralloc_free(vs);
                   if (reason)
@@ -1070,6 +1109,18 @@ hk_nir_gs_fused_mesh(const nir_shader *vs_source, const nir_shader *gs_source,
       } else {
          mesh_max_v = pack * v_out;
          mesh_max_p = pack * p_per_run;
+         unsigned quads = DIV_ROUND_UP(mesh_max_v, 4);
+         if (quads * planes + AGX_APPLE9_MESH_RING_HEADER_ROWS ==
+             AGX_APPLE9_MESH_RING_EXACT_WRAP_ROWS) {
+            if ((quads + 1) * planes + AGX_APPLE9_MESH_RING_HEADER_ROWS <=
+                AGX_APPLE9_MESH_RING_CONCURRENT_SAFE_ROWS) {
+               mesh_max_v = (quads + 1) * 4;
+            } else if (pack > 1) {
+               pack >>= 1;
+               mesh_max_v = pack * v_out;
+               mesh_max_p = pack * p_per_run;
+            }
+         }
          mesh_threads = (pack == 1 && v_out == 3 && p_per_run == 1) ? 16 : 32;
       }
    } else {
@@ -1427,11 +1478,13 @@ hk_nir_gs_fused_mesh(const nir_shader *vs_source, const nir_shader *gs_source,
       nir_def *p = nir_load_var(&b, s.primitives);
       nir_def *v = nir_bcsel(&b, nir_ine_imm(&b, p, 0),
                              nir_load_var(&b, s.vertices), nir_imm_int(&b, 0));
+      v = avoid_wg_rows_32_vcount(&b, v, planes, mesh_max_v);
       nir_set_vertex_and_primitive_count(&b, v, p, nir_imm_int(&b, 0));
    } else {
+      nir_def *v = avoid_wg_rows_32_vcount(&b, nir_imul_imm(&b, live, v_out),
+                                           planes, mesh_max_v);
       nir_set_vertex_and_primitive_count(
-         &b, nir_imul_imm(&b, live, v_out), nir_imul_imm(&b, live, p_per_run),
-         nir_imm_int(&b, 0));
+         &b, v, nir_imul_imm(&b, live, p_per_run), nir_imm_int(&b, 0));
    }
    nir_pop_if(&b, NULL);
 

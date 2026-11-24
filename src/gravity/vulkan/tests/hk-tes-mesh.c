@@ -884,7 +884,9 @@ fused_tess_suite(void)
       compiled++;
    }
    {
-      /* 12 comps (POS + 2 vec4) -> V8/P6; with FS mask reading 0 vars -> V32/P42! */
+      /* 12 comps (POS + 2 vec4) -> V4/P2 (avoids wg_rows==32 TVB-grow divisor,
+       * wg_rows=20 unbounded); 16 comps (POS + 3 vec4) -> V8/P6 (wg_rows=40);
+       * with FS mask reading 0 vars -> V32/P42! */
       nir_shader *vs = make_fused_vs(0, false);
       nir_shader *tcs = make_fused_tcs(1, 0, 1.0f, 1.0f, false, false, false,
                                        TESS_SPACING_EQUAL, false, false);
@@ -892,8 +894,15 @@ fused_tess_suite(void)
                                        false, false, 1, 2, 0, 0, false, false);
       struct hk_tess_fused_info info = {0};
       compile_fused_tess_pair(vs, tcs, tes, &base_opts, &info);
+      CHECK(info.mesh_max_vertices == 4 && info.mesh_max_primitives == 2);
+      CHECK(info.max_child_wgs_per_patch == 1 && info.max_prims_per_patch == 2);
+
+      nir_shader *tes16 = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
+                                         false, false, 1, 3, 0, 0, false, false);
+      compile_fused_tess_pair(vs, tcs, tes16, &base_opts, &info);
       CHECK(info.mesh_max_vertices == 8 && info.mesh_max_primitives == 6);
       CHECK(info.max_child_wgs_per_patch == 1 && info.max_prims_per_patch == 2);
+      ralloc_free(tes16);
 
       struct hk_tess_fused_options depth_opts = base_opts;
       depth_opts.has_fs_inputs_mask = true; /* FS reads 0 generic vars */
@@ -902,7 +911,7 @@ fused_tess_suite(void)
       ralloc_free(vs);
       ralloc_free(tcs);
       ralloc_free(tes);
-      compiled += 2;
+      compiled += 3;
    }
    {
       /* Elden Ring Triangle shape: 3->3 CPs, FracOdd, CW, Clip[2] + Cull[1] + 4 vec4
@@ -1018,6 +1027,125 @@ fused_tess_suite(void)
       compiled++;
    }
 
+   /* 3c. Synthetic TCS RMW store narrowing (multi-component vec RMW, masked-off
+    * dead-lane RMW loads, disjoint-channel multi-store scalar chains, direct
+    * identity load->store passthroughs, and shared load_const across top-level
+    * TCS barrier splits). */
+   {
+      nir_shader *vs = make_fused_vs(2, false);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "fused_tess_rmw_chain_tcs");
+      b.shader->info.io_lowered = true;
+      b.shader->info.tess.tcs_vertices_out = 3;
+      b.shader->info.tess.spacing = TESS_SPACING_FRACTIONAL_ODD;
+      nir_def *inv = nir_load_invocation_id(&b);
+      nir_def *zero = nir_imm_int(&b, 0);
+      nir_def *pos = nir_load_per_vertex_input(
+         &b, 4, 32, inv, zero, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_def *v0 = nir_load_per_vertex_input(
+         &b, 4, 32, inv, zero, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &b, pos, inv, zero, .write_mask = 15, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+
+      /* (a) Multi-component RMW: 2 live lanes (.y, .w) + 2 passthrough lanes
+       * (.x, .z) -> must strip passthrough lanes AND undef the hole lane so
+       * load_per_vertex_output is dead. */
+      nir_def *old0 = nir_load_per_vertex_output(
+         &b, 4, 32, inv, zero, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_def *rmw_yw = nir_vec4(&b, nir_channel(&b, old0, 0),
+                                 nir_channel(&b, v0, 1),
+                                 nir_channel(&b, old0, 2),
+                                 nir_channel(&b, v0, 3));
+      nir_store_per_vertex_output(
+         &b, rmw_yw, inv, zero, .write_mask = 15, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+
+      /* (b) Pre-masked vec3 store (wrmask=yz) whose masked-off .x holds a
+       * load_per_vertex_output, plus wrmask=xz with dead .y hole. */
+      nir_def *old_x = nir_load_per_vertex_output(
+         &b, 1, 32, inv, zero, .component = 0, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_def *yz_vec = nir_vec3(&b, old_x, nir_channel(&b, v0, 1),
+                                 nir_channel(&b, v0, 2));
+      nir_store_per_vertex_output(
+         &b, yz_vec, inv, zero, .write_mask = 0x6, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+
+      nir_def *old_y = nir_load_per_vertex_output(
+         &b, 1, 32, inv, zero, .component = 1, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_def *xz_vec = nir_vec3(&b, nir_channel(&b, v0, 0), old_y,
+                                 nir_channel(&b, v0, 2));
+      nir_store_per_vertex_output(
+         &b, xz_vec, inv, zero, .write_mask = 0x5, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+
+      /* (c) Disjoint-channel multi-store scalar chain to the SAME loc + direct
+       * identity load->store passthroughs (non-vec). */
+      nir_def *old_c1 = nir_load_per_vertex_output(
+         &b, 1, 32, inv, zero, .component = 1, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1});
+      nir_def *old_c23 = nir_load_per_vertex_output(
+         &b, 2, 32, inv, zero, .component = 2, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &b, nir_channel(&b, v0, 0), inv, zero, .component = 0, .write_mask = 1,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &b, old_c1, inv, zero, .component = 1, .write_mask = 1,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &b, old_c23, inv, zero, .component = 2, .write_mask = 3,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1});
+
+      /* (d) Top-level barrier followed by load_per_vertex_input reusing `zero`
+       * from before the barrier (regression for load_const hoisting before
+       * nir_repair_ssa_impl). */
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_shader_out);
+      nir_def *v1_post = nir_load_per_vertex_input(
+         &b, 4, 32, inv, zero, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &b, nir_channel(&b, v1_post, 1), inv, zero, .component = 1,
+         .write_mask = 1, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1});
+      nir_push_if(&b, nir_ieq_imm(&b, inv, 0));
+      nir_store_output(
+         &b, nir_imm_vec4(&b, 3.0f, 3.0f, 3.0f, 1.0f), zero, .write_mask = 15,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER,
+                          .num_slots = 1});
+      nir_store_output(
+         &b, nir_imm_vec2(&b, 2.0f, 1.0f), zero, .write_mask = 3,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER,
+                          .num_slots = 1});
+      nir_pop_if(&b, NULL);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      nir_shader *tcs = b.shader;
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                       TESS_SPACING_FRACTIONAL_ODD, false, false,
+                                       3, 2, 0, 0, false, false);
+      struct hk_tess_fused_info info = {0};
+      compile_fused_tess_pair(vs, tcs, tes, &base_opts, &info);
+      CHECK(info.constant_tess_levels);
+      CHECK(info.max_child_wgs_per_patch > 0);
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+      compiled++;
+   }
+
    /* 4. Clean rejection / fallback cases. */
    const char *reason = NULL;
    /* Isolines rejected */
@@ -1125,7 +1253,35 @@ fused_tess_suite(void)
       ralloc_free(tes);
    }
 
-   printf("fused tessellation suite: %u OBJECT+MESH compiles + 6 fallback rejections passed\n",
+   /* Cross-invocation TCS output read inside a multi-component vec4 RMW store
+    * must still be strictly rejected. */
+   {
+      nir_shader *vs = make_fused_vs(1, false);
+      nir_shader *tcs = make_fused_tcs(3, 1, 4.0f, 4.0f, true, false, false,
+                                       TESS_SPACING_EQUAL, false, false);
+      nir_builder b = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(tcs)));
+      nir_def *inv = nir_load_invocation_id(&b);
+      nir_def *other = nir_load_per_vertex_output(
+         &b, 4, 32, nir_imm_int(&b, 1), nir_imm_int(&b, 0),
+         .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_def *mix = nir_vec4(&b, nir_channel(&b, other, 0), nir_imm_float(&b, 1.0f),
+                              nir_channel(&b, other, 2), nir_imm_float(&b, 2.0f));
+      nir_store_per_vertex_output(
+         &b, mix, inv, nir_imm_int(&b, 0),
+         .write_mask = 15, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                       TESS_SPACING_EQUAL, false, false, 3,
+                                       1, 0, 0, false, false);
+      CHECK(!hk_nir_tess_fused_lower(vs, tcs, tes, &base_opts, NULL, NULL, NULL,
+                                     &reason));
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+   }
+
+   printf("fused tessellation suite: %u OBJECT+MESH compiles + 7 fallback rejections passed\n",
           compiled);
 }
 
