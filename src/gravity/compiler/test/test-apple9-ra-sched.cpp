@@ -1658,6 +1658,10 @@ TEST(Apple9RaSched, UnifiedOperandGroupsAndLatencyTable)
    ins.encoding = AGX_APPLE9_ENC_GET_SR_ZEXT16;
    EXPECT_EQ(apple9_ra_dependency_delay(&ins), 2u);
 
+   ins.encoding = AGX_APPLE9_ENC_PREDICATE_COMPARE_SHORT;
+   ins.op = AGX_APPLE9_VIR_PREDICATE_COMPARE;
+   EXPECT_EQ(apple9_ra_dependency_delay(&ins), 5u);
+
    ins.encoding = AGX_APPLE9_ENC_SELECT_GPR_WIDE;
    ins.op = AGX_APPLE9_VIR_SELECT;
    EXPECT_EQ(apple9_ra_dependency_delay(&ins), 3u);
@@ -1747,4 +1751,72 @@ TEST(Apple9RaSched, UnifiedOperandGroupsAndLatencyTable)
    EXPECT_EQ(priv_idx.width, 1u);
    EXPECT_EQ(priv_idx.max_gpr, 63u);
    EXPECT_FALSE(priv_idx.clobber);
+}
+
+TEST(Apple9RaSched, PredicateCompareHoistsAboveIndependentAluBeforeLoopUpdate)
+{
+   struct agx_apple9_vir_program p;
+   agx_apple9_vir_init(&p);
+
+   struct agx_apple9_block *blk = agx_apple9_block_create(&p);
+   agx_apple9_block_begin(&p, blk);
+
+   uint32_t lim = agx_apple9_vir_input(&p, 0);
+   uint32_t i0 = agx_apple9_vir_input(&p, 1);
+   uint32_t a0 = agx_apple9_vir_input(&p, 2);
+   uint32_t b0 = agx_apple9_vir_input(&p, 3);
+   uint32_t c0 = agx_apple9_vir_input(&p, 4);
+   uint32_t k1 = agx_apple9_vir_input(&p, 5);
+
+   uint32_t next_i = emit_iadd(&p, i0, k1);
+   uint32_t next_a = emit_iadd(&p, a0, k1);
+   uint32_t next_b = emit_iadd(&p, b0, k1);
+   uint32_t next_c = emit_iadd(&p, c0, k1);
+
+   uint32_t pred_srcs[2] = {next_i, lim};
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_PREDICATE_COMPARE,
+      AGX_APPLE9_ENC_PREDICATE_COMPARE_SHORT, pred_srcs, 2,
+      AGX_APPLE9_PREDICATE_ULT));
+
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_LOOP_MASK_UPDATE, AGX_APPLE9_ENC_LOOP_MASK_UPDATE,
+      NULL, 0, 0x02));
+
+   agx_apple9_vir_add_live_out(&p, next_i);
+   agx_apple9_vir_add_live_out(&p, next_a);
+   agx_apple9_vir_add_live_out(&p, next_b);
+   agx_apple9_vir_add_live_out(&p, next_c);
+   ASSERT_TRUE(agx_apple9_vir_build_logical_cfg(&p));
+
+   apple9_ra_sched_options opts = {
+      .latency = true,
+      .pressure_slack = 0,
+      .auto_tier_slack = true,
+      .rejected_pressure_increase = 0,
+   };
+   ASSERT_TRUE(apple9_ra_pressure_schedule_opts(&p, &opts));
+
+   unsigned pred_idx = UINT_MAX, upd_idx = UINT_MAX, alu_after_pred = 0;
+   unsigned pos = 0;
+   for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(blk); I;
+        I = agx_apple9_instr_next(I), ++pos) {
+      if (I->op == AGX_APPLE9_VIR_PREDICATE_COMPARE)
+         pred_idx = pos;
+      else if (I->op == AGX_APPLE9_VIR_LOOP_MASK_UPDATE)
+         upd_idx = pos;
+      else if (I->op == AGX_APPLE9_VIR_IADD && pred_idx != UINT_MAX &&
+               upd_idx == UINT_MAX)
+         alu_after_pred++;
+   }
+   ASSERT_NE(pred_idx, UINT_MAX);
+   ASSERT_NE(upd_idx, UINT_MAX);
+   EXPECT_LT(pred_idx, upd_idx);
+   /* All 3 independent IADDs move between PREDICATE_COMPARE and
+    * LOOP_MASK_UPDATE to hide predicate latency. */
+   EXPECT_EQ(alu_after_pred, 3u);
+
+   apple9_ra_validate_error verr = {};
+   EXPECT_TRUE(apple9_ra_validate_ssa(&p, &verr)) << verr.message;
+   agx_apple9_vir_finish(&p);
 }

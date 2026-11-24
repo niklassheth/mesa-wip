@@ -784,6 +784,12 @@ apple9_ra_schedule_resources(const struct agx_apple9_vir_instr *ins,
       *reads |= APPLE9_RA_SCHED_TILE;
       *writes |= APPLE9_RA_SCHED_TILE;
       return;
+   case AGX_APPLE9_VIR_PREDICATE_COMPARE:
+      /* Writes only the hardware predicate register; orthogonal to pure ALU
+       * and memory ops while still observing execution/coverage state. */
+      *reads |= APPLE9_RA_SCHED_PREDICATE;
+      *writes |= APPLE9_RA_SCHED_PREDICATE;
+      return;
    case AGX_APPLE9_VIR_PUBLICATION_TUPLE:
       return;
    default:
@@ -854,6 +860,7 @@ apple9_ra_dependency_delay(const struct agx_apple9_vir_instr *ins)
    case AGX_APPLE9_VIR_SUBGROUP_ROTATE:
    case AGX_APPLE9_VIR_SUBGROUP_BALLOT:
    case AGX_APPLE9_VIR_DERIVATIVE:
+   case AGX_APPLE9_VIR_PREDICATE_COMPARE:
       return 5;
    case AGX_APPLE9_VIR_GET_SR:
       return ins->encoding == AGX_APPLE9_ENC_GET_SR_ZEXT16 ? 2 : 5;
@@ -1755,15 +1762,24 @@ compute_dual_issue_transitions(struct vir_sched_node *const *nodes,
    return transitions;
 }
 
+static inline bool
+tail_consumes_predicate(const struct agx_apple9_vir_instr *first_tail)
+{
+   return first_tail &&
+          (first_tail->op == AGX_APPLE9_VIR_LOOP_MASK_UPDATE ||
+           first_tail->op == AGX_APPLE9_VIR_EXEC_MASK_PUSH ||
+           first_tail->op == AGX_APPLE9_VIR_BREAK_MASK_UNWIND);
+}
+
 static unsigned
 compute_schedule_stalls(struct vir_sched_node *const *nodes, unsigned count,
                         bool reverse, struct vir_sched_node *const *dep_pool,
-                        const unsigned *dep_start)
+                        const unsigned *dep_start, bool tail_uses_pred)
 {
    for (unsigned i = 0; i < count; ++i)
       nodes[i]->ready = 0;
 
-   unsigned issue = 0, stalls = 0;
+   unsigned issue = 0, stalls = 0, last_pred_ready = 0;
    for (unsigned k = 0; k < count; ++k) {
       struct vir_sched_node *node = nodes[reverse ? (count - 1 - k) : k];
       unsigned earliest = issue;
@@ -1773,8 +1789,12 @@ compute_schedule_stalls(struct vir_sched_node *const *nodes, unsigned count,
       }
       stalls += earliest - issue;
       node->ready = earliest + apple9_ra_dependency_delay(node->instr);
+      if (node->instr->op == AGX_APPLE9_VIR_PREDICATE_COMPARE)
+         last_pred_ready = node->ready;
       issue = earliest + 1;
    }
+   if (tail_uses_pred && last_pred_ready > issue)
+      stalls += last_pred_ready - issue;
 
    for (unsigned i = 0; i < count; ++i)
       nodes[i]->ready = 0;
@@ -1822,6 +1842,7 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
    if (count <= 1)
       return res;
 
+   const bool tail_uses_pred = tail_consumes_predicate(first_tail);
    struct vir_sched_node **dep_pool = NULL;
    unsigned *dep_start = NULL;
    if (latency) {
@@ -1847,7 +1868,8 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
       dep_start[count] = pos;
       if (orig_stalls_out) {
          *orig_stalls_out =
-            compute_schedule_stalls(orig, count, false, dep_pool, dep_start);
+            compute_schedule_stalls(orig, count, false, dep_pool, dep_start,
+                                    tail_uses_pred);
       }
       if (orig_dual_issue_out) {
          *orig_dual_issue_out =
@@ -1888,6 +1910,13 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
    res.max_64 = base_64;
    res.max_16 = base_16;
    unsigned nr = 0;
+
+   if (latency && tail_uses_pred) {
+      list_for_each_entry(struct vir_sched_node, n, &s.dag->heads, dag.link) {
+         if (n->instr->op == AGX_APPLE9_VIR_PREDICATE_COMPARE)
+            n->ready = MAX2(n->ready, apple9_ra_dependency_delay(n->instr));
+      }
+   }
 
    while (!list_is_empty(&s.dag->heads)) {
       struct vir_sched_node *node = choose_vir_instr(&s);
@@ -1955,7 +1984,7 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
    res.count = count;
    if (latency) {
       res.stalls = compute_schedule_stalls(sched_nodes, count, true, dep_pool,
-                                           dep_start);
+                                           dep_start, tail_uses_pred);
       res.dual_issue = compute_dual_issue_transitions(sched_nodes, count, true);
    }
    res.valid = true;

@@ -1394,6 +1394,146 @@ cleanup:
    return ok;
 }
 
+/* Fuse single-use same-block pure binary float (FADD/FSUB/FMUL) or logic
+ * (IAND/IANDN/IOR/IXOR) producers directly into scalar publication exports
+ * (FLOAT2_EXPORT / LOGIC_EXPORT), eliminating the intermediate GPR and export
+ * move. Keeps the fusion window short so source live ranges do not inflate
+ * register pressure. */
+static bool
+fold_alu_exports(struct agx_apple9_vir_program *p, const bool *constant,
+                 const uint32_t *values)
+{
+   unsigned *instr_uses = calloc(p->value_count, sizeof(*instr_uses));
+   struct agx_apple9_vir_instr **def_instr =
+      calloc(p->value_count, sizeof(*def_instr));
+   unsigned *def_pos = calloc(p->value_count, sizeof(*def_pos));
+   if (!instr_uses || !def_instr || !def_pos) {
+      free(instr_uses);
+      free(def_instr);
+      free(def_pos);
+      return false;
+   }
+
+   for (unsigned i = 0; i < p->instruction_count; ++i) {
+      struct agx_apple9_vir_instr *I = p->instructions[i];
+      if (I->dest < p->value_count && I->dest_components == 1 &&
+          agx_apple9_instr_is_pure_alu(I)) {
+         def_instr[I->dest] = I;
+         def_pos[I->dest] = i;
+      }
+      unsigned nr_srcs = agx_apple9_vir_nr_srcs(I);
+      for (unsigned s = 0; s < nr_srcs; ++s) {
+         uint32_t v = *agx_apple9_vir_src_ptr(I, s);
+         if (v >= p->value_count)
+            continue;
+         bool dup = false;
+         for (unsigned k = 0; k < s; ++k) {
+            if (*agx_apple9_vir_src_ptr(I, k) == v) {
+               dup = true;
+               break;
+            }
+         }
+         if (!dup)
+            instr_uses[v]++;
+      }
+   }
+   for (unsigned i = 0; i < p->live_out_count; ++i) {
+      if (p->live_out[i] < p->value_count)
+         instr_uses[p->live_out[i]]++;
+   }
+   if (p->output < p->value_count)
+      instr_uses[p->output]++;
+
+   for (unsigned i = 0; i < p->instruction_count; ++i) {
+      struct agx_apple9_vir_instr *I = p->instructions[i];
+      if (I->dest >= p->value_count ||
+          (I->encoding != AGX_APPLE9_ENC_LOGIC_EXPORT &&
+           I->encoding != AGX_APPLE9_ENC_FLOAT2_EXPORT) ||
+          I->nr_srcs != 2 || I->alu_src_uniform_mask ||
+          I->alu_src_immediate_mask)
+         continue;
+
+      uint32_t v = AGX_APPLE9_VREG_INVALID;
+      bool float_only = false;
+      if (I->op == AGX_APPLE9_VIR_IOR &&
+          I->encoding == AGX_APPLE9_ENC_LOGIC_EXPORT &&
+          I->src[0] == I->src[1]) {
+         v = I->src[0];
+      } else if (I->op == AGX_APPLE9_VIR_FMUL &&
+                 I->encoding == AGX_APPLE9_ENC_FLOAT2_EXPORT) {
+         if (I->src[1] < p->value_count && constant[I->src[1]] &&
+             values[I->src[1]] == 0x3f800000u) {
+            v = I->src[0];
+            float_only = true;
+         } else if (I->src[0] < p->value_count && constant[I->src[0]] &&
+                    values[I->src[0]] == 0x3f800000u) {
+            v = I->src[1];
+            float_only = true;
+         }
+      }
+      if (v >= p->value_count || instr_uses[v] != 1)
+         continue;
+
+      struct agx_apple9_vir_instr *def = def_instr[v];
+      if (!def || p->fixed_phys[v] != AGX_APPLE9_PHYS_INVALID ||
+          agx_apple9_instr_block(def) != agx_apple9_instr_block(I) ||
+          i <= def_pos[v])
+         continue;
+      if (def->nr_srcs != 2 || def->saturate || def->src_abs_mask ||
+          def->src_neg_mask || def->src_half_mask || def->src_hi_mask ||
+          def->src_sext_mask || def->alu_src_uniform_mask ||
+          def->alu_src_immediate_mask ||
+          def->src[0] >= p->value_count || def->src[1] >= p->value_count)
+         continue;
+
+      enum agx_apple9_encoding target_enc;
+      if (def->op == AGX_APPLE9_VIR_FADD || def->op == AGX_APPLE9_VIR_FSUB ||
+          def->op == AGX_APPLE9_VIR_FMUL) {
+         target_enc = AGX_APPLE9_ENC_FLOAT2_EXPORT;
+      } else if (!float_only &&
+                 (def->op == AGX_APPLE9_VIR_IAND ||
+                  def->op == AGX_APPLE9_VIR_IANDN ||
+                  def->op == AGX_APPLE9_VIR_IOR ||
+                  def->op == AGX_APPLE9_VIR_IXOR)) {
+         target_enc = AGX_APPLE9_ENC_LOGIC_EXPORT;
+      } else {
+         continue;
+      }
+
+      bool barrier = false;
+      unsigned intervening_gpr_ops = 0;
+      for (unsigned k = def_pos[v] + 1; k < i; ++k) {
+         const struct agx_apple9_vir_instr *mid = p->instructions[k];
+         if (mid->op == AGX_APPLE9_VIR_STORE_UNIFORM ||
+             agx_apple9_vir_opcode_has_prop(mid->op,
+                                            AGX_APPLE9_VIR_PROP_OPT_BARRIER)) {
+            barrier = true;
+            break;
+         }
+         if (mid->op != AGX_APPLE9_VIR_VARY_STORE &&
+             mid->encoding != AGX_APPLE9_ENC_LOGIC_EXPORT &&
+             mid->encoding != AGX_APPLE9_ENC_FLOAT2_EXPORT) {
+            if (++intervening_gpr_ops > 16) {
+               barrier = true;
+               break;
+            }
+         }
+      }
+      if (barrier)
+         continue;
+
+      I->op = def->op;
+      I->encoding = target_enc;
+      I->src[0] = def->src[0];
+      I->src[1] = def->src[1];
+   }
+
+   free(instr_uses);
+   free(def_instr);
+   free(def_pos);
+   return true;
+}
+
 bool
 agx_apple9_optimize_vir_with_constants(
    struct agx_apple9_vir_program *p,
@@ -1571,7 +1711,8 @@ agx_apple9_optimize_vir_with_constants(
       p->output = resolve(replacement, p->output);
    success = fold_saturate(p, replacement) &&
              (!uniform_writes || fold_uniform_stores(p)) &&
-             fold_half_sources(p, constants);
+             fold_half_sources(p, constants) &&
+             fold_alu_exports(p, constant, values);
 
 cleanup:
    if (constant_words)

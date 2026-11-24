@@ -15,6 +15,7 @@
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_builtin_builder.h"
+#include "compiler/nir/nir_control_flow.h"
 #include "poly/cl/libpoly.h"
 #include "util/u_dynarray.h"
 
@@ -1150,6 +1151,7 @@ struct apple9_loop_context {
    nir_loop *nir;
    nir_block *exit;
    struct agx_apple9_block *exit_block;
+   struct agx_apple9_block *deferred_break_block;
    unsigned mask_depth;
 };
 
@@ -1231,13 +1233,14 @@ struct apple9_dag_lower {
    nir_block *active_nir_block;
    unsigned active_load_instruction_count;
    unsigned active_emitted_load_count;
-   /* Small FIFO of exported varying publications waiting for VARY_STORE so
-    * back-to-back exports separate producer and consumer without interleaving
-    * GPR writes that could clobber borrowed export sources. */
+   /* Small batch buffer of exported varying publications waiting for
+    * VARY_STORE (up to 7, matching Apple9's per-slot scoreboard share limit)
+    * so back-to-back exports share a single scoreboard slot and wait once per
+    * batch without interleaving GPR writes that could clobber borrowed sources. */
    struct {
       uint32_t publication;
       unsigned slot;
-   } pending_vary_stores[4];
+   } pending_vary_stores[7];
    unsigned pending_vary_store_count;
    bool structured_cf;
    unsigned mask_depth;
@@ -5163,22 +5166,6 @@ apple9_flush_vary_stores(struct apple9_dag_lower *lower)
 }
 
 static bool
-apple9_pop_oldest_vary_store(struct apple9_dag_lower *lower)
-{
-   assert(lower->pending_vary_store_count > 0);
-   uint32_t pub = lower->pending_vary_stores[0].publication;
-   if (!agx_apple9_vir_emit_side_effect(
-          &lower->program, AGX_APPLE9_VIR_VARY_STORE,
-          AGX_APPLE9_ENC_VARY_STORE, &pub, 1,
-          lower->pending_vary_stores[0].slot))
-      return false;
-   lower->pending_vary_store_count--;
-   for (unsigned i = 0; i < lower->pending_vary_store_count; ++i)
-      lower->pending_vary_stores[i] = lower->pending_vary_stores[i + 1];
-   return true;
-}
-
-static bool
 apple9_emit_graphics_output(struct apple9_dag_lower *lower,
                             nir_intrinsic_instr *intr)
 {
@@ -5321,6 +5308,13 @@ apple9_emit_graphics_output(struct apple9_dag_lower *lower,
    }
 
    for (unsigned k = 0; k < count; ++k) {
+      /* Flush a full 7-deep batch BEFORE publishing the next varying so the
+       * new batch starts with slot 1 free (allowing 4B MOV4 packing and a
+       * single wait per 7 VARY_STOREs). */
+      if (lower->pending_vary_store_count == ARRAY_SIZE(lower->pending_vary_stores) &&
+          !apple9_flush_vary_stores(lower))
+         return false;
+
       /* Export publications stay live until completion, so a value stored to
        * several UVS slots (a clip distance's varying and rasterizer copies)
        * publishes once. */
@@ -5349,11 +5343,6 @@ apple9_emit_graphics_output(struct apple9_dag_lower *lower,
          }
       }
       if (exported == AGX_APPLE9_VREG_INVALID)
-         return false;
-      /* Queue VARY_STORE in a 4-deep FIFO so back-to-back exports hide their
-       * completion latency without starving in-flight load scoreboard slots. */
-      if (lower->pending_vary_store_count == ARRAY_SIZE(lower->pending_vary_stores) &&
-          !apple9_pop_oldest_vary_store(lower))
          return false;
       lower->pending_vary_stores[lower->pending_vary_store_count].publication = exported;
       lower->pending_vary_stores[lower->pending_vary_store_count].slot = slots[k];
@@ -6786,31 +6775,71 @@ apple9_emit_loop(struct apple9_dag_lower *lower, struct util_dynarray *stores,
       return false;
    assert(lower->mask_depth > 0);
    --lower->mask_depth;
+   /* Place a single-exit direct break block right after LOOP_MASK_POP so any
+    * spill/reload edge coupling inserted by RA executes once all exiting lanes
+    * have been restored, rather than under the post-update continuing mask. */
+   if (context.deferred_break_block)
+      agx_apple9_block_begin(&lower->program, context.deferred_break_block);
    return true;
 }
 
 /* Estimated issue cost of a structured arm, weighted as for the common
- * backend's forward-branch heuristic: memory and texture operations stand in
- * for their latency. */
+ * backend's forward-branch heuristic: memory, texture, and loop operations
+ * stand in for their latency so empty-mask warps skip loops and heavy arms. */
+static unsigned
+apple9_cf_list_cost(struct exec_list *list);
+
+static unsigned
+apple9_cf_node_cost(nir_cf_node *node)
+{
+   unsigned cost = 0;
+   switch (node->type) {
+   case nir_cf_node_block: {
+      nir_block *block = nir_cf_node_as_block(node);
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_tex) {
+            cost += 50;
+         } else if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            if (op == nir_intrinsic_image_load_apple9_agx)
+               cost += 50;
+            else if (op == nir_intrinsic_barrier ||
+                     op == nir_intrinsic_demote ||
+                     op == nir_intrinsic_demote_if ||
+                     op == nir_intrinsic_terminate ||
+                     op == nir_intrinsic_terminate_if)
+               cost += 20;
+            else
+               cost += 10;
+         } else if (instr->type == nir_instr_type_alu) {
+            cost += 1;
+         }
+      }
+      break;
+   }
+   case nir_cf_node_if: {
+      nir_if *nif = nir_cf_node_as_if(node);
+      cost += apple9_cf_list_cost(&nif->then_list);
+      cost += apple9_cf_list_cost(&nif->else_list);
+      break;
+   }
+   case nir_cf_node_loop: {
+      nir_loop *loop = nir_cf_node_as_loop(node);
+      cost += 20 + apple9_cf_list_cost(&loop->body);
+      break;
+   }
+   default:
+      break;
+   }
+   return cost;
+}
+
 static unsigned
 apple9_cf_list_cost(struct exec_list *list)
 {
    unsigned cost = 0;
-   foreach_list_typed(nir_cf_node, node, node, list) {
-      nir_foreach_block_in_cf_node(block, node) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_tex ||
-                (instr->type == nir_instr_type_intrinsic &&
-                 nir_instr_as_intrinsic(instr)->intrinsic ==
-                    nir_intrinsic_image_load_apple9_agx))
-               cost += 50;
-            else if (instr->type == nir_instr_type_intrinsic)
-               cost += 10;
-            else if (instr->type == nir_instr_type_alu)
-               cost += 1;
-         }
-      }
-   }
+   foreach_list_typed(nir_cf_node, node, node, list)
+      cost += apple9_cf_node_cost(node);
    return cost;
 }
 
@@ -6838,6 +6867,114 @@ apple9_emit_skip(struct apple9_dag_lower *lower, struct exec_list *arm,
    return true;
 }
 
+/* Check whether an if/else directly inside a loop is a pure conditional break
+ * (one arm is a single block containing only nir_jump_break, the other arm is
+ * a single empty block). */
+static bool
+apple9_is_trivial_loop_break_if(nir_if *nif, bool *then_breaks)
+{
+   nir_block *first_then = nir_if_first_then_block(nif);
+   nir_block *last_then = nir_if_last_then_block(nif);
+   nir_block *first_else = nir_if_first_else_block(nif);
+   nir_block *last_else = nir_if_last_else_block(nif);
+   if (first_then != last_then || first_else != last_else)
+      return false;
+
+   if (exec_list_is_singular(&last_then->instr_list) &&
+       nir_block_ends_in_break(last_then) &&
+       exec_list_is_empty(&last_else->instr_list)) {
+      *then_breaks = true;
+      return true;
+   }
+   if (exec_list_is_singular(&last_else->instr_list) &&
+       nir_block_ends_in_break(last_else) &&
+       exec_list_is_empty(&last_then->instr_list)) {
+      *then_breaks = false;
+      return true;
+   }
+   return false;
+}
+
+/* Direct loop-mask update lowering for `if (cond) break;` directly inside a
+ * single-exit loop (at the loop's own mask depth) when the loop exit has a
+ * single predecessor and the merge block has no phis. Replaces EXEC_MASK_PUSH
+ * + MOV 0 + PREDICATE_COMPARE(0==0) + BREAK_MASK_UNWIND + EXEC_MASK_POP with a
+ * single 4-byte LOOP_MASK_UPDATE.
+ *
+ * Requiring a single-exit loop (nir_block_num_preds(exit) == 1) guarantees
+ * RA cannot introduce synthetic exit join phis, and deferring `break_block`
+ * placement until right after LOOP_MASK_POP guarantees any RA/spill edge
+ * coupling placed in `break_block` runs with all exiting lanes restored. */
+static bool
+apple9_try_emit_direct_loop_break(struct apple9_dag_lower *lower, nir_if *nif,
+                                  nir_block *merge, bool *handled)
+{
+   *handled = false;
+   if (lower->object_region || lower->loop == NULL ||
+       lower->mask_depth != lower->loop->mask_depth ||
+       lower->loop->deferred_break_block != NULL ||
+       nir_block_num_preds(lower->loop->exit) != 1 ||
+       apple9_block_has_phi(lower->loop->exit) ||
+       apple9_block_has_phi(merge))
+      return true;
+
+   bool then_breaks = false;
+   if (!apple9_is_trivial_loop_break_if(nif, &then_breaks))
+      return true;
+
+   nir_block *break_nir =
+      then_breaks ? nir_if_last_then_block(nif) : nir_if_last_else_block(nif);
+   nir_block *cont_nir =
+      then_breaks ? nir_if_last_else_block(nif) : nir_if_last_then_block(nif);
+   struct agx_apple9_block *break_block = lower->nir_blocks[break_nir->index];
+   struct agx_apple9_block *cont_block = lower->nir_blocks[cont_nir->index];
+   if (!break_block || !cont_block || break_block->placed || cont_block->placed)
+      return true;
+
+   *handled = true;
+
+   bool invert_push = false;
+   if (!apple9_emit_if_predicate(lower, nif, &invert_push))
+      return false;
+
+   /* apple9_emit_if_predicate computes p0 such that (invert_push ? !p0 : p0)
+    * equals nif->condition. LOOP_MASK_UPDATE keeps lanes where its selected
+    * predicate is true (the continuing lanes), so invert when the break arm
+    * corresponds to the true condition. */
+   const bool update_invert = then_breaks ? !invert_push : invert_push;
+   const uint32_t update_imm =
+      AGX_APPLE9_LOOP_MASK_PREDICATE(0) |
+      (update_invert ? AGX_APPLE9_LOOP_MASK_INVERT : 0);
+   if (!apple9_emit_loop_mask_op(lower, AGX_APPLE9_VIR_LOOP_MASK_UPDATE,
+                                 AGX_APPLE9_ENC_LOOP_MASK_UPDATE, update_imm,
+                                 "could not emit an Apple9 loop-mask update"))
+      return false;
+
+   /* For an early break with non-trivial work remaining in the loop body, skip
+    * directly to LOOP_MASK_POP when all lanes have exited. For a bottom-tested
+    * latch (empty tail before JMP_EXEC_ANY), fall straight through to the
+    * backedge. */
+   unsigned remaining_cost = 0;
+   for (nir_cf_node *n = nir_cf_node_next(&nif->cf_node); n;
+        n = nir_cf_node_next(n))
+      remaining_cost += apple9_cf_node_cost(n);
+   if (remaining_cost > APPLE9_SKIP_COST &&
+       !agx_apple9_vir_emit_branch(&lower->program,
+                                   AGX_APPLE9_VIR_JMP_EXEC_NONE,
+                                   AGX_APPLE9_ENC_JMP_EXEC_NONE,
+                                   lower->loop->exit_block)) {
+      lower->reason = "could not emit an Apple9 loop exit skip";
+      return false;
+   }
+
+   /* Defer `break_block` until immediately after LOOP_MASK_POP and place
+    * `cont_block` immediately in the loop body so logical CFG and active-lane
+    * masks both remain exact even under spilling. */
+   lower->loop->deferred_break_block = break_block;
+   agx_apple9_block_begin(&lower->program, cont_block);
+   return true;
+}
+
 static bool
 apple9_emit_if(struct apple9_dag_lower *lower, struct util_dynarray *stores,
                nir_if *nif)
@@ -6849,6 +6986,12 @@ apple9_emit_if(struct apple9_dag_lower *lower, struct util_dynarray *stores,
    }
 
    nir_block *merge = nir_cf_node_as_block(next);
+   bool direct_break_handled = false;
+   if (!apple9_try_emit_direct_loop_break(lower, nif, merge,
+                                          &direct_break_handled))
+      return false;
+   if (direct_break_handled)
+      return true;
    const bool has_phis = apple9_block_has_phi(merge);
    /* Preserve both NIR predecessor blocks. The shared allocator can insert
     * edge copies even when an arm has no selected arithmetic. */
@@ -8550,6 +8693,166 @@ apple9_nir_sink_loads(nir_shader *nir)
    return progress;
 }
 
+/* Rotate top-tested structured loops (`loop { header_test; if (exit) break; body; }`)
+ * into guarded bottom-tested loops (`if (init_exit) {} else { loop { body; test; if (exit) break; } }`)
+ * when the header contains only cheap pure ALU/uniform-read instructions. This
+ * eliminates a mid-loop branch/skip per iteration and pairs with direct
+ * LOOP_MASK_UPDATE lowering at the bottom latch. */
+static bool
+apple9_header_is_cheap_pure(nir_block *header)
+{
+   unsigned work = 0;
+   nir_foreach_instr(instr, header) {
+      switch (instr->type) {
+      case nir_instr_type_phi:
+         break;
+      case nir_instr_type_alu:
+      case nir_instr_type_load_const:
+      case nir_instr_type_undef:
+         work++;
+         break;
+      case nir_instr_type_intrinsic: {
+         nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+         if (op != nir_intrinsic_load_preamble &&
+             op != nir_intrinsic_load_push_constant)
+            return false;
+         work++;
+         break;
+      }
+      default:
+         return false;
+      }
+      if (work > 8)
+         return false;
+   }
+   return true;
+}
+
+static bool
+apple9_rotate_loop(nir_loop *loop)
+{
+   if (loop->do_while || nir_loop_has_continue_construct(loop))
+      return false;
+
+   nir_cf_node *prev_node = nir_cf_node_prev(&loop->cf_node);
+   nir_cf_node *next_node = nir_cf_node_next(&loop->cf_node);
+   if (!prev_node || prev_node->type != nir_cf_node_block ||
+       !next_node || next_node->type != nir_cf_node_block)
+      return false;
+
+   nir_block *prev_block = nir_cf_node_as_block(prev_node);
+   nir_block *exit_block = nir_cf_node_as_block(next_node);
+   nir_block *header_block = nir_loop_first_block(loop);
+   nir_block *latch_block = nir_loop_last_block(loop);
+
+   if (nir_block_ends_in_jump(header_block) ||
+       nir_block_ends_in_jump(latch_block) ||
+       nir_block_num_preds(header_block) != 2)
+      return false;
+
+   nir_cf_node *if_node = nir_cf_node_next(&header_block->cf_node);
+   if (!if_node || if_node->type != nir_cf_node_if)
+      return false;
+
+   nir_if *nif = nir_cf_node_as_if(if_node);
+   bool then_breaks = false;
+   if (!apple9_is_trivial_loop_break_if(nif, &then_breaks))
+      return false;
+
+   nir_cf_node *after_if_node = nir_cf_node_next(if_node);
+   if (!after_if_node || after_if_node->type != nir_cf_node_block)
+      return false;
+   nir_block *after_if = nir_cf_node_as_block(after_if_node);
+   /* Already bottom-tested if nothing follows the break if inside the loop. */
+   if (after_if == latch_block && exec_list_is_empty(&after_if->instr_list))
+      return false;
+
+   if (!apple9_header_is_cheap_pure(header_block))
+      return false;
+
+   nir_remove_single_src_phis_block(after_if);
+   nir_convert_loop_to_lcssa(loop);
+   nir_lower_phis_to_regs_block(header_block, false);
+   nir_lower_ssa_defs_to_regs_block(header_block);
+   nir_lower_phis_to_regs_block(exit_block, false);
+
+   nir_block *break_blk =
+      then_breaks ? nir_if_last_then_block(nif) : nir_if_last_else_block(nif);
+   nir_block *cont_arm_blk =
+      then_breaks ? nir_if_first_else_block(nif) : nir_if_first_then_block(nif);
+
+   nir_cf_list tmp;
+   nir_cf_extract(&tmp, nir_before_block(header_block),
+                  nir_after_cf_node(if_node));
+
+   nir_block *cont_block = nir_loop_last_block(loop);
+   struct hash_table *remap_table = _mesa_pointer_hash_table_create(NULL);
+   nir_cf_list_clone_and_reinsert(&tmp, &loop->cf_node,
+                                  nir_after_block(cont_block), remap_table);
+   _mesa_hash_table_destroy(remap_table, NULL);
+
+   nir_cf_reinsert(&tmp, nir_after_block(prev_block));
+   nir_instr_remove_v(nir_block_last_instr(break_blk));
+
+   nir_cf_extract(&tmp, nir_before_cf_node(&loop->cf_node),
+                  nir_after_cf_node(&loop->cf_node));
+   nir_cf_reinsert(&tmp, nir_after_block(cont_arm_blk));
+
+   loop->do_while = true;
+   return true;
+}
+
+static bool
+apple9_rotate_loops_cf_list(struct exec_list *cf_list)
+{
+   bool progress = false;
+   foreach_list_typed_safe(nir_cf_node, node, node, cf_list) {
+      switch (node->type) {
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         progress |= apple9_rotate_loops_cf_list(&nif->then_list);
+         progress |= apple9_rotate_loops_cf_list(&nif->else_list);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         progress |= apple9_rotate_loops_cf_list(&loop->body);
+         progress |= apple9_rotate_loop(loop);
+         break;
+      }
+      default:
+         break;
+      }
+   }
+   return progress;
+}
+
+static bool
+apple9_nir_rotate_loops(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      if (apple9_rotate_loops_cf_list(&impl->body)) {
+         nir_progress(true, impl, nir_metadata_none);
+         nir_lower_reg_intrinsics_to_ssa_impl(impl);
+         progress = true;
+      } else {
+         nir_no_progress(impl);
+      }
+   }
+   if (progress) {
+      bool opt_progress;
+      do {
+         opt_progress = nir_opt_constant_folding(nir);
+         opt_progress |= nir_opt_copy_prop(nir);
+         opt_progress |= nir_opt_remove_phis(nir);
+         opt_progress |= nir_opt_dead_cf(nir);
+         opt_progress |= nir_opt_dce(nir);
+      } while (opt_progress);
+   }
+   return progress;
+}
+
 static bool
 apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
                         struct agx_apple9_compute_profile *profile,
@@ -8577,6 +8880,8 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
          progress |= nir_opt_dce(nir);
       } while (progress);
    }
+
+   apple9_nir_rotate_loops(nir);
 
    /* Selection follows NIR order, so shorten live ranges after lowering and
     * before collecting loads or assigning virtual registers. Use the same

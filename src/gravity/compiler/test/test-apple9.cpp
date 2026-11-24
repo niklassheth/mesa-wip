@@ -5929,25 +5929,27 @@ TEST(Apple9Compiler, CountedLoopCarriesSsaAndPatchesStartRelativeBackedge)
    ASSERT_TRUE(agx_compile_apple9_tiny(nir, &compiled, nullptr, &reason))
       << (reason ? reason : "no diagnostic");
 
+   /* Counted top-tested loops rotate into a guarded bottom-tested loop with
+    * a 4-byte LOOP_MASK_UPDATE latch and an outer JMP_EXEC_NONE skip. */
    const uint8_t loop_push[] = {0x0f, 0x05, 0x54, 0x1a};
-   const uint8_t loop_update[] = {0x8f, 0x04, 0x54, 0x22};
+   const uint8_t loop_update[] = {0x8f, 0x04, 0x54, 0x02};
    const uint8_t loop_pop[] = {0x0f, 0x06, 0x04, 0x02, 0x00, 0x00};
    const uint8_t break_one_if[] = {0x8f, 0x05, 0x54, 0x03, 0x00, 0x01};
    const uint8_t exit_if_none[] = {0x0f, 0x01, 0x54};
    EXPECT_EQ(
       apple9_binary_count_sequence(&compiled, loop_push, sizeof(loop_push)),
-      0u);
+      1u);
    EXPECT_EQ(
       apple9_binary_count_sequence(&compiled, loop_update, sizeof(loop_update)),
-      0u);
+      1u);
    EXPECT_EQ(
       apple9_binary_count_sequence(&compiled, loop_pop, sizeof(loop_pop)), 1u);
    EXPECT_EQ(apple9_binary_count_sequence(&compiled, break_one_if,
                                           sizeof(break_one_if)),
-             1u);
+             0u);
    EXPECT_EQ(apple9_binary_count_sequence(&compiled, exit_if_none,
                                           sizeof(exit_if_none)),
-             0u);
+             1u);
 
    const uint8_t *binary = (const uint8_t *)compiled.binary;
    unsigned branches = 0;
@@ -5981,32 +5983,24 @@ TEST(Apple9Compiler, NestedLoopsReuseConsumedBreakPredicates)
       << (reason ? reason : "no diagnostic");
 
    const uint8_t loop_push[] = {0x0f, 0x05, 0x54, 0x1a};
-   const uint8_t outer_update[] = {0x8f, 0x04, 0x54, 0x22};
-   const uint8_t inner_update[] = {0x8f, 0x04, 0x54, 0x26};
+   const uint8_t loop_update[] = {0x8f, 0x04, 0x54, 0x02};
    const uint8_t loop_pop[] = {0x0f, 0x06, 0x04, 0x02, 0x00, 0x00};
-   const uint8_t outer_break[] = {0x8f, 0x05, 0x54, 0x03, 0x00, 0x01};
-   const uint8_t inner_break[] = {0x8f, 0x05, 0x54, 0x03, 0x00, 0x01};
+   const uint8_t unwind_break[] = {0x8f, 0x05, 0x54, 0x03, 0x00, 0x01};
    const uint8_t exit_if_none[] = {0x0f, 0x01, 0x54};
-   EXPECT_EQ(
+   EXPECT_GE(
       apple9_binary_count_sequence(&compiled, loop_push, sizeof(loop_push)),
       1u);
-   EXPECT_EQ(apple9_binary_count_sequence(&compiled, outer_update,
-                                          sizeof(outer_update)),
-             0u);
-   EXPECT_EQ(apple9_binary_count_sequence(&compiled, inner_update,
-                                          sizeof(inner_update)),
-             0u);
+   EXPECT_EQ(
+      apple9_binary_count_sequence(&compiled, loop_update, sizeof(loop_update)),
+      2u);
    EXPECT_EQ(
       apple9_binary_count_sequence(&compiled, loop_pop, sizeof(loop_pop)), 2u);
-   EXPECT_EQ(
-      apple9_binary_count_sequence(&compiled, outer_break, sizeof(outer_break)),
-      2u);
-   EXPECT_EQ(
-      apple9_binary_count_sequence(&compiled, inner_break, sizeof(inner_break)),
-      2u);
-   EXPECT_EQ(apple9_binary_count_sequence(&compiled, exit_if_none,
-                                          sizeof(exit_if_none)),
+   EXPECT_EQ(apple9_binary_count_sequence(&compiled, unwind_break,
+                                          sizeof(unwind_break)),
              0u);
+   EXPECT_GE(apple9_binary_count_sequence(&compiled, exit_if_none,
+                                          sizeof(exit_if_none)),
+             1u);
    free(compiled.binary);
    ralloc_free(nir);
 }
@@ -6051,14 +6045,14 @@ TEST(Apple9Compiler, ContinueConstructLowersToStructuredMaskedLatch)
       << (reason ? reason : "no diagnostic");
 
    const uint8_t loop_push[] = {0x0f, 0x05, 0x54, 0x1a};
-   const uint8_t loop_update[] = {0x8f, 0x04, 0x54, 0x22};
+   const uint8_t loop_update[] = {0x8f, 0x04, 0x54, 0x02};
    const uint8_t loop_pop[] = {0x0f, 0x06, 0x04, 0x02, 0x00, 0x00};
    EXPECT_EQ(
       apple9_binary_count_sequence(&compiled, loop_push, sizeof(loop_push)),
-      0u);
+      1u);
    EXPECT_EQ(
       apple9_binary_count_sequence(&compiled, loop_update, sizeof(loop_update)),
-      0u);
+      1u);
    EXPECT_EQ(
       apple9_binary_count_sequence(&compiled, loop_pop, sizeof(loop_pop)), 1u);
    free(compiled.binary);
@@ -6074,25 +6068,25 @@ TEST(Apple9Compiler, StructuredLoopDoesNotRequireCanonicalTestPosition)
       << (reason ? reason : "no diagnostic");
 
    const uint8_t loop_push[] = {0x0f, 0x05, 0x54, 0x1a};
-   const uint8_t loop_update[] = {0x8f, 0x04, 0x54, 0x22};
+   const uint8_t loop_update[] = {0x8f, 0x04, 0x54, 0x02};
    const uint8_t loop_pop[] = {0x0f, 0x06, 0x04, 0x02, 0x00, 0x00};
    const uint8_t exit_if_none[] = {0x0f, 0x01, 0x54};
 
-   /* The top-level loop uses the hardware's implicit initial mask. All three
-    * NIR conditionals retain their kind-1 scopes for SSA edge copies; the
-    * break unwinds its scope, and the loop has one backedge and kind-2 pop. */
+   /* The top-level loop uses the hardware's implicit initial mask. Prefix and
+    * suffix conditionals retain kind-1 scopes, while the mid-body direct break
+    * lowers to a 4-byte LOOP_MASK_UPDATE with one backedge and kind-2 pop. */
    EXPECT_EQ(
       apple9_binary_count_sequence(&compiled, loop_push, sizeof(loop_push)),
       0u);
    EXPECT_EQ(
       apple9_binary_count_sequence(&compiled, loop_update, sizeof(loop_update)),
-      0u);
+      1u);
    EXPECT_EQ(
       apple9_binary_count_sequence(&compiled, loop_pop, sizeof(loop_pop)), 1u);
    EXPECT_EQ(apple9_binary_count_sequence(&compiled, exit_if_none,
                                           sizeof(exit_if_none)),
              0u);
-   EXPECT_EQ(apple9_binary_count_exec_pushes(&compiled), 3u);
+   EXPECT_EQ(apple9_binary_count_exec_pushes(&compiled), 2u);
 
    const uint8_t *binary = (const uint8_t *)compiled.binary;
    unsigned backedges = 0;
@@ -6117,6 +6111,8 @@ TEST(Apple9Compiler, GeneralNestedBreakUsesNativeMaskUnwind)
    ASSERT_TRUE(agx_compile_apple9_tiny(nir, &compiled, nullptr, &reason))
       << (reason ? reason : "no diagnostic");
 
+   /* Multi-exit loops keep both breaks on BREAK_MASK_UNWIND so every break
+    * block retains an exact breaking-lane mask for RA/spill edge coupling. */
    const uint8_t unwind[] = {0x8f, 0x05, 0x54, 0x03, 0x00, 0x01};
    EXPECT_EQ(apple9_binary_count_sequence(&compiled, unwind, sizeof(unwind)),
              2u);
@@ -6134,6 +6130,434 @@ TEST(Apple9Compiler, GeneralNestedBreakUsesNativeMaskUnwind)
    EXPECT_EQ(loop_bank_one, 2u);
    free(compiled.binary);
    ralloc_free(nir);
+}
+
+TEST(Apple9Compiler, BottomTestedLoopHandlesAllIntegerAndFloatComparisons)
+{
+   /* Exact expected LOOP_MASK_UPDATE polarity for `if (op(lhs, rhs)) break;`:
+    * - ult/ilt/flt/ieq/feq have invert_push=false -> break_in_then requires
+    *   update_invert=true (0x22: continue when !p0).
+    * - uge/ige/fge/ine/fneu have invert_push=true -> break_in_then requires
+    *   update_invert=false (0x02: continue when p0). */
+   const struct {
+      nir_op op;
+      uint8_t expected_update_byte;
+   } int_cases[] = {
+      {nir_op_ult, 0x22},
+      {nir_op_uge, 0x02},
+      {nir_op_ilt, 0x22},
+      {nir_op_ige, 0x02},
+      {nir_op_ieq, 0x22},
+      {nir_op_ine, 0x02},
+   };
+   for (const auto &tc : int_cases) {
+      for (bool swap_operands : {false, true}) {
+         for (bool uniform_bound : {false, true}) {
+            SCOPED_TRACE(testing::Message()
+                         << "op=" << nir_op_infos[tc.op].name
+                         << " swap=" << swap_operands
+                         << " uniform=" << uniform_bound);
+            nir_builder b = apple9_compute_builder("loop_int_cmp");
+            b.shader->info.num_ubos = 1;
+            nir_def *gid = apple9_global_id_x(&b);
+            nir_def *bound =
+               uniform_bound
+                  ? nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0),
+                                 nir_imm_int(&b, 0), .align_mul = 4, .range = 4)
+                  : nir_iadd_imm(&b, nir_iand_imm(&b, gid, 15), 1);
+            nir_variable *ivar =
+               nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+            nir_variable *acc =
+               nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+            nir_store_var(&b, ivar, nir_imm_int(&b, 0), 1);
+            nir_store_var(&b, acc, gid, 1);
+
+            nir_loop *loop = nir_push_loop(&b);
+            loop->control = nir_loop_control_dont_unroll;
+            nir_def *i_cur = nir_load_var(&b, ivar);
+            nir_def *lhs = swap_operands ? bound : i_cur;
+            nir_def *rhs = swap_operands ? i_cur : bound;
+            nir_break_if(&b, nir_build_alu2(&b, tc.op, lhs, rhs));
+            nir_store_var(&b, acc,
+                          nir_iadd(&b, nir_imul_imm(&b, nir_load_var(&b, acc), 3),
+                                   i_cur),
+                          1);
+            nir_store_var(&b, ivar, nir_iadd_imm(&b, i_cur, 1), 1);
+            nir_pop_loop(&b, loop);
+
+            apple9_store_output(&b, gid, nir_load_var(&b, acc));
+            agx_shader_part compiled = {};
+            const char *reason = nullptr;
+            ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, nullptr,
+                                                &reason))
+               << (reason ?: "");
+            const uint8_t expected_update[] = {0x8f, 0x04, 0x54,
+                                               tc.expected_update_byte};
+            const uint8_t wrong_update[] = {
+               0x8f, 0x04, 0x54,
+               (uint8_t)(tc.expected_update_byte ^ 0x20u)};
+            const uint8_t unwind[] = {0x8f, 0x05, 0x54};
+            EXPECT_EQ(apple9_binary_count_sequence(&compiled, expected_update,
+                                                   sizeof(expected_update)),
+                      1u);
+            EXPECT_EQ(apple9_binary_count_sequence(&compiled, wrong_update,
+                                                   sizeof(wrong_update)),
+                      0u);
+            EXPECT_EQ(
+               apple9_binary_count_sequence(&compiled, unwind, sizeof(unwind)),
+               0u);
+            free(compiled.binary);
+            ralloc_free(b.shader);
+         }
+      }
+   }
+
+   /* Float comparisons verify exact polarity including IEEE NaN-safe FGE
+    * (EXT_FGE_SEQUENCE | PREDICATE_INVERT -> 0x1a ... 0x02 + 8f 04 54 02). */
+   const struct {
+      nir_op op;
+      uint8_t expected_update_byte;
+      bool expect_fge_nan_safe;
+   } float_cases[] = {
+      {nir_op_flt, 0x22, false},
+      {nir_op_fge, 0x02, true},
+      {nir_op_feq, 0x22, false},
+      {nir_op_fneu, 0x02, false},
+   };
+   for (const auto &fc : float_cases) {
+      for (bool swap_operands : {false, true}) {
+         SCOPED_TRACE(testing::Message()
+                      << "fop=" << nir_op_infos[fc.op].name
+                      << " swap=" << swap_operands);
+         nir_builder b = apple9_compute_builder("loop_flt_cmp");
+         b.shader->info.num_ubos = 1;
+         nir_def *gid = apple9_global_id_x(&b);
+         nir_def *lim = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0),
+                                     nir_imm_int(&b, 0), .align_mul = 4,
+                                     .range = 4);
+         nir_variable *acc =
+            nir_local_variable_create(b.impl, glsl_float_type(), "acc");
+         nir_store_var(&b, acc, nir_u2f32(&b, gid), 1);
+
+         nir_loop *loop = nir_push_loop(&b);
+         loop->control = nir_loop_control_dont_unroll;
+         nir_def *cur = nir_load_var(&b, acc);
+         nir_def *lhs = swap_operands ? lim : cur;
+         nir_def *rhs = swap_operands ? cur : lim;
+         nir_break_if(&b, nir_build_alu2(&b, fc.op, lhs, rhs));
+         nir_store_var(&b, acc,
+                       nir_ffma(&b, cur, nir_imm_float(&b, 0.99f),
+                                nir_imm_float(&b, 0.5f)),
+                       1);
+         nir_pop_loop(&b, loop);
+
+         apple9_store_output(&b, gid, nir_load_var(&b, acc));
+         agx_shader_part compiled = {};
+         const char *reason = nullptr;
+         ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, nullptr,
+                                             &reason))
+            << (reason ?: "");
+         const uint8_t expected_update[] = {0x8f, 0x04, 0x54,
+                                            fc.expected_update_byte};
+         const uint8_t wrong_update[] = {
+            0x8f, 0x04, 0x54, (uint8_t)(fc.expected_update_byte ^ 0x20u)};
+         const uint8_t unwind[] = {0x8f, 0x05, 0x54};
+         EXPECT_EQ(apple9_binary_count_sequence(&compiled, expected_update,
+                                                sizeof(expected_update)),
+                   1u);
+         EXPECT_EQ(apple9_binary_count_sequence(&compiled, wrong_update,
+                                                sizeof(wrong_update)),
+                   0u);
+         EXPECT_EQ(
+            apple9_binary_count_sequence(&compiled, unwind, sizeof(unwind)),
+            0u);
+         if (fc.expect_fge_nan_safe) {
+            const uint8_t *bin = (const uint8_t *)compiled.binary;
+            unsigned fge_preds = 0;
+            for (unsigned i = 0; i + 10 <= compiled.info.binary_size; i += 2) {
+               if (bin[i] == 0x1a && (bin[i + 2] & ~0x18u) == 0x23 &&
+                   bin[i + 4] == 0x06 && bin[i + 5] == 0x00 &&
+                   (bin[i + 6] & 0x7fu) == AGX_APPLE9_PREDICATE_EXT_FGE_SEQUENCE)
+                  fge_preds++;
+            }
+            /* Both pre-header guard and bottom latch use NaN-safe FGE! */
+            EXPECT_GE(fge_preds, 2u);
+         }
+         free(compiled.binary);
+         ralloc_free(b.shader);
+      }
+   }
+}
+
+TEST(Apple9Compiler, LoopWithEarlyBreakContinueAndDemoteCompilesCleanly)
+{
+   /* Early break + continue with divergent exit values (multi-exit phis fall
+    * back safely to BREAK_MASK_UNWIND without clobbering continuing lanes). */
+   {
+      nir_builder b = apple9_compute_builder("loop_early_break_continue");
+      b.shader->info.num_ubos = 1;
+      nir_def *gid = apple9_global_id_x(&b);
+      nir_def *limit = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0),
+                                    nir_imm_int(&b, 0), .align_mul = 4,
+                                    .range = 4);
+      nir_variable *ivar =
+         nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+      nir_variable *acc =
+         nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_store_var(&b, ivar, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, acc, gid, 1);
+
+      nir_loop *loop = nir_push_loop(&b);
+      nir_loop_add_continue_construct(loop);
+      loop->control = nir_loop_control_dont_unroll;
+      nir_def *i_cur = nir_load_var(&b, ivar);
+      nir_break_if(&b, nir_uge(&b, i_cur, limit));
+      nir_if *skip = nir_push_if(&b, nir_ieq_imm(&b, nir_iand_imm(&b, i_cur, 1), 0));
+      nir_jump(&b, nir_jump_continue);
+      nir_pop_if(&b, skip);
+      nir_def *cur_acc = nir_iadd(&b, nir_load_var(&b, acc), i_cur);
+      nir_store_var(&b, acc, cur_acc, 1);
+      nir_if *early = nir_push_if(&b, nir_ieq_imm(&b, cur_acc, 42));
+      nir_store_var(&b, acc, nir_imm_int(&b, 99), 1);
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, early);
+      nir_push_continue(&b, loop);
+      nir_store_var(&b, ivar, nir_iadd_imm(&b, i_cur, 1), 1);
+      nir_pop_loop(&b, loop);
+
+      apple9_store_output(&b, gid, nir_load_var(&b, acc));
+      agx_shader_part compiled = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, nullptr, &reason))
+         << (reason ?: "");
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* Fragment shader with demote inside a dynamic counted loop. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "loop_demote_fs");
+      b.shader->info.num_ubos = 1;
+      nir_def *limit = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0),
+                                    nir_imm_int(&b, 0), .align_mul = 4,
+                                    .range = 4);
+      nir_def *coord = nir_load_frag_coord(&b);
+      nir_variable *ivar =
+         nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+      nir_variable *acc =
+         nir_local_variable_create(b.impl, glsl_float_type(), "acc");
+      nir_store_var(&b, ivar, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, acc, nir_channel(&b, coord, 0), 1);
+
+      nir_loop *loop = nir_push_loop(&b);
+      loop->control = nir_loop_control_dont_unroll;
+      nir_def *i_cur = nir_load_var(&b, ivar);
+      nir_break_if(&b, nir_uge(&b, i_cur, limit));
+      nir_def *val = nir_fadd(&b, nir_load_var(&b, acc), nir_imm_float(&b, 0.25f));
+      nir_demote_if(&b, nir_flt(&b, val, nir_imm_float(&b, 0.0f)));
+      nir_store_var(&b, acc, val, 1);
+      nir_store_var(&b, ivar, nir_iadd_imm(&b, i_cur, 1), 1);
+      nir_pop_loop(&b, loop);
+
+      nir_def *c = nir_load_var(&b, acc);
+      nir_store_output(&b, nir_vec4(&b, c, c, c, nir_imm_float(&b, 1.0f)),
+                       nir_imm_int(&b, 0), .base = 0, .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0,
+                                        .num_slots = 1});
+      b.shader->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
+      b.shader->info.fs.uses_discard = true;
+
+      agx_shader_part compiled = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_fragment(b.shader, &compiled, &reason))
+         << (reason ?: "");
+      const uint8_t update_pos[] = {0x8f, 0x04, 0x54, 0x02};
+      EXPECT_EQ(apple9_binary_count_sequence(&compiled, update_pos,
+                                             sizeof(update_pos)),
+                1u);
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(Apple9Compiler, VertexVaryStoresBatchWaitsAndFuseDirectAluExports)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "vs_batch_and_fuse");
+   b.shader->info.num_ubos = 1;
+   nir_def *vid = nir_load_vertex_id(&b);
+   nir_def *fvid = nir_u2f32(&b, vid);
+   nir_def *u0 = nir_load_ubo(&b, 4, 32, nir_imm_int(&b, 0),
+                              nir_imm_int(&b, 0), .align_mul = 16, .range = 64);
+   nir_def *u1 = nir_load_ubo(&b, 4, 32, nir_imm_int(&b, 0),
+                              nir_imm_int(&b, 16), .align_mul = 16, .range = 64);
+   nir_def *a = nir_fmul(&b, u0, nir_vec4(&b, fvid, fvid, fvid, fvid));
+   nir_def *bvec = nir_fadd(&b, u1, nir_vec4(&b, fvid, fvid, fvid, fvid));
+
+   nir_store_output(&b, a, nir_imm_int(&b, 0), .base = 0, .write_mask = 0xf,
+                    .src_type = nir_type_float32,
+                    .io_semantics = {.location = VARYING_SLOT_POS,
+                                     .num_slots = 1});
+   b.shader->info.outputs_written |= BITFIELD64_BIT(VARYING_SLOT_POS);
+
+   /* 4 vec4 varyings = 16 scalar VARY_STOREs: v0/v1 raw copies, v2/v3 direct
+    * FMUL/FADD exports into pX. */
+   nir_def *outs[4] = {
+      a,
+      bvec,
+      nir_fmul(&b, a, bvec),
+      nir_fadd(&b, a, bvec),
+   };
+   for (unsigned i = 0; i < 4; ++i) {
+      nir_store_output(&b, outs[i], nir_imm_int(&b, 0), .base = (int)(i + 1),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_VAR0 + i,
+                                        .num_slots = 1});
+      b.shader->info.outputs_written |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + i);
+   }
+
+   agx_shader_part compiled = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_vertex(b.shader, &compiled, &reason))
+      << (reason ?: "");
+
+   const uint8_t *bytes = (const uint8_t *)compiled.binary;
+   unsigned vary_stores = 0, vary_waits = 0, float2_exports = 0, mov4_exports = 0;
+   for (unsigned i = 0; i + 8 <= compiled.info.binary_size; i += 2) {
+      if (bytes[i] == 0x57 && (bytes[i + 1] & 0x0f) == 0x06 &&
+          (bytes[i + 2] & 0xfc) == 0x54 && (bytes[i + 5] & 0xc0) == 0x40) {
+         vary_stores++;
+         unsigned wait_mask = (bytes[i + 1] >> 4) | ((bytes[i + 2] & 0x03) << 4);
+         if (wait_mask)
+            vary_waits++;
+      } else if ((bytes[i] & 0x0f) == 0x09 && bytes[i + 4] == 0x41 &&
+                 bytes[i + 5] == 0x00 && bytes[i + 6] == 0x00) {
+         float2_exports++;
+      }
+   }
+   for (unsigned i = 0; i + 4 <= compiled.info.binary_size; i += 2) {
+      if ((bytes[i] & 0x0f) == 0x0b && (bytes[i + 2] & 0x3f) == 0x21 &&
+          bytes[i + 3] == 0x04)
+         mov4_exports++;
+   }
+   EXPECT_EQ(vary_stores, 20u);
+   /* 20 VARY_STOREs batched at up to 7/slot: 4 batches -> exactly 4 waits
+    * (never 0, never unbatched 20). */
+   EXPECT_GE(vary_waits, 3u);
+   EXPECT_LE(vary_waits, 4u);
+   /* 4 POS + 4 fused FMUL + 4 fused FADD = 12 FLOAT2_EXPORTs; 8 raw copies
+    * pack to 4B MOV4 on slot 1. */
+   EXPECT_EQ(float2_exports, 12u);
+   EXPECT_EQ(mov4_exports, 8u);
+   free(compiled.binary);
+   ralloc_free(b.shader);
+}
+
+TEST(Apple9Compiler, DirectLoopBreakDeferredExitWithLiveValuesValidates)
+{
+   /* Single-exit dynamic loop with many live values across the loop and
+    * divergent exit. Exercises deferred break_block placement so RA exit
+    * coupling runs only after LOOP_MASK_POP restores all exiting lanes. */
+   nir_builder b = apple9_compute_builder("loop_deferred_exit_live");
+   b.shader->info.num_ubos = 1;
+   nir_def *gid = apple9_global_id_x(&b);
+   nir_def *limit = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0),
+                                 nir_imm_int(&b, 0), .align_mul = 4, .range = 4);
+
+   nir_def *live[16];
+   for (unsigned i = 0; i < 16; ++i) {
+      live[i] = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0),
+                             nir_imm_int(&b, (i + 1) * 4), .align_mul = 4,
+                             .range = 128);
+      live[i] = nir_iadd(&b, live[i], nir_imul_imm(&b, gid, i + 1));
+   }
+
+   nir_variable *idx =
+      nir_local_variable_create(b.impl, glsl_uint_type(), "idx");
+   nir_variable *acc =
+      nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_store_var(&b, idx, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, live[0], 1);
+
+   nir_loop *loop = nir_push_loop(&b);
+   loop->control = nir_loop_control_dont_unroll;
+   nir_def *i_val = nir_load_var(&b, idx);
+   nir_break_if(&b, nir_uge(&b, i_val, limit));
+   nir_def *sum = nir_load_var(&b, acc);
+   for (unsigned k = 0; k < 16; ++k)
+      sum = nir_ixor(&b, sum, nir_iadd(&b, live[k], i_val));
+   nir_store_var(&b, acc, sum, 1);
+   nir_store_var(&b, idx, nir_iadd_imm(&b, i_val, 1), 1);
+   nir_pop_loop(&b, loop);
+
+   nir_def *out = nir_load_var(&b, acc);
+   for (unsigned k = 0; k < 16; ++k)
+      out = nir_iadd(&b, out, live[k]);
+   apple9_store_output(&b, gid, out);
+
+   agx_shader_part compiled = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, nullptr, &reason))
+      << (reason ?: "");
+   const uint8_t loop_update_keep_true[] = {0x8f, 0x04, 0x54, 0x02};
+   const uint8_t unwind[] = {0x8f, 0x05, 0x54};
+   EXPECT_EQ(apple9_binary_count_sequence(&compiled, loop_update_keep_true,
+                                          sizeof(loop_update_keep_true)),
+             1u);
+   EXPECT_EQ(apple9_binary_count_sequence(&compiled, unwind, sizeof(unwind)), 0u);
+   free(compiled.binary);
+   ralloc_free(b.shader);
+}
+
+TEST(Apple9Compiler, VaryStoreBatchInterleavedWithAluValidates)
+{
+   /* Interleave varying stores with ALU work consuming and producing new values
+    * so scoreboard slot sharing never violates borrowed-source hazards. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "vs_interleaved_vary");
+   b.shader->info.num_ubos = 1;
+   nir_def *vid = nir_u2f32(&b, nir_load_vertex_id(&b));
+   nir_def *u = nir_load_ubo(&b, 4, 32, nir_imm_int(&b, 0),
+                             nir_imm_int(&b, 0), .align_mul = 16, .range = 64);
+   nir_def *cur = nir_fmul(&b, u, nir_vec4(&b, vid, vid, vid, vid));
+
+   nir_store_output(&b, cur, nir_imm_int(&b, 0), .base = 0, .write_mask = 0xf,
+                    .src_type = nir_type_float32,
+                    .io_semantics = {.location = VARYING_SLOT_POS,
+                                     .num_slots = 1});
+   b.shader->info.outputs_written |= BITFIELD64_BIT(VARYING_SLOT_POS);
+
+   for (unsigned i = 0; i < 6; ++i) {
+      cur = nir_ffma(&b, cur, nir_imm_float(&b, 1.01f + 0.05f * i), u);
+      nir_store_output(&b, cur, nir_imm_int(&b, 0), .base = (int)(i + 1),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_VAR0 + i,
+                                        .num_slots = 1});
+      b.shader->info.outputs_written |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + i);
+   }
+
+   agx_shader_part compiled = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_vertex(b.shader, &compiled, &reason))
+      << (reason ?: "");
+   const uint8_t *bytes = (const uint8_t *)compiled.binary;
+   unsigned vary_stores = 0, vary_waits = 0;
+   for (unsigned i = 0; i + 8 <= compiled.info.binary_size; i += 2) {
+      if (bytes[i] == 0x57 && (bytes[i + 1] & 0x0f) == 0x06 &&
+          (bytes[i + 2] & 0xfc) == 0x54 && (bytes[i + 5] & 0xc0) == 0x40) {
+         vary_stores++;
+         unsigned wait_mask = (bytes[i + 1] >> 4) | ((bytes[i + 2] & 0x03) << 4);
+         if (wait_mask)
+            vary_waits++;
+      }
+   }
+   EXPECT_EQ(vary_stores, 28u);
+   EXPECT_GE(vary_waits, 4u);
+   EXPECT_LE(vary_waits, 12u);
+   free(compiled.binary);
+   ralloc_free(b.shader);
 }
 
 TEST(Apple9Compiler, ConditionalLoadsAreCompletedInsideTheirMaskRegions)

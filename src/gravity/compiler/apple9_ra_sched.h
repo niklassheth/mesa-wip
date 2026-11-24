@@ -24,7 +24,8 @@ enum apple9_ra_sched_resource {
    APPLE9_RA_SCHED_INTERPOLATION = BITFIELD_BIT(3),
    APPLE9_RA_SCHED_TILE          = BITFIELD_BIT(4),
    APPLE9_RA_SCHED_MESH          = BITFIELD_BIT(5),
-   APPLE9_RA_SCHED_ALL           = BITFIELD_MASK(6),
+   APPLE9_RA_SCHED_PREDICATE     = BITFIELD_BIT(6),
+   APPLE9_RA_SCHED_ALL           = BITFIELD_MASK(7),
 };
 
 /* Native VIR CFG liveness output (32-bit GPR SSA units, indexed by

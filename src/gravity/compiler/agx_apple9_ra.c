@@ -762,13 +762,16 @@ apple9_merge_pending(struct apple9_completion *to_state,
    }
 }
 
-/* Producers that may share a counting slot with each other. Fixed producers,
- * publications, atomics and scratch traffic keep a slot to themselves. */
+/* Producers that may share a counting slot with each other. Scalar
+ * publications share only with other scalar publications (never mixing with
+ * memory/texture slots). Fixed producers, atomics and scratch traffic keep a
+ * slot to themselves. */
 static bool
 apple9_shares_slot(const struct agx_apple9_vir_instr *ins)
 {
    return !apple9_fixed_producer_slot(ins) &&
-          (ins->op == AGX_APPLE9_VIR_DEVICE_LOAD ||
+          (apple9_scalar_publication(ins) ||
+           ins->op == AGX_APPLE9_VIR_DEVICE_LOAD ||
            ins->op == AGX_APPLE9_VIR_TEXTURE_SAMPLE ||
            ins->op == AGX_APPLE9_VIR_SHARED_LOAD ||
            ins->op == AGX_APPLE9_VIR_PRIVATE_LOAD ||
@@ -826,21 +829,42 @@ apple9_fixed_slots_ahead(const struct agx_apple9_vir_program *program,
 
 /* Whether a sharing producer can be added to the slot without retiring it. */
 static bool
-apple9_slot_joinable(const struct apple9_completion *state, unsigned slot)
+apple9_slot_joinable(const struct apple9_completion *state, unsigned slot,
+                     bool for_pub)
 {
    const struct apple9_pending *p = &state->pending[slot];
    if (!p->count || p->unknown || p->count >= APPLE9_SLOT_SHARE_LIMIT)
       return false;
    for (unsigned i = 0; i < p->count; ++i) {
-      if (!apple9_shares_slot(&p->producer[i]))
+      if (!apple9_shares_slot(&p->producer[i]) ||
+          apple9_scalar_publication(&p->producer[i]) != for_pub)
          return false;
    }
    return apple9_conflicting_slots(state, BITFIELD_BIT(slot - 1)) ==
           BITFIELD_BIT(slot - 1);
 }
 
+static bool
+apple9_contiguous_vary_stores(const struct agx_apple9_vir_program *program,
+                              unsigned a, unsigned b)
+{
+   if (a == UINT_MAX || b == UINT_MAX ||
+       a >= program->instruction_count || b >= program->instruction_count)
+      return false;
+   if (program->instructions[a]->op != AGX_APPLE9_VIR_VARY_STORE ||
+       program->instructions[b]->op != AGX_APPLE9_VIR_VARY_STORE)
+      return false;
+   unsigned lo = MIN2(a, b), hi = MAX2(a, b);
+   for (unsigned k = lo + 1; k < hi; ++k) {
+      if (program->instructions[k]->op != AGX_APPLE9_VIR_VARY_STORE)
+         return false;
+   }
+   return true;
+}
+
 /* Choose a slot to join for a sharing producer first needed at need. With
- * free slots, only a slot whose first need is the same instruction, or whose
+ * free slots, only a slot whose first need is the same instruction, a scalar
+ * publication batch consumed by a contiguous VARY_STORE burst, or whose
  * producers all issued in the other arm of an enclosing if/else: those are
  * alternatives on disjoint lanes that merge after it, so the consumer of the
  * merged value waits once for both (native Metal tags both arms' samples
@@ -849,17 +873,21 @@ apple9_slot_joinable(const struct apple9_completion *state, unsigned slot)
  * prefer the slot needed soonest at or after need (older producers are
  * waited for slightly early), else the one needed latest. */
 static unsigned
-apple9_join_slot(const struct apple9_completion *state, unsigned need,
-                 bool exhausted, const struct apple9_arms *arms, unsigned arm)
+apple9_join_slot(const struct apple9_completion *state,
+                 const struct agx_apple9_vir_program *program, unsigned need,
+                 bool exhausted, const struct apple9_arms *arms, unsigned arm,
+                 bool for_pub)
 {
    unsigned best = 0;
    for (unsigned slot = 1; slot <= 6; ++slot) {
-      if (!apple9_slot_joinable(state, slot))
+      if (!apple9_slot_joinable(state, slot, for_pub))
          continue;
       const struct apple9_pending *p = &state->pending[slot];
       unsigned other = p->first_need;
       if (!exhausted) {
          if (need != UINT_MAX && other == need)
+            return slot;
+         if (for_pub && apple9_contiguous_vary_stores(program, other, need))
             return slot;
          bool alternatives = true;
          for (unsigned i = 0; i < p->count; ++i)
@@ -1121,20 +1149,25 @@ agx_apple9_schedule_physical(struct agx_apple9_vir_program *program,
          if (apple9_async(&ins)) {
             unsigned slot = apple9_fixed_producer_slot(&ins);
             const bool share = apple9_shares_slot(&ins);
+            const bool for_pub = apple9_scalar_publication(&ins);
             const unsigned need =
                share ? apple9_first_need(program, i + 1, end, &ins, drain)
                      : UINT_MAX;
             bool joined = false;
             if (share) {
-               slot = apple9_join_slot(&state, need, false, &arms, arms.of[i]);
+               slot = apple9_join_slot(&state, program, need, false, &arms,
+                                       arms.of[i], for_pub);
                joined = slot != 0;
             }
             if (!slot) {
                /* Samples and memory traffic share six completion tags.
-                * Keep independent operations pending until a real hazard,
-                * consumer, or tag exhaustion requires their result handoff. */
-               unsigned first = ins.op == AGX_APPLE9_VIR_TEXTURE_SAMPLE ? 1
-                              : ins.op == AGX_APPLE9_VIR_IMAGE_STORE ? 2 : 6;
+                * Prefer slot 1 for scalar publications so raw IOR(v, v)
+                * exports pack to 4B MOV4. Keep independent operations pending
+                * until a real hazard, consumer, or tag exhaustion requires
+                * their result handoff. */
+               unsigned first =
+                  (ins.op == AGX_APPLE9_VIR_TEXTURE_SAMPLE || for_pub) ? 1
+                  : ins.op == AGX_APPLE9_VIR_IMAGE_STORE ? 2 : 6;
                const unsigned avoid = apple9_fixed_slots_ahead(
                   program, i + 1, need == UINT_MAX ? end : need);
                for (unsigned pass = 0; !slot && pass < 2; ++pass) {
@@ -1149,7 +1182,8 @@ agx_apple9_schedule_physical(struct agx_apple9_vir_program *program,
                   }
                }
                if (!slot && share) {
-                  slot = apple9_join_slot(&state, need, true, &arms, arms.of[i]);
+                  slot = apple9_join_slot(&state, program, need, true, &arms,
+                                          arms.of[i], for_pub);
                   joined = slot != 0;
                }
                if (!slot) {
