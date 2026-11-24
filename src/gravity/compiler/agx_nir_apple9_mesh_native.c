@@ -3,6 +3,7 @@
  */
 #include "agx_apple9_mesh.h"
 #include "compiler/nir/nir_builder.h"
+#include "util/u_dynarray.h"
 
 static bool
 fail(const char **reason, const char *message)
@@ -717,6 +718,132 @@ gather_mesh_info_preserving_clips(nir_shader *nir, unsigned clip_distances)
    nir->info.cull_distance_array_size = 0;
 }
 
+static nir_def *
+emit_const_slot_io(nir_builder *b, nir_intrinsic_instr *orig, unsigned slot_off)
+{
+   nir_intrinsic_instr *clone =
+      nir_intrinsic_instr_create(b->shader, orig->intrinsic);
+   clone->num_components = orig->num_components;
+   nir_intrinsic_copy_const_indices(clone, orig);
+   nir_io_semantics sem = nir_intrinsic_io_semantics(orig);
+   sem.location += slot_off;
+   sem.num_slots = 1;
+   nir_intrinsic_set_io_semantics(clone, sem);
+   if (nir_intrinsic_has_base(clone))
+      nir_intrinsic_set_base(clone, nir_intrinsic_base(orig) + slot_off);
+   if (nir_intrinsic_has_range(clone))
+      nir_intrinsic_set_range(clone, 1);
+
+   bool store = orig->intrinsic == nir_intrinsic_store_per_vertex_output ||
+                orig->intrinsic == nir_intrinsic_store_per_primitive_output;
+   if (store) {
+      clone->src[0] = nir_src_for_ssa(orig->src[0].ssa);
+      clone->src[1] = nir_src_for_ssa(orig->src[1].ssa);
+      clone->src[2] = nir_src_for_ssa(nir_imm_int(b, 0));
+      nir_builder_instr_insert(b, &clone->instr);
+      return NULL;
+   }
+
+   clone->src[0] = nir_src_for_ssa(orig->src[0].ssa);
+   clone->src[1] = nir_src_for_ssa(nir_imm_int(b, 0));
+   nir_def_init(&clone->instr, &clone->def, orig->def.num_components,
+                orig->def.bit_size);
+   nir_builder_instr_insert(b, &clone->instr);
+   return &clone->def;
+}
+
+static nir_def *
+emit_slot_tree(nir_builder *b, nir_intrinsic_instr *orig, nir_def *offset,
+               unsigned start, unsigned end)
+{
+   assert(start < end);
+   if (start == end - 1)
+      return emit_const_slot_io(b, orig, start);
+
+   unsigned mid = start + (end - start) / 2;
+   nir_push_if(b, nir_ult_imm(b, offset, mid));
+   nir_def *then_def = emit_slot_tree(b, orig, offset, start, mid);
+   nir_push_else(b, NULL);
+   nir_def *else_def = emit_slot_tree(b, orig, offset, mid, end);
+   nir_pop_if(b, NULL);
+   return then_def ? nir_if_phi(b, then_def, else_def) : NULL;
+}
+
+/* Native mesh links a fixed component map, so per-vertex/per-primitive
+ * output-array slot offsets must be constant while dynamic vertex/primitive
+ * indices stay untouched. Lower only non-constant user-varying slot offsets
+ * strictly on the native clone so emulated fallback NIR never pays for
+ * if-else trees on vertex/primitive indexing. */
+static bool
+lower_indirect_io_slots(nir_shader *nir)
+{
+   struct util_dynarray work = UTIL_DYNARRAY_INIT;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            bool store = intr->intrinsic == nir_intrinsic_store_per_vertex_output ||
+                         intr->intrinsic == nir_intrinsic_store_per_primitive_output;
+            bool load = intr->intrinsic == nir_intrinsic_load_per_vertex_output ||
+                        intr->intrinsic == nir_intrinsic_load_per_primitive_output;
+            if (!store && !load)
+               continue;
+            unsigned offset_src = store ? 2 : 1;
+            if (nir_src_is_const(intr->src[offset_src]))
+               continue;
+            nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+            if (sem.location < VARYING_SLOT_VAR0 || sem.num_slots <= 1 ||
+                sem.location + sem.num_slots > VARYING_SLOT_VAR0 + 32)
+               continue;
+            util_dynarray_append(&work, intr);
+         }
+      }
+   }
+   if (!util_dynarray_num_elements(&work, nir_intrinsic_instr *)) {
+      util_dynarray_fini(&work);
+      return false;
+   }
+
+   util_dynarray_foreach(&work, nir_intrinsic_instr *, it) {
+      nir_intrinsic_instr *intr = *it;
+      bool store = intr->intrinsic == nir_intrinsic_store_per_vertex_output ||
+                   intr->intrinsic == nir_intrinsic_store_per_primitive_output;
+      unsigned offset_src = store ? 2 : 1;
+      nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+      nir_builder b = nir_builder_at(nir_before_instr(&intr->instr));
+      nir_def *offset = intr->src[offset_src].ssa;
+
+      if (store) {
+         nir_push_if(&b, nir_ult_imm(&b, offset, sem.num_slots));
+         emit_slot_tree(&b, intr, offset, 0, sem.num_slots);
+         nir_pop_if(&b, NULL);
+         nir_instr_remove(&intr->instr);
+      } else {
+         nir_push_if(&b, nir_ult_imm(&b, offset, sem.num_slots));
+         nir_def *in_bounds = emit_slot_tree(&b, intr, offset, 0, sem.num_slots);
+         nir_push_else(&b, NULL);
+         nir_def *oob =
+            nir_imm_zero(&b, intr->def.num_components, intr->def.bit_size);
+         nir_pop_if(&b, NULL);
+         nir_def_replace(&intr->def, nir_if_phi(&b, in_bounds, oob));
+      }
+   }
+   util_dynarray_fini(&work);
+
+   unsigned saved_clip = nir->info.clip_distance_array_size;
+   unsigned saved_cull = nir->info.cull_distance_array_size;
+   nir_foreach_function_impl(impl, nir)
+      nir_progress(true, impl, nir_metadata_none);
+   nir_opt_constant_folding(nir);
+   nir_opt_dce(nir);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   nir->info.clip_distance_array_size = saved_clip;
+   nir->info.cull_distance_array_size = saved_cull;
+   return true;
+}
+
 bool
 agx_nir_lower_apple9_native_mesh(
    nir_shader *nir, bool enable_native_mesh,
@@ -747,6 +874,8 @@ agx_nir_lower_apple9_native_mesh(
           (nir->info.outputs_written & VARYING_BIT_CULL_PRIMITIVE))
          return fail(reason, "native point/line culling is unsupported");
    }
+
+   lower_indirect_io_slots(nir);
 
    /* Strip unused gl_PointSize stores on lines and triangles before IO
     * validation runs. Point topology retains VARYING_SLOT_PSIZ and clamps

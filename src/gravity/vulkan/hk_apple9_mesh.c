@@ -129,13 +129,18 @@ uint64_t
 hk_apple9_native_mesh_packed_shapes(void)
 {
    /* An explicit legacy research configuration keeps its original semantics,
-    * including HK_APPLE9_NATIVE_MESH=0 as a complete opt-out. An explicit
-    * shape list alone must not widen the production qualification. */
-   if (getenv("HK_APPLE9_NATIVE_MESH"))
-      return hk_apple9_native_mesh_enabled()
-                ? hk_apple9_packed_mesh_shapes_parse(
-                     debug_get_option_native_mesh_packed_shapes())
-                : 0;
+    * including HK_APPLE9_NATIVE_MESH=0 as a complete opt-out. When
+    * HK_APPLE9_NATIVE_MESH=1 without an explicit shape list, default to the
+    * 31 qualified native-index classes (including T32V32P32) so 1-round
+    * position-only meshlets route natively without needing an extra override.
+    * An explicit shape list alone must not widen the production qualification. */
+   if (getenv("HK_APPLE9_NATIVE_MESH")) {
+      if (!hk_apple9_native_mesh_enabled())
+         return 0;
+      const char *selection = debug_get_option_native_mesh_packed_shapes();
+      return selection ? hk_apple9_packed_mesh_shapes_parse(selection)
+                       : hk_apple9_native_index_shapes();
+   }
    return debug_get_option_native_index() ? hk_apple9_native_index_shapes() : 0;
 }
 

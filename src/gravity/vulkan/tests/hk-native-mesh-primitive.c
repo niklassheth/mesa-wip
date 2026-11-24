@@ -233,6 +233,9 @@ main(void)
                sem.location = VARYING_SLOT_VAR0;
                nir_intrinsic_set_io_semantics(intr, sem);
             } else if (bad == 1) {
+               nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+               sem.num_slots = 1;
+               nir_intrinsic_set_io_semantics(intr, sem);
                nir_src_rewrite(&intr->src[2], nir_load_local_invocation_index(&b));
             } else if (bad == 2) {
                nir_src_rewrite(&intr->src[0], nir_u2u16(&b, intr->src[0].ssa));

@@ -100,6 +100,52 @@ ownership(void)
       }
       free(m.value);
    }
+   /* Verify 2D/3D hardware child-grid linearization (lifting the 65535 1D cap):
+    * a 4x3x2 native grid executes linear indices 0..8 and skips padding 9..23
+    * without touching global outputs or emitting vertices/primitives. */
+   params = (struct libagx_mesh_params){
+      .payloads = 0x40000, .task_grids = 0x50000, .task_count = 3,
+      .payload_stride_B = 16384, .mesh_count = 9,
+   };
+   for (unsigned gz = 0; gz < 2; ++gz) {
+      for (unsigned gy = 0; gy < 3; ++gy) {
+         for (unsigned gx = 0; gx < 4; ++gx) {
+            unsigned g = gx + 4 * (gy + 3 * gz);
+            uint32_t output[11];
+            uint8_t written[sizeof(output)] = {0};
+            memset(output, 0xcc, sizeof(output));
+            struct machine m = {
+               .ubo_base = 0x20000, .group_id = {gx, gy, gz}, .num_groups = {4, 3, 2},
+               .region = {
+                  {0x20000,sizeof(root),(uint8_t *)&root,NULL},
+                  {0x30000,sizeof(params),(uint8_t *)&params,NULL},
+                  {0x40000,sizeof(payloads),(uint8_t *)payloads,NULL},
+                  {0x50000,sizeof(grids),(uint8_t *)grids,NULL},
+                  {0x60000,sizeof(output),(uint8_t *)output,written},
+               },
+            };
+            m.value = calloc(impl->ssa_alloc, sizeof(*m.value));
+            CHECK(m.value);
+            execute(&m, &impl->body, ALL_LANES);
+            if (g < 9) {
+               unsigned local = g ? g - 1 : 0, parent = g ? 2 : 0;
+               const uint32_t expect[] = {
+                  local % 2, (local / 2) % 2, local / 4,
+                  g ? 2 : 1, g ? 2 : 1, g ? 2 : 1,
+                  2 * (local % 2), 2 * ((local / 2) % 2), local / 4,
+                  0xa000 + parent, 0xb000 + parent,
+               };
+               CHECK(!memcmp(output, expect, sizeof(output)));
+               CHECK(m.actual_vertices == 3 && m.actual_primitives == 1);
+               for (unsigned i = 0; i < sizeof(written); ++i) CHECK(written[i] == 1);
+            } else {
+               for (unsigned i = 0; i < ARRAY_SIZE(output); ++i) CHECK(output[i] == 0xcccccccc);
+               CHECK(m.writes == 0 && m.actual_vertices == 0 && m.actual_primitives == 0);
+            }
+            free(m.value);
+         }
+      }
+   }
    ralloc_free(s);
 }
 

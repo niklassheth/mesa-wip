@@ -115,22 +115,99 @@ libagx_mesh_prefix(global struct libagx_mesh_params *p,
    p->mesh_dispatch[2] = 1;
 }
 
-/* Native children need no emulated output records. The CPU proves the sum
- * fits a one-dimensional native grid before recording any task work, and
- * allocates independent task records in the command pool. Keep payloads and
- * task-grid records until the whole native render retires. */
+/* Native children need no emulated output records unless a dynamic task
+ * shader's total exceeds max_groups. Factor totals in [1, 2^20 - 1] into a
+ * 2D hardware child grid (dx <= 65535, dy <= 1023, dx * dy <= 2^20 - 1);
+ * padding workgroups (g >= mesh_count) exit without side effects via the
+ * task-bridge guard. When overflow_p is provided and total > max_groups,
+ * record overflow_p->mesh_count for libagx_mesh_overflow_alloc() in the
+ * fallback render's own mesh-heap epoch and park native on a safe dummy. */
 KERNEL(1024)
-libagx_mesh_prefix_native(global struct libagx_mesh_params *p)
+libagx_mesh_prefix_native(global struct libagx_mesh_params *p,
+                          uint max_groups,
+                          global struct libagx_mesh_params *overflow_p)
 {
    local uint scratch[32];
+   local uint64_t total_scratch[1024];
    uint tasks = p->task_count;
+   uint tid = cl_local_id.x;
+
+   /* Compute an exact 64-bit total before the 32-bit in-place prefix sum so
+    * aggregate totals >= 2^32 can never wrap back into native admission. */
+   uint64_t partial = 0;
+   for (uint i = tid; i < tasks; i += 1024)
+      partial += (uint64_t)p->task_grids[i * 4 + 3];
+   total_scratch[tid] = partial;
+   barrier(CLK_LOCAL_MEM_FENCE);
+   for (uint stride = 512; stride > 0; stride >>= 1) {
+      if (tid < stride)
+         total_scratch[tid] += total_scratch[tid + stride];
+      barrier(CLK_LOCAL_MEM_FENCE);
+   }
+   uint64_t total64 = total_scratch[0];
+   barrier(CLK_LOCAL_MEM_FENCE);
+
    poly_prefix_sum(scratch, p->task_grids, tasks, 4, 3, 1024);
    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
-   if (cl_local_id.x != 0)
+   if (tid != 0)
       return;
-   uint total = tasks ? p->task_grids[(tasks - 1) * 4 + 3] : 0;
-   p->mesh_count = total;
-   p->mesh_dispatch[0] = max(total, 1u);
+
+   uint capped_max = min(max_groups, 1048575u);
+   if (overflow_p && total64 > capped_max) {
+      p->mesh_count = 0;
+      p->mesh_dispatch[0] = 1;
+      p->mesh_dispatch[1] = 1;
+      p->mesh_dispatch[2] = 1;
+
+      overflow_p->mesh_count = total64 <= UINT_MAX ? (uint)total64 : 0;
+      return;
+   }
+
+   uint native_total = (uint)min(total64, (uint64_t)capped_max);
+   uint dx = 1, dy = 1;
+   if (native_total <= 65535u) {
+      dx = max(native_total, 1u);
+   } else {
+      dy = (native_total + 65534u) / 65535u;
+      dx = (native_total + dy - 1u) / dy;
+      if ((uint64_t)dx * dy > 1048575u) {
+         /* native_total in [1048560, 1048575]: 1025 * 1023 == 2^20 - 1. */
+         dx = 1025u;
+         dy = 1023u;
+      }
+   }
+   p->mesh_count = native_total;
+   p->mesh_dispatch[0] = dx;
+   p->mesh_dispatch[1] = dy;
+   p->mesh_dispatch[2] = 1;
+
+   if (overflow_p)
+      overflow_p->mesh_count = 0;
+}
+
+/* Allocate emulated output records inside the fallback render's own mesh-heap
+ * epoch when libagx_mesh_prefix_native() routed an oversized dynamic task draw
+ * to overflow_p. No-ops cleanly when overflow_p->mesh_count == 0. */
+KERNEL(1)
+libagx_mesh_overflow_alloc(global struct libagx_mesh_params *p,
+                           global struct poly_heap *heap, uint group_stride_B,
+                           uint vertices_per_group)
+{
+   uint total = p->mesh_count;
+   if (!total) {
+      p->outputs = 0;
+      p->mesh_dispatch[0] = 0;
+      p->mesh_dispatch[1] = 1;
+      p->mesh_dispatch[2] = 1;
+      p->draw[0] = 0;
+      p->draw[1] = 1;
+      p->draw[2] = 0;
+      p->draw[3] = 0;
+      return;
+   }
+
+   mesh_set_records(p, heap, total, group_stride_B, vertices_per_group);
+   p->mesh_dispatch[0] = p->mesh_count;
    p->mesh_dispatch[1] = 1;
    p->mesh_dispatch[2] = 1;
 }

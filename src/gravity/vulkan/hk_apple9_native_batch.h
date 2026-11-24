@@ -14,6 +14,10 @@
 #include <stddef.h>
 #include "gravity/lib/agx_native_mesh.h"
 
+/* Hardware 64 KiB mesh output ring capacity in 16-byte rows (static_assert'd
+ * against AGX_APPLE9_MESH_RING_ROWS in hk_cmd_apple9.c). */
+#define HK_APPLE9_NATIVE_RING_ROWS 4096u
+
 /* Largest ordinary draw block in the stream, including its terminator: the
  * state header (8 words), 8 PPP header/pointer pairs and the trailing PPP
  * word (agx_apple9_emit_draw_state, 100 bytes), then the largest draw form,
@@ -79,6 +83,10 @@ struct hk_apple9_stream_summary {
    size_t bytes, capacity;
    /* Estimated binned primitives already in the render. */
    uint64_t primitives;
+   /* Cumulative hardware 64 KiB mesh output ring rows of native blocks in the
+    * render, and whether any block had wg_rows > 40 (ring-limited). */
+   uint64_t ring_rows;
+   bool ring_limited;
 };
 
 struct hk_apple9_draw_summary {
@@ -90,6 +98,10 @@ struct hk_apple9_draw_summary {
    bool same_shaders;
    /* Estimated binned primitives of the draw (UINT64_MAX: unknown). */
    uint64_t primitives;
+   /* Hardware 64 KiB mesh output ring rows of this native draw (UINT64_MAX:
+    * unknown), and whether its per-WG footprint exceeds the 40-row safe cap. */
+   uint64_t ring_rows;
+   bool ring_limited;
 };
 
 static inline bool
@@ -114,6 +126,14 @@ hk_apple9_native_stream_admits(const struct hk_apple9_stream_summary *s,
       return false;
    if (!d->native)
       return p->mixed && !d->mesh && !d->gs && !d->tess;
+   /* When either the open render or the incoming native block has wg_rows > 40,
+    * enforce that combined ring occupancy stays within the 64 KiB (4096-row)
+    * mesh output ring without assuming an implicit cross-block hardware drain. */
+   if (s->ring_limited || d->ring_limited) {
+      if (d->ring_rows > HK_APPLE9_NATIVE_RING_ROWS ||
+          s->ring_rows > HK_APPLE9_NATIVE_RING_ROWS - d->ring_rows)
+         return false;
+   }
    return s->dispatches < p->batch;
 }
 

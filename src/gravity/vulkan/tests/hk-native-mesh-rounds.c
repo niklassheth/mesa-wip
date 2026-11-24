@@ -226,10 +226,35 @@ main(int argc, char **argv)
       /* Single-round non-class shapes use the model too; V3/P1 does not. */
       CHECK(hk_apple9_native_mesh_model_counts_eligible(size, 32, 42));
       CHECK(!hk_apple9_native_mesh_model_counts_eligible(size, 3, 1));
-      /* Within one round: attributes take the model, position-only stays
-       * under the class list (V20/P10 is not a class). */
+      /* Within one round: attributes take the model; plain HK_APPLE9_NATIVE_MESH=1
+       * without HK_APPLE9_NATIVE_MESH_PACKED_SHAPES also admits the 31 qualified
+       * native-index position-only classes (including T32V32P32 and T32V32P42),
+       * while excluding unqualified shapes (T32V20P10, T16V16P16). */
       check(32, 20, 10, true, false, 32);
       check(32, 20, 10, false, false, 0);
+      check(16, 16, 16, false, false, 0);
+      {
+         const unsigned qualified_pos[][2] = {{32, 32}, {32, 42}};
+         for (unsigned i = 0; i < ARRAY_SIZE(qualified_pos); ++i) {
+            nir_shader *nir = source(32, qualified_pos[i][0], qualified_pos[i][1],
+                                     false, false);
+            struct hk_apple9_graphics_key key = {0};
+            bool supported = false;
+            const char *why = NULL;
+            CHECK(hk_apple9_native_mesh_check(nir, &key, &supported, &why) ==
+                  VK_SUCCESS);
+            CHECK(supported);
+            struct agx_shader_part part = {0};
+            struct agx_apple9_mesh_body_info body;
+            CHECK(hk_apple9_compile_native_mesh_program(nir, &key, &part, &body,
+                                                        &why));
+            CHECK(!body.publication_rounds && body.key.physical_threads == 32);
+            CHECK(hk_apple9_native_shader_valid(&part.info, &body,
+                                                HK_APPLE9_NATIVE_MESH));
+            free(part.binary);
+            ralloc_free(nir);
+         }
+      }
       CHECK(!hk_apple9_native_mesh_round_counts_eligible(size, 257, 126));
       CHECK(!hk_apple9_native_mesh_round_counts_eligible(size, 64, 257));
       size[0] = 129;

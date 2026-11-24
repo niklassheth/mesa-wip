@@ -430,7 +430,7 @@ hk_nir_lower_native_mesh_task(nir_shader *nir)
       .native_id = nir_load_workgroup_id(&b),
       .native_count = nir_load_num_workgroups(&b),
    };
-   nir_def *g = nir_channel(&b, s.native_id, 0);
+   nir_def *g = hk_linear_workgroup(&b, s.native_id, s.native_count);
    nir_def *count = hk_mesh_param(&b, s.params, 1, 32, mesh_count);
    nir_if *active = nir_push_if(&b, nir_ult(&b, g, count));
    active->control = nir_selection_control_dont_flatten;

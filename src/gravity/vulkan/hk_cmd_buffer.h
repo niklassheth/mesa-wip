@@ -544,6 +544,10 @@ struct hk_cs {
    /* Estimated binned primitives of the stream's native render (blocks
     * and the ordinary draws between them). */
    uint64_t apple9_native_primitives;
+   /* Cumulative 16-byte rows of the 64 KiB mesh output ring used by native
+    * blocks in this render, and whether any block had wg_rows > 40. */
+   uint64_t apple9_native_ring_rows;
+   bool apple9_native_ring_limited;
    /* PPP state of the stream's last native block, for blocks that update
     * only what changed (on by default; HK_APPLE9_NATIVE_PPP_DELTA=0 turns it off). Any other draw clears it. */
    bool apple9_ppp_valid;
@@ -813,6 +817,10 @@ struct hk_cmd_buffer {
    /* Estimated binned primitives of the draw being recorded, for the native
     * render bound (hk_apple9_native_stream_admits); UINT64_MAX: unknown. */
    uint64_t apple9_draw_primitives;
+   /* Hardware 64 KiB mesh output ring rows of the native draw being recorded,
+    * and whether its per-WG footprint exceeds the 40-row concurrent cap. */
+   uint64_t apple9_draw_ring_rows;
+   bool apple9_draw_ring_limited;
    struct hk_cs *apple9_prev_cs;
 
    /* Prepared ordinary draw state. Dynamic/shader/vertex state dirties this

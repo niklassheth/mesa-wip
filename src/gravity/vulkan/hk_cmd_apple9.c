@@ -1735,6 +1735,8 @@ hk_apple9_native_can_append(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                      ? 0
                      : cs->root_size - 0x800 - AGX_VDM_STREAM_LINK_LENGTH,
       .primitives = cs->apple9_native_primitives,
+      .ring_rows = cs->apple9_native_ring_rows,
+      .ring_limited = cs->apple9_native_ring_limited,
    };
    struct hk_apple9_draw_summary draw = {
       .native = native,
@@ -1750,6 +1752,8 @@ hk_apple9_native_can_append(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .tess = gfx->shaders[MESA_SHADER_TESS_CTRL] ||
               gfx->shaders[MESA_SHADER_TESS_EVAL],
       .primitives = cmd->apple9_draw_primitives,
+      .ring_rows = native ? cmd->apple9_draw_ring_rows : 0,
+      .ring_limited = native && cmd->apple9_draw_ring_limited,
    };
    for (unsigned s = 0; s < HK_APPLE9_GFX_STAGES; ++s)
       draw.writes_memory |= gfx->shaders[s] && gfx->shaders[s]->writes_memory;
@@ -2013,6 +2017,8 @@ hk_apple9_emit_ordinary_draw(struct hk_cs *cs,
 
 static_assert(HK_APPLE9_MESH_COMMAND_BYTES == HK_APPLE9_NATIVE_BLOCK_MAX_B,
               "batch reservation covers a complete native block");
+static_assert(HK_APPLE9_NATIVE_RING_ROWS == AGX_APPLE9_MESH_RING_ROWS,
+              "batch ring budget matches hardware 64 KiB mesh ring");
 
 /* Backstop for hk_apple9_native_stream_admits: a block appended to a batched
  * native stream must stay in the root chunk and the decoder budget, and be
@@ -2047,6 +2053,16 @@ hk_apple9_add_native_primitives(struct hk_cs *cs, uint64_t primitives)
       primitives > UINT64_MAX - cs->apple9_native_primitives
          ? UINT64_MAX
          : cs->apple9_native_primitives + primitives;
+}
+
+static inline void
+hk_apple9_add_native_ring_rows(struct hk_cs *cs, uint64_t rows, bool limited)
+{
+   cs->apple9_native_ring_rows =
+      rows > UINT64_MAX - cs->apple9_native_ring_rows
+         ? UINT64_MAX
+         : cs->apple9_native_ring_rows + rows;
+   cs->apple9_native_ring_limited |= limited;
 }
 
 static bool
@@ -2096,6 +2112,8 @@ hk_apple9_record_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       cs->apple9_native_mesh = true;
       ++cs->apple9_native_dispatches;
       hk_apple9_add_native_primitives(cs, cmd->apple9_draw_primitives);
+      hk_apple9_add_native_ring_rows(cs, cmd->apple9_draw_ring_rows,
+                                     cmd->apple9_draw_ring_limited);
       if (!hk_apple9_check_native_block(cmd, cs, before))
          return false;
       if (debug_get_option_native_batch_log())

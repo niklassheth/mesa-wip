@@ -442,8 +442,38 @@ task_routes(struct hk_cmd_buffer *cmd)
    m->info.apple9_native.writes_layer_viewport = false;
    t->info.task.max_mesh_groups = 0;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   /* Standalone native leaves lack paired emulated variants, so dynamic task
+    * counts stay off; paired hybrid shaders admit dynamic task bridge. */
    t->info.task.max_mesh_groups = UINT32_MAX;
    CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
+   {
+      struct hk_api_shader *outer_mesh = shader(MESA_SHADER_MESH);
+      struct hk_api_shader *outer_task = shader(MESA_SHADER_TASK);
+      outer_mesh->apple9_native = mesh;
+      outer_task->apple9_native = task;
+      gfx->shaders[MESA_SHADER_MESH] = outer_mesh;
+      gfx->shaders[MESA_SHADER_TASK] = outer_task;
+      CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+      /* Legal aggregate task count must not be able to wrap 32 bits:
+       * max 1023 task groups (1023 * 2^22 < 2^32 <= 1024 * 2^22). */
+      uint32_t dyn_ok[] = {1023, 1, 1}, dyn_wrap[] = {1024, 1, 1};
+      CHECK(hk_apple9_use_native_mesh(cmd, dyn_ok, 0));
+      CHECK(!hk_apple9_use_native_mesh(cmd, dyn_wrap, 0));
+      /* Still rejected when the native layout cannot fit even 1 WG in ring. */
+      m->info.apple9_native.layout.max_vertices = 256;
+      m->info.apple9_native.layout.vertex_components = 64;
+      CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
+      m->info.apple9_native.layout.max_vertices = 0;
+      m->info.apple9_native.layout.vertex_components = 0;
+      /* Indirect and conditional rendering still stay off task bridge. */
+      CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
+      cmd->state.cond_render.active = true;
+      CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
+      cmd->state.cond_render.active = false;
+      gfx->shaders[MESA_SHADER_MESH] = mesh;
+      gfx->shaders[MESA_SHADER_TASK] = task;
+      free(outer_mesh); free(outer_task);
+   }
    t->info.task.max_mesh_groups = 3;
    task->apple9_native_pair_id[5] ^= 1;
    CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
@@ -454,11 +484,19 @@ task_routes(struct hk_cmd_buffer *cmd)
    gfx->shaders[MESA_SHADER_TASK] = NULL;
    CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
    gfx->shaders[MESA_SHADER_TASK] = task;
+   /* 2D dispatch factorization lifts the 65535 1D cap up to max_groups
+    * (min(2^20 - 1, TVB primitive cap / max_primitives)). */
    direct[0] = 21845; direct[1] = direct[2] = 1;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0)); /* 65535 children */
    direct[0]++;
-   CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
-   direct[0] = 2;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0)); /* 65538 children (2D) */
+   t->info.task.max_mesh_groups = 10;
+   direct[0] = 10000; direct[1] = 10; direct[2] = 1;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0)); /* 1000000 <= TVB cap */
+   direct[0] = 10001; direct[1] = 10; direct[2] = 1;
+   CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0)); /* 1000100 > TVB cap */
+   t->info.task.max_mesh_groups = 3;
+   direct[0] = 2; direct[1] = direct[2] = 1;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
    /* Task bridge multiplies parent grid by max_mesh_groups before checking the
     * 64 KiB mesh output ring (V=128, n=8 -> 15 safe groups). */
@@ -591,11 +629,11 @@ tess_routes(struct hk_cmd_buffer *cmd)
          CHECK(hk_apple9_use_native_tess(cmd, draw));
       }
       /* Hardware 64 KiB mesh output ring gate also protects native TES:
-       * V=3 with <= 56 components stays <= 64 rows/WG; 60 components exceeds
-       * the ring for a densely tessellated patch (8192 max groups). */
-      main->info.apple9_native.layout.vertex_components = 56;
+       * V=3 with <= 32 components stays <= 40 rows/WG; 36 components (44 rows)
+       * exceeds the ring for a densely tessellated patch (8192 max groups). */
+      main->info.apple9_native.layout.vertex_components = 32;
       CHECK(hk_apple9_use_native_tess(cmd, draw));
-      main->info.apple9_native.layout.vertex_components = 60;
+      main->info.apple9_native.layout.vertex_components = 36;
       CHECK(!hk_apple9_use_native_tess(cmd, draw));
       main->info.apple9_native.layout.vertex_components = 0;
       gfx->shaders[MESA_SHADER_TESS_EVAL] = ng;

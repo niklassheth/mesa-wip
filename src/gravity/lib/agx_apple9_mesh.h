@@ -37,8 +37,12 @@ agx_apple9_mesh_state_build(uint32_t out[AGX_APPLE9_MESH_STATE_WORDS],
  * Each workgroup consumes ceil(V / 4) * ALIGN_POT(n, 4) + 8 rows. */
 #define AGX_APPLE9_MESH_RING_ROWS 4096u
 #define AGX_APPLE9_MESH_RING_HEADER_ROWS 8u
-#define AGX_APPLE9_MESH_RING_CONCURRENT_SAFE_ROWS 64u
+#define AGX_APPLE9_MESH_RING_CONCURRENT_SAFE_ROWS 40u
 
+bool agx_apple9_mesh_ring_max_groups(const struct agx_apple9_mesh_layout *layout,
+                                     uint64_t *max_groups);
+bool agx_apple9_mesh_ring_usage(const struct agx_apple9_mesh_layout *layout,
+                                uint64_t groups, uint64_t *rows, bool *limited);
 bool agx_apple9_mesh_ring_fits(const struct agx_apple9_mesh_layout *layout,
                                uint64_t groups);
 

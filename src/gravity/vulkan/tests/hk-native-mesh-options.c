@@ -8,6 +8,8 @@
 #include "hk_shader.h"
 #include "hk_shader_priv.h"
 #include "hk_apple9_mesh.h"
+#include "hk_device.h"
+#include "hk_physical_device.h"
 #include "vk_graphics_state.h"
 #include "gravity/compiler/agx_nir.h"
 #include "compiler/nir/nir_builder.h"
@@ -232,6 +234,13 @@ check_output_array(bool primitive, bool reverse)
    array->data.location = VARYING_SLOT_VAR8;
    array->data.per_primitive = primitive;
    nir_builder b = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(mesh)));
+   nir_variable *readback = nir_variable_create(
+      mesh, nir_var_shader_out,
+      glsl_array_type(glsl_array_type(glsl_vec4_type(), 4, 0),
+                      primitive ? 1 : 3, 0),
+      "output_readback");
+   readback->data.location = VARYING_SLOT_VAR12;
+   readback->data.per_primitive = primitive;
    for (unsigned v = 0; v < (primitive ? 1 : 3); ++v) {
       for (unsigned j = 0; j < 3; ++j) {
          nir_def *index = nir_load_global(&b, 1, 32,
@@ -244,11 +253,30 @@ check_output_array(bool primitive, bool reverse)
             values[c] = nir_imm_int(&b, 0x80000 + 100 * v + 10 * j + c);
          nir_store_deref(&b, deref, nir_vec(&b, values, 4), 15);
       }
+      /* Out-of-bounds dynamic store must be guarded and leave valid slots intact. */
+      nir_def *oob_idx = nir_load_global(&b, 1, 32,
+         nir_imm_int64(&b, INPUT_ADDR + 3 * 4), .align_mul = 4);
+      nir_deref_instr *oob_deref = nir_build_deref_array(&b,
+         nir_build_deref_array_imm(&b, nir_build_deref_var(&b, array), v),
+         oob_idx);
+      nir_store_deref(&b, oob_deref, nir_imm_ivec4(&b, -1, -1, -1, -1), 15);
+      /* Exercise dynamic output-array loads (both in-bounds and OOB -> 0). */
+      for (unsigned j = 0; j < 4; ++j) {
+         nir_def *index = nir_load_global(&b, 1, 32,
+            nir_imm_int64(&b, INPUT_ADDR + j * 4), .align_mul = 4);
+         nir_deref_instr *deref = nir_build_deref_array(&b,
+            nir_build_deref_array_imm(&b, nir_build_deref_var(&b, array), v),
+            index);
+         nir_def *loaded = nir_load_deref(&b, deref);
+         nir_deref_instr *dst = nir_build_deref_array_imm(&b,
+            nir_build_deref_array_imm(&b, nir_build_deref_var(&b, readback), v),
+            j);
+         nir_store_deref(&b, dst, loaded, 15);
+      }
    }
-   /* Exercise the normal deref-to-IO passes, then the actual driver compiler
-    * boundary. The recording Vulkan regression checks pipeline wiring. */
-   CHECK(nir_lower_indirect_derefs_to_if_else_trees(
-      mesh, nir_var_shader_out, UINT32_MAX));
+   /* Exercise nir_lower_io WITHOUT pre-lowering nir_var_shader_out to if-else
+    * trees (matching hk_lower_nir): native mesh lowering must resolve only the
+    * inner dynamic slot offset on its own clone, keeping fallback NIR untouched. */
    nir_lower_io(mesh, nir_var_shader_out, io_size, 0);
    nir_opt_constant_folding(mesh);
    nir_opt_dce(mesh);
@@ -259,9 +287,10 @@ check_output_array(bool primitive, bool reverse)
    const char *reason = NULL;
    CHECK(hk_apple9_compile_native_mesh_program(mesh, &key, &part, &info, &reason));
    CHECK(hk_apple9_native_shader_valid(&part.info, &info, HK_APPLE9_NATIVE_MESH));
-   uint32_t indices[3];
+   uint32_t indices[4];
    for (unsigned j = 0; j < 3; ++j)
       indices[j] = reverse ? 2 - j : j;
+   indices[3] = 99; /* OOB slot index */
    struct machine m = {.num_groups = {1, 1, 1}};
    m.region[5] = (struct region){INPUT_ADDR, sizeof(indices), (uint8_t *)indices, NULL};
    nir_function_impl *impl = nir_shader_get_entrypoint(mesh);
@@ -274,10 +303,18 @@ check_output_array(bool primitive, bool reverse)
             unsigned slot = VARYING_SLOT_VAR8 + indices[j];
             unsigned channel = 4 + agx_apple9_varying_index(
                &part.info.apple9_varyings, slot, c);
-            CHECK(m.submitted_position[v][channel] ==
-                  0x80000 + 100 * (primitive ? 0 : v) + 10 * j + c);
+            uint32_t expected = 0x80000 + 100 * (primitive ? 0 : v) + 10 * j + c;
+            CHECK(m.submitted_position[v][channel] == expected);
             CHECK(part.info.apple9_varyings.group[slot] == (primitive ? 1 : 0));
+            unsigned rb_ch = 4 + agx_apple9_varying_index(
+               &part.info.apple9_varyings, VARYING_SLOT_VAR12 + j, c);
+            CHECK(m.submitted_position[v][rb_ch] == expected);
          }
+      }
+      for (unsigned c = 0; c < 4; ++c) {
+         unsigned oob_ch = 4 + agx_apple9_varying_index(
+            &part.info.apple9_varyings, VARYING_SLOT_VAR12 + 3, c);
+         CHECK(m.submitted_position[v][oob_ch] == 0);
       }
    }
    free(m.value);
@@ -413,6 +450,74 @@ check_multiview_key(void)
    ralloc_free(oversized);
 }
 
+static void
+check_no_fallback_if_else_bloat(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_physical_device pdev = {0};
+   CHECK(dev);
+   dev->vk.base.type = VK_OBJECT_TYPE_DEVICE;
+   dev->vk.physical = &pdev.vk;
+   dev->dev.chip = pdev.dev.chip = AGX_CHIP_G16G;
+
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_MESH, &agx_nir_options, "no fallback if-else bloat");
+   nir_shader *nir = b.shader;
+   nir->info.workgroup_size[0] = 32;
+   nir->info.workgroup_size[1] = nir->info.workgroup_size[2] = 1;
+   nir->info.mesh.max_vertices_out = 128;
+   nir->info.mesh.max_primitives_out = 64;
+   nir->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+
+   nir_variable *pos = nir_variable_create(
+      nir, nir_var_shader_out, glsl_array_type(glsl_vec4_type(), 128, 0), "pos");
+   pos->data.location = VARYING_SLOT_POS;
+   nir_variable *col = nir_variable_create(
+      nir, nir_var_shader_out, glsl_array_type(glsl_vec4_type(), 128, 0), "col");
+   col->data.location = VARYING_SLOT_VAR0;
+   nir_variable *idx = nir_variable_create(
+      nir, nir_var_shader_out, glsl_array_type(glsl_uvec_type(3), 64, 0), "idx");
+   idx->data.location = VARYING_SLOT_PRIMITIVE_INDICES;
+   idx->data.per_primitive = true;
+
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 128),
+                                      nir_imm_int(&b, 64), nir_imm_int(&b, 0));
+   nir_store_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, pos), lane),
+                   nir_imm_vec4(&b, 0, 0, 0.5f, 1), 0xf);
+   nir_store_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, col), lane),
+                   nir_imm_vec4(&b, 1, 0, 0, 1), 0xf);
+   nir_store_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, idx), lane),
+                   nir_imm_ivec3(&b, 0, 1, 2), 0x7);
+
+   const struct vk_pipeline_robustness_state rs = vk_robustness_disabled;
+   hk_lower_nir(dev, nir, &rs, false, 0, NULL, 0);
+
+   /* hk_lower_nir must NOT expand per-vertex/per-primitive dynamic indexing
+    * into if-else trees even with HK_APPLE9_NATIVE_MESH=1. */
+   unsigned if_count = 0;
+   unsigned store_count = 0;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   foreach_list_typed(nir_cf_node, node, node, &impl->body) {
+      if (node->type == nir_cf_node_if)
+         ++if_count;
+   }
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+         if (op == nir_intrinsic_store_per_vertex_output ||
+             op == nir_intrinsic_store_per_primitive_output)
+            ++store_count;
+      }
+   }
+   CHECK(if_count == 0);
+   CHECK(store_count == 3);
+   ralloc_free(nir);
+   free(dev);
+}
+
 int main(void)
 {
    CHECK(hk_apple9_native_mesh_enabled());
@@ -425,6 +530,7 @@ int main(void)
    check_primitive_key();
    check_capabilities();
    check_multiview_key();
+   check_no_fallback_if_else_bloat();
    for (unsigned primitive = 0; primitive < 2; ++primitive)
       for (unsigned reverse = 0; reverse < 2; ++reverse)
          check_output_array(primitive, reverse);

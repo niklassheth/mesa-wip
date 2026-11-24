@@ -183,9 +183,10 @@ hk_hash_apple9_native_mesh_abi(struct mesa_blake3 *ctx)
       1, /* P1 logical workgroups independent of physical output class. */
       2, /* Destination-addressed publication rounds beyond 32 entries. */
       hk_apple9_native_task_bridge_enabled(),
-      1, /* Compute-task records and guarded native child grids. */
+      2, /* 2D/3D-linearized compute-task records and dynamic overflow bridge. */
       1, /* Guarded empty-grid taskless object/mesh for indirect & cond render. */
       1, /* Multiview native mesh layer lowering from root.draw.view_index. */
+      1, /* Native-only indirect output-slot lowering without fallback bloat. */
    };
    _mesa_blake3_update(ctx, abi, sizeof(abi));
 }

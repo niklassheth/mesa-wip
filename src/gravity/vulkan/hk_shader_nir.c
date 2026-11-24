@@ -3536,18 +3536,10 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    else if (nir->info.stage == MESA_SHADER_VERTEX)
       lower_indirect_modes |= nir_var_shader_in | nir_var_shader_out;
 
-   /* Native mesh links a fixed component map. Resolve indirect output-array
-    * slots while their declared bounds are still available as derefs. This
-    * also covers arrays nested inside per-vertex/per-primitive blocks. */
-   if (hk_apple9_native_mesh_available(hk_device_physical(dev)) &&
-       ((hk_apple9_native_mesh_enabled() &&
-         agx_apple9_native_mesh_shape_eligible(nir)) ||
-        (hk_apple9_native_task_bridge_enabled() &&
-         nir->info.stage == MESA_SHADER_MESH) ||
-        hk_apple9_native_mesh_packed_shape_eligible(nir) ||
-        hk_apple9_native_mesh_round_shape_eligible(nir)))
-      lower_indirect_modes |= nir_var_shader_out;
-
+   /* Native mesh resolves indirect per-vertex/per-primitive output-array slots
+    * strictly on its own native clone in agx_nir_lower_apple9_native_mesh,
+    * keeping emulated fallback NIR untouched and dynamic vertex/primitive
+    * indexing free of if-else trees. */
    NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
             lower_indirect_modes, UINT32_MAX);
 
