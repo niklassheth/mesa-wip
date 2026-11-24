@@ -786,10 +786,11 @@ bool agx_apple9_vir_ensure_value_capacity(
 /* Deep copy. Logical NIR block pointers are copied as they are. */
 bool agx_apple9_vir_clone(struct agx_apple9_vir_program *dst,
                           const struct agx_apple9_vir_program *src);
-/* Append a serialization of everything an allocation reads from the program:
- * equal keys mean equal programs, with pointers expressed as layout indices
- * and NIR blocks as their relation to the program's blocks. Padding is
- * included, so equal programs may still differ in key. */
+/* Test-only helper (defined in agx_apple9_ir_test_support.c): append a
+ * serialization of everything an allocation reads from the program: equal keys
+ * mean equal programs, with pointers expressed as layout indices and NIR blocks
+ * as their relation to the program's blocks. Padding is included, so equal
+ * programs may still differ in key. */
 bool agx_apple9_vir_key(const struct agx_apple9_vir_program *program,
                         struct util_dynarray *key);
 
@@ -1457,11 +1458,13 @@ bool
 agx_apple9_validate_mesh_control(const struct agx_apple9_vir_program *program,
                                 const char **reason);
 
+/* Test-only allocation validator (defined in agx_apple9_ir_test_support.c). */
 bool
 agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
                                    const char **reason);
 
-/* Allocate pending asynchronous producers to scoreboard slots from final VIR
+/* Test-only VIR scoreboard assigner (defined in agx_apple9_ir_test_support.c):
+ * allocate pending asynchronous producers to scoreboard slots from final VIR
  * order.  The first capable consumer performs the handoff; later reads use
  * slot 0. */
 bool

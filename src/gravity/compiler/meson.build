@@ -72,12 +72,20 @@ if with_tests or with_tools.contains('drm-shim')
 endif
 
 if with_tests
+  libgravity_compiler_test_support = static_library(
+    'gravity_compiler_test_support',
+    files('agx_apple9_ir_test_support.c'),
+    dependencies: [idep_gravity_debug, idep_nir, idep_mesautil],
+    c_args : [no_override_init_args, '-Wno-c2x-extensions'],
+    gnu_symbol_visibility : 'hidden',
+    build_by_default : false,
+  )
   gravity_ra_budget_test = executable('gravity-apple9-ra-budget',
     'test/apple9-ra-budget.c',
     c_args : [c_msvc_compat_args, no_override_init_args],
     gnu_symbol_visibility : 'hidden',
     dependencies : [idep_nir, idep_mesautil],
-    link_with : [libgravity_compiler],
+    link_with : [libgravity_compiler_test_support, libgravity_compiler],
   )
   test('gravity-apple9-ra-budget', gravity_ra_budget_test, suite : ['gravity'])
   gravity_mesh_limits_test = executable('gravity-apple9-mesh-limits',
@@ -175,7 +183,7 @@ if with_tests
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       dependencies: [idep_gtest, idep_nir, idep_mesautil],
-      link_with : [libgravity_compiler],
+      link_with : [libgravity_compiler_test_support, libgravity_compiler],
     ),
     suite : ['gravity'],
     protocol : 'gtest',
