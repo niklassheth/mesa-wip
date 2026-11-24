@@ -1741,7 +1741,8 @@ hk_apple9_native_can_append(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .meta = cmd->in_meta,
       .queries = gfx->occlusion.active_count ||
                  gfx->descriptors.root.draw.pipeline_stats_flags ||
-                 hk_cond_render_applies(cmd),
+                 hk_cond_render_applies(cmd) ||
+                 gfx->render.view_mask != 0,
       .task = gfx->shaders[MESA_SHADER_TASK],
       .xfb = gfx->xfb_enabled,
       .mesh = gfx->shaders[MESA_SHADER_MESH],
@@ -2311,6 +2312,8 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
             : hk_any_variant(gfx->shaders[MESA_SHADER_VERTEX]);
    shaders[1] = hk_any_variant(null_trivial ? dev->null_fs_trivial
                                            : fragment_api ?: dev->null_fs);
+   bool allow_line_multiview = hk_apple9_native_mesh_enabled() &&
+                               mesh && mesh->vk.stage == MESA_SHADER_MESH;
    if (native_grid &&
        (!mesh ||
         (gfx->shaders[MESA_SHADER_TASK] &&
@@ -2318,7 +2321,11 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
           mesh->vk.stage != MESA_SHADER_MESH ||
           !shaders[0]->info.mesh.native_task_bridge)) || (tes && gs) ||
         shaders[0]->info.apple9_native_stage != HK_APPLE9_NATIVE_MESH ||
-        dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL || gfx->render.view_mask))
+        (dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL &&
+         (!allow_line_multiview || dyn->rs.polygon_mode != VK_POLYGON_MODE_LINE)) ||
+        (gfx->render.view_mask &&
+         (!allow_line_multiview || !shaders[0]->info.mesh.native_multiview ||
+          !shaders[0]->info.apple9_native.writes_layer_viewport))))
       UNSUPPORTED();
    /* Geometry and tessellation have already run as compute, and draw their
     * own output topology. Adjacency primitives without a geometry shader
@@ -3050,14 +3057,17 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
     * stream. */
    bool append = hk_apple9_native_can_append(cmd, cs, !!native_grid);
    bool allow_multilayer_msaa = hk_apple9_native_mesh_enabled();
+   uint32_t layers = gfx->render.view_mask
+                        ? util_last_bit(gfx->render.view_mask)
+                        : gfx->render.layer_count;
    if ((cs->apple9_native_mesh && !append) ||
        (native_grid &&
         ((!append && cs->current != cs->start) ||
          (!allow_multilayer_msaa &&
-          (pipeline.samples != 1 || gfx->render.layer_count != 1)) ||
+          (pipeline.samples != 1 || layers != 1)) ||
          (pipeline.samples != 1 && pipeline.samples != 2 &&
           pipeline.samples != 4) ||
-         !gfx->render.layer_count || gfx->render.layer_count > 2048)))
+         !layers || layers > 2048)))
       UNSUPPORTED();
    cs->tib = gfx->render.tilebuffer;
    const struct vk_dynamic_graphics_state *ms_dyn = &cmd->vk.dynamic_graphics_state;

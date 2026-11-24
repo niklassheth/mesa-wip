@@ -6,7 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "hk_shader.h"
+#include "hk_shader_priv.h"
 #include "hk_apple9_mesh.h"
+#include "vk_graphics_state.h"
 #include "gravity/compiler/agx_nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_serialize.h"
@@ -360,6 +362,57 @@ check_capabilities(void)
    check_capability(nir, false);
 }
 
+static void
+check_multiview_key(void)
+{
+   /* hk_apple9_graphics_key propagates multiview state from state->mv. */
+   struct vk_multiview_state mv_off = {.view_mask = 0};
+   struct vk_multiview_state mv_on = {.view_mask = 0x5};
+   struct vk_graphics_pipeline_state st_off = {.mv = &mv_off};
+   struct vk_graphics_pipeline_state st_on = {.mv = &mv_on};
+   struct hk_apple9_graphics_key k_null, k_off, k_on;
+   hk_apple9_graphics_key(&k_null, NULL);
+   hk_apple9_graphics_key(&k_off, &st_off);
+   hk_apple9_graphics_key(&k_on, &st_on);
+   CHECK(!k_null.is_multiview);
+   CHECK(!k_off.is_multiview);
+   CHECK(k_on.is_multiview);
+
+   /* V3/P1 (primitive_broadcast) and V4/P2 (primitive_vertices multi-round)
+    * both compile natively with multiview layer output into the packed
+    * Layer/Viewport UVS plane. */
+   const unsigned shapes[][2] = {{3, 1}, {4, 2}};
+   for (unsigned i = 0; i < ARRAY_SIZE(shapes); ++i) {
+      nir_shader *mesh = producer(true);
+      mesh->info.mesh.max_vertices_out = shapes[i][0];
+      mesh->info.mesh.max_primitives_out = shapes[i][1];
+      struct hk_apple9_graphics_key key = {.is_multiview = true};
+      bool supported = false;
+      const char *reason = NULL;
+      CHECK(hk_apple9_native_mesh_check(mesh, &key, &supported, &reason) == VK_SUCCESS);
+      CHECK(supported);
+      struct agx_shader_part part = {0};
+      struct agx_apple9_mesh_body_info info;
+      CHECK(hk_apple9_compile_native_mesh_program(mesh, &key, &part, &info, &reason));
+      CHECK(info.writes_layer_viewport && part.info.writes_layer_viewport);
+      CHECK(hk_apple9_native_shader_valid(&part.info, &info, HK_APPLE9_NATIVE_MESH));
+      free(part.binary);
+      ralloc_free(mesh);
+   }
+
+   /* V + P > 256 cannot allocate provoking-vertex layer duplicates and must
+    * decline multiview native admission cleanly without mutating NIR. */
+   nir_shader *oversized = producer(true);
+   oversized->info.mesh.max_vertices_out = 200;
+   oversized->info.mesh.max_primitives_out = 100;
+   struct hk_apple9_graphics_key key = {.is_multiview = true};
+   bool supported = true;
+   const char *reason = NULL;
+   CHECK(hk_apple9_native_mesh_check(oversized, &key, &supported, &reason) == VK_SUCCESS);
+   CHECK(!supported && reason);
+   ralloc_free(oversized);
+}
+
 int main(void)
 {
    CHECK(hk_apple9_native_mesh_enabled());
@@ -371,6 +424,7 @@ int main(void)
    }
    check_primitive_key();
    check_capabilities();
+   check_multiview_key();
    for (unsigned primitive = 0; primitive < 2; ++primitive)
       for (unsigned reverse = 0; reverse < 2; ++reverse)
          check_output_array(primitive, reverse);

@@ -185,7 +185,7 @@ main(void)
    glsl_type_singleton_init_or_ref();
    const unsigned shapes[][3] = {
       {2, 1, 1}, {3, 1, 1}, {64, 126, 1}, {126, 64, 1},
-      {128, 65, 16}, {256, 256, 32}, {64, 126, 64},
+      {128, 65, 16}, {256, 255, 32}, {256, 256, 32}, {64, 126, 64},
    };
    for (unsigned s = 0; s < ARRAY_SIZE(shapes); ++s) {
       unsigned v = shapes[s][0], p = shapes[s][1], l = shapes[s][2];
@@ -217,6 +217,32 @@ main(void)
       const char *why = NULL;
       CHECK(hk_apple9_native_mesh_check(nir, &key, &supported, &why) == VK_SUCCESS);
       CHECK(!supported && why);
+      ralloc_free(nir);
+   }
+   /* V=256, P=255 lines with per-primitive color (misc.max_lines shape):
+    * exceeds 256-vertex provoking duplication so native falls back cleanly,
+    * while emulated record sizing accounts for 2-index lines and vec4 color. */
+   {
+      nir_shader *nir = source(256, 255, 32);
+      nir_builder b = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(nir)));
+      nir_store_per_primitive_output(&b, nir_imm_vec4(&b, 1.0f, 0.0f, 0.0f, 1.0f),
+         nir_imm_int(&b, 0), nir_imm_int(&b, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1});
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+      struct hk_apple9_graphics_key key = {0};
+      bool supported = true;
+      const char *why = NULL;
+      CHECK(hk_apple9_native_mesh_check(nir, &key, &supported, &why) == VK_SUCCESS);
+      CHECK(!supported && why);
+      struct hk_mesh_info info;
+      hk_mesh_gather_info(nir, &info);
+      CHECK(info.max_vertices == 256 && info.max_primitives == 255);
+      CHECK(info.prim == MESA_PRIM_LINES);
+      CHECK(hk_mesh_slot_words(&info, VARYING_SLOT_PRIMITIVE_INDICES) == 2);
+      CHECK(hk_mesh_primitives_offset_B(&info) == 16u + 256u * (16u + 16u));
+      CHECK(info.group_stride_B ==
+            hk_mesh_primitives_offset_B(&info) + 255u * (8u + 16u));
       ralloc_free(nir);
    }
    glsl_type_singleton_decref();

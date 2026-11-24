@@ -135,6 +135,12 @@ main(int argc, char **argv)
       cmd->state.gfx.occlusion.active_count = 0;
       CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
       CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
+      cmd->state.gfx.render.view_mask = 3;
+      CHECK(!hk_apple9_use_native_mesh(cmd, groups, 0));
+      cmd->state.gfx.render.view_mask = 0;
+      cmd->vk.dynamic_graphics_state.rs.polygon_mode = VK_POLYGON_MODE_LINE;
+      CHECK(!hk_apple9_use_native_mesh(cmd, groups, 0));
+      cmd->vk.dynamic_graphics_state.rs.polygon_mode = VK_POLYGON_MODE_FILL;
       cmd->state.cond_render.active = true;
       CHECK(!hk_apple9_use_native_mesh(cmd, groups, 0));
       cmd->state.cond_render.active = false;

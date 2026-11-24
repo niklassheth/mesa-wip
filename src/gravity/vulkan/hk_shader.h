@@ -109,7 +109,9 @@ struct hk_mesh_info {
    uint8_t polygon_points;
    /* Native mesh consumes compute-task grids and per-parent payloads. */
    bool native_task_bridge;
-   uint8_t _pad[5];
+   /* Native mesh publishes root.draw.view_index as its rasterizer Layer. */
+   bool native_multiview;
+   uint8_t _pad[4];
 };
 
 /* Fragment shaders read user per-primitive varyings from the output records,
@@ -765,6 +767,8 @@ struct hk_apple9_graphics_key {
    bool native_task_bridge;
    /* Generated mesh NIR from an API GS/TES stage (already guarded / own draw ABI). */
    bool native_stage_generated;
+   /* Pipeline compiles for a multiview render pass (viewMask != 0). */
+   bool is_multiview;
    /* Independently keyed stage admission; never implied by a native mesh. */
    uint8_t native_stages;
 };

@@ -1474,6 +1474,82 @@ hk_apple9_native_mesh_options(nir_shader *nir,
    };
 }
 
+static bool
+strip_mesh_layer_store(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   bool *has_indirect = data;
+   if (intr->intrinsic != nir_intrinsic_store_per_primitive_output)
+      return false;
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   if (!nir_src_is_const(intr->src[2])) {
+      if (sem.location <= VARYING_SLOT_LAYER &&
+          sem.location + sem.num_slots > VARYING_SLOT_LAYER)
+         *has_indirect = true;
+      return false;
+   }
+   unsigned slot = sem.location + nir_src_as_uint(intr->src[2]);
+   if (slot != VARYING_SLOT_LAYER)
+      return false;
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+/* Multiview renders each enabled view into its own attachment layer via
+ * hk_foreach_view(cmd) + root.draw.view_index. Inject a per-primitive Layer
+ * store of root.draw.view_index across every declared primitive slot before
+ * native mesh lowering so both P1 (primitive_broadcast) and multi-round
+ * (primitive_vertices) paths pack (view_index & 0xffff) | (viewport << 16)
+ * into the hardware UVS Layer/Viewport word. */
+static bool
+hk_apple9_lower_native_mesh_multiview(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_MESH || nir->info.workgroup_size_variable)
+      return false;
+   unsigned max_verts = nir->info.mesh.max_vertices_out;
+   unsigned max_prims = nir->info.mesh.max_primitives_out;
+   if (!max_verts || max_verts > 256 || !max_prims || max_prims > 256)
+      return false;
+   uint64_t logical_threads = (uint64_t)nir->info.workgroup_size[0] *
+                              nir->info.workgroup_size[1] *
+                              nir->info.workgroup_size[2];
+   if (!logical_threads || logical_threads > AGX_APPLE9_NATIVE_MAX_INVOCATIONS)
+      return false;
+
+   bool has_indirect = false;
+   nir_shader_intrinsics_pass(nir, strip_mesh_layer_store,
+                              nir_metadata_control_flow, &has_indirect);
+   if (has_indirect)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   unsigned offset = hk_root_descriptor_offset(draw.view_index);
+   nir_def *view_idx = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0),
+                                    nir_imm_int(&b, offset), .align_mul = 4,
+                                    .range_base = offset, .range = 4);
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   for (unsigned first = 0; first < max_prims;
+        first += (unsigned)logical_threads) {
+      nir_def *p = nir_iadd_imm(&b, lane, first);
+      nir_if *nif = NULL;
+      if (first + logical_threads > max_prims)
+         nif = nir_push_if(&b, nir_ult_imm(&b, p, max_prims));
+      nir_store_per_primitive_output(&b, view_idx, p, nir_imm_int(&b, 0),
+                                     .write_mask = 0x1,
+                                     .src_type = nir_type_uint32,
+                                     .io_semantics = {
+                                        .location = VARYING_SLOT_LAYER,
+                                        .num_slots = 1,
+                                     });
+      if (nif)
+         nir_pop_if(&b, nif);
+   }
+   nir->info.outputs_written |= VARYING_BIT_LAYER;
+   nir->info.per_primitive_outputs |= VARYING_BIT_LAYER;
+   nir_progress(true, impl, nir_metadata_none);
+   return true;
+}
+
 /* Native incompatibility is a capability result, not a Vulkan error. Run the
  * actual lowering on a clone: some rejection sites occur after NIR mutation.
  * This runs at pipeline/library/shader creation even when final compilation
@@ -1487,12 +1563,22 @@ hk_apple9_native_mesh_check(nir_shader *nir,
    *supported = false;
    if (reason)
       *reason = NULL;
-   if ((!hk_apple9_native_mesh_enabled() && !key->native_index) || key->line_stipple)
+   if ((!hk_apple9_native_mesh_enabled() && !key->native_index) ||
+       key->line_stipple ||
+       (key->is_multiview && !key->native_stage_generated &&
+        !hk_apple9_native_mesh_enabled()))
       return VK_SUCCESS;
 
    nir_shader *probe = nir_shader_clone(NULL, nir);
    if (!probe)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   if (key->is_multiview && !key->native_stage_generated &&
+       !hk_apple9_lower_native_mesh_multiview(probe)) {
+      if (reason)
+         *reason = "native mesh multiview layer lowering failed";
+      ralloc_free(probe);
+      return VK_SUCCESS;
+   }
    if (key->native_task_bridge)
       hk_nir_lower_native_mesh_task(probe);
    if (!hk_apple9_native_mesh_enabled() &&
@@ -1522,6 +1608,14 @@ hk_apple9_compile_native_mesh_program(
    struct agx_shader_part *out, struct agx_apple9_mesh_body_info *info,
    const char **reason)
 {
+   if (key->is_multiview && !key->native_stage_generated) {
+      if (!hk_apple9_native_mesh_enabled() ||
+          !hk_apple9_lower_native_mesh_multiview(nir)) {
+         if (reason)
+            *reason = "native mesh multiview layer lowering failed";
+         return false;
+      }
+   }
    if (key->native_task_bridge)
       hk_nir_lower_native_mesh_task(nir);
    const struct agx_apple9_native_mesh_options options =
@@ -1723,6 +1817,13 @@ hk_apple9_compile_native_mesh(struct hk_device *dev, nir_shader *nir,
       *unsupported = true;
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
+   if (mesh_key.is_multiview && !mesh_key.native_stage_generated) {
+      if (!mesh->info.apple9_native.writes_layer_viewport) {
+         *unsupported = true;
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
+      mesh->info.mesh.native_multiview = true;
+   }
    VkResult result = hk_apple9_finish_shader(dev, mesh, nir);
    if (result != VK_SUCCESS)
       return result;
@@ -1835,6 +1936,7 @@ hk_apple9_graphics_key(struct hk_apple9_graphics_key *key,
    }
    key->is_library =
       !!(state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR);
+   key->is_multiview = state->mv && state->mv->view_mask != 0;
    if (state->cal) {
       for (unsigned rt = 0; rt < ARRAY_SIZE(key->color_map); ++rt)
          key->color_map[rt] = state->cal->color_map[rt];

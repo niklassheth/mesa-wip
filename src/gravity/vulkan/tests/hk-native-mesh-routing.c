@@ -64,18 +64,23 @@ routes(struct hk_cmd_buffer *cmd)
    dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_UNKNOWN;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
    dev->dev.vm_id = saved_vm_id;
-   /* Unknown GPU indirect / indirect-count grids stay on emulation (cannot
-    * bound native child-grid limits or per-render TVB primitive budget). */
-   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
-   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
+   /* Guarded taskless indirect and indirect-count draws are admitted when the
+    * output footprint is concurrent-safe (<= 64 rows/WG); invalid direct+count
+    * and oversized direct grids still fall back. */
+   CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0));
+   CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
    CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0x1000));
    CHECK(!hk_apple9_use_native_mesh(cmd, oversized, 0));
    /* An unguarded binary (e.g. production 31-class cache) must fall back on
-    * conditional rendering. */
+    * conditional rendering, indirect, and indirect-count draws. */
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.guard_empty_grid = false;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
    cmd->state.cond_render.active = true;
    CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
    cmd->state.cond_render.active = false;
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.guard_empty_grid = true;
 #define FALLBACK(field, value)                                                 \
@@ -91,18 +96,40 @@ routes(struct hk_cmd_buffer *cmd)
    FALLBACK(nf->apple9_native_pair_id[0], 0x35);
    FALLBACK(nf->apple9_native_pair_id[31], 0x35);
    FALLBACK(nf->apple9_native_leaf, false);
-   /* Deferred native variants are themselves leaves. Pairing is checked
-    * identically to the alternatives of an eagerly compiled pipeline. */
+   /* Deferred native variants are themselves leaves. Direct draws route
+    * identically to eager alternatives, while indirect/indirect-count draws
+    * fall back because standalone leaves lack paired emulated overflow shaders. */
    gfx->shaders[MESA_SHADER_MESH] = nm;
    gfx->shaders[MESA_SHADER_FRAGMENT] = nf;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
    FALLBACK(nf->apple9_native_pair_id[7], 0x35);
    gfx->shaders[MESA_SHADER_MESH] = mesh;
    gfx->shaders[MESA_SHADER_FRAGMENT] = fs;
    FALLBACK(gfx->shaders[MESA_SHADER_TASK], mesh);
    FALLBACK(gfx->shaders[MESA_SHADER_GEOMETRY], mesh);
    FALLBACK(gfx->shaders[MESA_SHADER_TESS_EVAL], mesh);
+   /* Multiview requires a matching native_multiview binary with packed
+    * Layer/Viewport output, uses effective layer count from view_mask even
+    * when VkRenderingInfo.layerCount == 0, and rejects mismatched binaries. */
    FALLBACK(gfx->render.view_mask, 3);
+   nm->variants[HK_MESH_VARIANT_MAIN].info.mesh.native_multiview = true;
+   CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
+   gfx->render.view_mask = 3;
+   CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0)); /* missing writes_layer_viewport */
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.writes_layer_viewport = true;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0));
+   CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
+   gfx->render.layer_count = 0; /* legal with nonzero viewMask */
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0));
+   gfx->render.layer_count = 1;
+   gfx->render.view_mask = 0;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.mesh.native_multiview = false;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.writes_layer_viewport = false;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
    /* Multi-layer (1..=2048) and MSAA (1x/2x/4x) are admitted under
     * HK_APPLE9_NATIVE_MESH=1 (paired with kernel 932adc520b3c); out-of-range
     * layer counts and sample counts still fall back cleanly. */
@@ -121,14 +148,22 @@ routes(struct hk_cmd_buffer *cmd)
    gfx->occlusion.active_count = 1;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
    gfx->occlusion.active_count = 0;
-   /* Conditional rendering is admitted for guarded taskless direct draws;
-    * indirect / indirect-count draws remain on emulation. */
+   /* Conditional rendering is admitted for guarded taskless direct, indirect,
+    * and indirect-count draws. */
    cmd->state.cond_render.active = true;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
-   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
-   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
+   CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0));
+   CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
    cmd->state.cond_render.active = false;
-   FALLBACK(dyn->rs.polygon_mode, VK_POLYGON_MODE_LINE);
+   /* VK_POLYGON_MODE_LINE is admitted natively without stipple or software
+    * degenerate-index culling; VK_POLYGON_MODE_POINT stays emulated. */
+   dyn->rs.polygon_mode = VK_POLYGON_MODE_LINE;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0));
+   dyn->rs.line.stipple.enable = true;
+   CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
+   dyn->rs.line.stipple.enable = false;
+   dyn->rs.polygon_mode = VK_POLYGON_MODE_FILL;
    FALLBACK(dyn->rs.polygon_mode, VK_POLYGON_MODE_POINT);
    dyn->ms.rasterization_samples = 2;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
@@ -145,12 +180,15 @@ routes(struct hk_cmd_buffer *cmd)
    FALLBACK(gfx->xfb_enabled, true);
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.primitive_broadcast =
       VARYING_BIT_CULL_PRIMITIVE;
+   FALLBACK(dyn->rs.polygon_mode, VK_POLYGON_MODE_LINE);
    FALLBACK(dyn->rs.conservative_mode,
             VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT);
    /* CullDistance alone also removes a whole triangle with degenerate
-    * indices. A cached native pair must fall back under conservative raster. */
+    * indices. A cached native pair must fall back under conservative raster
+    * or wireframe line mode. */
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.primitive_broadcast = 0;
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.cull_distances = 2;
+   FALLBACK(dyn->rs.polygon_mode, VK_POLYGON_MODE_LINE);
    FALLBACK(dyn->rs.conservative_mode,
             VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT);
    FALLBACK(dyn->rs.conservative_mode,
@@ -163,14 +201,18 @@ routes(struct hk_cmd_buffer *cmd)
    gfx->shaders[MESA_SHADER_FRAGMENT] = fs;
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.cull_distances = 0;
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.cull_primitive = true;
+   FALLBACK(dyn->rs.polygon_mode, VK_POLYGON_MODE_LINE);
    FALLBACK(dyn->rs.conservative_mode,
             VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT);
    FALLBACK(dyn->rs.conservative_mode,
             VK_CONSERVATIVE_RASTERIZATION_MODE_UNDERESTIMATE_EXT);
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.cull_primitive = false;
    gfx->shaders[MESA_SHADER_FRAGMENT] = NULL;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
    /* Hardware 64 KiB mesh output ring gate: V=128, n=8 (264 rows/WG) admits up
-    * to 15 workgroups (e.g. draw_count_{1,2}) and falls back at 16/32/64. */
+    * to 15 direct workgroups (and indirect draws via GPU max_groups=15 +
+    * emulated overflow fallback), while a single-WG ring overflow (V=256,
+    * n=128) has max_groups=0 and falls back even for indirect draws. */
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_vertices = 128;
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.vertex_components = 8;
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_primitives = 32;
@@ -180,6 +222,14 @@ routes(struct hk_cmd_buffer *cmd)
    CHECK(!hk_apple9_use_native_mesh(cmd, ring_wrap, 0));
    CHECK(!hk_apple9_use_native_mesh(cmd, ring_32, 0));
    CHECK(!hk_apple9_use_native_mesh(cmd, ring_64, 0));
+   CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0));
+   CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_vertices = 256;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.vertex_components = 128;
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_vertices = 128;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.vertex_components = 8;
    /* Multi-axis product crossing the same threshold falls back too. */
    const uint32_t ring_2d_fit[] = {3, 5, 1}, ring_2d_wrap[] = {4, 4, 1};
    CHECK(hk_apple9_use_native_mesh(cmd, ring_2d_fit, 0));
@@ -380,6 +430,16 @@ task_routes(struct hk_cmd_buffer *cmd)
    cmd->state.cond_render.active = true;
    CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
    cmd->state.cond_render.active = false;
+   /* Multiview task-bridged draws require a matching native_multiview binary. */
+   gfx->render.view_mask = 3;
+   CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
+   m->info.mesh.native_multiview = true;
+   m->info.apple9_native.writes_layer_viewport = true;
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
+   gfx->render.view_mask = 0;
+   m->info.mesh.native_multiview = false;
+   m->info.apple9_native.writes_layer_viewport = false;
    t->info.task.max_mesh_groups = 0;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
    t->info.task.max_mesh_groups = UINT32_MAX;

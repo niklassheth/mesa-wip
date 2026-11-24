@@ -185,6 +185,7 @@ hk_hash_apple9_native_mesh_abi(struct mesa_blake3 *ctx)
       hk_apple9_native_task_bridge_enabled(),
       1, /* Compute-task records and guarded native child grids. */
       1, /* Guarded empty-grid taskless object/mesh for indirect & cond render. */
+      1, /* Multiview native mesh layer lowering from root.draw.view_index. */
    };
    _mesa_blake3_update(ctx, abi, sizeof(abi));
 }
@@ -457,8 +458,9 @@ hk_hash_graphics_state(struct vk_physical_device *device,
       _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
    }
 
-   if (state &&
-       (stages & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT))) {
+   if (state && state->mv &&
+       (stages & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                  VK_SHADER_STAGE_MESH_BIT_EXT))) {
       const bool is_multiview = state->mv->view_mask != 0;
       _mesa_blake3_update(&blake3_ctx, &is_multiview, sizeof(is_multiview));
    }
@@ -673,7 +675,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 }
 
 /* Version the container independently of the hardware programs it owns. */
-#define HK_SHADER_CONTAINER_VERSION 0x484b0012u
+#define HK_SHADER_CONTAINER_VERSION 0x484b0013u
 
 static VkResult
 hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *blob,
