@@ -169,6 +169,11 @@ apple9_system_source(nir_scalar scalar, struct apple9_system_source *source)
       components = 2;
       zext16 = scalar.comp == 1;
       break;
+   case nir_intrinsic_load_mesh_payload_base_apple9_agx:
+      base = 0xe0;
+      components = 2;
+      zext16 = scalar.comp == 1;
+      break;
    case nir_intrinsic_load_pixel_coord:
       base = 0xa0;
       components = 2;
@@ -1083,6 +1088,7 @@ apple9_instruction_is_in_subset(nir_instr *instr, bool graphics)
              op == nir_intrinsic_end_task_apple9_agx ||
              op == nir_intrinsic_load_local_apple9_agx ||
              op == nir_intrinsic_load_mesh_primitive_base_apple9_agx ||
+             op == nir_intrinsic_load_mesh_payload_base_apple9_agx ||
              op == nir_intrinsic_load_native_pointer_apple9_agx ||
              op == nir_intrinsic_image_store_apple9_agx ||
              op == nir_intrinsic_image_load_apple9_agx ||

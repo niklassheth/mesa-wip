@@ -40,13 +40,13 @@ hk_apple9_native_gs_packed_class(unsigned threads, unsigned vertices,
            (vertices == 4 * HK_APPLE9_NATIVE_GS_PACK && primitives == 16));
 }
 
-DEBUG_GET_ONCE_BOOL_OPTION(native_task_bridge, "HK_APPLE9_NATIVE_TASK_BRIDGE", false)
+DEBUG_GET_ONCE_BOOL_OPTION(native_task_bridge, "HK_APPLE9_NATIVE_TASK_BRIDGE", true)
 DEBUG_GET_ONCE_BOOL_OPTION(native_object, "HK_APPLE9_NATIVE_OBJECT", true)
 
 bool
 hk_apple9_native_task_bridge_enabled(void)
 {
-   return debug_get_option_native_task_bridge();
+   return hk_apple9_native_mesh_enabled() && debug_get_option_native_task_bridge();
 }
 
 bool
@@ -545,11 +545,21 @@ hk_apple9_native_shader_valid(const struct agx_shader_info *code,
       if (!logical_limit ||
           !logical_size_valid(body->logical_size, logical_limit))
          return false;
-      return !body->layout.local_size_B && !body->reads_native_payload;
+      if (k->hw_payload &&
+          (!hk_apple9_native_mesh_enabled() ||
+           (body->writes_child_grid &&
+            body->task_payload_stride_B > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES - 16)))
+         return false;
+      return !body->layout.local_size_B && !body->reads_native_payload &&
+             !body->reads_child_grid;
    }
    if (body->writes_child_grid ||
-       ((body->task_payload_size_B || body->reads_native_payload) &&
-        !hk_apple9_native_mesh_enabled()))
+       ((body->task_payload_size_B || body->reads_native_payload ||
+         body->reads_child_grid || k->hw_payload) &&
+        !hk_apple9_native_mesh_enabled()) ||
+       (body->reads_child_grid && !body->reads_native_payload) ||
+       (k->hw_payload && body->reads_child_grid &&
+        body->task_payload_stride_B > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES - 16))
       return false;
    const struct agx_apple9_mesh_layout *l = &body->layout;
    if (body->primitive_vertices) {

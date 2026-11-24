@@ -1667,14 +1667,29 @@ bool hk_apple9_native_blocks_enabled(const struct hk_device *dev);
 bool hk_apple9_native_lanes(const struct hk_device *dev);
 uint64_t hk_apple9_native_render_primitives(void);
 void hk_apple9_end_native_batch(struct hk_cmd_buffer *cmd);
+enum hk_apple9_native_mesh_route {
+   HK_APPLE9_MESH_ROUTE_EMULATED = 0,
+   HK_APPLE9_MESH_ROUTE_NATIVE = 1,
+   HK_APPLE9_MESH_ROUTE_TASK_BRIDGE = 2,
+};
+
 bool hk_apple9_prepare_draw(struct hk_cmd_buffer *cmd, bool reads_buffers,
-                             bool native_mesh);
+                            bool native_mesh);
+bool hk_apple9_prepare_draw_ex(struct hk_cmd_buffer *cmd, bool reads_buffers,
+                               bool native_mesh, bool native_object);
 bool hk_apple9_use_native_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw);
 bool hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw);
+enum hk_apple9_native_mesh_route
+hk_apple9_select_native_mesh_route(struct hk_cmd_buffer *cmd,
+                                   const uint32_t *direct,
+                                   uint64_t count_addr);
 bool hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
-                                uint64_t count_addr);
+                               uint64_t count_addr);
 void hk_apple9_draw_native_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                                 uint64_t grid);
+void hk_apple9_draw_native_task_bridge(struct hk_cmd_buffer *cmd,
+                                       uint32_t draw_id, uint64_t grid,
+                                       bool secondary_bridge);
 void hk_apple9_draw_native_object(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                                   const uint32_t object_groups[3],
                                   uint64_t grid, uint64_t payload);

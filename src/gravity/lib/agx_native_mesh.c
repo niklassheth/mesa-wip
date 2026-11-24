@@ -244,7 +244,8 @@ agx_native_blocks_probe(int drm_fd)
 
 /* asahi-native-object v1 generation=<G> profile=<qualified|research|none>
  * multi_parent=<0|1> payload_bytes=<B> max_threads=<T> max_shared=<S>
- * max_groups=<M>\n, exact single spaces. Fails closed on any mismatch. */
+ * max_groups=<M>[ mp_payload_bytes=<P>]\n, exact single spaces. Fails closed
+ * on any mismatch; older kernels omitting mp_payload_bytes default to 0. */
 struct agx_native_object_support
 agx_native_object_parse(const char *text, size_t size)
 {
@@ -254,7 +255,7 @@ agx_native_object_parse(const char *text, size_t size)
       return no;
    size_t pos = 0, end = size - 1;
    uint64_t generation, multi_parent, payload_bytes, max_threads, max_shared,
-      max_groups;
+      max_groups, mp_payload_bytes = 0;
    enum agx_native_mesh_profile profile;
    if (!parse_literal(text, end, &pos, "asahi-native-object v1 generation=") ||
        !parse_decimal(text, end, &pos, AGX_NATIVE_MESH_GENERATION_MAX,
@@ -281,12 +282,18 @@ agx_native_object_parse(const char *text, size_t size)
                       &max_shared) ||
        !parse_literal(text, end, &pos, " max_groups=") ||
        !parse_decimal(text, end, &pos, AGX_NATIVE_OBJECT_MAX_GROUPS,
-                      &max_groups) ||
-       pos != end)
+                      &max_groups))
       return no;
+   if (pos != end) {
+      if (!parse_literal(text, end, &pos, " mp_payload_bytes=") ||
+          !parse_decimal(text, end, &pos, AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES,
+                         &mp_payload_bytes) ||
+          pos != end)
+         return no;
+   }
    if (profile == AGX_NATIVE_MESH_PROFILE_NONE) {
-      if (multi_parent || payload_bytes || max_threads != 16 || max_shared ||
-          max_groups != 1)
+      if (multi_parent || payload_bytes || mp_payload_bytes ||
+          max_threads != 16 || max_shared || max_groups != 1)
          return no;
       return (struct agx_native_object_support){
          .profile = AGX_NATIVE_MESH_PROFILE_NONE,
@@ -295,7 +302,8 @@ agx_native_object_parse(const char *text, size_t size)
          .max_groups = 1,
       };
    }
-   if (!multi_parent || !payload_bytes ||
+   if (!multi_parent || !payload_bytes || mp_payload_bytes > payload_bytes ||
+       (mp_payload_bytes & 15) ||
        (max_threads != 16 && max_threads != 32) || !max_shared ||
        max_groups < 2)
       return no;
@@ -304,6 +312,7 @@ agx_native_object_parse(const char *text, size_t size)
       .generation = generation,
       .multi_parent = true,
       .payload_bytes = payload_bytes,
+      .mp_payload_bytes = mp_payload_bytes,
       .max_threads = max_threads,
       .max_shared = max_shared,
       .max_groups = max_groups,

@@ -856,6 +856,7 @@ lower_indirect_io_slots(nir_shader *nir)
 struct native_child_grid_lower {
    unsigned payload_uniform;
    unsigned grid_offset_B;
+   bool hw_payload;
    bool lowered;
 };
 
@@ -868,7 +869,9 @@ lower_native_mesh_child_num_workgroups(nir_builder *b,
       return false;
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *base = nir_pack_64_2x32(
-      b, nir_load_native_pointer_apple9_agx(b, .base = st->payload_uniform));
+      b, st->hw_payload
+            ? nir_load_mesh_payload_base_apple9_agx(b)
+            : nir_load_native_pointer_apple9_agx(b, .base = st->payload_uniform));
    nir_def *addr = nir_iadd_imm(b, base, st->grid_offset_B);
    nir_def *nwg = nir_load_global(b, 3, 32, addr, .align_mul = 4,
                                   .access = ACCESS_NON_WRITEABLE);
@@ -890,6 +893,10 @@ agx_nir_lower_apple9_native_mesh(
                                   : AGX_APPLE9_NATIVE_THREADS;
    bool packed_indices = options && options->packed_index_publication;
    bool native_object_payload = options && options->native_object_payload;
+   bool native_object_hw_payload = options && options->native_object_hw_payload;
+   if (native_object_hw_payload && !native_object_payload)
+      return fail(reason,
+                  "native mesh hardware payload requires native object payload mode");
    if (!eligible(nir, physical_threads, packed_indices, native_object_payload,
                  reason))
       return false;
@@ -951,9 +958,14 @@ agx_nir_lower_apple9_native_mesh(
       child_grid = (struct native_child_grid_lower){
          .payload_uniform = AGX_APPLE9_MESH_PAYLOAD_UNIFORM,
          .grid_offset_B = payload_stride_B,
+         .hw_payload = native_object_hw_payload,
       };
       nir_shader_intrinsics_pass(nir, lower_native_mesh_child_num_workgroups,
                                  nir_metadata_control_flow, &child_grid);
+      if (native_object_hw_payload && child_grid.lowered &&
+          payload_stride_B > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES - 16)
+         return fail(reason,
+                     "native mesh hardware child grid exceeds 16 KiB payload limit");
    }
 
    struct cull_storage cull = {
@@ -1045,10 +1057,12 @@ agx_nir_lower_apple9_native_mesh(
       return false;
 
    key.physical_threads = physical_threads;
+   key.hw_payload = native_object_hw_payload;
    if (!agx_nir_lower_apple9_mesh(nir, &key, info, reason))
       return false;
    if (native_object_payload) {
       info->task_payload_stride_B = payload_stride_B;
+      info->reads_child_grid = child_grid.lowered;
       info->reads_native_payload =
          info->task_payload_size_B > 0 || child_grid.lowered;
    }

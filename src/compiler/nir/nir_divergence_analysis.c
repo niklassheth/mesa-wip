@@ -235,6 +235,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
 
    /* Intrinsics which are always uniform */
    case nir_intrinsic_load_mesh_primitive_base_apple9_agx:
+   case nir_intrinsic_load_mesh_payload_base_apple9_agx:
    case nir_intrinsic_load_native_pointer_apple9_agx:
    case nir_intrinsic_load_preamble:
    case nir_intrinsic_load_push_constant_zink:

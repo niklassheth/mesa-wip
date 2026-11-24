@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 /* The driver-local v1 advertisement is not a shared DRM UAPI capability. */
-#define AGX_NATIVE_MESH_ADVERTISEMENT_MAX 160
+#define AGX_NATIVE_MESH_ADVERTISEMENT_MAX 256
 /* bits/219 stores generation << 8 | mode in its atomic u64. */
 #define AGX_NATIVE_MESH_GENERATION_MAX (UINT64_MAX >> 8)
 
@@ -107,6 +107,7 @@ struct agx_native_object_support {
    uint64_t generation;
    bool multi_parent;
    uint32_t payload_bytes;
+   uint32_t mp_payload_bytes;
    uint32_t max_threads;
    uint32_t max_shared;
    uint32_t max_groups;
@@ -125,6 +126,8 @@ agx_native_object_enabled(const struct agx_native_object_support *o)
            o->profile == AGX_NATIVE_MESH_PROFILE_RESEARCH) &&
           o->multi_parent && o->payload_bytes &&
           o->payload_bytes <= AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES &&
+          o->mp_payload_bytes <= o->payload_bytes &&
+          !(o->mp_payload_bytes & 15) &&
           (o->max_threads == 16 || o->max_threads == 32) &&
           o->max_shared && o->max_shared <= AGX_NATIVE_OBJECT_MAX_SHARED_BYTES &&
           o->max_groups && o->max_groups <= AGX_NATIVE_OBJECT_MAX_GROUPS;
@@ -139,6 +142,7 @@ agx_native_object_same(struct agx_native_object_support before,
           before.generation == after.generation &&
           before.multi_parent == after.multi_parent &&
           before.payload_bytes == after.payload_bytes &&
+          before.mp_payload_bytes == after.mp_payload_bytes &&
           before.max_threads == after.max_threads &&
           before.max_shared == after.max_shared &&
           before.max_groups == after.max_groups;

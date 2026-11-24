@@ -1762,8 +1762,8 @@ hk_apple9_native_can_append(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 }
 
 bool
-hk_apple9_prepare_draw(struct hk_cmd_buffer *cmd, bool reads_buffers,
-                         bool native_mesh)
+hk_apple9_prepare_draw_ex(struct hk_cmd_buffer *cmd, bool reads_buffers,
+                          bool native_mesh, bool native_object)
 {
    if (vk_command_buffer_has_error(&cmd->vk))
       return false;
@@ -1894,15 +1894,9 @@ hk_apple9_prepare_draw(struct hk_cmd_buffer *cmd, bool reads_buffers,
    uint8_t reads = reads_buffers ? HK_READS_BUFFERS : 0;
    if (cmd->in_meta)
       reads |= HK_READS_META;
-   bool native_object_task =
-      native_mesh && gfx->shaders[MESA_SHADER_TASK] &&
-      gfx->shaders[MESA_SHADER_MESH] &&
-      hk_api_shader_native(gfx->shaders[MESA_SHADER_MESH]) &&
-      hk_api_shader_native(gfx->shaders[MESA_SHADER_MESH])
-         ->variants[HK_MESH_VARIANT_MAIN].info.mesh.native_object;
    if (gfx->xfb_enabled || gfx->shaders[MESA_SHADER_TESS_CTRL] ||
        gfx->shaders[MESA_SHADER_TESS_EVAL] || gfx->shaders[MESA_SHADER_GEOMETRY] ||
-       (native_mesh && gfx->shaders[MESA_SHADER_TASK] && !native_object_task))
+       (native_mesh && gfx->shaders[MESA_SHADER_TASK] && !native_object))
       reads |= HK_READS_INTERNAL;
    for (unsigned s = 0; s < ARRAY_SIZE(gfx->shaders); ++s) {
       if (s == MESA_SHADER_FRAGMENT || s == MESA_SHADER_COMPUTE || !gfx->shaders[s])
@@ -1913,6 +1907,21 @@ hk_apple9_prepare_draw(struct hk_cmd_buffer *cmd, bool reads_buffers,
    cs->linear_store |= gfx->render.linear_store;
 
    return true;
+}
+
+bool
+hk_apple9_prepare_draw(struct hk_cmd_buffer *cmd, bool reads_buffers,
+                       bool native_mesh)
+{
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   bool native_object =
+      native_mesh && gfx->shaders[MESA_SHADER_TASK] &&
+      gfx->shaders[MESA_SHADER_MESH] &&
+      hk_api_shader_native(gfx->shaders[MESA_SHADER_MESH]) &&
+      hk_api_shader_native(gfx->shaders[MESA_SHADER_MESH])
+         ->variants[HK_MESH_VARIANT_MAIN].info.mesh.native_object;
+   return hk_apple9_prepare_draw_ex(cmd, reads_buffers, native_mesh,
+                                    native_object);
 }
 
 /* The compiler's local roots and ordinary graphics roots share one table.
@@ -2319,7 +2328,7 @@ static void
 hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                     struct agx_draw draw, uint64_t native_grid,
                     const uint32_t *native_object_groups,
-                    uint64_t native_payload)
+                    uint64_t native_payload, bool use_bridge_leaf)
 {
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
@@ -2359,11 +2368,13 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    /* Mesh shaders have written their records as compute. */
    struct hk_api_shader *mesh = gfx->shaders[MESA_SHADER_MESH];
    if (native_grid) {
-      mesh = hk_api_shader_native(mesh ?: gs ?: tes);
-      if (!mesh || (gs && !hk_apple9_native_stage_available_device(
-                             dev, MESA_SHADER_GEOMETRY)) ||
+      mesh = use_bridge_leaf ? hk_api_shader_task_bridge(mesh)
+                             : hk_api_shader_native(mesh ?: gs ?: tes);
+      if (!mesh || (use_bridge_leaf && (gs || tes)) ||
+          (gs && !hk_apple9_native_stage_available_device(
+                     dev, MESA_SHADER_GEOMETRY)) ||
           (tes && !hk_apple9_native_stage_available_device(
-                             dev, MESA_SHADER_TESS_EVAL)))
+                     dev, MESA_SHADER_TESS_EVAL)))
          UNSUPPORTED();
    }
    /* Without an API fragment shader (or when rasterizer discard suppresses
@@ -2381,7 +2392,8 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
           BITFIELD_MASK(null_samples));
    struct hk_api_shader *fragment_api = gfx->shaders[MESA_SHADER_FRAGMENT];
    if (native_grid && !null_fs) {
-      fragment_api = hk_api_shader_native(fragment_api);
+      fragment_api = use_bridge_leaf ? hk_api_shader_task_bridge(fragment_api)
+                                     : hk_api_shader_native(fragment_api);
       if (!fragment_api)
          UNSUPPORTED();
    } else if (!null_fs && gs && !gs->is_passthrough &&
@@ -2403,7 +2415,7 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
         (gfx->shaders[MESA_SHADER_TASK] &&
          (mesh->vk.stage != MESA_SHADER_MESH ||
           (!(shaders[0]->info.mesh.native_object &&
-             native_object_groups &&
+             native_object_groups && !use_bridge_leaf &&
              hk_apple9_native_object_available_device(dev)) &&
            !(shaders[0]->info.mesh.native_task_bridge &&
              !native_object_groups &&
@@ -3527,15 +3539,25 @@ unsupported:
 void
 hk_apple9_draw(struct hk_cmd_buffer *cmd, uint32_t draw_id, struct agx_draw draw)
 {
-   hk_apple9_draw_impl(cmd, draw_id, draw, 0, NULL, 0);
+   hk_apple9_draw_impl(cmd, draw_id, draw, 0, NULL, 0, false);
 }
 
 void
 hk_apple9_draw_native_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
-                            uint64_t grid)
+                           uint64_t grid)
 {
    hk_apple9_draw_impl(cmd, draw_id,
-                       (struct agx_draw){.b = agx_3d(3, 1, 1)}, grid, NULL, 0);
+                       (struct agx_draw){.b = agx_3d(3, 1, 1)}, grid, NULL, 0,
+                       false);
+}
+
+void
+hk_apple9_draw_native_task_bridge(struct hk_cmd_buffer *cmd, uint32_t draw_id,
+                                  uint64_t grid, bool secondary_bridge)
+{
+   hk_apple9_draw_impl(cmd, draw_id,
+                       (struct agx_draw){.b = agx_3d(3, 1, 1)}, grid, NULL, 0,
+                       secondary_bridge);
 }
 
 void
@@ -3545,5 +3567,5 @@ hk_apple9_draw_native_object(struct hk_cmd_buffer *cmd, uint32_t draw_id,
 {
    hk_apple9_draw_impl(cmd, draw_id,
                        (struct agx_draw){.b = agx_3d(3, 1, 1)}, grid,
-                       object_groups, payload);
+                       object_groups, payload, false);
 }

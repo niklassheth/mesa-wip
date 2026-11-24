@@ -2177,21 +2177,22 @@ hk_apple9_native_mesh_max_groups(const struct agx_apple9_mesh_layout *layout)
    return (uint32_t)limit;
 }
 
-bool
-hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
-                          uint64_t count_addr)
+static bool
+hk_apple9_native_mesh_leaves_eligible(struct hk_cmd_buffer *cmd,
+                                      const uint32_t *direct,
+                                      uint64_t count_addr,
+                                      const struct hk_api_shader *mesh,
+                                      const struct hk_api_shader *task,
+                                      const struct hk_api_shader *fs)
 {
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
    const struct hk_api_shader *api_mesh = gfx->shaders[MESA_SHADER_MESH];
-   const struct hk_api_shader *mesh = hk_api_shader_native(api_mesh);
    const struct hk_api_shader *api_fs = gfx->shaders[MESA_SHADER_FRAGMENT];
-   const struct hk_api_shader *fs = api_fs;
    if (!mesh)
       return false;
    if (direct && count_addr)
       return false;
-   if (fs && fs != hk_cmd_buffer_device(cmd)->null_fs) {
-      fs = hk_api_shader_native(fs);
+   if (api_fs && api_fs != hk_cmd_buffer_device(cmd)->null_fs) {
       if (!fs || !fs->apple9_native_leaf || !mesh->apple9_native_leaf ||
           memcmp(fs->apple9_native_pair_id, mesh->apple9_native_pair_id,
                  sizeof(mesh->apple9_native_pair_id)))
@@ -2200,8 +2201,6 @@ hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
    const struct hk_shader *main = &mesh->variants[HK_MESH_VARIANT_MAIN];
    if (main->info.apple9_native_stage != HK_APPLE9_NATIVE_MESH)
       return false;
-   const struct hk_api_shader *task =
-      hk_api_shader_native(gfx->shaders[MESA_SHADER_TASK]);
    const bool has_task = !!gfx->shaders[MESA_SHADER_TASK];
    if (main->info.mesh.native_task_bridge && main->info.mesh.native_object)
       return false;
@@ -2231,6 +2230,15 @@ hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
             hk_apple9_native_mesh_max_groups(&main->info.apple9_native.layout);
          if (main->info.mesh.native_object) {
             struct hk_device *dev = hk_cmd_buffer_device(cmd);
+            uint32_t payload_alloc_B =
+               t->info.apple9_native.task_payload_stride_B +
+               (t->info.apple9_native.writes_child_grid ? 16 : 0);
+            uint32_t mesh_payload_alloc_B =
+               main->info.apple9_native.task_payload_stride_B +
+               (main->info.apple9_native.reads_child_grid ? 16 : 0);
+            bool uses_payload = t->info.apple9_native.task_payload_size_B ||
+                                t->info.apple9_native.writes_child_grid ||
+                                main->info.apple9_native.reads_native_payload;
             if (!hk_apple9_native_object_available_device(dev) ||
                 hk_cond_render_applies(cmd) ||
                 t->info.apple9_native_stage != HK_APPLE9_NATIVE_OBJECT ||
@@ -2247,21 +2255,34 @@ hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
                    &t->info.apple9_native) >
                    dev->dev.native_object.max_shared)
                return false;
-            /* args.payload is a single draw-wide 64-bit uniform shared across
-             * all parents and child meshes in the draw. Keep payload and
-             * child-grid traffic isolated to single-parent draws; payload-free
-             * multi-parent OBJECT -> MESH runs natively up to max_groups. */
-            if (groups > 1 &&
-                (t->info.apple9_native.task_payload_size_B ||
-                 t->info.apple9_native.writes_child_grid ||
-                 main->info.apple9_native.reads_native_payload))
+            /* Per-parent hardware payload slots (GET_SR 0xe0/0xe1) require the
+             * booted kernel's backed multi-parent aperture to cover the full
+             * allocation (including the 12-byte child-grid tail). Both stages
+             * must agree on the payload mechanism whenever payload is used. */
+            if (uses_payload &&
+                t->info.apple9_native.key.hw_payload !=
+                   main->info.apple9_native.key.hw_payload)
+               return false;
+            if ((t->info.apple9_native.key.hw_payload ||
+                 main->info.apple9_native.key.hw_payload) &&
+                (!dev->dev.native_object.mp_payload_bytes ||
+                 payload_alloc_B > dev->dev.native_object.mp_payload_bytes ||
+                 mesh_payload_alloc_B > dev->dev.native_object.mp_payload_bytes))
+               return false;
+            /* Multi-parent payload/child-grid traffic requires GET_SR 0xe0/0xe1;
+             * single-parent payloads in (mp_payload_bytes, 16 KiB] continue to
+             * use the draw-wide args.payload uniform isolated to groups == 1. */
+            if (groups > 1 && uses_payload &&
+                (!t->info.apple9_native.key.hw_payload ||
+                 payload_alloc_B > dev->dev.native_object.mp_payload_bytes ||
+                 mesh_payload_alloc_B > dev->dev.native_object.mp_payload_bytes))
                return false;
             if (t->info.task.max_mesh_groups == UINT32_MAX ||
                 (t->info.task.max_mesh_groups &&
                  groups > max_groups / t->info.task.max_mesh_groups))
                return false;
          } else {
-            if (!max_groups ||
+            if (!hk_apple9_native_task_bridge_enabled() || !max_groups ||
                 groups * ALIGN_POT(t->info.task.payload_B, 16) > UINT32_MAX ||
                 groups * 16 > UINT32_MAX)
                return false;
@@ -2315,6 +2336,47 @@ hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
       main->info.apple9_native.cull_primitive);
 }
 
+enum hk_apple9_native_mesh_route
+hk_apple9_select_native_mesh_route(struct hk_cmd_buffer *cmd,
+                                   const uint32_t *direct,
+                                   uint64_t count_addr)
+{
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   const struct hk_api_shader *api_mesh = gfx->shaders[MESA_SHADER_MESH];
+   const struct hk_api_shader *api_task = gfx->shaders[MESA_SHADER_TASK];
+   const struct hk_api_shader *api_fs = gfx->shaders[MESA_SHADER_FRAGMENT];
+   const struct hk_api_shader *null_fs = hk_cmd_buffer_device(cmd)->null_fs;
+   const struct hk_api_shader *fs_primary =
+      (api_fs && api_fs != null_fs) ? hk_api_shader_native(api_fs) : api_fs;
+   if (hk_apple9_native_mesh_leaves_eligible(
+          cmd, direct, count_addr, hk_api_shader_native(api_mesh),
+          hk_api_shader_native(api_task), fs_primary))
+      return HK_APPLE9_MESH_ROUTE_NATIVE;
+
+   const struct hk_api_shader *bridge_mesh = hk_api_shader_task_bridge(api_mesh);
+   const struct hk_api_shader *bridge_task = hk_api_shader_task_bridge(api_task);
+   if (api_task && bridge_mesh && bridge_task &&
+       bridge_mesh->variants[HK_MESH_VARIANT_MAIN].info.mesh.native_task_bridge &&
+       !bridge_mesh->variants[HK_MESH_VARIANT_MAIN].info.mesh.native_object) {
+      const struct hk_api_shader *bridge_fs =
+         (api_fs && api_fs != null_fs) ? hk_api_shader_task_bridge(api_fs)
+                                       : api_fs;
+      if (hk_apple9_native_mesh_leaves_eligible(cmd, direct, count_addr,
+                                                bridge_mesh, bridge_task,
+                                                bridge_fs))
+         return HK_APPLE9_MESH_ROUTE_TASK_BRIDGE;
+   }
+   return HK_APPLE9_MESH_ROUTE_EMULATED;
+}
+
+bool
+hk_apple9_use_native_mesh(struct hk_cmd_buffer *cmd, const uint32_t *direct,
+                          uint64_t count_addr)
+{
+   return hk_apple9_select_native_mesh_route(cmd, direct, count_addr) !=
+          HK_APPLE9_MESH_ROUTE_EMULATED;
+}
+
 /* Mesh shader draws run the task and mesh workgroups as compute kernels, and
  * then draw every primitive slot of the mesh workgroups' output records. The
  * workgroup grid is either given (direct) or read from grid_addr. For draws
@@ -2344,19 +2406,28 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    if (!mesh || (!direct && !grid_addr))
       return;
 
-   bool native = hk_apple9_use_native_mesh(cmd, direct, count_addr);
+   enum hk_apple9_native_mesh_route route =
+      hk_apple9_select_native_mesh_route(cmd, direct, count_addr);
+   bool native = route != HK_APPLE9_MESH_ROUTE_EMULATED;
+   bool use_bridge_leaf = route == HK_APPLE9_MESH_ROUTE_TASK_BRIDGE;
    bool predicated = hk_cond_render_applies(cmd);
+   struct hk_api_shader *native_mesh_api =
+      !native ? NULL
+              : (use_bridge_leaf ? hk_api_shader_task_bridge(mesh)
+                                 : hk_api_shader_native(mesh));
+   struct hk_api_shader *native_task_api =
+      (!native || !task) ? NULL
+                         : (use_bridge_leaf ? hk_api_shader_task_bridge(task)
+                                            : hk_api_shader_native(task));
    struct hk_shader *native_main =
-      native ? &hk_api_shader_native(mesh)->variants[HK_MESH_VARIANT_MAIN]
-             : NULL;
+      native_mesh_api ? &native_mesh_api->variants[HK_MESH_VARIANT_MAIN] : NULL;
    struct hk_shader *main = &mesh->variants[HK_MESH_VARIANT_MAIN];
    const struct hk_mesh_info *info = &main->info.mesh;
    const bool native_object =
       native && task && native_main->info.mesh.native_object;
    const bool task_dynamic =
       native && direct && task && !native_object &&
-      hk_only_variant(hk_api_shader_native(task))->info.task.max_mesh_groups ==
-         UINT32_MAX;
+      hk_only_variant(native_task_api)->info.task.max_mesh_groups == UINT32_MAX;
    uint64_t draw_primitives = UINT64_MAX;
    uint64_t draw_ring_rows = UINT64_MAX;
    bool draw_ring_limited = true;
@@ -2365,8 +2436,7 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       if (direct && !task_dynamic) {
          native_groups =
             (uint64_t)direct[0] * direct[1] * direct[2] *
-            (task ? hk_only_variant(hk_api_shader_native(task))
-                       ->info.task.max_mesh_groups
+            (task ? hk_only_variant(native_task_api)->info.task.max_mesh_groups
                   : 1);
          draw_primitives =
             native_groups * native_main->info.apple9_native.layout.max_primitives;
@@ -2380,9 +2450,11 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    }
    if (debug_get_option_mesh_route_log()) {
       struct hk_shader *logged = native ? native_main : main;
-      fprintf(stderr, "HK_MESH_ROUTE native=%u T=%u V=%u P=%u\n", native,
+      fprintf(stderr, "HK_MESH_ROUTE native=%u T=%u V=%u P=%u obj=%u bridge=%u\n",
+              native,
               native ? logged->info.apple9_native.key.physical_threads : 0,
-              logged->info.mesh.max_vertices, logged->info.mesh.max_primitives);
+              logged->info.mesh.max_vertices, logged->info.mesh.max_primitives,
+              native_object, native && task && !native_object);
    }
    struct hk_shader *mesh_rast =
       (!native || !direct || task_dynamic)
@@ -2402,10 +2474,10 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          cmd->apple9_draw_primitives = draw_primitives;
          cmd->apple9_draw_ring_rows = draw_ring_rows;
          cmd->apple9_draw_ring_limited = draw_ring_limited;
-         if (!hk_apple9_prepare_draw(cmd, true, true))
+         if (!hk_apple9_prepare_draw_ex(cmd, true, true, native_object))
             return;
          if (task) {
-            struct hk_shader *t = hk_only_variant(hk_api_shader_native(task));
+            struct hk_shader *t = hk_only_variant(native_task_api);
             if (native_object) {
                uint64_t grid =
                   hk_pool_upload(cmd, direct, 3 * sizeof(uint32_t), 4);
@@ -2415,7 +2487,7 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                uint32_t payload_alloc_B =
                   t->info.apple9_native.task_payload_stride_B +
                   (t->info.apple9_native.writes_child_grid ? 16 : 0);
-               if (payload_alloc_B) {
+               if (payload_alloc_B && !t->info.apple9_native.key.hw_payload) {
                   payload_gpu = hk_pool_alloc(cmd, payload_alloc_B, 16).gpu;
                   if (!payload_gpu)
                      return;
@@ -2480,8 +2552,10 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                                       params.gpu, max_groups, overflow_params_gpu);
             /* HK_READS_INTERNAL retains task/prefix -> tiling ordering. The
              * object consumes the GPU grid; the mesh consumes the same records. */
-            hk_apple9_draw_native_mesh(cmd, draw_id, params.gpu +
-               offsetof(struct libagx_mesh_params, mesh_dispatch));
+            hk_apple9_draw_native_task_bridge(
+               cmd, draw_id,
+               params.gpu + offsetof(struct libagx_mesh_params, mesh_dispatch),
+               use_bridge_leaf);
             continue;
          }
          /* Taskless native object consumes a 3-word GPU grid directly. For

@@ -177,7 +177,7 @@ main(int argc, char **argv)
    input[good_size] = '\n';
    CHECK(!agx_native_mesh_parse(input, good_size + 1, classes).qualified);
    memset(input + good_size, 'x', sizeof(input) - good_size);
-   CHECK(!agx_native_mesh_parse(input, 161, classes).qualified);
+   CHECK(!agx_native_mesh_parse(input, AGX_NATIVE_MESH_ADVERTISEMENT_MAX + 1, classes).qualified);
    CHECK(!agx_native_mesh_parse(good, good_size, NULL).qualified);
    CHECK(!agx_native_mesh_parse(NULL, good_size, classes).qualified);
 
@@ -283,9 +283,9 @@ main(int argc, char **argv)
    memset(input, 'x', sizeof(input));
    failed = agx_native_mesh_probe(42, classes);
    CHECK(!failed.qualified && failed.profile == AGX_NATIVE_MESH_PROFILE_NONE);
-   CHECK(offset == 161);
+   CHECK(offset == AGX_NATIVE_MESH_ADVERTISEMENT_MAX + 1);
    CHECK(agx_native_mesh_probe_disabled(42));
-   CHECK(offset == 161);
+   CHECK(offset == AGX_NATIVE_MESH_ADVERTISEMENT_MAX + 1);
    puts("PASS: strict grammar, generation race, own-fd path, bounded reads and failures");
    return 0;
 }

@@ -225,6 +225,11 @@ instruction(struct machine *m, nir_instr *i, unsigned lane)
          }
          break;
       }
+      case nir_intrinsic_load_mesh_payload_base_apple9_agx:
+         CHECK(m->side_effect_address);
+         out[0].u32 = m->side_effect_address;
+         out[1].u32 = m->side_effect_address >> 32;
+         break;
       case nir_intrinsic_load_native_pointer_apple9_agx: {
          unsigned base = nir_intrinsic_base(n);
          CHECK(base == AGX_APPLE9_MESH_DRAW_UNIFORM ||

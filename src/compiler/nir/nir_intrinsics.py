@@ -3404,6 +3404,7 @@ intrinsic("fence_tex_invalidate_apple9_agx")
 intrinsic("store_local_apple9_agx", [1, 1], indices=[BASE, BIT_SIZE])
 intrinsic("load_local_apple9_agx", [1], 1, indices=[BASE], bit_sizes=[32], flags=[CAN_ELIMINATE])
 intrinsic("load_mesh_primitive_base_apple9_agx", dest_comp=2, bit_sizes=[32], flags=[CAN_ELIMINATE, CAN_REORDER])
+intrinsic("load_mesh_payload_base_apple9_agx", dest_comp=2, bit_sizes=[32], flags=[CAN_ELIMINATE, CAN_REORDER])
 # Read a native entry pointer from the uniform pair starting at BASE.
 intrinsic("load_native_pointer_apple9_agx", dest_comp=2, indices=[BASE], bit_sizes=[32], flags=[CAN_ELIMINATE, CAN_REORDER])
 # Collective task completion remains distinct from STOP. Its final call/frame

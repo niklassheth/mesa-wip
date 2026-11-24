@@ -645,7 +645,9 @@ static nir_def *
 payload_pointer(nir_builder *b, const struct lower *s, nir_def *offset)
 {
    nir_def *base =
-      nir_load_native_pointer_apple9_agx(b, .base = s->key->payload_uniform);
+      s->key->hw_payload
+         ? nir_load_mesh_payload_base_apple9_agx(b)
+         : nir_load_native_pointer_apple9_agx(b, .base = s->key->payload_uniform);
    return nir_iadd(b, nir_pack_64_2x32(b, base), nir_u2u64(b, offset));
 }
 
@@ -1127,10 +1129,13 @@ agx_nir_lower_apple9_native_object_ex(
    unsigned min_stride = ALIGN_POT(nir->info.task_payload_size, 16);
    unsigned payload_stride_B =
       options && options->payload_stride_B ? options->payload_stride_B : min_stride;
-   if ((payload_stride_B & 15) || payload_stride_B < min_stride ||
-       payload_stride_B > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES)
-      return fail(reason, "native object task payload stride is invalid");
    bool write_child_grid = options && options->write_child_grid;
+   bool hw_payload = key->hw_payload || (options && options->hw_payload);
+   if ((payload_stride_B & 15) || payload_stride_B < min_stride ||
+       payload_stride_B > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES ||
+       (hw_payload && write_child_grid &&
+        payload_stride_B > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES - 16))
+      return fail(reason, "native object task payload stride is invalid");
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    struct util_dynarray launches = UTIL_DYNARRAY_INIT;
@@ -1191,6 +1196,7 @@ agx_nir_lower_apple9_native_object_ex(
 
    struct agx_apple9_mesh_key physical = *key;
    physical.physical_threads = physical_threads;
+   physical.hw_payload = hw_payload;
    if (!agx_nir_lower_apple9_mesh(nir, &physical, info, reason))
       return false;
    memcpy(info->logical_size, logical_size, sizeof(logical_size));
@@ -1232,11 +1238,14 @@ agx_nir_lower_apple9_native_object_ex(
          nir_iand(&b, nir_iand(&b, nir_ine_imm(&b, g[0], 0),
                                nir_ine_imm(&b, g[1], 0)),
                   nir_ine_imm(&b, g[2], 0));
-      nir_def *base = write_child_grid
-                         ? nir_pack_64_2x32(
-                              &b, nir_load_native_pointer_apple9_agx(
-                                     &b, .base = key->payload_uniform))
-                         : NULL;
+      nir_def *base =
+         write_child_grid
+            ? nir_pack_64_2x32(
+                 &b, hw_payload
+                        ? nir_load_mesh_payload_base_apple9_agx(&b)
+                        : nir_load_native_pointer_apple9_agx(
+                             &b, .base = key->payload_uniform))
+            : NULL;
       for (unsigned c = 0; c < 3; ++c) {
          nir_def *word = nir_bcsel(&b, active, g[c], nir_imm_int(&b, 0));
          store_local(&b, key->grid_root, word,

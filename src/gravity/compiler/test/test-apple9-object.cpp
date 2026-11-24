@@ -727,3 +727,168 @@ TEST(Apple9NativeObject, MeshPayloadReadAndNumWorkgroups)
       disabled, true, &opts, &info, &reason));
    ralloc_free(disabled);
 }
+
+static bool
+binary_has_get_sr_u32(const uint8_t *bin, size_t size, uint8_t selector)
+{
+   for (size_t i = 0; i + 4 <= size; i += 2) {
+      if ((bin[i] & 0x0f) == 0x0c && bin[i + 1] == selector &&
+          (bin[i + 2] & 0x3e) == 0x10 && (bin[i + 3] & 0x1f) == 0x06)
+         return true;
+   }
+   return false;
+}
+
+static bool
+binary_has_get_sr_zext16(const uint8_t *bin, size_t size, uint8_t selector)
+{
+   for (size_t i = 0; i + 8 <= size; i += 2) {
+      if ((bin[i] & 0x0f) == 0x04 && bin[i + 1] == selector &&
+          (bin[i + 2] & 0x3f) == 0x10 && bin[i + 3] == 0x06 &&
+          (bin[i + 4] & 0x0f) == 0x03 && bin[i + 5] == 0x00 &&
+          (bin[i + 6] & 0x3f) == 0x00 && bin[i + 7] == 0x01 &&
+          (bin[i] & 0xf0) == (bin[i + 4] & 0xf0) &&
+          (bin[i + 2] & 0xc0) == (bin[i + 6] & 0xc0))
+         return true;
+   }
+   return false;
+}
+
+TEST(Apple9NativeObject, HardwarePerParentPayloadSR)
+{
+   /* OBJECT stage: payload + optional child grid lowered to GET_SR 0xe0/0xe1. */
+   for (unsigned payload_B : {16u, 256u, 1008u, 1024u}) {
+      bool write_grid = payload_B <= 1008u;
+      nir_shader *nir = build_app_task_shader(16, 1, 1, payload_B, 0, true, false);
+      nir_shader *lower_probe = nir_shader_clone(nullptr, nir);
+      agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+      agx_apple9_native_object_options opts = {
+         .payload_stride_B = payload_B,
+         .write_child_grid = write_grid,
+         .hw_payload = true,
+      };
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_nir_lower_apple9_native_object_ex(
+         lower_probe, true, &key, &opts, &info, &reason))
+         << (reason ? reason : "");
+      EXPECT_TRUE(info.key.hw_payload);
+      EXPECT_EQ(info.task_payload_size_B, payload_B);
+      EXPECT_EQ(info.task_payload_stride_B, payload_B);
+      EXPECT_EQ(info.writes_child_grid, write_grid);
+      EXPECT_TRUE(has_intrinsic(lower_probe,
+                                nir_intrinsic_load_mesh_payload_base_apple9_agx));
+      EXPECT_FALSE(has_native_pointer_base(lower_probe,
+                                           AGX_APPLE9_MESH_PAYLOAD_UNIFORM));
+      ralloc_free(lower_probe);
+
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_apple9_native_object_ex(
+         nir, true, &key, &opts, &part, &info, &reason))
+         << (reason ? reason : "");
+      EXPECT_TRUE(info.key.hw_payload);
+      EXPECT_EQ(part.info.scratch_size, 0u);
+      EXPECT_GT(part.info.binary_size, 0u);
+      const uint8_t *bin = static_cast<const uint8_t *>(part.binary);
+      EXPECT_TRUE(binary_has_get_sr_u32(bin, part.info.binary_size, 0xe0));
+      EXPECT_TRUE(binary_has_get_sr_zext16(bin, part.info.binary_size, 0xe1));
+      free(part.binary);
+      ralloc_free(nir);
+   }
+
+   /* OBJECT child-grid-only (0 user payload + 12B child grid) via 0xe0/0xe1. */
+   {
+      nir_shader *nir = build_app_task_shader(16, 1, 1, 0, 0, false, false);
+      agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+      agx_apple9_native_object_options opts = {
+         .payload_stride_B = 0,
+         .write_child_grid = true,
+         .hw_payload = true,
+      };
+      agx_shader_part part = {};
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_native_object_ex(
+         nir, true, &key, &opts, &part, &info, &reason))
+         << (reason ? reason : "");
+      EXPECT_TRUE(info.key.hw_payload);
+      EXPECT_TRUE(info.writes_child_grid);
+      const uint8_t *bin = static_cast<const uint8_t *>(part.binary);
+      EXPECT_TRUE(binary_has_get_sr_u32(bin, part.info.binary_size, 0xe0));
+      EXPECT_TRUE(binary_has_get_sr_zext16(bin, part.info.binary_size, 0xe1));
+      free(part.binary);
+      ralloc_free(nir);
+   }
+
+   /* MESH stage: payload read + child gl_NumWorkGroups via GET_SR 0xe0/0xe1. */
+   for (unsigned payload_B : {16u, 256u, 1008u, 1024u}) {
+      bool read_nwg = payload_B <= 1008u;
+      nir_shader *nir = build_mesh_with_payload(payload_B, read_nwg, false);
+      nir_shader *lower_probe = nir_shader_clone(nullptr, nir);
+      agx_apple9_native_mesh_options opts = {
+         .attributes = true,
+         .native_object_payload = true,
+         .native_object_hw_payload = true,
+         .native_object_payload_stride_B = payload_B,
+      };
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_nir_lower_apple9_native_mesh(
+         lower_probe, true, &opts, &info, &reason))
+         << (reason ? reason : "");
+      EXPECT_TRUE(info.key.hw_payload);
+      EXPECT_TRUE(info.reads_native_payload);
+      EXPECT_EQ(info.reads_child_grid, read_nwg);
+      EXPECT_TRUE(has_intrinsic(lower_probe,
+                                nir_intrinsic_load_mesh_payload_base_apple9_agx));
+      EXPECT_FALSE(has_native_pointer_base(lower_probe,
+                                           AGX_APPLE9_MESH_PAYLOAD_UNIFORM));
+      ralloc_free(lower_probe);
+
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_apple9_native_mesh(
+         nir, true, &opts, &part, &info, &reason))
+         << (reason ? reason : "");
+      EXPECT_TRUE(info.key.hw_payload);
+      EXPECT_EQ(part.info.scratch_size, 0u);
+      EXPECT_GT(part.info.binary_size, 0u);
+      const uint8_t *bin = static_cast<const uint8_t *>(part.binary);
+      EXPECT_TRUE(binary_has_get_sr_u32(bin, part.info.binary_size, 0xe0));
+      EXPECT_TRUE(binary_has_get_sr_zext16(bin, part.info.binary_size, 0xe1));
+      free(part.binary);
+      ralloc_free(nir);
+   }
+
+   /* Validation: hw_payload requires native_object_payload and child-grid fit. */
+   {
+      nir_shader *bad_obj = build_app_task_shader(16, 1, 1, 16384, 0, false, false);
+      agx_apple9_mesh_key key = AGX_APPLE9_MESH_KEY;
+      agx_apple9_native_object_options opts = {
+         .payload_stride_B = 16384,
+         .write_child_grid = true,
+         .hw_payload = true,
+      };
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      EXPECT_FALSE(agx_nir_lower_apple9_native_object_ex(
+         bad_obj, true, &key, &opts, &info, &reason));
+      ralloc_free(bad_obj);
+
+      nir_shader *bad_mesh = build_mesh_with_payload(64, false, false);
+      agx_apple9_native_mesh_options mopts = {
+         .attributes = true,
+         .native_object_payload = false,
+         .native_object_hw_payload = true,
+      };
+      EXPECT_FALSE(agx_nir_lower_apple9_native_mesh(
+         bad_mesh, true, &mopts, &info, &reason));
+      ralloc_free(bad_mesh);
+
+      nir_shader *bad_mesh_grid = build_mesh_with_payload(16384, true, false);
+      mopts.native_object_payload = true;
+      mopts.native_object_payload_stride_B = 16384;
+      EXPECT_FALSE(agx_nir_lower_apple9_native_mesh(
+         bad_mesh_grid, true, &mopts, &info, &reason));
+      ralloc_free(bad_mesh_grid);
+   }
+}

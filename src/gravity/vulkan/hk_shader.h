@@ -484,6 +484,11 @@ struct hk_api_shader {
    /* Pipelines own an emulated realization and this optional native leaf. */
    struct hk_api_shader *apple9_native;
 
+   /* Optional secondary Phase 1 Task Bridge native leaf retained alongside a
+    * native OBJECT -> MESH leaf so draw-time rejections cascade cleanly to
+    * Task Bridge before falling back to Emulation. */
+   struct hk_api_shader *apple9_task_bridge;
+
    /* Optional software polygon-mode POINT realization for an application
     * geometry shader compiled with dynamic polygon mode / ESO / GPL. */
    struct hk_api_shader *apple9_gs_polygon_points;
@@ -531,6 +536,14 @@ hk_api_shader_native(const struct hk_api_shader *shader)
       return NULL;
    return shader->apple9_native_leaf ? (struct hk_api_shader *)shader
                                      : shader->apple9_native;
+}
+
+static inline struct hk_api_shader *
+hk_api_shader_task_bridge(const struct hk_api_shader *shader)
+{
+   if (!shader || shader->apple9_native_leaf)
+      return NULL;
+   return shader->apple9_task_bridge;
 }
 
 static inline struct hk_shader *
@@ -616,6 +629,7 @@ hk_api_shader_init_constant_data(struct hk_api_shader *shader)
    const struct hk_api_shader *paths[] = {
       shader,
       shader->apple9_native,
+      shader->apple9_task_bridge,
       shader->apple9_fs_native_per_vertex,
    };
    for (unsigned p = 0; p < ARRAY_SIZE(paths); ++p) {
@@ -771,6 +785,8 @@ struct hk_apple9_graphics_key {
    bool native_object;
    /* Native OBJECT writes emitted child mesh grid for MESH gl_NumWorkGroups. */
    bool native_object_write_child_grid;
+   /* Native OBJECT/MESH read per-parent hardware payload via GET_SR 0xe0/0xe1. */
+   bool native_object_hw_payload;
    /* Maximum payload bytes across paired native OBJECT and MESH stages. */
    uint32_t native_object_payload_B;
    /* Generated mesh NIR from an API GS/TES stage (already guarded / own draw ABI). */

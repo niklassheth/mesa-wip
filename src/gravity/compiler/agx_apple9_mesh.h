@@ -30,6 +30,9 @@ struct agx_apple9_mesh_key {
     * invocations skip the user body and reconverge before native completion.
     * This is independent of the output allocation family's capacity. */
    unsigned physical_threads;
+   /* Load the per-parent hardware payload VA from GET_SR 0xe0/0xe1 instead of
+    * the draw-wide AGX_APPLE9_MESH_PAYLOAD_UNIFORM pointer. */
+   bool hw_payload;
 };
 
 #define AGX_APPLE9_MESH_KEY                                                    \
@@ -171,6 +174,7 @@ struct agx_apple9_mesh_body_info {
    unsigned task_payload_size_B;
    unsigned task_payload_stride_B;
    bool writes_child_grid;
+   bool reads_child_grid;
    bool reads_native_payload;
    unsigned argument_uniform_words;
 };
@@ -255,6 +259,9 @@ struct agx_apple9_native_object_options {
     * before OBJECT_GRID_EXPORT so a paired native mesh reading gl_NumWorkGroups
     * receives the emitted child grid. */
    bool write_child_grid;
+   /* Load the per-parent hardware payload VA from GET_SR 0xe0/0xe1 instead of
+    * AGX_APPLE9_MESH_PAYLOAD_UNIFORM. */
+   bool hw_payload;
 };
 
 /* Application or taskless task NIR -> native Apple9 OBJECT program.
@@ -332,9 +339,11 @@ struct agx_apple9_native_mesh_options {
    bool guard_empty_grid;
    /* Mesh shader paired with a native hardware OBJECT stage: allow task payload
     * up to AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES directly via
-    * AGX_APPLE9_MESH_PAYLOAD_UNIFORM, and lower load_num_workgroups from the
+    * AGX_APPLE9_MESH_PAYLOAD_UNIFORM (or GET_SR 0xe0/0xe1 when
+    * native_object_hw_payload is set), and lower load_num_workgroups from the
     * emitted child grid at native_object_payload_stride_B. */
    bool native_object_payload;
+   bool native_object_hw_payload;
    unsigned native_object_payload_stride_B;
    uint64_t outputs_flat, outputs_linear;
 };
