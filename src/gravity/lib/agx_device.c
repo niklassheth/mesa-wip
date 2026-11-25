@@ -9,7 +9,6 @@
 
 #include "util/u_wait_watchdog.h"
 #include "agx_device.h"
-#include "agx_native_mesh.h"
 #include "agx_apple9_layout.h"
 #include <inttypes.h>
 #include "clc/gravity_clc.h"
@@ -642,60 +641,12 @@ agx_open_device(void *memctx, struct agx_device *dev)
    assert(user_start < user_end);
    uint64_t user_size = user_end - user_start;
 
-   /* Only native G16G VMs can qualify for the current mesh profile. */
-   const char *classes = dev->params.gpu_generation == 16 &&
-                         dev->params.gpu_variant == 'G'
-                            ? dev->native_mesh_classes : NULL;
-   struct agx_native_mesh_support before =
-      agx_native_mesh_probe(dev->fd, classes);
-   struct agx_native_blocks_support blocks_before =
-      classes ? agx_native_blocks_probe(dev->fd)
-              : (struct agx_native_blocks_support){0};
-   struct agx_native_object_support object_before =
-      classes ? agx_native_object_probe(dev->fd)
-              : (struct agx_native_object_support){0};
-   dev->native_mesh_qualified = false;
-   dev->native_mesh_profile = AGX_NATIVE_MESH_PROFILE_UNKNOWN;
-   dev->native_blocks = (struct agx_native_blocks_support){0};
-   dev->native_object = (struct agx_native_object_support){0};
    int ret = asahi_simple_ioctl(dev, DRM_IOCTL_ASAHI_VM_CREATE, &vm_create);
    if (ret) {
       fprintf(stderr, "DRM_IOCTL_ASAHI_VM_CREATE failed: %m\n");
       assert(0);
       return false;
    }
-
-   /* The kernel latches profile+generation at VM_CREATE and retains that
-    * profile for the VM lifetime. A concurrent mode change fails closed. */
-   struct agx_native_mesh_support after =
-      agx_native_mesh_probe(dev->fd, classes);
-   dev->native_mesh_qualified =
-      agx_native_mesh_same_qualification(before, after);
-   dev->native_mesh_profile = agx_native_mesh_latched_profile(before, after);
-
-   /* Batched native blocks are a property of the same latched profile: both
-    * attributes, sampled around VM_CREATE, must agree on one generation. */
-   struct agx_native_blocks_support blocks_after =
-      classes ? agx_native_blocks_probe(dev->fd)
-              : (struct agx_native_blocks_support){0};
-   if (dev->native_mesh_qualified &&
-       agx_native_blocks_same(blocks_before, blocks_after) &&
-       blocks_before.generation == before.generation)
-      dev->native_blocks = blocks_before;
-
-   /* Phase 2 native object support shares the same atomic generation counter
-    * and must agree with the latched profile across VM_CREATE. */
-   struct agx_native_object_support object_after =
-      classes ? agx_native_object_probe(dev->fd)
-              : (struct agx_native_object_support){0};
-   if (agx_native_object_same(object_before, object_after) &&
-       ((object_before.profile == AGX_NATIVE_MESH_PROFILE_QUALIFIED &&
-         dev->native_mesh_qualified &&
-         object_before.generation == before.generation) ||
-        (object_before.profile == AGX_NATIVE_MESH_PROFILE_RESEARCH &&
-         dev->native_mesh_profile == AGX_NATIVE_MESH_PROFILE_RESEARCH &&
-         object_before.generation == before.profile_generation)))
-      dev->native_object = object_before;
 
    /* Round the user VA window to powers-of-two... */
    user_start = util_next_power_of_two64(user_start);

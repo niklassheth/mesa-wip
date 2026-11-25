@@ -958,24 +958,10 @@ main(void)
    struct hk_device *dev = calloc(1, sizeof(*dev));
    struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
    CHECK(dev && pdev);
-   dev->dev.chip = AGX_CHIP_G16G;
+   dev->dev.chip = pdev->dev.chip = AGX_CHIP_G16G;
+   dev->dev.params.features = pdev->dev.params.features =
+      DRM_ASAHI_FEATURE_NATIVE_MESH;
    dev->dev.shader_base = 0x1200000000ull;
-   if (getenv("HK_TEST_NATIVE_OBJECT_MP")) {
-      dev->dev.native_mesh_qualified = true;
-      dev->dev.native_object = (struct agx_native_object_support){
-         .profile = AGX_NATIVE_MESH_PROFILE_QUALIFIED,
-         .generation = 1,
-         .multi_parent = true,
-         .payload_bytes = 16384,
-         .mp_payload_bytes = 1024,
-         .max_threads = 32,
-         .max_shared = 32768,
-         .max_groups = 1048575,
-      };
-      pdev->dev.chip = AGX_CHIP_G16G;
-      pdev->dev.native_mesh_qualified = true;
-      pdev->dev.native_object = dev->dev.native_object;
-   }
    dev->vk.alloc = *vk_default_allocator();
    dev->vk.physical = &pdev->vk;
    hk_device_init_usc_heap(dev);
@@ -985,7 +971,7 @@ main(void)
    for (unsigned v = 1; v <= 32; v = v == 1 ? 3 : v == 3 ? 32 : 33)
       compile_tess(dev, v, false, 0);
    if (hk_apple9_native_tess_enabled()) {
-      if (dev->dev.native_object.mp_payload_bytes)
+      if (hk_apple9_native_object_available_device(dev))
          check_tess_vbo_pack_pairing(dev);
       compile_tess(dev, 3, true, 0);
       unsigned count = compile_tess(dev, 3, false, 0);

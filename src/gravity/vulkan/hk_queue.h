@@ -12,7 +12,9 @@
 #include "hk_queue_completion.h"
 #include "vk_queue.h"
 
+struct drm_asahi_cmd_render;
 struct drm_asahi_sync;
+struct hk_cs;
 struct hk_device;
 struct vk_sync_wait;
 
@@ -60,5 +62,8 @@ VkResult hk_queue_submit(struct vk_queue *vk_queue,
 unsigned hk_fill_submit_wait_syncs(struct drm_asahi_sync *syncs,
                                    const struct vk_sync_wait *waits,
                                    unsigned wait_count);
+
+void hk_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
+                         struct drm_asahi_cmd_render *c);
 
 void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);

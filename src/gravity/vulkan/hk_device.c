@@ -401,7 +401,6 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       dev->vk.enabled_features.bufferDeviceAddressCaptureReplayEXT ||
       dev->vk.enabled_features.descriptorBufferCaptureReplay;
 
-   dev->dev.native_mesh_classes = hk_apple9_native_index_class_hash();
    bool succ = agx_open_device(NULL, &dev->dev);
    drmFreeDevice(&drm_device);
    if (!succ) {

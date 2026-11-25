@@ -62,8 +62,10 @@ main(int argc, char **argv)
    dev->vk.dispatch_table.AllocateCommandBuffers = vk_common_AllocateCommandBuffers;
    dev->vk.dispatch_table.ResetCommandBuffer = hk_ResetCommandBuffer;
    dev->dev.chip = pdev->dev.chip = AGX_CHIP_G16G;
-   pdev->dev.native_mesh_qualified = strcmp(argv[1], "kernel-absent") != 0;
-   dev->dev.native_mesh_qualified = strcmp(argv[1], "vm-absent") != 0;
+   pdev->dev.params.features =
+      strcmp(argv[1], "kernel-absent") != 0 ? DRM_ASAHI_FEATURE_NATIVE_MESH : 0;
+   dev->dev.params.features =
+      strcmp(argv[1], "vm-absent") != 0 ? DRM_ASAHI_FEATURE_NATIVE_MESH : 0;
    pdev->disable_native_index = !strcmp(argv[1], "drirc");
    simple_mtx_init(&dev->dev.apple9_entry_lock, mtx_plain);
    hk_device_init_usc_heap(dev);

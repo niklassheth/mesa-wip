@@ -1619,16 +1619,14 @@ hk_apple9_native_object_check(struct hk_device *dev, nir_shader *task,
    unsigned physical_threads =
       hk_apple9_native_mesh_threads(task->info.workgroup_size);
    if (!physical_threads ||
-       physical_threads > dev->dev.native_object.max_threads) {
+       physical_threads > AGX_NATIVE_OBJECT_MAX_THREADS) {
       if (reason)
          *reason = "native object workgroup exceeds kernel thread limit";
       return VK_SUCCESS;
    }
-   if (key->native_object_payload_B > dev->dev.native_object.payload_bytes ||
-       task->info.task_payload_size > dev->dev.native_object.payload_bytes ||
-       mesh->info.task_payload_size > dev->dev.native_object.payload_bytes ||
-       (key->native_object_write_child_grid &&
-        !dev->dev.native_object.payload_bytes)) {
+   if (key->native_object_payload_B > AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES ||
+       task->info.task_payload_size > AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES ||
+       mesh->info.task_payload_size > AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES) {
       if (reason)
          *reason = "native object task payload exceeds kernel payload limit";
       return VK_SUCCESS;
@@ -1659,7 +1657,7 @@ hk_apple9_native_object_check(struct hk_device *dev, nir_shader *task,
    if (!task_ok)
       return VK_SUCCESS;
    if (hk_apple9_native_object_tg_memory_bytes(&task_info) >
-       dev->dev.native_object.max_shared) {
+       AGX_NATIVE_OBJECT_MAX_SHARED_BYTES) {
       if (reason)
          *reason = "native object shared allocation exceeds kernel limit";
       return VK_SUCCESS;
@@ -1944,8 +1942,6 @@ hk_apple9_native_tess_fused_check(struct hk_device *dev,
    *supported = false;
    if (!hk_apple9_native_tess_enabled() ||
        !hk_apple9_native_object_available_device(dev) ||
-       !dev->dev.native_object.mp_payload_bytes ||
-       dev->dev.native_object.max_threads < AGX_APPLE9_NATIVE_SERIAL_THREADS ||
        !vs_source || !tcs_source || !tes_source)
       return VK_SUCCESS;
    const char *local_reason = NULL;
@@ -1981,7 +1977,7 @@ hk_apple9_native_tess_fused_check(struct hk_device *dev,
 
    struct hk_tess_fused_options opts = {
       .vertex = key->vertex,
-      .max_payload_bytes = dev->dev.native_object.mp_payload_bytes,
+      .max_payload_bytes = AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES,
       .fs_reads_clip_distance = key->fs_reads_clip_distance,
       .has_fs_inputs_mask = has_fs_mask,
    };
@@ -2038,7 +2034,7 @@ hk_apple9_native_tess_fused_check(struct hk_device *dev,
       obj_nir, true, &obj_k, &obj_opts, &obj_info, reason);
    ralloc_free(obj_nir);
    if (!obj_ok || hk_apple9_native_object_tg_memory_bytes(&obj_info) >
-                     dev->dev.native_object.max_shared) {
+                     AGX_NATIVE_OBJECT_MAX_SHARED_BYTES) {
       if (obj_ok)
          *reason = "fused tess object shared allocation exceeds kernel limit";
       if (debug_get_option_tess_native_log())
@@ -2226,7 +2222,7 @@ hk_apple9_compile_native_object(struct hk_device *dev, nir_shader *nir,
    unsigned physical_threads =
       hk_apple9_native_mesh_threads(nir->info.workgroup_size);
    if (!physical_threads ||
-       physical_threads > dev->dev.native_object.max_threads) {
+       physical_threads > AGX_NATIVE_OBJECT_MAX_THREADS) {
       if (reason)
          *reason = "native object workgroup exceeds kernel thread limit";
       *unsupported = true;
@@ -2264,12 +2260,11 @@ hk_apple9_compile_native_object(struct hk_device *dev, nir_shader *nir,
                                       &shader->info.apple9_native,
                                       HK_APPLE9_NATIVE_OBJECT) ||
        shader->info.apple9_native.task_payload_size_B >
-          dev->dev.native_object.payload_bytes ||
+          AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES ||
        (shader->info.apple9_native.key.hw_payload &&
-        (!dev->dev.native_object.mp_payload_bytes ||
-         payload_alloc_B > dev->dev.native_object.mp_payload_bytes)) ||
+        payload_alloc_B > AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES) ||
        hk_apple9_native_object_tg_memory_bytes(&shader->info.apple9_native) >
-          dev->dev.native_object.max_shared) {
+          AGX_NATIVE_OBJECT_MAX_SHARED_BYTES) {
       *unsupported = true;
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
@@ -3185,7 +3180,7 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                    fused_tcs_nir && fused_tcs_obj) {
                   struct hk_tess_fused_options tess_opts = {
                      .vertex = key.vertex,
-                     .max_payload_bytes = dev->dev.native_object.mp_payload_bytes,
+                     .max_payload_bytes = AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES,
                      .fs_reads_clip_distance = key.fs_reads_clip_distance,
                      .has_fs_inputs_mask = has_fs_var_read_mask,
                   };
@@ -3807,7 +3802,10 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
    bool bridge_fallback = false;
    VkResult result = VK_SUCCESS;
    const char *reason = NULL;
-   if (mesh && task && !per_vertex && !key.polygon_points) {
+   if (!hk_apple9_native_mesh_available(hk_device_physical(dev))) {
+      /* Kernel does not advertise DRM_ASAHI_FEATURE_NATIVE_MESH (or native
+       * paths are disabled): skip all native compilation probes cleanly. */
+   } else if (mesh && task && !per_vertex && !key.polygon_points) {
       if (hk_apple9_native_object_available_device(dev)) {
          uint32_t payload_B =
             MAX2(task_nir->info.task_payload_size, mesh->info.task_payload_size);
@@ -3819,7 +3817,7 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
          key.native_object_write_child_grid = write_child_grid;
          key.native_object_hw_payload =
             payload_alloc_B > 0 &&
-            payload_alloc_B <= dev->dev.native_object.mp_payload_bytes;
+            payload_alloc_B <= AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES;
          result = hk_apple9_native_object_check(dev, task_nir, mesh, &key,
                                                 &native, &reason);
          if (result == VK_SUCCESS && native) {
@@ -3862,8 +3860,7 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
           !(tes_next_stage_mask & VK_SHADER_STAGE_FRAGMENT_BIT) && state &&
           !(state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR));
       if (vs && tcs && hk_apple9_native_tess_enabled() &&
-          hk_apple9_native_object_available_device(dev) &&
-          dev->dev.native_object.mp_payload_bytes) {
+          hk_apple9_native_object_available_device(dev)) {
          result = hk_apple9_native_tess_fused_check(
             dev, vs, tcs, tes, fs_nir, has_fs_mask, &key, &native, &reason);
          if (result == VK_SUCCESS && native) {

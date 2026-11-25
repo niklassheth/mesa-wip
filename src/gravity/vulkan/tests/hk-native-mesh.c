@@ -455,22 +455,16 @@ static void
 check_batch_ring_budget(void)
 {
    const struct hk_apple9_native_profile profile = {
-      .batch = 64,
       .blocks = true,
-      .mixed = true,
-      .words = 4096,
       .max_render_primitives = HK_APPLE9_NATIVE_RENDER_PRIMITIVES,
    };
    const struct hk_apple9_stream_summary base_stream = {
       .native = true,
-      .dispatches = 1,
-      .bytes = 160,
-      .capacity = 14000,
+      .has_draws = true,
       .primitives = 32,
    };
    const struct hk_apple9_draw_summary base_draw = {
       .native = true,
-      .mesh = true,
       .primitives = 32,
    };
 
@@ -496,13 +490,11 @@ check_batch_ring_budget(void)
    CHECK(limited && rows == 168);
    s = base_stream;
    d = base_draw;
-   s.dispatches = 23;
    s.ring_rows = 23 * rows;
    s.ring_limited = true;
    d.ring_rows = rows;
    d.ring_limited = true;
    CHECK(hk_apple9_native_stream_admits(&s, &d, &profile));
-   s.dispatches = 24;
    s.ring_rows = 24 * rows;
    CHECK(!hk_apple9_native_stream_admits(&s, &d, &profile));
 

@@ -156,8 +156,8 @@ int main(int argc, char **argv)
    struct hk_device *dev=calloc(1,sizeof(*dev));
    struct hk_physical_device *pdev=calloc(1,sizeof(*pdev));CHECK(dev&&pdev);
    dev->dev.chip=pdev->dev.chip=AGX_CHIP_G16G;
-   pdev->dev.native_mesh_qualified = true;
-   dev->dev.native_mesh_qualified = true;
+   pdev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
+   dev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
    pdev->disable_native_index = drirc_kill;
    dev->dev.shader_base=0x1200000000ull;
    dev->vk.alloc=*vk_default_allocator();dev->vk.physical=&pdev->vk;

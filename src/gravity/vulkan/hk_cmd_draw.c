@@ -1858,13 +1858,12 @@ hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw)
       if (!hk_apple9_native_tess_enabled() ||
           !hk_apple9_native_object_available_device(dev) ||
           !hk_apple9_native_tess_common_state_eligible(cmd, draw) ||
-          !dev->dev.native_object.mp_payload_bytes ||
           main->info.apple9_tess_payload_B >
-             dev->dev.native_object.mp_payload_bytes ||
+             AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES ||
           object->b.info.workgroup_size[0] >
-             dev->dev.native_object.max_threads ||
+             AGX_NATIVE_OBJECT_MAX_THREADS ||
           hk_apple9_native_object_tg_memory_bytes(&object->info.apple9_native) >
-             dev->dev.native_object.max_shared)
+             AGX_NATIVE_OBJECT_MAX_SHARED_BYTES)
          return false;
       if (draw.indexed) {
          unsigned isz = agx_index_size_to_B(draw.index_size);
@@ -1882,7 +1881,7 @@ hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw)
                                     &max_child_wgs, &max_patch_prims);
       struct hk_apple9_fused_tess_chunk_plan plan;
       return hk_apple9_native_tess_fused_chunk_plan(
-         patches, draw.b.count[1], dev->dev.native_object.max_groups,
+         patches, draw.b.count[1], AGX_NATIVE_OBJECT_MAX_GROUPS,
          max_child_wgs, max_patch_prims, ring_max,
          hk_apple9_native_render_primitives(), &plan);
    }
@@ -1916,7 +1915,6 @@ static void
 hk_apple9_launch_native_tess_fused(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                                    struct agx_draw draw)
 {
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_descriptor_state *desc = &gfx->descriptors;
    const struct vk_dynamic_graphics_state *dyn =
@@ -1941,7 +1939,7 @@ hk_apple9_launch_native_tess_fused(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                                  &max_patch_prims);
    struct hk_apple9_fused_tess_chunk_plan plan = {0};
    bool plan_ok = hk_apple9_native_tess_fused_chunk_plan(
-      patches, instances, dev->dev.native_object.max_groups, max_child_wgs,
+      patches, instances, AGX_NATIVE_OBJECT_MAX_GROUPS, max_child_wgs,
       max_patch_prims, ring_max, hk_apple9_native_render_primitives(), &plan);
    assert(plan_ok);
    if (!plan_ok)
@@ -2419,6 +2417,27 @@ hk_draw_complete_from_state(const struct hk_cmd_buffer *cmd, struct agx_draw dra
    return draw;
 }
 
+uint64_t
+hk_apple9_ordinary_draw_primitives(const struct hk_cmd_buffer *cmd,
+                                   struct agx_draw draw)
+{
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+   /* Emulated GS/TES and indirect draws have GPU-determined output counts. */
+   if (agx_is_indirect(draw.b) || gfx->shaders[MESA_SHADER_GEOMETRY] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL])
+      return UINT64_MAX;
+   uint64_t prims =
+      (uint64_t)u_decomposed_prims_for_vertices(
+         vk_topology_to_mesa(dyn->ia.primitive_topology), draw.b.count[0]) *
+      draw.b.count[1];
+   /* Point/wireframe polygon modes can expand each triangle up to 3x. */
+   if (dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL)
+      prims = prims > UINT64_MAX / 3 ? UINT64_MAX : prims * 3;
+   return prims;
+}
+
 static void
 hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
 {
@@ -2433,13 +2452,16 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
    draw_ = hk_draw_complete_from_state(cmd, draw_);
    if (!hk_feedback_prepare_draw(cmd))
       return;
-   /* Binned-primitive estimate for the native render bound; native
-    * GS/TES below replace it with their output estimate. */
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   /* Binned-primitive estimate for the native render bound; native GS/TES
+    * below replace it with their output estimate. Reserve the full multiview
+    * total during preparation so multi-view ordinary draws split cleanly
+    * before view 0 instead of overflowing the backstop mid-loop. */
+   const uint64_t per_view_prims =
+      hk_apple9_ordinary_draw_primitives(cmd, draw_);
+   const unsigned views = util_bitcount(gfx->render.view_mask ?: 1);
    cmd->apple9_draw_primitives =
-      agx_is_indirect(draw_.b) ? UINT64_MAX
-      : (uint64_t)u_decomposed_prims_for_vertices(
-           vk_topology_to_mesa(dyn->ia.primitive_topology), draw_.b.count[0]) *
-           draw_.b.count[1];
+      per_view_prims > UINT64_MAX / views ? UINT64_MAX : per_view_prims * views;
    /* Batched native renders defer the ordinary split until stage
     * selection: a native GS/TES draw may continue the render. Also defer when
     * a fused native GS draw is eligible so prepare_draw is never called with
@@ -2454,7 +2476,6 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
    if (!defer_prepare &&
        !hk_apple9_prepare_draw(cmd, agx_is_indirect(draw_.b) || draw_.indexed, false))
       return;
-   const struct hk_graphics_state *gfx = &cmd->state.gfx;
    mesa_shader_stage producer = gfx->shaders[MESA_SHADER_GEOMETRY]
                                    ? MESA_SHADER_GEOMETRY
                                    : MESA_SHADER_TESS_EVAL;
@@ -2605,6 +2626,7 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
       !cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] &&
       !cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL] &&
       mesa_prim_has_adjacency(vk_topology_to_mesa(dyn->ia.primitive_topology));
+   cmd->apple9_draw_primitives = per_view_prims;
    hk_foreach_view(cmd) {
       struct agx_draw draw = draw_;
       if (adjacency)
@@ -2805,39 +2827,35 @@ hk_apple9_native_mesh_leaves_eligible(struct hk_cmd_buffer *cmd,
                 hk_cond_render_applies(cmd) ||
                 t->info.apple9_native_stage != HK_APPLE9_NATIVE_OBJECT ||
                 !max_groups ||
-                groups > dev->dev.native_object.max_groups ||
-                (groups > 1 && !dev->dev.native_object.multi_parent) ||
+                groups > AGX_NATIVE_OBJECT_MAX_GROUPS ||
                 t->info.apple9_native.key.physical_threads >
-                   dev->dev.native_object.max_threads ||
+                   AGX_NATIVE_OBJECT_MAX_THREADS ||
                 t->info.apple9_native.task_payload_size_B >
-                   dev->dev.native_object.payload_bytes ||
-                (t->info.apple9_native.writes_child_grid &&
-                 !dev->dev.native_object.payload_bytes) ||
+                   AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES ||
                 hk_apple9_native_object_tg_memory_bytes(
                    &t->info.apple9_native) >
-                   dev->dev.native_object.max_shared)
+                   AGX_NATIVE_OBJECT_MAX_SHARED_BYTES)
                return false;
             /* Per-parent hardware payload slots (GET_SR 0xe0/0xe1) require the
-             * booted kernel's backed multi-parent aperture to cover the full
-             * allocation (including the 12-byte child-grid tail). Both stages
-             * must agree on the payload mechanism whenever payload is used. */
+             * multi-parent payload aperture to cover the full allocation
+             * (including the 12-byte child-grid tail). Both stages must agree
+             * on the payload mechanism whenever payload is used. */
             if (uses_payload &&
                 t->info.apple9_native.key.hw_payload !=
                    main->info.apple9_native.key.hw_payload)
                return false;
             if ((t->info.apple9_native.key.hw_payload ||
                  main->info.apple9_native.key.hw_payload) &&
-                (!dev->dev.native_object.mp_payload_bytes ||
-                 payload_alloc_B > dev->dev.native_object.mp_payload_bytes ||
-                 mesh_payload_alloc_B > dev->dev.native_object.mp_payload_bytes))
+                (payload_alloc_B > AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES ||
+                 mesh_payload_alloc_B > AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES))
                return false;
             /* Multi-parent payload/child-grid traffic requires GET_SR 0xe0/0xe1;
              * single-parent payloads in (mp_payload_bytes, 16 KiB] continue to
              * use the draw-wide args.payload uniform isolated to groups == 1. */
             if (groups > 1 && uses_payload &&
                 (!t->info.apple9_native.key.hw_payload ||
-                 payload_alloc_B > dev->dev.native_object.mp_payload_bytes ||
-                 mesh_payload_alloc_B > dev->dev.native_object.mp_payload_bytes))
+                 payload_alloc_B > AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES ||
+                 mesh_payload_alloc_B > AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES))
                return false;
             if (t->info.task.max_mesh_groups == UINT32_MAX ||
                 (t->info.task.max_mesh_groups &&

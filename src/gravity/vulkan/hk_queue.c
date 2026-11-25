@@ -182,16 +182,20 @@ asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
    };
 }
 
-static void
-asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
-                       struct drm_asahi_cmd_render *c)
+void
+hk_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
+                    struct drm_asahi_cmd_render *c)
 {
    memset(c, 0, sizeof(*c));
 
    c->vdm_ctrl_stream_base = cs->addr;
-   if ((dev->dev.params.features & DRM_ASAHI_FEATURE_FEW_PRIMITIVES) &&
-       agx_has_few_primitives(cs->primitive_count))
+   if (cs->apple9_native_mesh) {
+      assert(dev->dev.params.features & DRM_ASAHI_FEATURE_NATIVE_MESH);
+      c->flags |= DRM_ASAHI_RENDER_NATIVE_MESH;
+   } else if ((dev->dev.params.features & DRM_ASAHI_FEATURE_FEW_PRIMITIVES) &&
+              agx_has_few_primitives(cs->primitive_count)) {
       c->flags |= DRM_ASAHI_RENDER_FEW_PRIMITIVES;
+   }
 
    agx_pack(&c->ppp_ctrl, CR_PPP_CONTROL, cfg) {
       cfg.enable_w_clamp = true;
@@ -1369,7 +1373,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                    cs->timestamp.end.handle);
 
             struct drm_asahi_cmd_render cmd;
-            asahi_fill_vdm_command(dev, cs, &cmd);
+            hk_fill_vdm_command(dev, cs, &cmd);
             const bool deferred =
                hk_defer_render_wait(dev, queue, cs, &streams[cs->sync_id]);
             if (deferred)

@@ -5,7 +5,6 @@
 
 #pragma once
 #include "agx_apple9_layout.h"
-#include "agx_native_mesh.h"
 
 #include <stdint.h>
 #include <xf86drm.h>
@@ -77,6 +76,15 @@ int agx_bind_timestamps(struct agx_device *dev, struct agx_bo *bo,
 /* Basis for the native Apple9 context-relative PPP and VDM addresses. */
 #define AGX_APPLE9_RENDER_CONTEXT_BASE UINT64_C(0x1000000000)
 
+/* Architectural limits for Apple9 native OBJECT -> MESH dispatches, backed by
+ * the kernel's per-render 0x1ca48 multi-cluster payload aperture whenever
+ * DRM_ASAHI_FEATURE_NATIVE_MESH is advertised. */
+#define AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES  16384u
+#define AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES   1024u
+#define AGX_NATIVE_OBJECT_MAX_THREADS        32u
+#define AGX_NATIVE_OBJECT_MAX_SHARED_BYTES   32768u
+#define AGX_NATIVE_OBJECT_MAX_GROUPS         ((1u << 20) - 1)
+
 struct agx_device {
    uint32_t debug;
 
@@ -87,22 +95,9 @@ struct agx_device {
    /* Device handle */
    int fd;
 
-   /* Set the expected class hash before opening the device. Qualification is
-    * sampled around this VM's creation and never upgraded later. */
-   const char *native_mesh_classes;
-
    /* Opened only to query the device (a Vulkan physical device): no shader
     * entries are allocated, so their 8 MiB arena is not created. */
    bool probe_only;
-   bool native_mesh_qualified;
-   enum agx_native_mesh_profile native_mesh_profile;
-   /* The VM's latched asahi_native_blocks profile; qualified only together
-    * with native_mesh_qualified, at the same generation. */
-   struct agx_native_blocks_support native_blocks;
-   /* The VM's latched asahi_native_object profile (Phase 2 multi-parent
-    * OBJECT -> MESH with 16 KiB task payload), sampled at the same generation
-    * as asahi_native_mesh around VM_CREATE. */
-   struct agx_native_object_support native_object;
 
    /* VM handle */
    uint32_t vm_id;
@@ -290,6 +285,13 @@ agx_has_soft_fault(struct agx_device *dev)
 {
    return (dev->params.features & DRM_ASAHI_FEATURE_SOFT_FAULTS) &&
           !(dev->debug & AGX_DBG_NOSOFT);
+}
+
+static inline bool
+agx_has_native_mesh(const struct agx_device *dev)
+{
+   return dev && dev->chip == AGX_CHIP_G16G &&
+          (dev->params.features & DRM_ASAHI_FEATURE_NATIVE_MESH) != 0;
 }
 
 static uint32_t

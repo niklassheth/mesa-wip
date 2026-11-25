@@ -166,8 +166,8 @@ record(struct hk_device *dev, const char *name, mesa_shader_stage producer,
       FALLBACK(cmd->state.gfx.xfb_enabled, true);
       FALLBACK(cmd->state.gfx.descriptors.root.draw.pipeline_stats_flags, 1);
       FALLBACK(cmd->state.cond_render.active, true);
-      FALLBACK(dev->dev.native_mesh_qualified, false);
-      FALLBACK(hk_device_physical(dev)->dev.native_mesh_qualified, false);
+      FALLBACK(dev->dev.params.features, 0);
+      FALLBACK(hk_device_physical(dev)->dev.params.features, 0);
       CHECK(!route(cmd, producer, agx_draw_indirect(0x1000)));
       struct hk_api_shader *n = hk_api_shader_native(api[producer]);
       FALLBACK(n->apple9_native_stage_mask, 0);
@@ -302,7 +302,7 @@ pipeline(struct hk_device *dev, mesa_shader_stage producer, unsigned vertices,
       save_object(dev,name,i,api[stages[i]],expected);
    }
    printf("COMPILE %s native=%u cpu_ns=%"PRIu64"\n",name,expected,ns);
-   bool recorded_native = expected && dev->dev.native_mesh_qualified;
+   bool recorded_native = expected && agx_has_native_mesh(&dev->dev);
    struct agx_shader_body *body = recorded_native
       ? hk_native_producer_main(hk_api_shader_native(api[producer]))->apple9_body : NULL;
    VkCommandPool pool = record(dev,name,producer,api,vertices,recorded_native);
@@ -329,8 +329,10 @@ main(int argc, char **argv)
    glsl_type_singleton_init_or_ref();
    struct hk_device *dev=calloc(1,sizeof(*dev));struct hk_physical_device *pdev=calloc(1,sizeof(*pdev));CHECK(dev&&pdev);
    dev->dev.chip=pdev->dev.chip=AGX_CHIP_G16G;
-   pdev->dev.native_mesh_qualified=strcmp(argv[1],"physical-negative")!=0;
-   dev->dev.native_mesh_qualified=strcmp(argv[1],"logical-negative")!=0;
+   pdev->dev.params.features =
+      strcmp(argv[1],"physical-negative")!=0 ? DRM_ASAHI_FEATURE_NATIVE_MESH : 0;
+   dev->dev.params.features =
+      strcmp(argv[1],"logical-negative")!=0 ? DRM_ASAHI_FEATURE_NATIVE_MESH : 0;
    pdev->disable_native_stages=!strcmp(argv[1],"drirc");
    dev->dev.shader_base=0x1200000000ull;
    dev->vk.base.type=VK_OBJECT_TYPE_DEVICE;

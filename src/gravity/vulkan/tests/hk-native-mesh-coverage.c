@@ -133,8 +133,10 @@ int main(int argc, char **argv)
    bool class_match = stage == MESA_SHADER_MESH &&
       hk_apple9_packed_mesh_class_selected(hk_apple9_native_index_shapes(), threads,
          nir->info.mesh.max_vertices_out, nir->info.mesh.max_primitives_out);
-   struct hk_physical_device pdev = {.dev.chip = AGX_CHIP_G16G,
-                                    .dev.native_mesh_qualified = true};
+   struct hk_physical_device pdev = {
+      .dev.chip = AGX_CHIP_G16G,
+      .dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH,
+   };
    bool enabled = hk_apple9_native_index_enabled(&pdev);
    bool gate = enabled && hk_apple9_native_mesh_packed_shape_eligible(nir);
    /* Observe the existing body-layout model independently of completion.

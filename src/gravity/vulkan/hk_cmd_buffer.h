@@ -535,9 +535,10 @@ struct hk_cs {
    /* The stream's render stores a linear colour attachment. */
    bool linear_store;
 
-   /* The stream leads with a native mesh block. With a qualified
-    * asahi_native_blocks profile, further native and (if mixed) ordinary
-    * blocks may follow it (hk_apple9_native_stream_admits). */
+   /* The stream contains at least one native object/mesh dispatch and is
+    * submitted with DRM_ASAHI_RENDER_NATIVE_MESH (opaque VDM stream; ordinary
+    * and native draws may appear in any order subject to hardware invariants
+    * in hk_apple9_native_stream_admits). */
    bool apple9_native_mesh;
    /* Native dispatches (blocks) in the stream. */
    unsigned apple9_native_dispatches;
@@ -1195,8 +1196,6 @@ hk_cmd_flush_empty_clears(struct hk_cmd_buffer *cmd)
 uint64_t hk_heap(struct hk_cmd_buffer *cmd);
 VkResult hk_heap_prepare_submit(struct hk_device *dev, uint64_t min_B);
 
-size_t hk_apple9_graphics_root_size(const struct hk_device *dev);
-
 static inline bool
 hk_cs_is_behind_other(const struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
 {
@@ -1243,8 +1242,7 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
       /* Most control streams are short. Reserve only a small root block;
        * hk_ensure_cs_has_space() chains larger blocks for long streams.
        */
-      size_t initial_size =
-         compute ? 4096 : hk_apple9_graphics_root_size(hk_cmd_buffer_device(cmd));
+      size_t initial_size = 4096;
       struct agx_ptr root = hk_pool_cs_alloc(cmd, initial_size, 1024, compute);
       if (!root.cpu)
          return NULL;
@@ -1677,6 +1675,8 @@ bool hk_apple9_prepare_draw(struct hk_cmd_buffer *cmd, bool reads_buffers,
                             bool native_mesh);
 bool hk_apple9_prepare_draw_ex(struct hk_cmd_buffer *cmd, bool reads_buffers,
                                bool native_mesh, bool native_object);
+uint64_t hk_apple9_ordinary_draw_primitives(const struct hk_cmd_buffer *cmd,
+                                            struct agx_draw draw);
 bool hk_apple9_use_native_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw);
 bool hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw);
 enum hk_apple9_native_mesh_route

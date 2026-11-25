@@ -143,8 +143,10 @@ main(int argc, char **argv)
        !strcmp(argv[1], "killed") ||
        !strcmp(argv[1], "drirc")) {
       bool enabled = !strcmp(argv[1], "enabled");
-      struct hk_physical_device pdev = {.dev.chip = AGX_CHIP_G16G,
-                                       .dev.native_mesh_qualified = true};
+      struct hk_physical_device pdev = {
+         .dev.chip = AGX_CHIP_G16G,
+         .dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH,
+      };
       pdev.disable_native_index = !strcmp(argv[1], "drirc");
       default_policy = hk_apple9_native_index_enabled(&pdev);
       CHECK(default_policy == enabled);
@@ -153,11 +155,11 @@ main(int argc, char **argv)
       CHECK(!hk_apple9_native_gs_enabled() && !hk_apple9_native_tess_enabled());
       CHECK(util_bitcount64(hk_apple9_native_index_shapes()) == 31);
       uint64_t active_flags = hk_physical_device_compiler_flags(&pdev);
-      pdev.dev.native_mesh_qualified = false;
+      pdev.dev.params.features = 0;
       CHECK(!hk_apple9_native_index_enabled(&pdev));
       CHECK(!hk_apple9_native_mesh_available(&pdev));
       CHECK((active_flags != hk_physical_device_compiler_flags(&pdev)) == enabled);
-      pdev.dev.native_mesh_qualified = true;
+      pdev.dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
       pdev.disable_native_index = true;
       CHECK((active_flags != hk_physical_device_compiler_flags(&pdev)) == enabled);
       pdev.disable_native_index = false;

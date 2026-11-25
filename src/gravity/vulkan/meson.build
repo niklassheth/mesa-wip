@@ -124,19 +124,11 @@ if get_option('hk-gpu-busy-counters')
   gravity_diagnostic_c_args += '-DHK_GPU_BUSY_COUNTERS=1'
 endif
 
-gravity_native_index_classes = custom_target(
-  'gravity_apple9_native_index_classes.h',
-  input : 'hk_apple9_native_index_shapes.def',
-  output : 'hk_apple9_native_index_classes.h',
-  command : [prog_python, files('hk_apple9_native_index_hash.py'), '@INPUT@', '@OUTPUT@'],
-)
-
 libgravity_vk = static_library(
   'gravity_vk',
   [
     gravity_entrypoints,
     gravity_drirc,
-    gravity_native_index_classes,
     gravity_vk_files,
     sha1_h,
   ],
@@ -296,7 +288,7 @@ if with_tests
                            inc_src, inc_gravity],
     dependencies : [gravity_vk_deps], link_with : [libgravity_vk],
     link_args : ['-Wl,--wrap=drmGetVersion', '-Wl,--wrap=drmFreeVersion',
-                 '-Wl,--wrap=drmIoctl', '-Wl,--wrap=agx_native_mesh_probe',
+                 '-Wl,--wrap=drmIoctl',
                  '-Wl,--wrap=agx_bo_create']), env : ['HK_APPLE9_NATIVE_INDEX=1'],
     suite : ['gravity'])
   gravity_routing_test = executable(
@@ -490,11 +482,11 @@ if with_tests
     suite : ['gravity'])
   test('gravity-hk-native-tess-hybrid', gravity_hybrid_test,
     env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_TESS_NATIVE=1',
+           'HK_APPLE9_NATIVE_OBJECT=0',
            'HK_APPLE9_NATIVE_MESH_PACKED_SHAPES=T16V3P1,T16V4P2'],
     suite : ['gravity'])
   test('gravity-hk-native-tess-fused-hybrid', gravity_hybrid_test,
-    env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_TESS_NATIVE=1',
-           'HK_TEST_NATIVE_OBJECT_MP=1'],
+    env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_TESS_NATIVE=1'],
     suite : ['gravity'])
   test('gravity-hk-native-mesh-hybrid', gravity_hybrid_test,
     env : ['HK_APPLE9_NATIVE_MESH=1', 'HK_APPLE9_NATIVE_MESH_ATTRIBUTES=1',

@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "../hk_cmd_buffer.h"
+#include "../hk_physical_device.h"
 #include "../hk_shader.h"
 
 #define CHECK(c)                                                               \
@@ -49,21 +50,15 @@ routes(struct hk_cmd_buffer *cmd)
    dyn->rs.polygon_mode = VK_POLYGON_MODE_FILL;
    const uint32_t direct[] = {2, 3, 4}, oversized[] = {1024, 1024, 1};
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
-   /* Latched VM profile=none (including probe/read/parse failure on a real VM)
-    * refuses native submission even with HK_APPLE9_NATIVE_MESH=1, while latched
-    * research, qualified, and confirmed-absent (UNKNOWN) profiles admit it. */
+   /* Missing DRM_ASAHI_FEATURE_NATIVE_MESH refuses native submission even with
+    * HK_APPLE9_NATIVE_MESH=1; advertising bit 28 admits it. */
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   uint32_t saved_vm_id = dev->dev.vm_id;
-   dev->dev.vm_id = 9;
-   dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_NONE;
+   uint64_t saved_features = dev->dev.params.features;
+   dev->dev.params.features = 0;
    CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
-   dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_RESEARCH;
+   dev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
-   dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_QUALIFIED;
-   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
-   dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_UNKNOWN;
-   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
-   dev->dev.vm_id = saved_vm_id;
+   dev->dev.params.features = saved_features;
    /* Guarded taskless indirect and indirect-count draws are admitted when the
     * output footprint is concurrent-safe (<= 64 rows/WG); invalid direct+count
     * and oversized direct grids still fall back. */
@@ -658,19 +653,8 @@ static void
 tess_fused_routes(struct hk_cmd_buffer *cmd)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   struct agx_native_object_support saved_obj = dev->dev.native_object;
-   bool saved_qual = dev->dev.native_mesh_qualified;
-   dev->dev.native_mesh_qualified = true;
-   dev->dev.native_object = (struct agx_native_object_support){
-      .profile = AGX_NATIVE_MESH_PROFILE_QUALIFIED,
-      .generation = 1,
-      .multi_parent = true,
-      .payload_bytes = 16384,
-      .mp_payload_bytes = 1024,
-      .max_threads = 32,
-      .max_shared = 32768,
-      .max_groups = 1048575,
-   };
+   uint64_t saved_features = dev->dev.params.features;
+   dev->dev.params.features |= DRM_ASAHI_FEATURE_NATIVE_MESH;
 
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
@@ -780,16 +764,6 @@ tess_fused_routes(struct hk_cmd_buffer *cmd)
       draw.b.count[1] = HK_APPLE9_NATIVE_TESS_MAX_CHUNKS * 2 + 1; /* 9 -> 5 */
       CHECK(!hk_apple9_use_native_tess(cmd, draw));
 
-      /* Grid-driven 4/5-chunk boundary (max_groups cap below TVB cap). */
-      main->info.apple9_tess_max_patch_prims = 0; /* culled -> 1 prim/patch */
-      dev->dev.native_object.max_groups = 1000;
-      draw.b.count[0] = 4 * 1000;
-      draw.b.count[1] = HK_APPLE9_NATIVE_TESS_MAX_CHUNKS;
-      CHECK(hk_apple9_use_native_tess(cmd, draw));
-      draw.b.count[1] = HK_APPLE9_NATIVE_TESS_MAX_CHUNKS + 1;
-      CHECK(!hk_apple9_use_native_tess(cmd, draw));
-      dev->dev.native_object.max_groups = 1048575;
-
       /* Single-chunk unbounded draw stays admitted. */
       main->info.apple9_tess_max_patch_prims = 32;
       draw.b.count[0] = 4 * (uint32_t)(prim_cap / 32);
@@ -833,14 +807,14 @@ tess_fused_routes(struct hk_cmd_buffer *cmd)
       util_dynarray_fini(&cmd->sync_first_event);
       free(pool);
 
-      /* Payload, multi-parent, shared memory, indirect, and ring-limit gates. */
+      /* Payload, feature bit-28, indirect, and ring-limit gates. */
       CHECK(!hk_apple9_use_native_tess(cmd, agx_draw_indirect(0x1000)));
       main->info.apple9_tess_payload_B = 1025;
       CHECK(!hk_apple9_use_native_tess(cmd, draw));
       main->info.apple9_tess_payload_B = 192;
-      dev->dev.native_object.mp_payload_bytes = 0;
+      dev->dev.params.features &= ~DRM_ASAHI_FEATURE_NATIVE_MESH;
       CHECK(!hk_apple9_use_native_tess(cmd, draw));
-      dev->dev.native_object.mp_payload_bytes = 1024;
+      dev->dev.params.features |= DRM_ASAHI_FEATURE_NATIVE_MESH;
 
       /* Ring-limited high-varying tier (V=4, n=40 -> 48 rows -> 85 safe WGs)
        * and wg_rows == 32 exact-wrap tier (V=4, n=24 -> 32 rows -> 128 WGs)
@@ -861,8 +835,7 @@ tess_fused_routes(struct hk_cmd_buffer *cmd)
    }
 
    memset(gfx->shaders, 0, sizeof(gfx->shaders));
-   dev->dev.native_object = saved_obj;
-   dev->dev.native_mesh_qualified = saved_qual;
+   dev->dev.params.features = saved_features;
    free(tes);
    free(tcs);
    free(vs);
@@ -880,12 +853,17 @@ mark_draw(struct hk_cs *cs, bool native)
     * Reserve representative stream bytes before the real next preparation. */
    cs->current += 160;
    cs->stats.cmds++;
-   cs->apple9_native_mesh = native;
+   if (native) {
+      cs->apple9_native_mesh = true;
+      cs->apple9_native_dispatches++;
+   }
 }
 
 static void
 transitions(struct hk_cmd_buffer *cmd)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_physical_device *pdev = hk_device_physical(dev);
    uint8_t *pool = calloc(2, HK_CMD_BO_SIZE);
    CHECK(pool);
    cmd->uploader[HK_CMD_POOL_MAIN].chunks[0].map = pool;
@@ -900,6 +878,120 @@ transitions(struct hk_cmd_buffer *cmd)
    r->cr.bg.partial.usc = 0x1000;
    r->cr.eot.partial.usc = 0x2000;
    memset(&r->cr.zls_control_partial, 0x35, sizeof(r->cr.zls_control_partial));
+
+   /* With DRM_ASAHI_FEATURE_NATIVE_MESH enabled (and native blocks not
+    * disabled), ordinary -> native -> native -> ordinary -> native -> meta
+    * all merge into ONE single render pass with 0 splits! */
+   if (hk_apple9_native_mesh_available_device(dev)) {
+      cmd->apple9_draw_primitives = 100;
+      cmd->apple9_draw_ring_rows = 40;
+      cmd->apple9_draw_ring_limited = false;
+      CHECK(hk_apple9_prepare_draw(cmd, false, false));
+      struct hk_cs *merged = cmd->current_cs.gfx;
+      CHECK(merged && !merged->apple9_native_mesh);
+      mark_draw(merged, false); /* ordinary draw leads the render pass */
+
+      const bool seq[] = {true, true, false, true, false};
+      for (unsigned i = 0; i < ARRAY_SIZE(seq); ++i) {
+         cmd->in_meta = i == ARRAY_SIZE(seq) - 1;
+         CHECK(hk_apple9_prepare_draw(cmd, seq[i], seq[i]));
+         CHECK(cmd->current_cs.gfx == merged);
+         mark_draw(merged, seq[i]);
+      }
+      cmd->in_meta = false;
+      CHECK(merged->apple9_native_mesh && merged->apple9_native_dispatches == 3);
+
+      /* Genuine hardware invariant: cumulative 64 KiB (4096-row) mesh ring
+       * overflow on a ring-limited (wg_rows > 40) shader MUST split! */
+      merged->apple9_native_ring_rows = 3000;
+      merged->apple9_native_ring_limited = true;
+      cmd->apple9_draw_ring_rows = 1200;
+      cmd->apple9_draw_ring_limited = true;
+      CHECK(hk_apple9_prepare_draw(cmd, true, true));
+      CHECK(cmd->current_cs.gfx != merged);
+      CHECK(merged->end_reason == HK_CS_END_RENDER_SPLIT);
+      cmd->apple9_draw_ring_rows = 0;
+      cmd->apple9_draw_ring_limited = false;
+      hk_cmd_buffer_end_graphics(cmd);
+
+      /* Emulated GS/TES output counts are GPU-determined (UINT64_MAX), so they
+       * split both after and before a capped native draw instead of using their
+       * API input primitive count. */
+      struct hk_api_shader *emu_gs = shader(MESA_SHADER_GEOMETRY);
+      struct hk_api_shader *emu_tes = shader(MESA_SHADER_TESS_EVAL);
+      struct agx_draw big_input = {.b = agx_3d(3 * 20000, 1, 1)};
+      cmd->vk.dynamic_graphics_state.ia.primitive_topology =
+         VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      cmd->vk.dynamic_graphics_state.rs.polygon_mode = VK_POLYGON_MODE_FILL;
+      CHECK(hk_apple9_ordinary_draw_primitives(cmd, big_input) == 20000);
+      cmd->vk.dynamic_graphics_state.rs.polygon_mode = VK_POLYGON_MODE_POINT;
+      CHECK(hk_apple9_ordinary_draw_primitives(cmd, big_input) == 60000);
+      cmd->vk.dynamic_graphics_state.rs.polygon_mode = VK_POLYGON_MODE_FILL;
+      cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] = emu_gs;
+      CHECK(hk_apple9_ordinary_draw_primitives(cmd, big_input) == UINT64_MAX);
+      cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] = NULL;
+      cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL] = emu_tes;
+      CHECK(hk_apple9_ordinary_draw_primitives(cmd, big_input) == UINT64_MAX);
+      cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL] = NULL;
+
+      /* Emulated GS after a 900k capped native draw splits cleanly. */
+      cmd->apple9_draw_primitives = 900000;
+      CHECK(hk_apple9_prepare_draw(cmd, true, true));
+      struct hk_cs *cs_cap = cmd->current_cs.gfx;
+      mark_draw(cs_cap, true);
+      cs_cap->apple9_native_primitives = 900000;
+      cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] = emu_gs;
+      cmd->apple9_draw_primitives =
+         hk_apple9_ordinary_draw_primitives(cmd, big_input);
+      CHECK(cmd->apple9_draw_primitives == UINT64_MAX);
+      CHECK(hk_apple9_prepare_draw(cmd, false, false));
+      struct hk_cs *cs_emu = cmd->current_cs.gfx;
+      CHECK(cs_emu != cs_cap && !cs_emu->apple9_native_mesh);
+      /* Emulated GS before a 100-prim capped native draw also splits cleanly. */
+      mark_draw(cs_emu, false);
+      cs_emu->apple9_native_primitives = cmd->apple9_draw_primitives;
+      cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] = NULL;
+      cmd->apple9_draw_primitives = 100;
+      CHECK(hk_apple9_prepare_draw(cmd, true, true));
+      CHECK(cmd->current_cs.gfx != cs_emu);
+      hk_cmd_buffer_end_graphics(cmd);
+      free(emu_gs);
+      free(emu_tes);
+
+      /* Multiview ordinary draw crossing 1M cap on view 2 (900k + 2 * 60k)
+       * reserves the complete multiview total at preparation and splits cleanly
+       * before view 0 so per-view emission never hits UNSUPPORTED(). */
+      cmd->apple9_draw_primitives = 900000;
+      CHECK(hk_apple9_prepare_draw(cmd, true, true));
+      struct hk_cs *cs_mv_pre = cmd->current_cs.gfx;
+      mark_draw(cs_mv_pre, true);
+      cs_mv_pre->apple9_native_primitives = 900000;
+      cmd->state.gfx.render.view_mask = 0x3;
+      struct agx_draw mv_draw = {.b = agx_3d(3 * 60000, 1, 1)};
+      uint64_t per_view = hk_apple9_ordinary_draw_primitives(cmd, mv_draw);
+      unsigned views = util_bitcount(cmd->state.gfx.render.view_mask);
+      CHECK(per_view == 60000 && views == 2);
+      cmd->apple9_draw_primitives = per_view * views;
+      CHECK(hk_apple9_prepare_draw(cmd, false, false));
+      struct hk_cs *cs_mv = cmd->current_cs.gfx;
+      CHECK(cs_mv != cs_mv_pre && !cs_mv->apple9_native_mesh);
+      cmd->apple9_draw_primitives = per_view;
+      for (unsigned v = 0; v < views; ++v) {
+         CHECK(hk_apple9_prepare_draw(cmd, false, false));
+         CHECK(cmd->current_cs.gfx == cs_mv);
+         mark_draw(cs_mv, false);
+         cs_mv->apple9_native_primitives += per_view;
+      }
+      CHECK(cs_mv->apple9_native_primitives == 120000);
+      CHECK(cmd->vk.record_result == VK_SUCCESS);
+      cmd->state.gfx.render.view_mask = 0;
+      hk_cmd_buffer_end_graphics(cmd);
+   }
+
+   /* Under the isolation kill switch (disable_native_blocks = true), every
+    * transition across native draws splits cleanly with partial-render state. */
+   pdev->disable_native_blocks = true;
+   cmd->apple9_draw_primitives = 100;
    CHECK(hk_apple9_prepare_draw(cmd, false, false));
    struct hk_cs *first = cmd->current_cs.gfx;
    CHECK(first && !first->stats.cmds);
@@ -932,6 +1024,7 @@ transitions(struct hk_cmd_buffer *cmd)
       mark_draw(next, paths[i]);
    }
    cmd->in_meta = false;
+   pdev->disable_native_blocks = false;
    struct hk_cs *last = cmd->current_cs.gfx;
    CHECK(hk_apple9_prepare_draw(cmd, false, false));
    CHECK(cmd->current_cs.gfx == last); /* ordinary draws still coalesce */
@@ -948,10 +1041,14 @@ transitions(struct hk_cmd_buffer *cmd)
 int
 main(void)
 {
+   struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
    struct hk_device *dev = calloc(1, sizeof(*dev));
    struct hk_cmd_buffer *cmd = calloc(1, sizeof(*cmd));
-   CHECK(dev && cmd);
-   dev->dev.chip = AGX_CHIP_G16G;
+   CHECK(pdev && dev && cmd);
+   pdev->dev.chip = dev->dev.chip = AGX_CHIP_G16G;
+   pdev->dev.params.features = dev->dev.params.features =
+      DRM_ASAHI_FEATURE_NATIVE_MESH;
+   dev->vk.physical = &pdev->vk;
    cmd->vk.base.device = &dev->vk;
    cmd->vk.state = MESA_VK_COMMAND_BUFFER_STATE_RECORDING;
    routes(cmd);
@@ -962,6 +1059,7 @@ main(void)
    transitions(cmd);
    free(cmd);
    free(dev);
+   free(pdev);
    puts(
       "hybrid draw routing, partial attachment state and continuation ordering pass");
    return 0;

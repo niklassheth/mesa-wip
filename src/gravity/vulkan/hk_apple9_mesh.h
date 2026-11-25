@@ -18,7 +18,6 @@ struct hk_device;
 bool hk_apple9_native_index_enabled(const struct hk_physical_device *pdev);
 bool hk_apple9_native_mesh_available(const struct hk_physical_device *pdev);
 bool hk_apple9_native_mesh_available_device(struct hk_device *dev);
-const char *hk_apple9_native_index_class_hash(void);
 uint64_t hk_apple9_native_index_shapes(void);
 /* Separate default-off GS route; also requires native mesh and exact classes. */
 bool hk_apple9_native_gs_enabled(void);

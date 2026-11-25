@@ -4,8 +4,6 @@
 #include "hk_apple9_mesh.h"
 #include "hk_physical_device.h"
 #include "hk_device.h"
-#include "hk_apple9_native_index_classes.h"
-#include "gravity/lib/agx_native_mesh.h"
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
 #include <string.h>
@@ -200,8 +198,8 @@ hk_apple9_native_index_shapes(void)
 bool
 hk_apple9_native_index_enabled(const struct hk_physical_device *pdev)
 {
-   return pdev && pdev->dev.chip == AGX_CHIP_G16G &&
-          pdev->dev.native_mesh_qualified && !pdev->disable_native_index &&
+   return pdev && agx_has_native_mesh(&pdev->dev) &&
+          !pdev->disable_native_index &&
           debug_get_option_native_index() &&
           !getenv("HK_APPLE9_NATIVE_MESH");
 }
@@ -209,59 +207,41 @@ hk_apple9_native_index_enabled(const struct hk_physical_device *pdev)
 bool
 hk_apple9_native_mesh_available(const struct hk_physical_device *pdev)
 {
-   return hk_apple9_native_mesh_enabled() || hk_apple9_native_index_enabled(pdev);
-}
-
-static bool
-native_mesh_kernel_disabled(const struct hk_device *dev)
-{
-   if (!dev || dev->dev.native_mesh_qualified)
-      return false;
-   if (dev->dev.native_mesh_profile != AGX_NATIVE_MESH_PROFILE_UNKNOWN)
-      return dev->dev.native_mesh_profile == AGX_NATIVE_MESH_PROFILE_NONE;
-   /* Real DRM VMs probe and latch asahi_native_mesh around VM_CREATE; UNKNOWN
-    * on a real VM means the sysfs attribute was absent (older kernel). */
-   if (dev->dev.vm_id || dev->dev.fd < 0)
-      return false;
-   return agx_native_mesh_probe_disabled(dev->dev.fd);
+   return pdev && agx_has_native_mesh(&pdev->dev) &&
+          (hk_apple9_native_mesh_enabled() ||
+           hk_apple9_native_index_enabled(pdev));
 }
 
 bool
 hk_apple9_native_mesh_available_device(struct hk_device *dev)
 {
-   /* The discovery VM partitions physical-device compiler/cache policy. It
-    * cannot authorize a distinct logical VM: recording also needs that VM's
-    * own immutable qualification. Research keeps its explicit pairing, unless
-    * the kernel explicitly advertises profile=none (decoding disabled). */
-   if (hk_apple9_native_mesh_enabled()) {
-      if (native_mesh_kernel_disabled(dev)) {
+   if (!dev || !agx_has_native_mesh(&dev->dev)) {
+      if (dev && hk_apple9_native_mesh_enabled()) {
          static bool warned_disabled;
          if (!p_atomic_xchg(&warned_disabled, true))
             fprintf(stderr,
-                    "HK_APPLE9_NATIVE_MESH: kernel reports profile=none; "
-                    "refusing native mesh submission\n");
-         return false;
+                    "HK_APPLE9_NATIVE_MESH: kernel does not advertise "
+                    "DRM_ASAHI_FEATURE_NATIVE_MESH; refusing native mesh submission\n");
       }
-      return true;
+      return false;
    }
-   return dev->dev.native_mesh_qualified &&
-          hk_apple9_native_index_enabled(hk_device_physical(dev));
+   if (hk_apple9_native_mesh_enabled())
+      return true;
+   return hk_apple9_native_index_enabled(hk_device_physical(dev));
 }
 
 bool
 hk_apple9_native_object_available(const struct hk_physical_device *pdev)
 {
    return hk_apple9_native_object_enabled() && pdev &&
-          pdev->dev.chip == AGX_CHIP_G16G &&
-          agx_native_object_enabled(&pdev->dev.native_object);
+          agx_has_native_mesh(&pdev->dev);
 }
 
 bool
 hk_apple9_native_object_available_device(struct hk_device *dev)
 {
    return hk_apple9_native_object_enabled() &&
-          hk_apple9_native_mesh_available_device(dev) && dev &&
-          agx_native_object_enabled(&dev->dev.native_object);
+          hk_apple9_native_mesh_available_device(dev);
 }
 
 uint8_t
@@ -294,14 +274,15 @@ bool
 hk_apple9_native_stage_available_device(struct hk_device *dev,
                                         mesa_shader_stage stage)
 {
+   if (!dev || !agx_has_native_mesh(&dev->dev))
+      return false;
    if (stage == MESA_SHADER_GEOMETRY && hk_apple9_native_gs_enabled())
-      return !native_mesh_kernel_disabled(dev);
+      return true;
    if (stage == MESA_SHADER_TESS_EVAL && hk_apple9_native_tess_enabled())
-      return !native_mesh_kernel_disabled(dev);
+      return true;
    unsigned bit = stage == MESA_SHADER_GEOMETRY ? HK_APPLE9_NATIVE_GS_BIT
                 : stage == MESA_SHADER_TESS_EVAL ? HK_APPLE9_NATIVE_TES_BIT : 0;
-   return dev->dev.native_mesh_qualified &&
-          (hk_apple9_native_stage_policy(hk_device_physical(dev)) & bit);
+   return (hk_apple9_native_stage_policy(hk_device_physical(dev)) & bit) != 0;
 }
 
 bool
@@ -324,12 +305,6 @@ hk_apple9_native_stage_class(mesa_shader_stage stage, unsigned threads,
       return (vertices == 3 && primitives == 1) ||
              (vertices == 4 && primitives == 2);
    return stage == MESA_SHADER_TESS_EVAL && vertices == 3 && primitives == 1;
-}
-
-const char *
-hk_apple9_native_index_class_hash(void)
-{
-   return HK_APPLE9_NATIVE_INDEX_CLASSES_SHA256;
 }
 
 bool

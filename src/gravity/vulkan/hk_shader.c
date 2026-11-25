@@ -238,16 +238,15 @@ static void
 hk_hash_apple9_native_object_cap(struct mesa_blake3 *ctx,
                                  const struct hk_physical_device *pdev)
 {
-   const struct agx_native_object_support *no = &pdev->dev.native_object;
    const bool avail = hk_apple9_native_object_available(pdev);
    const uint32_t cap[] = {
       avail,
-      avail ? (uint32_t)no->multi_parent : 0u,
-      avail ? no->payload_bytes : 0u,
-      avail ? no->mp_payload_bytes : 0u,
-      avail ? no->max_threads : 0u,
-      avail ? no->max_shared : 0u,
-      avail ? no->max_groups : 0u,
+      avail ? 1u : 0u,
+      avail ? AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES : 0u,
+      avail ? AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES : 0u,
+      avail ? AGX_NATIVE_OBJECT_MAX_THREADS : 0u,
+      avail ? AGX_NATIVE_OBJECT_MAX_SHARED_BYTES : 0u,
+      avail ? AGX_NATIVE_OBJECT_MAX_GROUPS : 0u,
    };
    _mesa_blake3_update(ctx, cap, sizeof(cap));
 }
@@ -256,14 +255,16 @@ uint64_t
 hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
 {
    call_once(&hk_compiler_env_hash_once, hk_compiler_env_hash_init);
-   /* Soft faults follow a kernel parameter, so they can change between
-    * boots with the same cache. */
+   /* Soft faults and native mesh follow kernel parameters, so they can change
+    * between boots with the same cache. */
    uint64_t flags = pdev->dev.debug |
                     ((uint64_t)pdev->apple9_layered_2d << 63) |
                     ((uint64_t)agx_has_soft_fault((struct agx_device *)&pdev->dev) << 62) |
                     ((uint64_t)pdev->apple9_d3d_mip_rounding << 61) |
                     ((uint64_t)hk_apple9_native_index_enabled(pdev) << 60) |
-                    ((uint64_t)hk_apple9_native_stage_policy(pdev) << 58);
+                    ((uint64_t)hk_apple9_native_stage_policy(pdev) << 58) |
+                    ((uint64_t)(hk_apple9_native_mesh_enabled() &&
+                                agx_has_native_mesh(&pdev->dev)) << 57);
    uint64_t native_obj_hash = 0;
    if (hk_apple9_native_object_available(pdev)) {
       struct mesa_blake3 ctx;
@@ -775,8 +776,10 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
        hk_apple9_native_object_available_device(dev)) &&
       stage == MESA_SHADER_TASK;
    if (blob->overrun ||
-       (obj->apple9_native_leaf && stage != MESA_SHADER_MESH &&
-        stage != MESA_SHADER_FRAGMENT && !gs_leaf && !tess_leaf && !task_leaf)) {
+       (obj->apple9_native_leaf &&
+        (!hk_apple9_native_mesh_available(hk_device_physical(dev)) ||
+         (stage != MESA_SHADER_MESH && stage != MESA_SHADER_FRAGMENT &&
+          !gs_leaf && !tess_leaf && !task_leaf)))) {
       hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
    }
@@ -800,16 +803,13 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
             (t->info.apple9_native.writes_child_grid ? 16 : 0);
          if (!hk_apple9_native_object_available_device(dev) ||
              t->info.apple9_native.key.physical_threads >
-                dev->dev.native_object.max_threads ||
+                AGX_NATIVE_OBJECT_MAX_THREADS ||
              t->info.apple9_native.task_payload_size_B >
-                dev->dev.native_object.payload_bytes ||
-             (t->info.apple9_native.writes_child_grid &&
-              !dev->dev.native_object.payload_bytes) ||
+                AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES ||
              (t->info.apple9_native.key.hw_payload &&
-              (!dev->dev.native_object.mp_payload_bytes ||
-               payload_alloc_B > dev->dev.native_object.mp_payload_bytes)) ||
+              payload_alloc_B > AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES) ||
              hk_apple9_native_object_tg_memory_bytes(&t->info.apple9_native) >
-                dev->dev.native_object.max_shared) {
+                AGX_NATIVE_OBJECT_MAX_SHARED_BYTES) {
             hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
             return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
          }
@@ -826,9 +826,7 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
       if ((mi->native_object &&
            (!hk_apple9_native_object_available_device(dev) ||
             (m->info.apple9_native.key.hw_payload &&
-             (!dev->dev.native_object.mp_payload_bytes ||
-              mesh_payload_alloc_B >
-                 dev->dev.native_object.mp_payload_bytes)))) ||
+             mesh_payload_alloc_B > AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES))) ||
           (mi->native_task_bridge && !hk_apple9_native_task_bridge_enabled())) {
          hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);

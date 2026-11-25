@@ -4,14 +4,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include "hk_physical_device.h"
+#include "hk_device.h"
+#include "hk_cmd_buffer.h"
+#include "hk_queue.h"
 #include "hk_shader.h"
 #include "hk_apple9_mesh.h"
-#include "agx_native_mesh.h"
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
 static jmp_buf stopped;
-static unsigned generation, probes, vm_creates;
-static const char *before_text, *after_text;
+static unsigned generation, vm_creates;
+static uint64_t mock_features;
 static struct agx_device *opening_device;
 
 /* Exercise agx_open_device itself, stopping before its first GPU allocation. */
@@ -34,6 +36,7 @@ int __wrap_drmIoctl(int fd, unsigned long request, void *arg)
       CHECK(get->size == sizeof(*p));
       CHECK(p == &opening_device->params && opening_device->chip == 0);
       *p = (struct drm_asahi_params_global){
+         .features = mock_features,
          .gpu_generation = generation, .gpu_variant = generation == 17 ? 'P' : 'G',
          .vm_start = 0, .vm_end = 1ull << 42, .vm_kernel_min_size = 1ull << 26,
          .command_timestamp_frequency_hz = 24000000,
@@ -41,31 +44,9 @@ int __wrap_drmIoctl(int fd, unsigned long request, void *arg)
       return 0;
    }
    CHECK(request == DRM_IOCTL_ASAHI_VM_CREATE);
-   CHECK(probes == 1);
    ((struct drm_asahi_vm_create *)arg)->vm_id = 9;
    vm_creates++;
    return 0;
-}
-struct agx_native_mesh_support __wrap_agx_native_mesh_probe(int fd, const char *classes);
-struct agx_native_mesh_support __wrap_agx_native_mesh_probe(int fd, const char *classes)
-{
-   CHECK(fd == 101 && probes < 2 && vm_creates == probes);
-   CHECK(opening_device->chip ==
-         (generation == 17 ? AGX_CHIP_G17P : AGX_CHIP_G16G));
-   const char *text = probes++ ? after_text : before_text;
-   if (!classes)
-      return (struct agx_native_mesh_support){
-         .profile = AGX_NATIVE_MESH_PROFILE_NONE,
-      };
-   if (!text)
-      return (struct agx_native_mesh_support){
-         .profile = AGX_NATIVE_MESH_PROFILE_UNKNOWN,
-      };
-   struct agx_native_mesh_support s =
-      agx_native_mesh_parse(text, strlen(text), classes);
-   if (s.profile == AGX_NATIVE_MESH_PROFILE_UNKNOWN)
-      s.profile = AGX_NATIVE_MESH_PROFILE_NONE;
-   return s;
 }
 struct agx_bo *__wrap_agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
                                    enum agx_bo_flags flags, const char *label);
@@ -73,29 +54,28 @@ struct agx_bo *__wrap_agx_bo_create(struct agx_device *dev, size_t size, unsigne
                                    enum agx_bo_flags flags, const char *label)
 {
    (void)size; (void)align; (void)flags; (void)label;
-   CHECK(probes == 2 && vm_creates == 1 && dev->vm_id == 9);
+   CHECK(vm_creates == 1 && dev->vm_id == 9);
    longjmp(stopped, 1);
 }
 
 static uint64_t
-check(unsigned gen, const char *before, const char *after, bool qualified,
-      enum agx_native_mesh_profile expected_profile, bool kill)
+check(unsigned gen, uint64_t features, bool expected_native, bool kill)
 {
    struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
    CHECK(pdev);
    pdev->dev.fd = 101;
-   pdev->dev.native_mesh_classes = hk_apple9_native_index_class_hash();
    pdev->disable_native_index = kill;
    opening_device = &pdev->dev;
-   generation = gen; probes = vm_creates = 0;
-   before_text = before; after_text = after;
+   generation = gen;
+   mock_features = features;
+   vm_creates = 0;
    if (!setjmp(stopped)) {
       agx_open_device(NULL, &pdev->dev);
       CHECK(!"device open returned before allocation boundary");
    }
-   CHECK(pdev->dev.native_mesh_qualified == qualified);
-   CHECK(pdev->dev.native_mesh_profile == expected_profile);
-   CHECK(hk_apple9_native_index_enabled(pdev) == (qualified && !kill));
+   CHECK(agx_has_native_mesh(&pdev->dev) == expected_native);
+   CHECK(hk_apple9_native_index_enabled(pdev) == (expected_native && !kill));
+   CHECK(hk_apple9_native_mesh_available(pdev) == (expected_native && !kill));
    uint64_t flags = hk_physical_device_compiler_flags(pdev);
    CHECK(!pdev->dev.bo_cache.started);
    agx_bo_cache_finish(&pdev->dev);
@@ -115,35 +95,52 @@ check(unsigned gen, const char *before, const char *after, bool qualified,
    return flags;
 }
 
+static void
+check_vdm_render_flags(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_cs *cs = calloc(1, sizeof(*cs));
+   CHECK(dev && cs);
+   dev->dev.chip = AGX_CHIP_G16G;
+   dev->dev.params.features =
+      DRM_ASAHI_FEATURE_FEW_PRIMITIVES | DRM_ASAHI_FEATURE_NATIVE_MESH;
+   cs->addr = 0x1000000000ull;
+   cs->cr.width = 64;
+   cs->cr.height = 64;
+   cs->cr.zls_width = 64;
+   cs->cr.zls_height = 64;
+   cs->cr.layers = 1;
+   cs->primitive_count = 1;
+
+   /* Ordinary few-primitive render sets FEW_PRIMITIVES and NOT NATIVE_MESH. */
+   struct drm_asahi_cmd_render cmd;
+   cs->apple9_native_mesh = false;
+   hk_fill_vdm_command(dev, cs, &cmd);
+   CHECK((cmd.flags & DRM_ASAHI_RENDER_FEW_PRIMITIVES) != 0);
+   CHECK((cmd.flags & DRM_ASAHI_RENDER_NATIVE_MESH) == 0);
+
+   /* Native-mesh render sets NATIVE_MESH (bit 28) and NEVER FEW_PRIMITIVES,
+    * even when primitive_count == 1 and FEW_PRIMITIVES is advertised. */
+   cs->apple9_native_mesh = true;
+   hk_fill_vdm_command(dev, cs, &cmd);
+   CHECK((cmd.flags & DRM_ASAHI_RENDER_NATIVE_MESH) != 0);
+   CHECK((cmd.flags & DRM_ASAHI_RENDER_FEW_PRIMITIVES) == 0);
+
+   free(cs);
+   free(dev);
+}
+
 int main(void)
 {
-   char yes[180], changed[180], wrong[180];
-   const char *hash = hk_apple9_native_index_class_hash();
-   snprintf(yes, sizeof(yes), "asahi-native-mesh v1 generation=16 profile=qualified classes=%s\n", hash);
-   snprintf(changed, sizeof(changed), "asahi-native-mesh v1 generation=17 profile=qualified classes=%s\n", hash);
-   strcpy(wrong, yes); wrong[strlen(wrong)-2] ^= 1;
-   const char *none = "asahi-native-mesh v1 generation=15 profile=none classes=-\n";
-   const char *research = "asahi-native-mesh v1 generation=15 profile=research classes=-\n";
-   CHECK(agx_native_mesh_parse_disabled(none, strlen(none)));
-   CHECK(!agx_native_mesh_parse_disabled(yes, strlen(yes)));
-   CHECK(!agx_native_mesh_parse_disabled(research, strlen(research)));
-   CHECK(!agx_native_mesh_parse_disabled("", 0));
-   CHECK(!agx_native_mesh_parse_disabled(NULL, 0));
-   CHECK(!agx_native_mesh_parse_disabled("asahi-native-mesh v2 generation=1 profile=none classes=-\n", 56));
-   uint64_t positive = check(16, yes, yes, true, AGX_NATIVE_MESH_PROFILE_QUALIFIED, false);
-   uint64_t negative = check(16, none, none, false, AGX_NATIVE_MESH_PROFILE_NONE, false);
+   uint64_t positive = check(16, DRM_ASAHI_FEATURE_NATIVE_MESH, true, false);
+   uint64_t negative = check(16, 0, false, false);
    CHECK((positive ^ negative) == (1ull << 60));
-   CHECK(check(16, research, research, false, AGX_NATIVE_MESH_PROFILE_RESEARCH, false) == negative);
-   CHECK(check(16, research, none, false, AGX_NATIVE_MESH_PROFILE_NONE, false) == negative);
-   CHECK(check(16, yes, yes, true, AGX_NATIVE_MESH_PROFILE_QUALIFIED, true) == negative);
-   CHECK(check(16, yes, changed, false, AGX_NATIVE_MESH_PROFILE_NONE, false) == negative);
-   CHECK(check(16, yes, wrong, false, AGX_NATIVE_MESH_PROFILE_NONE, false) == negative);
-   CHECK(check(16, none, yes, false, AGX_NATIVE_MESH_PROFILE_NONE, false) == negative);
-   /* Confirmed absent sysfs attribute (NULL) preserves UNKNOWN; read/parse
-    * failures ("") fail closed to NONE on both samples. */
-   CHECK(check(16, NULL, NULL, false, AGX_NATIVE_MESH_PROFILE_UNKNOWN, false) == negative);
-   CHECK(check(16, "", "", false, AGX_NATIVE_MESH_PROFILE_NONE, false) == negative);
-   check(17, yes, yes, false, AGX_NATIVE_MESH_PROFILE_NONE, false);
-   puts("PASS: real device-open ordering, profile latching, compiler bit 60; GPU execution=0");
+   CHECK(check(16, DRM_ASAHI_FEATURE_NATIVE_MESH, true, true) == negative);
+   CHECK(check(16, DRM_ASAHI_FEATURE_FEW_PRIMITIVES | DRM_ASAHI_FEATURE_FRAGMENT_BARRIER,
+               false, false) == negative);
+   /* Non-G16G chips do not enable native mesh even if bit 28 is set. */
+   CHECK(check(17, DRM_ASAHI_FEATURE_NATIVE_MESH, false, false) == negative);
+   check_vdm_render_flags();
+   puts("PASS: bit-28 feature detection, compiler bit 60, VDM flag mutual exclusion; GPU execution=0");
    return 0;
 }

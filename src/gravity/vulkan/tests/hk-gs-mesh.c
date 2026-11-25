@@ -1369,8 +1369,8 @@ setup_mock_device(struct hk_device *dev, struct hk_physical_device *pdev)
 {
    dev->dev.chip = pdev->dev.chip = AGX_CHIP_G16G;
    dev->dev.vm_id = 1;
-   dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_QUALIFIED;
-   dev->dev.native_mesh_qualified = pdev->dev.native_mesh_qualified = true;
+   dev->dev.params.features = pdev->dev.params.features =
+      DRM_ASAHI_FEATURE_NATIVE_MESH;
    dev->dev.shader_base = (1ull << 40);
    dev->vk.base.type = VK_OBJECT_TYPE_DEVICE;
    dev->vk.alloc = *vk_default_allocator();

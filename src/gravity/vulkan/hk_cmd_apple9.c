@@ -1661,33 +1661,28 @@ hk_apple9_native_render_primitives(void)
    return v > 0 ? (uint64_t)v : HK_APPLE9_NATIVE_RENDER_PRIMITIVES;
 }
 
-/* The admission profile of this device's VM: its latched asahi_native_blocks
- * profile (sampled around VM_CREATE with asahi_native_mesh, at one
- * generation), only together with the qualified native path. drirc
- * hk_disable_native_blocks and HK_APPLE9_NATIVE_BLOCKS=0 keep one native
- * block per render. */
+/* The admission profile of this device: enabled whenever the kernel advertises
+ * DRM_ASAHI_FEATURE_NATIVE_MESH. drirc hk_disable_native_blocks and
+ * HK_APPLE9_NATIVE_BLOCKS=0 keep one isolated native draw per render. */
 struct hk_apple9_native_profile
 hk_apple9_native_profile(const struct hk_device *dev)
 {
-   /* Every graphics stream asks (hk_apple9_graphics_root_size): stay cheap and
-    * device-independent unless the VM latched a qualified profile. */
-   if (!dev->dev.native_blocks.qualified)
-      return (struct hk_apple9_native_profile){.batch = 1};
+   if (!dev || !agx_has_native_mesh(&dev->dev))
+      return (struct hk_apple9_native_profile){0};
    const struct hk_physical_device *pdev =
       hk_device_physical((struct hk_device *)dev);
-   struct hk_apple9_native_profile p = hk_apple9_native_profile_from_kernel(
-      &dev->dev.native_blocks, dev->dev.native_mesh_qualified,
-      !debug_get_option_native_blocks() || !pdev || pdev->disable_native_blocks);
-   if (p.max_render_primitives)
-      p.max_render_primitives = hk_apple9_native_render_primitives();
-   return p;
+   bool blocks = debug_get_option_native_blocks() &&
+                 (!pdev || !pdev->disable_native_blocks);
+   return (struct hk_apple9_native_profile){
+      .blocks = blocks,
+      .max_render_primitives = hk_apple9_native_render_primitives(),
+   };
 }
 
 bool
 hk_apple9_native_blocks_enabled(const struct hk_device *dev)
 {
-   struct hk_apple9_native_profile p = hk_apple9_native_profile(dev);
-   return p.batch > 1 && p.blocks;
+   return hk_apple9_native_profile(dev).blocks;
 }
 
 /* Whether native GS/TES producer passes of batched native renders use the
@@ -1703,60 +1698,31 @@ hk_apple9_native_lanes(const struct hk_device *dev)
    return hk_apple9_native_blocks_enabled(dev) && debug_get_option_native_lanes();
 }
 
-/* Batched native graphics streams must not link (the decoder admits none):
- * give them room for the profile's decode budget plus the ensure padding. */
-size_t
-hk_apple9_graphics_root_size(const struct hk_device *dev)
-{
-   if (!hk_apple9_native_blocks_enabled(dev))
-      return 4096;
-   struct hk_apple9_native_profile p = hk_apple9_native_profile(dev);
-   return hk_apple9_native_decode_bytes(&p) > 4096 ? 16384 : 8192;
-}
-
-/* Whether a draw may continue the open native render, under the device's
- * profile (hk_apple9_native_stream_admits). */
+/* Whether a draw may share the open graphics render pass, under the device's
+ * hardware-invariant profile (hk_apple9_native_stream_admits). */
 static bool
 hk_apple9_native_can_append(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                             bool native)
 {
-   const struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!cs->apple9_native_mesh || !hk_apple9_native_mesh_available_device(dev))
+   bool has_draws = cs->current != cs->start;
+   if (!cs->apple9_native_mesh && !(has_draws && native))
+      return true;
+   if (!hk_apple9_native_mesh_available_device(dev))
       return false;
-   uint8_t *start = cs->start, *current = cs->current;
    const struct hk_apple9_stream_summary stream = {
       .native = cs->apple9_native_mesh,
-      .dispatches = cs->apple9_native_dispatches,
-      /* A continued stream has left the root chunk: never admissible. */
-      .bytes = current >= start ? current - start : SIZE_MAX / 2,
-      .capacity = cs->stream_linked ||
-                        cs->root_size < 0x800 + AGX_VDM_STREAM_LINK_LENGTH
-                     ? 0
-                     : cs->root_size - 0x800 - AGX_VDM_STREAM_LINK_LENGTH,
+      .has_draws = has_draws,
       .primitives = cs->apple9_native_primitives,
       .ring_rows = cs->apple9_native_ring_rows,
       .ring_limited = cs->apple9_native_ring_limited,
    };
-   struct hk_apple9_draw_summary draw = {
+   const struct hk_apple9_draw_summary draw = {
       .native = native,
-      .meta = cmd->in_meta,
-      .queries = gfx->occlusion.active_count ||
-                 gfx->descriptors.root.draw.pipeline_stats_flags ||
-                 hk_cond_render_applies(cmd) ||
-                 gfx->render.view_mask != 0,
-      .task = gfx->shaders[MESA_SHADER_TASK],
-      .xfb = gfx->xfb_enabled,
-      .mesh = gfx->shaders[MESA_SHADER_MESH],
-      .gs = gfx->shaders[MESA_SHADER_GEOMETRY],
-      .tess = gfx->shaders[MESA_SHADER_TESS_CTRL] ||
-              gfx->shaders[MESA_SHADER_TESS_EVAL],
       .primitives = cmd->apple9_draw_primitives,
       .ring_rows = native ? cmd->apple9_draw_ring_rows : 0,
       .ring_limited = native && cmd->apple9_draw_ring_limited,
    };
-   for (unsigned s = 0; s < HK_APPLE9_GFX_STAGES; ++s)
-      draw.writes_memory |= gfx->shaders[s] && gfx->shaders[s]->writes_memory;
    const struct hk_apple9_native_profile profile = hk_apple9_native_profile(dev);
    return hk_apple9_native_stream_admits(&stream, &draw, &profile);
 }
@@ -1775,14 +1741,12 @@ hk_apple9_prepare_draw_ex(struct hk_cmd_buffer *cmd, bool reads_buffers,
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
 
-   /* A native render leads with a native block. End it before any draw the
-    * VM's native blocks profile does not admit (always, without one), and
-    * end an ordinary stream before its first native draw. Existing
-    * partial-render stores/reloads and continuation dependencies preserve
-    * attachments and order; no emitted work is rerouted retroactively. */
-   bool append = hk_apple9_native_can_append(cmd, cs, native_mesh);
-   if ((cs->apple9_native_mesh && !append) ||
-       (native_mesh && !cs->apple9_native_mesh && cs->current != cs->start)) {
+   /* Under opaque DRM_ASAHI_RENDER_NATIVE_MESH, ordinary and native draws
+    * share one render pass in any order unless a hardware invariant (64 KiB
+    * mesh ring budget, conservative TVB primitive cap, or the isolation kill
+    * switch) requires splitting into a fresh render pass. */
+   if ((cs->apple9_native_mesh || (native_mesh && cs->current != cs->start)) &&
+       !hk_apple9_native_can_append(cmd, cs, native_mesh)) {
       hk_cs_end_hint(cmd, HK_CS_END_RENDER_SPLIT);
       hk_cmd_buffer_end_graphics(cmd);
       cs = hk_cmd_buffer_get_cs(cmd, false);
@@ -2105,34 +2069,8 @@ hk_apple9_emit_ordinary_draw(struct hk_cs *cs,
                        draw.indexed ? draw.index_bias : draw.start) - 4;
 }
 
-static_assert(HK_APPLE9_MESH_COMMAND_BYTES == HK_APPLE9_NATIVE_BLOCK_MAX_B,
-              "batch reservation covers a complete native block");
 static_assert(HK_APPLE9_NATIVE_RING_ROWS == AGX_APPLE9_MESH_RING_ROWS,
               "batch ring budget matches hardware 64 KiB mesh ring");
-
-/* Backstop for hk_apple9_native_stream_admits: a block appended to a batched
- * native stream must stay in the root chunk and the decoder budget, and be
- * no larger than the reservation the predicate assumed. Otherwise the paired
- * kernel rejects the whole render at SUBMIT, so fail recording instead. */
-static bool
-hk_apple9_check_native_block(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
-                             const uint8_t *before)
-{
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!cs->apple9_native_mesh || !hk_apple9_native_blocks_enabled(dev))
-      return true;
-   const struct hk_apple9_native_profile profile = hk_apple9_native_profile(dev);
-   const uint8_t *start = cs->start, *current = cs->current;
-   if (!cs->stream_linked && before >= start && current >= before &&
-       current + 4 - before <= HK_APPLE9_BATCH_BLOCK_MAX_B &&
-       current + 4 - start <=
-          MIN2(cs->root_size, hk_apple9_native_decode_bytes(&profile)))
-      return true;
-   fprintf(stderr, "HK_NATIVE_BATCH_OVERFLOW stream=%" PRIx64 " linked=%u\n",
-           cs->addr, cs->stream_linked);
-   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_UNKNOWN);
-   return false;
-}
 
 /* Record the final draw packet after its resources and pipeline are prepared.
  * Keep both routes here so admission and actual packet emission use one policy. */
@@ -2204,7 +2142,8 @@ hk_apple9_record_draw_ex(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       const bool multi_parent =
          is_native_object && hk_apple9_native_object_available_device(dev);
       size_t bytes;
-      if ((cs->apple9_native_mesh && !hk_apple9_native_can_append(cmd, cs, true)) ||
+      if (((cs->apple9_native_mesh || cs->current != cs->start) &&
+           !hk_apple9_native_can_append(cmd, cs, true)) ||
           !hk_apple9_prepare_native_mesh_ex(
              cmd, vertex, object, record, bindings, native_grid, native_payload,
              state) ||
@@ -2220,26 +2159,18 @@ hk_apple9_record_draw_ex(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       cs->apple9_ppp_viewport_offset = pipeline->ppp_viewport_offset;
       cs->apple9_ppp_viewport_words = pipeline->ppp_viewport_words;
       cs->apple9_ppp_valid = true;
-      const uint8_t *before = cs->current;
       cs->current += bytes - 4;
       cs->apple9_native_mesh = true;
       ++cs->apple9_native_dispatches;
       hk_apple9_add_native_primitives(cs, cmd->apple9_draw_primitives);
       hk_apple9_add_native_ring_rows(cs, cmd->apple9_draw_ring_rows,
                                      cmd->apple9_draw_ring_limited);
-      if (!hk_apple9_check_native_block(cmd, cs, before))
-         return false;
       if (debug_get_option_native_batch_log())
-         fprintf(stderr, "HK_NATIVE_BATCH stream=%" PRIx64 " dispatch=%u cap=%u\n",
-                 cs->addr, cs->apple9_native_dispatches,
-                 hk_apple9_native_profile(dev).batch);
+         fprintf(stderr, "HK_NATIVE_BATCH stream=%" PRIx64 " dispatch=%u\n",
+                 cs->addr, cs->apple9_native_dispatches);
    } else {
-      const uint8_t *before = cs->current;
       hk_apple9_emit_ordinary_draw(cs, pipeline, draw);
-      if (!hk_apple9_check_native_block(cmd, cs, before))
-         return false;
-      if (cs->apple9_native_mesh)
-         hk_apple9_add_native_primitives(cs, cmd->apple9_draw_primitives);
+      hk_apple9_add_native_primitives(cs, cmd->apple9_draw_primitives);
    }
    return true;
 }
@@ -2368,12 +2299,8 @@ hk_apple9_try_cached_draw(struct hk_cmd_buffer *cmd, uint32_t draw_id,
 
    if (!hk_ensure_cs_has_space(cmd, cs, 256))
       return true;
-   const uint8_t *before = cs->current;
    hk_apple9_emit_ordinary_draw(cs, pipeline, draw);
-   if (!hk_apple9_check_native_block(cmd, cs, before))
-      return true;
-   if (cs->apple9_native_mesh)
-      hk_apple9_add_native_primitives(cs, cmd->apple9_draw_primitives);
+   hk_apple9_add_native_primitives(cs, cmd->apple9_draw_primitives);
    hk_apple9_account_draw(cs, pipeline, draw, false,
                           cmd->apple9_draw_state.fragment);
    return true;
@@ -3215,15 +3142,16 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    /* Selection and preparation guarantee a leading native state and blocks
     * the profile admits. Keep this backstop before publishing a malformed
     * stream. */
-   bool append = hk_apple9_native_can_append(cmd, cs, !!native_grid);
+   bool need_check = cs->apple9_native_mesh ||
+                     (native_grid && cs->current != cs->start);
+   bool append = !need_check || hk_apple9_native_can_append(cmd, cs, !!native_grid);
    bool allow_multilayer_msaa = hk_apple9_native_mesh_enabled();
    uint32_t layers = gfx->render.view_mask
                         ? util_last_bit(gfx->render.view_mask)
                         : gfx->render.layer_count;
-   if ((cs->apple9_native_mesh && !append) ||
+   if (!append ||
        (native_grid &&
-        ((!append && cs->current != cs->start) ||
-         (!allow_multilayer_msaa &&
+        ((!allow_multilayer_msaa &&
           (pipeline.samples != 1 || layers != 1)) ||
          (pipeline.samples != 1 && pipeline.samples != 2 &&
           pipeline.samples != 4) ||

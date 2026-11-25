@@ -41,6 +41,7 @@ main(void)
    struct hk_cmd_buffer *cmd = calloc(1, sizeof(*cmd));
    CHECK(dev && cmd);
    dev->dev.chip = AGX_CHIP_G16G;
+   dev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
    cmd->vk.base.device = &dev->vk;
    cmd->vk.state = MESA_VK_COMMAND_BUFFER_STATE_RECORDING;
    struct hk_graphics_state *gfx = &cmd->state.gfx;

@@ -7,6 +7,7 @@
  * Phase 1 Task Bridge / Emulation.
  */
 #include "../hk_cmd_apple9.c"
+#include "../hk_entrypoints.h"
 #include "../hk_shader_priv.h"
 #include "compiler/nir/nir_builder.h"
 #include "util/blob.h"
@@ -118,35 +119,23 @@ __wrap___vk_errorf(const void *obj, VkResult error, const char *file, int line,
 }
 
 static void
-enable_phase2_kernel(struct hk_device *dev)
+enable_native_mesh_kernel(struct hk_device *dev)
 {
+   struct hk_physical_device *pdev = hk_device_physical(dev);
    dev->dev.vm_id = 1;
-   dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_QUALIFIED;
-   dev->dev.native_object = (struct agx_native_object_support){
-      .profile = AGX_NATIVE_MESH_PROFILE_QUALIFIED,
-      .generation = 1,
-      .multi_parent = true,
-      .payload_bytes = 16384,
-      .mp_payload_bytes = 1024,
-      .max_threads = 32,
-      .max_shared = 32768,
-      .max_groups = 1048575,
-   };
+   dev->dev.params.features |= DRM_ASAHI_FEATURE_NATIVE_MESH;
+   if (pdev)
+      pdev->dev.params.features |= DRM_ASAHI_FEATURE_NATIVE_MESH;
 }
 
 static void
-enable_phase2_legacy_16k_kernel(struct hk_device *dev)
+disable_native_mesh_kernel(struct hk_device *dev)
 {
-   enable_phase2_kernel(dev);
-   dev->dev.native_object.mp_payload_bytes = 0;
-}
-
-static void
-enable_phase1_only_kernel(struct hk_device *dev)
-{
+   struct hk_physical_device *pdev = hk_device_physical(dev);
    dev->dev.vm_id = 1;
-   dev->dev.native_mesh_profile = AGX_NATIVE_MESH_PROFILE_QUALIFIED;
-   memset(&dev->dev.native_object, 0, sizeof(dev->dev.native_object));
+   dev->dev.params.features &= ~DRM_ASAHI_FEATURE_NATIVE_MESH;
+   if (pdev)
+      pdev->dev.params.features &= ~DRM_ASAHI_FEATURE_NATIVE_MESH;
 }
 
 static nir_shader *
@@ -581,30 +570,102 @@ check_bridge_prepare_and_record(struct hk_device *dev,
    CHECK(cmd->apple9_linked.vertex == &nm->variants[HK_MESH_VARIANT_MAIN].apple9_stage);
    CHECK(!cmd->apple9_linked.fragment->uses_discard);
 
-   /* Tier 2 (Cascaded Task Bridge): PREGFX task+prefix -> MUST set HK_READS_INTERNAL,
-    * and hk_apple9_draw_native_task_bridge(..., true) must bind and record the
+   /* Tier 2 (Cascaded Task Bridge): merges into the same render pass under
+    * opaque bit 28, promotes HK_READS_INTERNAL for PREGFX task+prefix, and
+    * hk_apple9_draw_native_task_bridge(..., true) binds and records the
     * secondary bridge mesh/object/FS leaves (not the primary native_object leaf). */
    CHECK(hk_apple9_prepare_draw_ex(cmd, true, true, false));
    struct hk_cs *cs_br = cmd->current_cs.gfx;
-   CHECK(cs_br && cs_br != cs_obj && (cs_br->pre_raster_reads & HK_READS_INTERNAL));
-   uint32_t *vdm = (uint32_t *)cs_br->current;
+   CHECK(cs_br && cs_br == cs_obj && (cs_br->pre_raster_reads & HK_READS_INTERNAL));
    hk_apple9_draw_native_task_bridge(cmd, 0, 0x1400000000ull, true);
    CHECK(cmd->vk.record_result == VK_SUCCESS);
-   CHECK(cs_br->apple9_native_mesh && cs_br->apple9_native_dispatches == 1);
-   CHECK(vdm[0] == 0x40000d2c && vdm[39] == 0xc0000000);
-   /* Secondary Task Bridge uses the generated T16 (1,1,1) object stub. */
-   CHECK(vdm[33] == 16 && vdm[34] == 1 && vdm[35] == 1);
-   CHECK(vdm[36] == 16 && vdm[37] == 1 && vdm[38] == 1);
+   CHECK(cs_br->apple9_native_mesh && cs_br->apple9_native_dispatches == 2);
    struct hk_api_shader *bm = hk_api_shader_task_bridge(mesh);
    CHECK(cmd->apple9_linked.vertex == &bm->variants[HK_MESH_VARIANT_MAIN].apple9_stage);
    /* Confirm secondary bridge FS leaf was linked (uses_discard == true). */
    CHECK(cmd->apple9_linked.fragment->uses_discard);
+
+   /* Tier 3 (Emulated/ordinary transition after native): stays in same pass! */
+   CHECK(hk_apple9_prepare_draw_ex(cmd, false, false, false));
+   CHECK(cmd->current_cs.gfx == cs_br);
+
+   /* Also verify standalone full-PPP VDM layout of secondary Task Bridge (T16 1,1,1). */
+   hk_cmd_buffer_end_graphics(cmd);
+   CHECK(hk_apple9_prepare_draw_ex(cmd, true, true, false));
+   struct hk_cs *cs_br_fresh = cmd->current_cs.gfx;
+   CHECK(cs_br_fresh && cs_br_fresh != cs_br &&
+         (cs_br_fresh->pre_raster_reads & HK_READS_INTERNAL));
+   uint32_t *vdm = (uint32_t *)cs_br_fresh->current;
+   hk_apple9_draw_native_task_bridge(cmd, 0, 0x1400000000ull, true);
+   CHECK(cmd->vk.record_result == VK_SUCCESS);
+   CHECK(cs_br_fresh->apple9_native_mesh && cs_br_fresh->apple9_native_dispatches == 1);
+   CHECK(vdm[0] == 0x40000d2c && vdm[39] == 0xc0000000);
+   CHECK(vdm[33] == 16 && vdm[34] == 1 && vdm[35] == 1);
+   CHECK(vdm[36] == 16 && vdm[37] == 1 && vdm[38] == 1);
    nf->variants[0].apple9_stage.uses_discard = saved_nf_discard;
    bf->variants[0].apple9_stage.uses_discard = saved_bf_discard;
 
-   /* Tier 3 (Emulated transition after native): splits stream cleanly. */
-   CHECK(hk_apple9_prepare_draw_ex(cmd, false, false, false));
-   CHECK(cmd->current_cs.gfx && cmd->current_cs.gfx != cs_br);
+   /* End-to-end multiview ordinary hk_CmdDraw after a 900k capped native draw:
+    * 1) 2 views x 40k prims (980k <= 1M): shares the native render pass.
+    * 2) 2 views x 60k prims (900k + 120k > 1M): splits cleanly before view 0
+    *    and records both views with VK_SUCCESS (never hitting UNSUPPORTED()). */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "test_mv_vs");
+      nir_variable *pos =
+         nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "pos");
+      pos->data.location = VARYING_SLOT_POS;
+      nir_store_var(&b, pos, nir_imm_vec4(&b, 0.0f, 0.0f, 0.0f, 1.0f), 0xf);
+      struct vk_shader_compile_info mv_infos[2] = {
+         {.stage = MESA_SHADER_VERTEX, .nir = b.shader, .robustness = &vk_robustness_disabled},
+         {.stage = MESA_SHADER_FRAGMENT, .nir = make_fs_nir(), .robustness = &vk_robustness_disabled},
+      };
+      struct vk_shader *mv_out[2] = {0};
+      const struct vk_render_pass_state rp = {
+         .color_attachment_count = 1,
+         .color_attachment_formats = {VK_FORMAT_R8G8B8A8_UNORM},
+      };
+      const struct vk_color_blend_state cb = {
+         .attachment_count = 1,
+         .color_write_enables = 1,
+         .attachments = {{.write_mask = 15}},
+      };
+      const struct vk_graphics_pipeline_state st = {.rp = &rp, .cb = &cb};
+      struct hk_apple9_graphics_key gkey;
+      hk_apple9_graphics_key(&gkey, &st);
+      gkey.is_multiview = true;
+      CHECK(hk_apple9_compile_graphics(dev, 2, mv_infos, NULL, &gkey, NULL,
+                                       NULL, mv_out) == VK_SUCCESS);
+      struct hk_api_shader *mv_vs = container_of(mv_out[0], struct hk_api_shader, vk);
+      struct hk_api_shader *mv_fs = container_of(mv_out[1], struct hk_api_shader, vk);
+
+      cmd->vk.base.type = VK_OBJECT_TYPE_COMMAND_BUFFER;
+      cmd->state.gfx.shaders[MESA_SHADER_TASK] = NULL;
+      cmd->state.gfx.shaders[MESA_SHADER_MESH] = NULL;
+      cmd->state.gfx.shaders[MESA_SHADER_VERTEX] = mv_vs;
+      cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = mv_fs;
+      cmd->state.gfx.render.view_mask = 0x3;
+      cmd->state.gfx.render.layer_count = 2;
+      cmd->vk.dynamic_graphics_state.ia.primitive_topology =
+         VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+      cs_br_fresh->apple9_native_primitives = 900000;
+      hk_CmdDraw(hk_cmd_buffer_to_handle(cmd), 3 * 40000, 1, 0, 0);
+      CHECK(cmd->vk.record_result == VK_SUCCESS);
+      CHECK(cmd->current_cs.gfx == cs_br_fresh);
+      CHECK(cs_br_fresh->apple9_native_primitives == 980000);
+
+      cs_br_fresh->apple9_native_primitives = 900000;
+      hk_CmdDraw(hk_cmd_buffer_to_handle(cmd), 3 * 60000, 1, 0, 0);
+      CHECK(cmd->vk.record_result == VK_SUCCESS);
+      CHECK(cmd->current_cs.gfx && cmd->current_cs.gfx != cs_br_fresh);
+      CHECK(!cmd->current_cs.gfx->apple9_native_mesh);
+      CHECK(cmd->current_cs.gfx->stats.cmds == 2);
+      CHECK(cmd->current_cs.gfx->apple9_native_primitives == 120000);
+
+      mv_vs->vk.ops->destroy(&dev->vk, &mv_vs->vk, NULL);
+      mv_fs->vk.ops->destroy(&dev->vk, &mv_fs->vk, NULL);
+   }
 
    hk_apple9_unpin_entries(cmd);
    if (cmd->apple9_pinned)
@@ -716,7 +777,7 @@ main(int argc, char **argv)
    struct hk_device *dev = calloc(1, sizeof(*dev));
    struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
    CHECK(dev && pdev);
-   dev->dev.chip = AGX_CHIP_G16G;
+   dev->dev.chip = pdev->dev.chip = AGX_CHIP_G16G;
    dev->dev.shader_base = 0x1200000000ull;
    dev->vk.alloc = *vk_default_allocator();
    dev->vk.physical = &pdev->vk;
@@ -738,8 +799,8 @@ main(int argc, char **argv)
    cmd->vk.dynamic_graphics_state.rs.polygon_mode = VK_POLYGON_MODE_FILL;
 
    if (!strcmp(mode, "mesh-disabled")) {
-      /* HK_APPLE9_NATIVE_MESH=0: completely untouched even on a Phase 2 kernel. */
-      enable_phase2_kernel(dev);
+      /* HK_APPLE9_NATIVE_MESH=0: completely untouched even with bit 28 set. */
+      enable_native_mesh_kernel(dev);
       CHECK(!hk_apple9_native_mesh_enabled());
       CHECK(!hk_apple9_native_object_available_device(dev));
       struct hk_api_shader *t, *m, *f;
@@ -753,8 +814,8 @@ main(int argc, char **argv)
       destroy_pair(dev, t, m, f);
    } else if (!strcmp(mode, "object-disabled")) {
       /* HK_APPLE9_NATIVE_MESH=1 + HK_APPLE9_NATIVE_OBJECT=0: falls back to
-       * Phase 1 Task Bridge even on a Phase 2 kernel. */
-      enable_phase2_kernel(dev);
+       * Task Bridge even when DRM_ASAHI_FEATURE_NATIVE_MESH is advertised. */
+      enable_native_mesh_kernel(dev);
       CHECK(!hk_apple9_native_object_enabled());
       CHECK(!hk_apple9_native_object_available_device(dev));
       struct hk_api_shader *t, *m, *f;
@@ -764,24 +825,23 @@ main(int argc, char **argv)
             nm->variants[HK_MESH_VARIANT_MAIN].info.mesh.native_task_bridge);
       destroy_pair(dev, t, m, f);
    } else {
-      /* Phase 1 kernel (no asahi_native_object): falls back cleanly to Task Bridge. */
-      enable_phase1_only_kernel(dev);
+      /* Without DRM_ASAHI_FEATURE_NATIVE_MESH: native mesh & object are off. */
+      disable_native_mesh_kernel(dev);
+      CHECK(!hk_apple9_native_mesh_available_device(dev));
       CHECK(!hk_apple9_native_object_available_device(dev));
       struct hk_api_shader *t, *m, *f;
       compile_pair(dev, 32, 256, 128, 4, false, true, &t, &m, &f);
-      struct hk_api_shader *nm = hk_api_shader_native(m);
-      CHECK(nm && !nm->variants[HK_MESH_VARIANT_MAIN].info.mesh.native_object &&
-            nm->variants[HK_MESH_VARIANT_MAIN].info.mesh.native_task_bridge);
+      CHECK(!hk_api_shader_native(t) && !hk_api_shader_native(m));
       destroy_pair(dev, t, m, f);
 
-      /* Phase 2B kernel (mp_payload_bytes=1024): real application OBJECT -> MESH
-       * with 256 B payload + child grid (272 B <= 1024 B) uses GET_SR 0xe0/0xe1
-       * AND retains dual-leaf Task Bridge fallback. */
-      enable_phase2_kernel(dev);
+      /* With DRM_ASAHI_FEATURE_NATIVE_MESH (mp_payload_bytes=1024): real
+       * application OBJECT -> MESH with 256 B payload + child grid (272 B <=
+       * 1024 B) uses GET_SR 0xe0/0xe1 AND retains dual-leaf Task Bridge. */
+      enable_native_mesh_kernel(dev);
       CHECK(hk_apple9_native_object_available_device(dev));
       compile_pair(dev, 64, 256, 128, 4, false, true, &t, &m, &f);
       struct hk_api_shader *nt = hk_api_shader_native(t);
-      nm = hk_api_shader_native(m);
+      struct hk_api_shader *nm = hk_api_shader_native(m);
       struct hk_api_shader *nf = hk_api_shader_native(f);
       struct hk_api_shader *bt = hk_api_shader_task_bridge(t);
       struct hk_api_shader *bm = hk_api_shader_task_bridge(m);
@@ -810,25 +870,16 @@ main(int argc, char **argv)
       CHECK(memcmp(nt->apple9_native_pair_id, bt->apple9_native_pair_id,
                    sizeof(bt->apple9_native_pair_id)) != 0);
 
-      /* Cache identity must track latched Phase 2B capability and mp_payload_bytes. */
+      /* Cache identity must track DRM_ASAHI_FEATURE_NATIVE_MESH. */
       pdev->dev.chip = AGX_CHIP_G16G;
-      memset(&pdev->dev.native_object, 0, sizeof(pdev->dev.native_object));
-      uint64_t flags_p1 = hk_physical_device_compiler_flags(pdev);
-      pdev->dev.native_object = dev->dev.native_object;
-      uint64_t flags_p2 = hk_physical_device_compiler_flags(pdev);
-      CHECK(flags_p1 != flags_p2);
-      pdev->dev.native_object.payload_bytes = 8192;
-      CHECK(hk_physical_device_compiler_flags(pdev) != flags_p2);
-      pdev->dev.native_object.payload_bytes = 16384;
-      pdev->dev.native_object.mp_payload_bytes = 0;
-      CHECK(hk_physical_device_compiler_flags(pdev) != flags_p2);
-      pdev->dev.native_object.mp_payload_bytes = 1024;
-      pdev->dev.native_object.max_threads = 16;
-      CHECK(hk_physical_device_compiler_flags(pdev) != flags_p2);
-      pdev->dev.native_object = dev->dev.native_object;
+      pdev->dev.params.features = 0;
+      uint64_t flags_off = hk_physical_device_compiler_flags(pdev);
+      pdev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
+      uint64_t flags_on = hk_physical_device_compiler_flags(pdev);
+      CHECK(flags_off != flags_on);
 
       /* Cache roundtrip preserves BOTH native object and dual-leaf Task Bridge,
-       * and rejects stale hw_payload realizations when kernel lacks 512 KiB backing. */
+       * and rejects cached native leaves when bit 28 is absent. */
       struct hk_api_shader *t_rt = roundtrip_shader(dev, t);
       struct hk_api_shader *m_rt = roundtrip_shader(dev, m);
       struct hk_api_shader *f_rt = roundtrip_shader(dev, f);
@@ -850,8 +901,8 @@ main(int argc, char **argv)
          CHECK(t->vk.ops->serialize(&dev->vk, &t->vk, &tb));
          CHECK(m->vk.ops->serialize(&dev->vk, &m->vk, &mb));
 
-         /* Downgrade to Phase 1: cached Phase 2 task & mesh must be rejected. */
-         enable_phase1_only_kernel(dev);
+         /* Downgrade to kernel without bit 28: cached native leaves fail closed. */
+         disable_native_mesh_kernel(dev);
          struct blob_reader tr, mr;
          struct vk_shader *out_vk = NULL;
          blob_reader_init(&tr, tb.data, tb.size);
@@ -865,79 +916,14 @@ main(int argc, char **argv)
                VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
          CHECK(!out_vk);
 
-         /* Downgrade to legacy 16 KiB kernel (mp_payload_bytes=0): cached
-          * 0xe0/0xe1 hw_payload task & mesh must fail closed! */
-         enable_phase2_legacy_16k_kernel(dev);
-         blob_reader_init(&tr, tb.data, tb.size);
-         CHECK(hk_device_shader_ops.deserialize(&dev->vk, &tr, 0, NULL,
-                                                &out_vk) ==
-               VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
-         CHECK(!out_vk);
-         blob_reader_init(&mr, mb.data, mb.size);
-         CHECK(hk_device_shader_ops.deserialize(&dev->vk, &mr, 0, NULL,
-                                                &out_vk) ==
-               VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
-         CHECK(!out_vk);
-
-         /* Narrower mp_payload_bytes (256 < 272 including 16 B child grid):
-          * cached hw_payload task & mesh must be rejected. */
-         enable_phase2_kernel(dev);
-         dev->dev.native_object.mp_payload_bytes = 256;
-         blob_reader_init(&tr, tb.data, tb.size);
-         CHECK(hk_device_shader_ops.deserialize(&dev->vk, &tr, 0, NULL,
-                                                &out_vk) ==
-               VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
-         CHECK(!out_vk);
-         blob_reader_init(&mr, mb.data, mb.size);
-         CHECK(hk_device_shader_ops.deserialize(&dev->vk, &mr, 0, NULL,
-                                                &out_vk) ==
-               VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
-         CHECK(!out_vk);
-
-         /* Narrower payload limit (64 < 256): cached task leaf must be rejected. */
-         enable_phase2_kernel(dev);
-         dev->dev.native_object.payload_bytes = 64;
-         dev->dev.native_object.mp_payload_bytes = 64;
-         blob_reader_init(&tr, tb.data, tb.size);
-         CHECK(hk_device_shader_ops.deserialize(&dev->vk, &tr, 0, NULL,
-                                                &out_vk) ==
-               VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
-         CHECK(!out_vk);
-
-         /* Rounded TG memory boundary: raw GRID_ROOT(64) + local_allocation_B
-          * (16 + 128 = 144) = 208 <= 224, but hardware launch rounds up to 256.
-          * Both deserialization and draw-time routing must reject max_shared=224
-          * (cascading to Task Bridge at draw time) and accept max_shared=256. */
-         enable_phase2_kernel(dev);
-         uint64_t req_tg = hk_apple9_native_object_tg_memory_bytes(
-            &nt->variants[0].info.apple9_native);
-         uint64_t raw_tg = (uint64_t)HK_APPLE9_NATIVE_GRID_ROOT +
-                           nt->variants[0].info.apple9_native.local_allocation_B;
-         CHECK(req_tg > raw_tg);
-         dev->dev.native_object.max_shared = (uint32_t)(req_tg - 1);
-         blob_reader_init(&tr, tb.data, tb.size);
-         CHECK(hk_device_shader_ops.deserialize(&dev->vk, &tr, 0, NULL,
-                                                &out_vk) ==
-               VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
-         CHECK(!out_vk);
-         cmd->state.gfx.shaders[MESA_SHADER_TASK] = t_rt;
-         cmd->state.gfx.shaders[MESA_SHADER_MESH] = m_rt;
-         cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = f_rt;
-         const uint32_t g1_chk[3] = {1, 1, 1};
-         CHECK(hk_apple9_select_native_mesh_route(cmd, g1_chk, 0) ==
-               HK_APPLE9_MESH_ROUTE_TASK_BRIDGE);
-         dev->dev.native_object.max_shared = (uint32_t)req_tg;
-         CHECK(hk_apple9_select_native_mesh_route(cmd, g1_chk, 0) ==
-               HK_APPLE9_MESH_ROUTE_NATIVE);
-         enable_phase2_kernel(dev);
+         enable_native_mesh_kernel(dev);
          blob_finish(&tb);
          blob_finish(&mb);
       }
 
       /* Routing for hw_payload (256 B + 16 B child grid <= 1024 B):
        * BOTH single-parent and multi-parent route Native OBJECT (Zero-CDM)
-       * with payload_gpu=0! Draw-time mp_payload_bytes=0 fails closed to
-       * Task Bridge; indirect/cond_render fall back to Emulated. */
+       * with payload_gpu=0! Indirect/cond_render fall back to Emulated. */
       cmd->state.gfx.shaders[MESA_SHADER_TASK] = t_rt;
       cmd->state.gfx.shaders[MESA_SHADER_MESH] = m_rt;
       cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = f_rt;
@@ -955,13 +941,6 @@ main(int argc, char **argv)
       CHECK(hk_apple9_select_native_mesh_route(cmd, g1, 0) ==
             HK_APPLE9_MESH_ROUTE_EMULATED);
       cmd->state.cond_render.active = false;
-      /* Runtime mp_payload_bytes=0 fails closed out of Native OBJECT -> Bridge. */
-      dev->dev.native_object.mp_payload_bytes = 0;
-      CHECK(hk_apple9_select_native_mesh_route(cmd, g1, 0) ==
-            HK_APPLE9_MESH_ROUTE_TASK_BRIDGE);
-      CHECK(hk_apple9_select_native_mesh_route(cmd, g64, 0) ==
-            HK_APPLE9_MESH_ROUTE_TASK_BRIDGE);
-      enable_phase2_kernel(dev);
       check_vdm_recording(dev, t_rt, m_rt, f_rt, g1024, 0, 32);
 
       destroy_pair(dev, t_rt, m_rt, f_rt);
@@ -971,7 +950,7 @@ main(int argc, char **argv)
        * 1008 B + 16 B child grid = 1024 B -> hw_payload=true (multi-parent Native).
        * 1024 B without child grid = 1024 B -> hw_payload=true (multi-parent Native).
        * 1024 B + 16 B child grid = 1040 B -> hw_payload=false (single-parent Native,
-       *   multi-parent cascades cleanly to Phase 1 Task Bridge!). */
+       *   multi-parent cascades cleanly to Task Bridge!). */
       compile_pair(dev, 32, 1008, 0, 4, false, true, &t, &m, &f);
       CHECK(hk_api_shader_native(t)->variants[0].info.apple9_native.key.hw_payload);
       cmd->state.gfx.shaders[MESA_SHADER_TASK] = t;
@@ -1005,7 +984,7 @@ main(int argc, char **argv)
 
       /* Oversized multi-parent payload (2048 B & 16384 B):
        * Single-parent runs Zero-CDM Native OBJECT via args.payload (16 KiB);
-       * Multi-parent (groups=64) cascades to Phase 1 Task Bridge (NOT Emulated)! */
+       * Multi-parent (groups=64) cascades to Task Bridge (NOT Emulated)! */
       for (unsigned pbytes = 2048; pbytes <= 16384; pbytes *= 8) {
          compile_pair(dev, 32, pbytes, 0, 4, false, false, &t, &m, &f);
          CHECK(!hk_api_shader_native(t)->variants[0].info.apple9_native.key.hw_payload);
@@ -1051,24 +1030,6 @@ main(int argc, char **argv)
          blob_finish(&m2_blob);
       }
 
-      /* Fail-closed without kernel mp_payload_bytes (legacy 16 KiB kernel):
-       * 256 B payload must compile with args.payload (!hw_payload), route
-       * groups=1 natively, and cascade groups=64 to Task Bridge (never 0xe0/0xe1). */
-      enable_phase2_legacy_16k_kernel(dev);
-      compile_pair(dev, 32, 256, 0, 4, false, true, &t, &m, &f);
-      CHECK(!hk_api_shader_native(t)->variants[0].info.apple9_native.key.hw_payload);
-      CHECK(!hk_api_shader_native(m)->variants[HK_MESH_VARIANT_MAIN]
-                .info.apple9_native.key.hw_payload);
-      cmd->state.gfx.shaders[MESA_SHADER_TASK] = t;
-      cmd->state.gfx.shaders[MESA_SHADER_MESH] = m;
-      cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = f;
-      CHECK(hk_apple9_select_native_mesh_route(cmd, g1, 0) ==
-            HK_APPLE9_MESH_ROUTE_NATIVE);
-      CHECK(hk_apple9_select_native_mesh_route(cmd, g64, 0) ==
-            HK_APPLE9_MESH_ROUTE_TASK_BRIDGE);
-      destroy_pair(dev, t, m, f);
-      enable_phase2_kernel(dev);
-
       /* Payload-free multi-parent native OBJECT -> MESH (T32, groups={4,3,2}). */
       compile_pair(dev, 32, 0, 128, 2, false, false, &t, &m, &f);
       nm = hk_api_shader_native(m);
@@ -1079,12 +1040,6 @@ main(int argc, char **argv)
       cmd->state.gfx.shaders[MESA_SHADER_MESH] = m;
       cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = f;
       const uint32_t g_multi[3] = {4, 3, 2};
-      CHECK(hk_apple9_select_native_mesh_route(cmd, g_multi, 0) ==
-            HK_APPLE9_MESH_ROUTE_NATIVE);
-      dev->dev.native_object.max_groups = 16;
-      CHECK(hk_apple9_select_native_mesh_route(cmd, g_multi, 0) ==
-            HK_APPLE9_MESH_ROUTE_TASK_BRIDGE);
-      dev->dev.native_object.max_groups = 1048575;
       CHECK(hk_apple9_select_native_mesh_route(cmd, g_multi, 0) ==
             HK_APPLE9_MESH_ROUTE_NATIVE);
       check_vdm_recording(dev, t, m, f, g_multi, 0, 32);
