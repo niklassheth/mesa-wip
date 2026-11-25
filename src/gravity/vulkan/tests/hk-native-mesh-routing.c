@@ -1,7 +1,9 @@
 /* Copyright 2026 Asahi Linux Contributors
  * SPDX-License-Identifier: MIT
  */
+#include "../hk_buffer.h"
 #include "../hk_cmd_buffer.h"
+#include "../hk_entrypoints.h"
 #include "../hk_physical_device.h"
 #include "../hk_shader.h"
 
@@ -1141,6 +1143,81 @@ transitions(struct hk_cmd_buffer *cmd)
          cmd->vk.dynamic_graphics_state.rs.depth_bias.enable = false;
          hk_cmd_buffer_end_graphics(cmd);
       }
+
+      /* Ordinary draw prefix followed by a native-eligible indirect mesh draw:
+       * CPU admission must bound draw_primitives and ring usage by the
+       * GPU-enforced max_groups ceiling (never UINT64_MAX -> REJECT abort). */
+      {
+         struct hk_api_shader *ind_mesh = shader(MESA_SHADER_MESH);
+         struct hk_api_shader *ind_nm = shader(MESA_SHADER_MESH);
+         struct hk_api_shader *ind_fs = shader(MESA_SHADER_FRAGMENT);
+         struct hk_api_shader *ind_nf = shader(MESA_SHADER_FRAGMENT);
+         ind_mesh->apple9_native = ind_nm;
+         ind_fs->apple9_native = ind_nf;
+         ind_nm->apple9_native_leaf = ind_nf->apple9_native_leaf = true;
+         memset(ind_nm->apple9_native_pair_id, 0x33,
+                sizeof(ind_nm->apple9_native_pair_id));
+         memcpy(ind_nf->apple9_native_pair_id, ind_nm->apple9_native_pair_id,
+                sizeof(ind_nf->apple9_native_pair_id));
+         ind_mesh->variants[HK_MESH_VARIANT_MAIN].info.mesh.prim =
+            MESA_PRIM_TRIANGLES;
+         ind_mesh->variants[HK_MESH_VARIANT_MAIN].info.mesh.max_primitives = 1;
+         ind_nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native_stage =
+            HK_APPLE9_NATIVE_MESH;
+         ind_nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.guard_empty_grid =
+            true;
+         ind_nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout =
+            (struct agx_apple9_mesh_layout){
+               .max_vertices = 3,
+               .max_primitives = 1,
+               .indices_per_primitive = 3,
+               .vertex_components = 4,
+            };
+         cmd->state.gfx.shaders[MESA_SHADER_MESH] = ind_mesh;
+         cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = ind_fs;
+         cmd->vk.dynamic_graphics_state.rs.polygon_mode = VK_POLYGON_MODE_FILL;
+         cmd->vk.dynamic_graphics_state.rs.conservative_mode =
+            VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT;
+         cmd->vk.dynamic_graphics_state.rs.rasterizer_discard_enable = false;
+
+         /* Record an ordinary draw prefix on the active stream, then dispatch
+          * a native-eligible indirect mesh draw (uses_pre_gfx=true splits the
+          * active stream). CPU admission must bound draw_primitives and ring
+          * rows by max_groups so stream classification splits cleanly instead
+          * of aborting on REJECT for UINT64_MAX primitives. */
+         cmd->apple9_draw_primitives = 100;
+         cmd->apple9_draw_ring_rows = 0;
+         cmd->apple9_draw_ring_limited = false;
+         CHECK(hk_apple9_prepare_draw(cmd, false, false));
+         struct hk_cs *cs_ord = cmd->current_cs.gfx;
+         CHECK(cs_ord);
+         mark_draw(cs_ord, false);
+         cs_ord->apple9_native_primitives = 100;
+
+         struct agx_va ind_va = {.addr = 0x100000};
+         struct hk_buffer ind_buf = {
+            .vk = {.base = {.type = VK_OBJECT_TYPE_BUFFER, .device = &dev->vk},
+                   .size = 64,
+                   .device_address = 0x100000},
+            .va = &ind_va,
+         };
+         cmd->rendering = true;
+         hk_CmdDrawMeshTasksIndirectEXT(hk_cmd_buffer_to_handle(cmd),
+                                        hk_buffer_to_handle(&ind_buf), 0, 1, 12);
+         CHECK(cmd->apple9_draw_primitives < UINT64_MAX);
+         CHECK(cmd->apple9_draw_ring_rows < UINT64_MAX);
+         CHECK(cmd->current_cs.gfx != cs_ord);
+         CHECK(cs_ord->end_reason == HK_CS_END_RENDER_SPLIT);
+
+         cmd->vk.record_result = VK_SUCCESS;
+         cmd->state.gfx.shaders[MESA_SHADER_MESH] = NULL;
+         cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = NULL;
+         hk_cmd_buffer_end_graphics(cmd);
+         free(ind_nm);
+         free(ind_nf);
+         free(ind_mesh);
+         free(ind_fs);
+      }
    }
 
    /* Under the isolation kill switch (disable_native_blocks = true), every
@@ -1193,6 +1270,20 @@ transitions(struct hk_cmd_buffer *cmd)
    free(pool);
 }
 
+static struct agx_bo *
+mock_bo_alloc(struct agx_device *dev, size_t size, size_t align,
+              enum agx_bo_flags flags, enum agx_va_flags va_flags,
+              uint64_t fixed_va)
+{
+   (void)dev;
+   (void)size;
+   (void)align;
+   (void)flags;
+   (void)va_flags;
+   (void)fixed_va;
+   return NULL;
+}
+
 int
 main(void)
 {
@@ -1203,7 +1294,16 @@ main(void)
    pdev->dev.chip = dev->dev.chip = AGX_CHIP_G16G;
    pdev->dev.params.features = dev->dev.params.features =
       DRM_ASAHI_FEATURE_NATIVE_MESH;
+   dev->vk.base.type = VK_OBJECT_TYPE_DEVICE;
    dev->vk.physical = &pdev->vk;
+   dev->dev.fd = -1;
+   dev->dev.bo_cache.forked = true;
+   dev->dev.ops.bo_alloc = mock_bo_alloc;
+   dev->bg_eot.dev = &dev->dev;
+   simple_mtx_init(&dev->bg_eot.lock, mtx_plain);
+   simple_mtx_init(&dev->dev.vma_lock, mtx_plain);
+   glsl_type_singleton_init_or_ref();
+   cmd->vk.base.type = VK_OBJECT_TYPE_COMMAND_BUFFER;
    cmd->vk.base.device = &dev->vk;
    cmd->vk.state = MESA_VK_COMMAND_BUFFER_STATE_RECORDING;
    routes(cmd);
@@ -1212,6 +1312,9 @@ main(void)
    tess_routes(cmd);
    tess_fused_routes(cmd);
    transitions(cmd);
+   simple_mtx_destroy(&dev->dev.vma_lock);
+   simple_mtx_destroy(&dev->bg_eot.lock);
+   glsl_type_singleton_decref();
    free(cmd);
    free(dev);
    free(pdev);

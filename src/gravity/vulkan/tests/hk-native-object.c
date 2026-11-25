@@ -1064,6 +1064,46 @@ main(int argc, char **argv)
       CHECK(nm && !nm->variants[HK_MESH_VARIANT_MAIN].info.mesh.native_object &&
             nm->variants[HK_MESH_VARIANT_MAIN].info.mesh.native_task_bridge);
       destroy_pair(dev, t, m, f);
+
+      /* Public VK_EXT_shader_object binary compatibility across logical-off ->
+       * logical-on opens sharing the same physical shaderBinaryUUID: serialize
+       * an ordinary compute shader with physical-on / logical-off and import
+       * it on logical-on. */
+      {
+         pdev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
+         dev->dev.params.features = 0;
+         dev->vk.robustness_state = vk_robustness_disabled;
+         CHECK(hk_apple9_native_mesh_available(pdev) &&
+               !hk_apple9_native_mesh_available_device(dev));
+         nir_builder cb = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "cs_compat");
+         cb.shader->info.workgroup_size[0] = 1;
+         cb.shader->info.workgroup_size[1] = 1;
+         cb.shader->info.workgroup_size[2] = 1;
+         struct vk_shader_compile_info cinfo = {
+            .stage = MESA_SHADER_COMPUTE,
+            .nir = cb.shader,
+            .robustness = &vk_robustness_disabled,
+         };
+         struct vk_shader *cs_vk = NULL;
+         CHECK(hk_device_shader_ops.compile(&dev->vk, 1, &cinfo, NULL, NULL,
+                                            NULL, &cs_vk) == VK_SUCCESS);
+         struct blob cblob;
+         blob_init(&cblob);
+         CHECK(cs_vk->ops->serialize(&dev->vk, cs_vk, &cblob));
+         hk_api_shader_destroy(&dev->vk, cs_vk, NULL);
+
+         dev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
+         CHECK(hk_apple9_native_mesh_available_device(dev));
+         struct blob_reader cr;
+         struct vk_shader *cs_imp = NULL;
+         blob_reader_init(&cr, cblob.data, cblob.size);
+         CHECK(hk_device_shader_ops.deserialize(&dev->vk, &cr, 0, NULL,
+                                                &cs_imp) == VK_SUCCESS);
+         CHECK(cs_imp && cs_imp->stage == MESA_SHADER_COMPUTE);
+         hk_api_shader_destroy(&dev->vk, cs_imp, NULL);
+         blob_finish(&cblob);
+      }
    }
 
    free(cmd);

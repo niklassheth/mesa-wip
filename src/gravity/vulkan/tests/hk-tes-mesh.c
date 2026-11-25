@@ -2345,12 +2345,11 @@ ref_eval_1d_fxp(enum gl_tess_spacing spacing, uint32_t n, float f, uint32_t k)
       uint32_t fxp_half = (fxp_tess + 1u) >> 1;
       if (odd || fxp_half == 32768u)
          fxp_half += 32768u;
-      uint32_t ceil_int = MAX2((n + (odd ? 1u : 0u)) >> 1, 1u);
-      uint32_t fxp_ceil = ceil_int << 16;
-      bool below_ceil = fxp_half < fxp_ceil;
-      uint32_t floor_int = below_ceil ? ceil_int - 1u : ceil_int;
+      uint32_t floor_int = fxp_half >> 16;
+      uint32_t ceil_int = (fxp_half + 65535u) >> 16;
       uint32_t fxp_floor = floor_int << 16;
-      uint32_t frac = below_ceil ? fxp_half - fxp_floor : 0u;
+      uint32_t fxp_ceil = ceil_int << 16;
+      uint32_t frac = fxp_half - fxp_floor;
       uint32_t split;
       if (fxp_ceil == fxp_floor)
          split = ceil_int + 1u;
@@ -2431,8 +2430,8 @@ ref_tri_ring_uv(enum gl_tess_spacing spacing, uint32_t r, uint32_t e, uint32_t k
    }
    uint32_t s_r = ni - r2;
    uint32_t perp_raw = ref_eval_1d_fxp(spacing, ni, fi, r);
-   uint32_t half_perp = perp_raw / 3u;
-   uint32_t perp_fxp = half_perp << 1;
+   uint32_t perp_fxp = (perp_raw * 0x0000aaaau + 32768u) >> 16;
+   uint32_t half_perp = (perp_fxp + 1u) >> 1;
    uint32_t e_c = k == s_r ? (e == 2 ? 0 : e + 1) : e;
    uint32_t k_c = k == s_r ? 0 : k;
    uint32_t q = e_c == 1 ? r + k_c : (ni - r - k_c);
@@ -2451,25 +2450,32 @@ ref_seg_count(enum gl_tess_spacing spacing, float clamped)
 {
    if (spacing == TESS_SPACING_EQUAL)
       return (uint32_t)clamped;
-   if (spacing == TESS_SPACING_FRACTIONAL_ODD)
-      return 2u * (uint32_t)ceilf((clamped - 1.0f) * 0.5f) + 1u;
-   return 2u * (uint32_t)ceilf(clamped * 0.5f);
+   uint32_t fxp = ref_float_to_fxp(clamped);
+   bool odd = spacing == TESS_SPACING_FRACTIONAL_ODD;
+   uint32_t f = fxp + (odd ? 65537u : 1u);
+   uint32_t half_ceil = ((f >> 1) + 65535u) >> 16;
+   return odd ? (2u * half_ceil - 1u) : (2u * half_ceil);
 }
 
 static void
 fused_tess_topology_suite(void)
 {
-   /* 0. Spot-check bit-exact match with poly_tessellator.h PlacePointIn1D &
-    * NumPointsForTessFactor across sub-1/65536 float boundaries. */
+   /* 0. Spot-check bit-exact match with upstream poly/cl/tessellator.h
+    * PlacePointIn1D & NumPointsForTessFactor across sub-1/65536 boundaries. */
    CHECK(ref_eval_1d_fxp(TESS_SPACING_EQUAL, 7, 7.0f, 2) == 18724u);
    CHECK(ref_eval_1d_fxp(TESS_SPACING_FRACTIONAL_EVEN, 4, 2.5f, 1) == 28672u);
    CHECK(ref_eval_1d_fxp(TESS_SPACING_FRACTIONAL_EVEN, 4, 2.5f, 3) == 65536u - 28672u);
-   CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_ODD, 3.000000476837158f) == 5u);
+   /* Sub-1/65536 nextafter boundaries quantize to 16.16 before parity rounding,
+    * matching upstream tessellator.h with zero collapsed frac==0 folds. */
+   CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_ODD, nextafterf(3.0f, INFINITY)) == 3u);
+   CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_ODD, 3.0f + 1.0f / 65536.0f) == 5u);
+   CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_EVEN, nextafterf(4.0f, INFINITY)) == 4u);
+   CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_EVEN, 4.0f + 1.0f / 65536.0f) == 6u);
    {
       uint32_t prev = 0;
       for (uint32_t k = 0; k <= 5; ++k) {
          uint32_t q = ref_eval_1d_fxp(TESS_SPACING_FRACTIONAL_ODD, 5,
-                                      3.000000476837158f, k);
+                                      3.0f + 1.0f / 65536.0f, k);
          CHECK(q >= prev);
          prev = q;
       }
@@ -2521,6 +2527,17 @@ fused_tess_topology_suite(void)
       {1.0f, 17.5f, 9.25f, 32.0f, 2.5f, 15.0f},
       {3.000000476837158f, 3.000000476837158f, 3.000000476837158f,
        3.000000476837158f, 3.000000476837158f, 3.000000476837158f},
+      /* Mixed outer/inner nextafter boundary cases (R1/R2 regression). */
+      {2.0f, 2.0f, 2.0f, 2.0f, nextafterf(4.0f, INFINITY),
+       nextafterf(4.0f, INFINITY)},
+      {2.0f, 2.0f, 2.0f, 2.0f, 4.0f + 1.0f / 65536.0f,
+       4.0f + 1.0f / 65536.0f},
+      {1.0f, 1.0f, 1.0f, 1.0f, nextafterf(3.0f, INFINITY),
+       nextafterf(3.0f, INFINITY)},
+      {1.0f, 1.0f, 1.0f, 1.0f, 3.0f + 1.0f / 65536.0f,
+       3.0f + 1.0f / 65536.0f},
+      {nextafterf(1.0f, INFINITY), nextafterf(1.0f, INFINITY),
+       nextafterf(1.0f, INFINITY), nextafterf(1.0f, INFINITY), 1.0f, 1.0f},
       {63.0f, 63.0f, 63.0f, 63.0f, 63.0f, 63.0f},
       {64.0f, 64.0f, 64.0f, 64.0f, 64.0f, 64.0f},
    };
@@ -2643,9 +2660,7 @@ fused_tess_topology_suite(void)
                                  float v0 = ref_eval_1d(sp, n_in[1], f_in[1], oy + 1 + qy);
                                  float v1 = ref_eval_1d(sp, n_in[1], f_in[1], oy + 2 + qy);
                                  double cr = (double)(u1 - u0) * (double)(v1 - v0);
-                                 /* Strictly non-negative CW winding (zero folds,
-                               * even at degenerate frac == 0 boundaries). */
-                              CHECK(cr >= 0.0);
+                                 CHECK(cr >= 0.0);
                                  area += cr;
                               }
                            }
@@ -2742,9 +2757,11 @@ fused_tess_topology_suite(void)
                                     ((double)vbuf[d][1] - vbuf[a][1]) -
                                  ((double)vbuf[b][1] - vbuf[a][1]) *
                                     ((double)vbuf[d][0] - vbuf[a][0]);
-                              /* Strictly non-negative CW winding (zero folds,
-                               * even at degenerate frac == 0 boundaries). */
-                              CHECK(cr >= 0.0);
+                              /* Upstream D3D11/poly 16.16 fixed-point ring
+                               * rounding can produce a 1-LSB (1/65536) corner
+                               * sliver (~-2.5e-6) at frac==1; forbid any macro
+                               * fold (e.g. -0.08 from float parity rounding). */
+                              CHECK(cr >= -1e-5);
                               area += 0.5 * cr;
                            }
                         }
@@ -2844,15 +2861,17 @@ fused_tess_astra_regression_suite(void)
    }
 
    /* F2: Triangle equal-spacing (3,3,3 / 3) inner ring corner must match
-    * tessellator.h bit-for-bit using exact even 2 * floor(perp / 3) = 14562:
-    * (14562, 36410)/65536, with exact corner equality across edge 2 -> edge 0. */
+    * upstream poly/cl/tessellator.h bit-for-bit:
+    * perp = (21845 * 0xaaaa + 0x8000) >> 16 = 14563, half = (14563 + 1) >> 1
+    * = 7282, param = 65536 - 21845 = 43691, tmp = 43691 - 7282 = 36409,
+    * with exact corner equality across edge 2 -> edge 0. */
    {
       const uint32_t n_out[3] = {3, 3, 3};
       const float f_out[3] = {3.0f, 3.0f, 3.0f};
       float uv0[2], uv2_end[2];
       ref_tri_ring_uv(TESS_SPACING_EQUAL, 1, 0, 0, n_out, f_out, 3, 3.0f, uv0);
       ref_tri_ring_uv(TESS_SPACING_EQUAL, 1, 2, 1, n_out, f_out, 3, 3.0f, uv2_end);
-      CHECK(uv0[0] == 14562.0f / 65536.0f && uv0[1] == 36410.0f / 65536.0f);
+      CHECK(uv0[0] == 14563.0f / 65536.0f && uv0[1] == 36409.0f / 65536.0f);
       CHECK(f32_bits(uv0[0]) == f32_bits(uv2_end[0]) &&
             f32_bits(uv0[1]) == f32_bits(uv2_end[1]));
    }
@@ -2910,19 +2929,25 @@ fused_tess_astra_regression_suite(void)
       ralloc_free(tes);
    }
 
-   /* F5: Fractional even/odd parity rounding on clamped float before 16.16
-    * quantization retains 4 segments for 0x40000001 (even) and 3 segments for
-    * 0x3f800001 (odd) on both host reference and hk_nir_tess_fused_lower. */
+   /* F5: Fractional even/odd 16.16 quantization before parity rounding matches
+    * upstream poly/cl/tessellator.h bit-for-bit: sub-1/65536 nextafterf values
+    * (0x40000001 -> 2, 0x3f800001 -> 1) quantize cleanly without collapsed
+    * frac==0 folds, while +1/65536 advances to 4 (even) and 3 (odd) on both
+    * host reference and hk_nir_tess_fused_lower. */
    {
-      float even_eps, odd_eps;
+      float even_sub, odd_sub;
       uint32_t eb = 0x40000001u, ob = 0x3f800001u;
-      memcpy(&even_eps, &eb, sizeof(even_eps));
-      memcpy(&odd_eps, &ob, sizeof(odd_eps));
-      CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_EVEN, even_eps) == 4u);
-      CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_ODD, odd_eps) == 3u);
+      memcpy(&even_sub, &eb, sizeof(even_sub));
+      memcpy(&odd_sub, &ob, sizeof(odd_sub));
+      const float even_step = 2.0f + 1.0f / 65536.0f;
+      const float odd_step = 1.0f + 1.0f / 65536.0f;
+      CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_EVEN, even_sub) == 2u);
+      CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_EVEN, even_step) == 4u);
+      CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_ODD, odd_sub) == 1u);
+      CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_ODD, odd_step) == 3u);
 
       nir_shader *vs = make_fused_vs(0, false);
-      nir_shader *tcs_e = make_fused_tcs(3, 0, even_eps, 2.0f, false, false, false,
+      nir_shader *tcs_e = make_fused_tcs(3, 0, even_sub, 2.0f, false, false, false,
                                          TESS_SPACING_FRACTIONAL_EVEN, false, false);
       nir_shader *tes_e = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
                                          TESS_SPACING_FRACTIONAL_EVEN, false, false,
@@ -2930,10 +2955,21 @@ fused_tess_astra_regression_suite(void)
       struct hk_tess_fused_info info_e = {0};
       CHECK(hk_nir_tess_fused_lower(vs, tcs_e, tes_e, &opts, NULL, NULL,
                                     &info_e, NULL));
-      /* 3 outer edges * 4 segs + 3*(2-2) + 0 = 12 tris (NOT 6 tris from 2 segs!). */
-      CHECK(info_e.max_prims_per_patch == 12u);
+      /* 3 outer edges * 2 segs = 6 tris (sub-1/65536 quantizes to 2.0). */
+      CHECK(info_e.max_prims_per_patch == 6u);
 
-      nir_shader *tcs_o = make_fused_tcs(3, 0, odd_eps, 1.0f, false, false, false,
+      nir_shader *tcs_es = make_fused_tcs(3, 0, even_step, 2.0f, false, false, false,
+                                          TESS_SPACING_FRACTIONAL_EVEN, false, false);
+      nir_shader *tes_es = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                          TESS_SPACING_FRACTIONAL_EVEN, false, false,
+                                          3, 0, 0, 0, false, false);
+      struct hk_tess_fused_info info_es = {0};
+      CHECK(hk_nir_tess_fused_lower(vs, tcs_es, tes_es, &opts, NULL, NULL,
+                                    &info_es, NULL));
+      /* 3 outer edges * 4 segs = 12 tris at 2.0 + 1/65536. */
+      CHECK(info_es.max_prims_per_patch == 12u);
+
+      nir_shader *tcs_o = make_fused_tcs(3, 0, odd_step, 1.0f, false, false, false,
                                          TESS_SPACING_FRACTIONAL_ODD, false, false);
       nir_shader *tes_o = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
                                          TESS_SPACING_FRACTIONAL_ODD, false, false,
@@ -2941,11 +2977,13 @@ fused_tess_astra_regression_suite(void)
       struct hk_tess_fused_info info_o = {0};
       CHECK(hk_nir_tess_fused_lower(vs, tcs_o, tes_o, &opts, NULL, NULL,
                                     &info_o, NULL));
-      /* 3 outer * 3 + 3*(3-2) + (3*1)>>1 = 13 tris (NOT 1 tri all-ones!). */
+      /* 3 outer * 3 + 3*(3-2) + 1 = 13 tris at 1.0 + 1/65536. */
       CHECK(info_o.max_prims_per_patch == 13u);
       ralloc_free(vs);
       ralloc_free(tcs_e);
       ralloc_free(tes_e);
+      ralloc_free(tcs_es);
+      ralloc_free(tes_es);
       ralloc_free(tcs_o);
       ralloc_free(tes_o);
       /* Unfused native TES must decline fs_reads_primitive_id so FS never binds

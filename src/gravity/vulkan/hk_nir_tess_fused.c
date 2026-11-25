@@ -43,8 +43,9 @@
 #define HK_TESS_FLAG_ALL_ONES     (1u << 1)
 #define HK_TESS_FLAG_WHOLE_PATCH  (1u << 2)
 
-/* Minimum positive 16.16 fixed-point epsilon matching poly_tessellator.h. */
-#define HK_TESS_ODD_MIN_PLUS_EPS  (1.0f + 1.0f / 65536.0f)
+/* Minimum positive 16.16 fixed-point epsilon matching src/poly/cl/tessellator.h. */
+#define HK_TESS_ODD_MIN_PLUS_EPS       (1.0f + 1.0f / 65536.0f)
+#define HK_TESS_ODD_MIN_PLUS_HALF_EPS  (1.0f + 0.5f / 65536.0f)
 
 struct tess_meshlet_shape {
    unsigned max_v;
@@ -477,13 +478,13 @@ cpu_seg_count(float clamped, enum gl_tess_spacing spacing)
 {
    if (spacing == TESS_SPACING_EQUAL)
       return (unsigned)clamped;
-   /* Parity-round on the clamped binary32 float before 16.16 quantization so
-    * factors immediately above a parity boundary (e.g. 0x40000001 for even or
-    * 0x3f800001 for odd) retain their required segment count. Both (clamped - 1)
-    * in [0, 62] and * 0.5f are exact in IEEE-754 binary32. */
-   if (spacing == TESS_SPACING_FRACTIONAL_ODD)
-      return 2u * (unsigned)ceilf((clamped - 1.0f) * 0.5f) + 1u;
-   return 2u * (unsigned)ceilf(clamped * 0.5f);
+   /* Match src/poly/cl/tessellator.h::NumPointsForTessFactor bit-for-bit by
+    * quantizing to 16.16 fixed-point before parity rounding. */
+   uint32_t fxp = (uint32_t)(clamped * 65536.0f + 0.5f);
+   bool odd = spacing == TESS_SPACING_FRACTIONAL_ODD;
+   uint32_t f = fxp + (odd ? (65536u + 1u) : 1u);
+   uint32_t half_ceil = ((f >> 1) + 65535u) >> 16;
+   return odd ? (2u * half_ceil - 1u) : (2u * half_ceil);
 }
 
 static void
@@ -515,7 +516,8 @@ cpu_patch_counts(enum tess_primitive_mode domain, enum gl_tess_spacing spacing,
       if (raw_i > maxf)
          maxf = raw_i;
    }
-   float in_lo = (spacing == TESS_SPACING_FRACTIONAL_ODD && maxf > 1.0f)
+   float in_lo = (spacing == TESS_SPACING_FRACTIONAL_ODD &&
+                  maxf > HK_TESS_ODD_MIN_PLUS_HALF_EPS)
                     ? HK_TESS_ODD_MIN_PLUS_EPS
                     : 0.0f;
    for (unsigned a = 0; a < n_inner; ++a)
@@ -2009,16 +2011,12 @@ nir_eval_1d_fxp(nir_builder *b, enum gl_tess_spacing spacing, nir_def *n,
             b, nir_ieq_imm(b, fxp_half, HK_TESS_FXP_ONE_HALF),
             nir_imm_int(b, HK_TESS_FXP_ONE), fxp_half);
       }
-      nir_def *ceil_int = nir_umax(
-         b, nir_ushr_imm(b, nir_iadd_imm(b, n, odd ? 1 : 0), 1),
-         nir_imm_int(b, 1));
-      nir_def *fxp_ceil = nir_ishl_imm(b, ceil_int, 16);
-      nir_def *below_ceil = nir_ult(b, fxp_half, fxp_ceil);
-      nir_def *floor_int = nir_bcsel(
-         b, below_ceil, nir_iadd_imm(b, ceil_int, -1), ceil_int);
+      nir_def *floor_int = nir_ushr_imm(b, fxp_half, 16);
+      nir_def *ceil_int =
+         nir_ushr_imm(b, nir_iadd_imm(b, fxp_half, HK_TESS_FXP_ONE - 1), 16);
       nir_def *fxp_floor = nir_ishl_imm(b, floor_int, 16);
-      nir_def *frac = nir_bcsel(
-         b, below_ceil, nir_isub(b, fxp_half, fxp_floor), nir_imm_int(b, 0));
+      nir_def *fxp_ceil = nir_ishl_imm(b, ceil_int, 16);
+      nir_def *frac = nir_isub(b, fxp_half, fxp_floor);
 
       nir_def *split_raw;
       if (odd) {
@@ -2175,16 +2173,15 @@ nir_seg_count_from_factor(nir_builder *b, nir_def *clamped,
 {
    if (spacing == TESS_SPACING_EQUAL)
       return nir_f2u32(b, clamped);
-   /* Parity-round on the clamped binary32 float before 16.16 quantization so
-    * factors immediately above a parity boundary retain their required segment
-    * count, matching tessellator.h::NumSegmentsForTessFactorFloat bit-for-bit. */
-   if (spacing == TESS_SPACING_FRACTIONAL_ODD) {
-      nir_def *half = nir_fmul_imm(b, nir_fadd_imm(b, clamped, -1.0f), 0.5f);
-      return nir_iadd_imm(b, nir_ishl_imm(b, nir_f2u32(b, nir_fceil(b, half)), 1),
-                          1);
-   }
-   nir_def *half = nir_fmul_imm(b, clamped, 0.5f);
-   return nir_ishl_imm(b, nir_f2u32(b, nir_fceil(b, half)), 1);
+   /* Match src/poly/cl/tessellator.h::NumPointsForTessFactor bit-for-bit by
+    * quantizing to 16.16 fixed-point before parity rounding. */
+   const bool odd = spacing == TESS_SPACING_FRACTIONAL_ODD;
+   nir_def *fxp = nir_float_to_fxp(b, clamped);
+   nir_def *f = nir_iadd_imm(b, fxp, odd ? (HK_TESS_FXP_ONE + 1) : 1);
+   nir_def *half_ceil = nir_ushr_imm(
+      b, nir_iadd_imm(b, nir_ushr_imm(b, f, 1), HK_TESS_FXP_ONE - 1), 16);
+   nir_def *r = nir_ishl_imm(b, half_ceil, 1);
+   return odd ? nir_iadd_imm(b, r, -1) : r;
 }
 
 static nir_def *
@@ -2803,7 +2800,8 @@ build_object_shader(nir_shader *vs, nir_shader *tcs,
          nir_def *in_lo = NULL;
          if (spacing == TESS_SPACING_FRACTIONAL_ODD) {
             in_lo = nir_bcsel(
-               &b, nir_flt(&b, nir_imm_float(&b, 1.0f), maxf),
+               &b, nir_flt(&b, nir_imm_float(&b, HK_TESS_ODD_MIN_PLUS_HALF_EPS),
+                           maxf),
                nir_imm_float(&b, HK_TESS_ODD_MIN_PLUS_EPS),
                nir_imm_float(&b, 1.0f));
          }
@@ -3141,13 +3139,18 @@ nir_tri_ring_uv(nir_builder *b, enum gl_tess_spacing spacing, nir_def *r,
       nir_def *is_center = nir_ieq(b, r2, n_in);
       nir_def *s_r = nir_usub_sat(b, n_in, r2);
       nir_def *perp_raw = nir_eval_1d_fxp(b, spacing, n_in, f_in, r);
-      /* Exact floor(perp_raw / 3) via umul_high(x, 0xaaaaaaab) >> 1 so
-       * perp_fxp = 2 * half_perp is even and 3 * half_perp <= perp_raw,
-       * matching tessellator.h bit-for-bit with strictly non-negative winding
-       * across all degenerate frac == 0 boundaries (e.g. 0x40400001). */
-      nir_def *half_perp = nir_ushr_imm(
-         b, nir_umul_high(b, perp_raw, nir_imm_int(b, 0xaaaaaaabu)), 1);
-      nir_def *perp_fxp = nir_ishl_imm(b, half_perp, 1);
+      /* Match upstream src/poly/cl/tessellator.h bit-for-bit:
+       *   fxpPerpParam = (perp_raw * FXP_TWO_THIRDS + FXP_ONE_HALF) >> 16;
+       *   tmp = fxpParam - (fxpPerpParam + 1) / 2;
+       * With 16.16 quantization before parity rounding, fractional segments
+       * never collapse to frac == 0 and triangle winding is non-negative across
+       * all mixed outer/inner factor combinations. */
+      nir_def *perp_fxp = nir_ushr_imm(
+         b,
+         nir_iadd_imm(b, nir_imul_imm(b, perp_raw, HK_TESS_FXP_TWO_THIRDS),
+                      HK_TESS_FXP_ONE_HALF),
+         16);
+      nir_def *half_perp = nir_ushr_imm(b, nir_iadd_imm(b, perp_fxp, 1), 1);
       /* Canonicalize ring endpoints (k == s_r) to the next edge's start
        * ((e + 1) % 3, k = 0) and evaluate the exact fallback tessellator.h
        * formula fxpParam - fxpHalfPerp so every interior vertex and corner

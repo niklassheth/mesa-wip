@@ -115,8 +115,13 @@ def check_program(rows, channels=None):
                 assert (word >> 50) & 31 == 0 and (word >> 84) & 63 == 16
                 return ("low16", value(r["src"][0], i))
             if r["op"] == "SELECT":
-                assert len(r["src"]) == 1
-                return ("safe_u0_b", value(r["src"][0], i))
+                assert len(r["src"]) == 1 and len(r["code"]) == 10
+                word = int.from_bytes(r["code"], "little")
+                assert (r["imm"] & 0xff) == 7  # EQ
+                if_true = ((word >> 40) & 0x7f) | (((word >> 39) & 1) << 7)
+                if_false = ((word >> 72) & 0x7f) | (((word >> 71) & 1) << 7)
+                assert if_true == 0, (if_true, r)
+                return ("safe_u0_b", if_false, value(r["src"][0], i))
             raise AssertionError(("unmodelled input definition", r))
         raise AssertionError(("undefined allocated input", reg, before))
 
@@ -128,8 +133,18 @@ def check_program(rows, channels=None):
         killed.discard(r["dst"])
 
     planes = ((len(channels) + 3) & ~3)
-    needs_safe_u0_b = (4096 % (planes + 4)) not in range(0, 1) and (4096 % (planes + 4)) < planes
-    u0_b = ("safe_u0_b", ("local", 6, 20)) if needs_safe_u0_b else ("local", 6, 20)
+    live_rows = planes + 4
+    safe_u0_b = None
+    for q in range(1, 65):
+        stride = q * planes + 4
+        if stride > 2048:
+            break
+        rem = 4096 % stride
+        if rem == 0 or rem >= live_rows:
+            safe_u0_b = 3 if q == 1 else q * 4
+            break
+    assert safe_u0_b is not None
+    u0_b = ("safe_u0_b", safe_u0_b, ("local", 6, 20)) if safe_u0_b > 4 else ("local", 6, 20)
     expected = [[("low16", ("local", 6, 16)), u0_b],
                 *channels, [("local", 6, 20), 0]]
     for i, want in zip(units, expected):

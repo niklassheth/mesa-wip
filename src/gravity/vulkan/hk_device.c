@@ -487,8 +487,17 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       }
    }
 
+   if (hk_apple9_native_mesh_available(pdev) !=
+       hk_apple9_native_mesh_available_device(dev)) {
+      /* A logical device whose native-mesh policy disagrees with the physical
+       * device must not pollute or read the shared physical disk cache, while
+       * preserving public VK_EXT_shader_object binary compatibility. */
+      dev->vk.disable_internal_cache = true;
+   }
+
    struct vk_pipeline_cache_create_info cache_info = {
       .weak_ref = true,
+      .skip_disk_cache = dev->vk.disable_internal_cache,
    };
    dev->vk.mem_cache = vk_pipeline_cache_create(&dev->vk, &cache_info, NULL);
    if (dev->vk.mem_cache == NULL) {

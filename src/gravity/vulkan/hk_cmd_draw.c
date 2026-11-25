@@ -3059,16 +3059,25 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    uint64_t draw_ring_rows = UINT64_MAX;
    uint32_t draw_ring_stride = 0;
    bool draw_ring_limited = true;
+   const uint32_t max_groups =
+      native ? hk_apple9_native_mesh_max_groups(
+                  &native_main->info.apple9_native.layout)
+             : 0;
    if (native) {
-      uint64_t native_groups = UINT64_MAX;
+      /* For indirect and dynamic task-bridge draws, the GPU dispatch clamps
+       * native execution to max_groups (overflowing larger grids to the paired
+       * emulated fallback). Bound CPU admission and ring usage by max_groups
+       * so a legal indirect draw after an ordinary prefix never produces
+       * UINT64_MAX primitives and trips REJECT in stream classification. */
+      uint64_t native_groups = max_groups;
       if (direct && !task_dynamic) {
          native_groups =
             (uint64_t)direct[0] * direct[1] * direct[2] *
             (task ? hk_only_variant(native_task_api)->info.task.max_mesh_groups
                   : 1);
-         draw_primitives =
-            native_groups * native_main->info.apple9_native.layout.max_primitives;
       }
+      draw_primitives =
+         native_groups * native_main->info.apple9_native.layout.max_primitives;
       if (!agx_apple9_mesh_ring_usage(&native_main->info.apple9_native.layout,
                                       native_groups, &draw_ring_rows,
                                       &draw_ring_limited)) {
@@ -3099,8 +3108,6 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    uint32_t overflow_min_groups = 0;
    uint64_t task_emu_params[32] = {0};
    if (native) {
-      const uint32_t max_groups =
-         hk_apple9_native_mesh_max_groups(&native_main->info.apple9_native.layout);
       hk_foreach_view(cmd) {
          cmd->apple9_draw_primitives = draw_primitives;
          cmd->apple9_draw_ring_rows = draw_ring_rows;
@@ -3222,7 +3229,7 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          }
          hk_apple9_draw_native_mesh(cmd, draw_id, grid);
       }
-      if (direct && !task_dynamic)
+      if ((direct && !task_dynamic) || vk_command_buffer_has_error(&cmd->vk))
          return;
       /* Indirect/indirect-count grids exceeding max_groups (up to Vulkan's
        * 4,194,304 total workgroups) and dynamic task draws whose runtime sum

@@ -741,12 +741,8 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
    if (blob_read_uint32(blob) != HK_SHADER_CONTAINER_VERSION)
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
    mesa_shader_stage stage = blob_read_uint8(blob);
-   uint8_t native_flags = blob_read_uint8(blob);
-   bool native_candidate = (native_flags & 0x1u) != 0;
-   bool logical_disabled_mismatch = (native_flags & 0x80u) != 0;
-   if (blob->overrun || stage >= MESA_SHADER_MESH_STAGES ||
-       (logical_disabled_mismatch &&
-        hk_apple9_native_mesh_available_device(dev)))
+   bool native_candidate = blob_read_uint8(blob);
+   if (blob->overrun || stage >= MESA_SHADER_MESH_STAGES)
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    size_t size = sizeof(struct hk_api_shader) +
@@ -997,16 +993,9 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
    struct hk_api_shader *obj =
       container_of(vk_shader, struct hk_api_shader, vk);
 
-   struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
-   bool logical_disabled_mismatch =
-      hk_apple9_native_mesh_available(hk_device_physical(dev)) &&
-      !hk_apple9_native_mesh_available_device(dev);
-   uint8_t native_flags =
-      (p_atomic_read(&obj->apple9_native_candidate) ? 0x1u : 0u) |
-      (logical_disabled_mismatch ? 0x80u : 0u);
    blob_write_uint32(blob, HK_SHADER_CONTAINER_VERSION);
    blob_write_uint8(blob, vk_shader->stage);
-   blob_write_uint8(blob, native_flags);
+   blob_write_uint8(blob, p_atomic_read(&obj->apple9_native_candidate));
    blob_write_uint8(blob, obj->apple9_native_cull_primitive);
    blob_write_uint8(blob, obj->apple9_native_leaf);
    blob_write_uint8(blob, obj->apple9_native_stage_mask);
