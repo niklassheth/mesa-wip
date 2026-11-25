@@ -20940,6 +20940,298 @@ TEST(Apple9Compiler, VertexInputUnprovenAlignmentStaysNativeWidth)
    ralloc_free(b.shader);
 }
 
+TEST(Apple9Compiler, VertexInputDominatorAnchorWidensPostIfMerge)
+{
+   /* Modeling depth-prepass VS where an earlier if/else leaves entry without
+    * binding-0 loads:
+    * - attr 0 (R32G32B32_FLOAT, bind 0) and attr 1 (R8G8B8A8_UNORM, bind 0)
+    *   in the merge block MUST widen attr 1 to a single 32-bit load +
+    *   unpack_unorm_4x8.
+    * - attr 4 (R8G8_UNORM, bind 0) in a child block dominated by the merge
+    *   block MUST widen to a single 16-bit load + unpack_unorm_4x8.
+    * - attr 2 (R32G32B32_FLOAT, bind 1) read ONLY inside an if-branch does NOT
+    *   dominate the merge block, so attr 3 (R8G8B8A8_UNORM, bind 1) in the
+    *   merge block MUST stay 8-bit scalar loads while STILL using exact
+    *   unpack_unorm_4x8 for invariance. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "vertex_dom_anchor");
+   nir_def *vid = nir_load_vertex_id(&b);
+   nir_def *cond = nir_ieq_imm(&b, nir_iand_imm(&b, vid, 1), 0);
+   nir_def *then_scale, *else_scale;
+   nir_if *nif = nir_push_if(&b, cond);
+   {
+      nir_def *b1_pos = nir_load_input(
+         &b, 3, 32, nir_imm_int(&b, 0), .base = 2, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VERT_ATTRIB_GENERIC2, .num_slots = 1});
+      then_scale = nir_channel(&b, b1_pos, 0);
+   }
+   nir_push_else(&b, nif);
+   {
+      else_scale = nir_imm_float(&b, 1.0f);
+   }
+   nir_pop_if(&b, nif);
+   nir_def *scale = nir_if_phi(&b, then_scale, else_scale);
+
+   nir_def *pos = nir_load_input(
+      &b, 3, 32, nir_imm_int(&b, 0), .base = 0, .dest_type = nir_type_float32,
+      .io_semantics = {.location = VERT_ATTRIB_GENERIC0, .num_slots = 1});
+   nir_def *c0 = nir_load_input(
+      &b, 3, 32, nir_imm_int(&b, 0), .base = 1, .dest_type = nir_type_float32,
+      .io_semantics = {.location = VERT_ATTRIB_GENERIC1, .num_slots = 1});
+   nir_def *c1 = nir_load_input(
+      &b, 2, 32, nir_imm_int(&b, 0), .base = 3, .dest_type = nir_type_float32,
+      .io_semantics = {.location = VERT_ATTRIB_GENERIC3, .num_slots = 1});
+
+   nir_def *then_rg, *else_rg;
+   nir_if *nif2 = nir_push_if(&b, nir_ieq_imm(&b, nir_iand_imm(&b, vid, 2), 0));
+   {
+      nir_def *rg = nir_load_input(
+         &b, 2, 32, nir_imm_int(&b, 0), .base = 4, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VERT_ATTRIB_GENERIC4, .num_slots = 1});
+      then_rg = nir_fadd(&b, nir_channel(&b, rg, 0), nir_channel(&b, rg, 1));
+   }
+   nir_push_else(&b, nif2);
+   {
+      else_rg = nir_imm_float(&b, 0.0f);
+   }
+   nir_pop_if(&b, nif2);
+   nir_def *rg_phi = nir_if_phi(&b, then_rg, else_rg);
+
+   nir_def *out = nir_vec4(
+      &b,
+      nir_fadd(&b, nir_fmul(&b, nir_channel(&b, pos, 0), scale), nir_channel(&b, c0, 0)),
+      nir_fadd(&b, nir_channel(&b, pos, 1), nir_channel(&b, c0, 1)),
+      nir_fadd(&b, nir_channel(&b, pos, 2), nir_channel(&b, c0, 2)),
+      nir_fadd(&b, nir_fadd(&b, nir_channel(&b, c1, 0), nir_channel(&b, c1, 1)), rg_phi));
+   nir_store_output(&b, out, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .src_type = nir_type_float32,
+                    .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   b.shader->info.io_lowered = true;
+   nir_validate_shader(b.shader, "VertexInputDominatorAnchorWidensPostIfMerge");
+
+   agx_apple9_vertex_layout layout = {};
+   layout.buffer_descriptor_ubo = 66;
+   layout.dynamic_stride = true;
+   layout.format[0] = PIPE_FORMAT_R32G32B32_FLOAT;
+   layout.offset[0] = 0;
+   layout.buffer[0] = 0;
+   layout.format[1] = PIPE_FORMAT_R8G8B8A8_UNORM;
+   layout.offset[1] = 12;
+   layout.buffer[1] = 0;
+   layout.format[2] = PIPE_FORMAT_R32G32B32_FLOAT;
+   layout.offset[2] = 0;
+   layout.buffer[2] = 1;
+   layout.format[3] = PIPE_FORMAT_R8G8B8A8_UNORM;
+   layout.offset[3] = 12;
+   layout.buffer[3] = 1;
+   layout.format[4] = PIPE_FORMAT_R8G8_SNORM;
+   layout.offset[4] = 16;
+   layout.buffer[4] = 0;
+
+   nir_shader *check_nir = nir_shader_clone(NULL, b.shader);
+   ASSERT_TRUE(agx_nir_lower_apple9_vertex_inputs(check_nir, &layout, false));
+   unsigned loads_32 = 0, loads_16 = 0, loads_8 = 0, unpack_u8 = 0, unpack_s8 = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(check_nir)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global_constant) {
+               if (intr->def.bit_size == 32)
+                  loads_32++;
+               else if (intr->def.bit_size == 16)
+                  loads_16++;
+               else if (intr->def.bit_size == 8)
+                  loads_8++;
+            }
+         } else if (ins->type == nir_instr_type_alu) {
+            nir_op op = nir_instr_as_alu(ins)->op;
+            if (op == nir_op_unpack_unorm_4x8)
+               unpack_u8++;
+            else if (op == nir_op_unpack_snorm_4x8)
+               unpack_s8++;
+         }
+      }
+   }
+   /* attr 0 (vec3 f32) + attr 2 (vec3 f32) + attr 1 (widened u32) = 3x 32b;
+    * attr 4 (widened R8G8_SNORM u16) = 1x 16b;
+    * attr 3 (unproven bind-1 R8G8B8A8_UNORM, 2 channels) = 2x 8b. */
+   EXPECT_EQ(loads_32, 3u);
+   EXPECT_EQ(loads_16, 1u);
+   EXPECT_EQ(loads_8, 2u);
+   /* 1 (attr 1) + 2 (attr 3 scalar channels) = 3 unpack_unorm_4x8;
+    * 1 (attr 4 R8G8_SNORM both bytes .x/.y) = 1 unpack_snorm_4x8. */
+   EXPECT_EQ(unpack_u8, 3u);
+   EXPECT_EQ(unpack_s8, 1u);
+   ralloc_free(check_nir);
+
+   agx_shader_part compiled = {};
+   const char *reason = nullptr;
+   ASSERT_TRUE(agx_compile_apple9_vertex_inputs(b.shader, &layout, &compiled, &reason))
+      << (reason ?: "");
+   /* Confirm post-optimization NIR retained both unpack ops (never expanded
+    * back to reciprocal fmul) and the dominated R8G8_SNORM branch survived. */
+   unsigned final_u8 = 0, final_s8 = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(b.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type == nir_instr_type_alu) {
+            nir_op op = nir_instr_as_alu(ins)->op;
+            if (op == nir_op_unpack_unorm_4x8)
+               final_u8++;
+            else if (op == nir_op_unpack_snorm_4x8)
+               final_s8++;
+         }
+      }
+   }
+   EXPECT_EQ(final_u8, 3u);
+   EXPECT_EQ(final_s8, 1u);
+   EXPECT_GT(compiled.info.binary_size, 0u);
+   free(compiled.binary);
+   ralloc_free(b.shader);
+}
+
+TEST(Apple9Compiler, VertexInputStaticUnequalStrideDoesNotProveAlign)
+{
+   /* With static strides, an anchor on the same binding with a different
+    * stride than the target cannot prove the target's alignment. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "vertex_unequal_static_stride");
+   nir_def *a0 = nir_load_input(
+      &b, 1, 32, nir_imm_int(&b, 0), .base = 0, .dest_type = nir_type_float32,
+      .io_semantics = {.location = VERT_ATTRIB_GENERIC0, .num_slots = 1});
+   nir_def *a1 = nir_load_input(
+      &b, 4, 32, nir_imm_int(&b, 0), .base = 1, .dest_type = nir_type_float32,
+      .io_semantics = {.location = VERT_ATTRIB_GENERIC1, .num_slots = 1});
+   nir_def *out = nir_vec4(&b, a0, nir_channel(&b, a1, 0),
+                           nir_channel(&b, a1, 1), nir_channel(&b, a1, 3));
+   nir_store_output(&b, out, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .src_type = nir_type_float32,
+                    .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   b.shader->info.io_lowered = true;
+
+   agx_apple9_vertex_layout layout = {};
+   layout.buffer_descriptor_ubo = 66;
+   layout.dynamic_stride = false;
+   layout.format[0] = PIPE_FORMAT_R32_FLOAT;
+   layout.offset[0] = 0;
+   layout.stride[0] = 6;
+   layout.buffer[0] = 0;
+   layout.format[1] = PIPE_FORMAT_R8G8B8A8_UNORM;
+   layout.offset[1] = 4;
+   layout.stride[1] = 8;
+   layout.buffer[1] = 0;
+
+   ASSERT_TRUE(agx_nir_lower_apple9_vertex_inputs(b.shader, &layout, false));
+   unsigned loads_32 = 0, loads_8 = 0, unpack_u8 = 0;
+   nir_foreach_block(blk, nir_shader_get_entrypoint(b.shader)) {
+      nir_foreach_instr(ins, blk) {
+         if (ins->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic == nir_intrinsic_load_global_constant) {
+               if (intr->def.bit_size == 32)
+                  loads_32++;
+               else if (intr->def.bit_size == 8)
+                  loads_8++;
+            }
+         } else if (ins->type == nir_instr_type_alu &&
+                    nir_instr_as_alu(ins)->op == nir_op_unpack_unorm_4x8) {
+            unpack_u8++;
+         }
+      }
+   }
+   EXPECT_EQ(loads_32, 1u);
+   EXPECT_EQ(loads_8, 4u);
+   EXPECT_EQ(unpack_u8, 4u);
+   ralloc_free(b.shader);
+}
+
+TEST(Apple9Compiler, VertexInputScalarNormalizedUsesExactUnpackNorm)
+{
+   /* Scalar (unproven-alignment) 8/16-bit UNORM/SNORM vertex fetches must use
+    * hardware unpack_*norm_* through final NIR and codegen so they match
+    * vectorized loads bit-for-bit and compile cleanly when only lane 0 of
+    * UNPACK_NORM is live. */
+   struct Case {
+      enum pipe_format fmt;
+      nir_op expected_op;
+      unsigned expected_bits;
+   } cases[] = {
+      {PIPE_FORMAT_R8G8B8A8_UNORM, nir_op_unpack_unorm_4x8, 8},
+      {PIPE_FORMAT_R8G8B8A8_SNORM, nir_op_unpack_snorm_4x8, 8},
+      {PIPE_FORMAT_R8G8_SNORM, nir_op_unpack_snorm_4x8, 8},
+      {PIPE_FORMAT_R16G16_UNORM, nir_op_unpack_unorm_2x16, 16},
+      {PIPE_FORMAT_R16G16_SNORM, nir_op_unpack_snorm_2x16, 16},
+   };
+   for (const auto &tc : cases) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "vertex_scalar_norm");
+      nir_def *v = nir_load_input(
+         &b, 2, 32, nir_imm_int(&b, 0), .base = 0, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VERT_ATTRIB_GENERIC0, .num_slots = 1});
+      nir_def *out = nir_vec4(&b, nir_channel(&b, v, 0), nir_channel(&b, v, 1),
+                              nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f));
+      nir_store_output(&b, out, nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      b.shader->info.io_lowered = true;
+
+      agx_apple9_vertex_layout layout = {};
+      layout.buffer_descriptor_ubo = 66;
+      layout.dynamic_stride = true;
+      layout.format[0] = tc.fmt;
+      layout.offset[0] = 0;
+      layout.buffer[0] = 0;
+
+      nir_shader *check_nir = nir_shader_clone(NULL, b.shader);
+      ASSERT_TRUE(agx_nir_lower_apple9_vertex_inputs(check_nir, &layout, false));
+      unsigned scalar_loads = 0, unpack_cnt = 0, fmul_cnt = 0;
+      nir_foreach_block(blk, nir_shader_get_entrypoint(check_nir)) {
+         nir_foreach_instr(ins, blk) {
+            if (ins->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+               if (intr->intrinsic == nir_intrinsic_load_global_constant) {
+                  EXPECT_EQ(intr->def.bit_size, tc.expected_bits);
+                  scalar_loads++;
+               }
+            } else if (ins->type == nir_instr_type_alu) {
+               nir_op op = nir_instr_as_alu(ins)->op;
+               if (op == tc.expected_op)
+                  unpack_cnt++;
+               if (op == nir_op_fmul)
+                  fmul_cnt++;
+            }
+         }
+      }
+      EXPECT_EQ(scalar_loads, 2u);
+      EXPECT_EQ(unpack_cnt, 2u);
+      EXPECT_EQ(fmul_cnt, 0u);
+      ralloc_free(check_nir);
+
+      agx_shader_part compiled = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_vertex_inputs(b.shader, &layout, &compiled, &reason))
+         << (reason ?: "");
+      /* Verify post-opt NIR still uses exact unpack_*norm_* (zero reciprocal
+       * fmul expansion). */
+      unsigned final_unpack = 0, final_fmul = 0;
+      nir_foreach_block(blk, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(ins, blk) {
+            if (ins->type == nir_instr_type_alu) {
+               nir_op op = nir_instr_as_alu(ins)->op;
+               if (op == tc.expected_op)
+                  final_unpack++;
+               if (op == nir_op_fmul)
+                  final_fmul++;
+            }
+         }
+      }
+      EXPECT_EQ(final_unpack, 2u);
+      EXPECT_EQ(final_fmul, 0u);
+      EXPECT_GT(compiled.info.binary_size, 0u);
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+}
+
 TEST(Apple9Vir, LogicExportLiveMaskNormalization)
 {
    /* Identical-source IOR(r, r) LOGIC_EXPORT on non-compact slot (>= 2) must
