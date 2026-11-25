@@ -2397,6 +2397,94 @@ TEST_F(Apple9RaAssignTest, VirSplitReadsEvictedLaneBeforeSplit)
    }
 }
 
+TEST_F(Apple9RaAssignTest, VirSplitCrossBlockEvictedLanePreservedAcrossPhiCycle)
+{
+   /* Regression test for post-assignment liveness refresh across a block edge
+    * when a non-base tuple lane (tup+1) was evicted before a block boundary
+    * and VIR_SPLIT executes in a single-predecessor successor block alongside
+    * a 2-way phi-copy swap cycle (no join phi for tup+1): apple9_ra_liveness()
+    * must recognize explicit per-lane VIR_SPLIT sources as the sole use of the
+    * evicted lane so its new GPR (r4) stays in live_out[pred] and phi-edge
+    * lowering cannot clobber r4 as the cycle-break temporary. */
+   auto *b0 = agx_apple9_block_create(&p);
+   auto *b1 = agx_apple9_block_create(&p);
+
+   /* Block b0: create 2-component tuple (tup, tup+1) in (r0, r1) plus x0@r2,
+    * y0@r3, then evict tup+1 out of r1 into r4 and keep evict_v@r1 live across
+    * b0->b1 so r0..r3 are busy and r4 (evicted tup+1) is the lowest GPR that
+    * would look free if post-assignment liveness missed VIR_SPLIT's src[1]. */
+   agx_apple9_block_begin(&p, b0);
+   uint32_t a = agx_apple9_vir_emit_entry_reg(&p, 0);
+   uint32_t b = agx_apple9_vir_emit_entry_reg(&p, 1);
+   uint32_t x0 = agx_apple9_vir_emit_entry_reg(&p, 2);
+   uint32_t y0 = agx_apple9_vir_emit_entry_reg(&p, 3);
+   uint32_t csrcs[2] = {a, b};
+   uint32_t tup = agx_apple9_vir_emit_collect(&p, csrcs, 2);
+   ASSERT_NE(tup, AGX_APPLE9_VREG_INVALID);
+
+   uint32_t evict_v = emit_imm(555u);
+   p.fixed_phys[evict_v] = 1;
+   uint32_t x_adj = emit_iadd(x0, evict_v);
+   p.fixed_phys[x_adj] = 2;
+
+   /* Single-predecessor successor b1: 1-pred 2-way phi swap cycle (px@r2 <-
+    * y0@r3, py@r3 <- x_adj@r2) and VIR_SPLIT(tup) as the ONLY use of evicted
+    * tup+1 (no synthetic join phi is emitted for tup+1!). */
+   agx_apple9_block_begin(&p, b1);
+   uint32_t px = agx_apple9_vir_emit_phi(&p, b1);
+   uint32_t py = agx_apple9_vir_emit_phi(&p, b1);
+   uint32_t split = agx_apple9_vir_emit_split(&p, tup, 2);
+   ASSERT_NE(split, AGX_APPLE9_VREG_INVALID);
+   uint32_t s_sum = emit_iadd(split, split + 1);
+   uint32_t p_sum = emit_iadd(px, py);
+   uint32_t out1 = emit_isub(split + 1, px);
+   uint32_t out0 = emit_iadd(emit_iadd(s_sum, p_sum), evict_v);
+
+   ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, out0, 0));
+   ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, out1, 1));
+   ASSERT_TRUE(agx_apple9_vir_emit_abi_return(&p));
+
+   cfg_init(&p, {b0, b1});
+   cfg_edge(b0, b1);
+
+   agx_apple9_vir_instr *phi_x = agx_apple9_block_first_instr(b1);
+   agx_apple9_vir_instr *phi_y = agx_apple9_instr_next(phi_x);
+   phi_x->nr_srcs = 1;
+   phi_x->src[0] = y0;
+   phi_y->nr_srcs = 1;
+   phi_y->src[0] = x_adj;
+
+   p.fixed_phys[px] = 2;
+   p.fixed_phys[py] = 3;
+
+   auto opts = validated_opts();
+   opts.skip_schedule = true;
+   opts.max_gprs = 6;
+   opts.reserved_gprs = 0;
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+   EXPECT_FALSE(res.has_spills);
+
+   const agx_apple9_block *pb0 = p.blocks;
+   const agx_apple9_block *pb1 = pb0->next;
+   ASSERT_NE(pb1, nullptr);
+
+   PhysVirSim sim;
+   sim.gpr[0] = 100u; /* tup+0 */
+   sim.gpr[1] = 200u; /* tup+1 (evicted to r4 in b0) */
+   sim.gpr[2] = 10u;  /* x0 -> x_adj = 565 -> py */
+   sim.gpr[3] = 30u;  /* y0 -> px = 30 */
+   sim.exec_block(pb0);
+   sim.exec_block(pb1);
+   /* s_sum = 300; p_sum = 595; evict_v = 555 -> 1450 */
+   EXPECT_EQ(sim.gpr[0], 1450u);
+   /* out1 = tup+1(200) - px(30) = 170 */
+   EXPECT_EQ(sim.gpr[1], 170u);
+
+   EXPECT_GT(verify_binary_emission(&p), 0u);
+}
+
 TEST_F(Apple9RaAssignTest, DeferredLoopBreakExitEdgeRestoresDivergentLanes)
 {
    /* Verify that a divergent-lane loop with LOOP_MASK_UPDATE, LOOP_MASK_POP,
@@ -2409,6 +2497,7 @@ TEST_F(Apple9RaAssignTest, DeferredLoopBreakExitEdgeRestoresDivergentLanes)
    auto *b_body = agx_apple9_block_create(&p);
    auto *b_pop = agx_apple9_block_create(&p);
    auto *b_break = agx_apple9_block_create(&p);
+   auto *b_after = agx_apple9_block_create(&p);
 
    /* Entry: r0 = lane_limit (0..7), r1 = base_val (1000 + lane*10). */
    agx_apple9_block_begin(&p, b_entry);
@@ -2447,22 +2536,32 @@ TEST_F(Apple9RaAssignTest, DeferredLoopBreakExitEdgeRestoresDivergentLanes)
       &p, AGX_APPLE9_VIR_LOOP_MASK_POP, AGX_APPLE9_ENC_LOOP_MASK_POP,
       nullptr, 0, 0));
 
-   /* Deferred break block: exit-edge copy of acc_phi + base_val and idx_phi
-    * into fixed ABI outputs (plus forced spill/reload under tight budget). */
+   /* Deferred break block: empty landing pad placed immediately after
+    * LOOP_MASK_POP so RA/pcopy exit-edge copies for b_after execute with all
+    * exiting lanes restored. */
    agx_apple9_block_begin(&p, b_break);
-   uint32_t final_out = emit_iadd(acc_phi, base_val);
+
+   /* Post-loop block: exit-edge VIR_PHIs pinned to distinct GPRs so
+    * apple9_ra_lower_phi_edge emits explicit exit-edge copies in b_break. */
+   agx_apple9_block_begin(&p, b_after);
+   uint32_t exit_acc = agx_apple9_vir_emit_phi(&p, b_after);
+   uint32_t exit_idx = agx_apple9_vir_emit_phi(&p, b_after);
+   p.fixed_phys[exit_acc] = 6;
+   p.fixed_phys[exit_idx] = 7;
+   uint32_t final_out = emit_iadd(exit_acc, base_val);
    ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, final_out, 8));
-   ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, idx_phi, 9));
+   ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, exit_idx, 9));
    ASSERT_TRUE(agx_apple9_vir_emit_abi_return(&p));
 
-   cfg_init(&p, {b_entry, b_header, b_body, b_pop, b_break});
+   cfg_init(&p, {b_entry, b_header, b_body, b_pop, b_break, b_after});
    cfg_edge(b_entry, b_header);
    cfg_edge(b_header, b_body);
    cfg_edge(b_header, b_pop);
    cfg_edge(b_body, b_header);
    cfg_edge(b_pop, b_break);
+   cfg_edge(b_break, b_after);
 
-   /* Wire phi sources matching predecessor order (b_entry, b_body). */
+   /* Wire phi sources matching predecessor order (b_entry, b_body) and (b_break). */
    agx_apple9_vir_instr *p_idx = agx_apple9_block_first_instr(b_header);
    agx_apple9_vir_instr *p_acc = agx_apple9_instr_next(p_idx);
    p_idx->nr_srcs = 2;
@@ -2471,6 +2570,12 @@ TEST_F(Apple9RaAssignTest, DeferredLoopBreakExitEdgeRestoresDivergentLanes)
    p_acc->nr_srcs = 2;
    p_acc->src[0] = base_val;
    p_acc->src[1] = acc_next;
+   agx_apple9_vir_instr *p_exit_acc = agx_apple9_block_first_instr(b_after);
+   agx_apple9_vir_instr *p_exit_idx = agx_apple9_instr_next(p_exit_acc);
+   p_exit_acc->nr_srcs = 1;
+   p_exit_acc->src[0] = acc_phi;
+   p_exit_idx->nr_srcs = 1;
+   p_exit_idx->src[0] = idx_phi;
 
    auto opts = validated_opts();
    opts.skip_schedule = true;
@@ -2484,16 +2589,23 @@ TEST_F(Apple9RaAssignTest, DeferredLoopBreakExitEdgeRestoresDivergentLanes)
    auto *pb_body = pb_hdr->next;
    auto *pb_pop = pb_body->next;
    auto *pb_break = pb_pop->next;
-   ASSERT_NE(pb_break, nullptr);
+   auto *pb_after = pb_break ? pb_break->next : nullptr;
+   ASSERT_NE(pb_after, nullptr);
 
-   /* Verify LOOP_MASK_POP is in pb_pop and all exit copies/uses occur after it. */
-   bool saw_pop = false;
-   for (const agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(pb_pop);
+   /* Verify pb_pop contains ONLY LOOP_MASK_POP (no exit copies before pop)
+    * and pb_break contains the lowered exit-edge copies writing r6/r7 strictly
+    * AFTER LOOP_MASK_POP restores all exiting lanes. */
+   const agx_apple9_vir_instr *first_pop = agx_apple9_block_first_instr(pb_pop);
+   ASSERT_NE(first_pop, nullptr);
+   EXPECT_EQ(first_pop->op, AGX_APPLE9_VIR_LOOP_MASK_POP);
+   EXPECT_EQ(agx_apple9_instr_next(first_pop), nullptr);
+   bool saw_exit_copy_after_pop = false;
+   for (const agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(pb_break);
         ins; ins = agx_apple9_instr_next(ins)) {
-      if (ins->op == AGX_APPLE9_VIR_LOOP_MASK_POP)
-         saw_pop = true;
+      if (ins->dest == 6u || ins->dest == 7u)
+         saw_exit_copy_after_pop = true;
    }
-   EXPECT_TRUE(saw_pop);
+   EXPECT_TRUE(saw_exit_copy_after_pop);
 
    /* Simulate an 8-lane divergent warp across the physical CFG. */
    constexpr unsigned LANES = 8;

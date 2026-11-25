@@ -1518,7 +1518,12 @@ fold_alu_exports(struct agx_apple9_vir_program *p, const bool *constant,
 
       bool barrier = false;
       unsigned intervening_gpr_ops = 0;
+      unsigned scanned = 0;
       for (unsigned k = def_pos[v] + 1; k < i; ++k) {
+         if (++scanned > 64) {
+            barrier = true;
+            break;
+         }
          const struct agx_apple9_vir_instr *mid = p->instructions[k];
          if (mid->op == AGX_APPLE9_VIR_STORE_UNIFORM ||
              agx_apple9_vir_opcode_has_prop(mid->op,

@@ -23,15 +23,27 @@
 #define APPLE9_LAST_ALLOCATABLE_GPR  (AGX_APPLE9_GPR_COUNT - 1)
 
 static uint32_t
-apple9_block_ref(const struct agx_apple9_block *block)
+apple9_block_ref_map(const struct agx_apple9_block *block,
+                     struct hash_table *block_ids)
 {
-   return block ? block->index : UINT32_MAX;
+   if (!block)
+      return UINT32_MAX;
+   if (!block_ids)
+      return block->index;
+   struct hash_entry *e = _mesa_hash_table_search(block_ids, block);
+   return e ? (uint32_t)((uintptr_t)e->data - 1u) : UINT32_MAX;
 }
 
 static uint32_t
-apple9_instr_ref(const struct agx_apple9_vir_instr *instr)
+apple9_instr_ref_map(const struct agx_apple9_vir_instr *instr,
+                     struct hash_table *instr_pos)
 {
-   return instr ? agx_apple9_instr_position(instr) : UINT32_MAX;
+   if (!instr)
+      return UINT32_MAX;
+   if (!instr_pos)
+      return agx_apple9_instr_position(instr);
+   struct hash_entry *e = _mesa_hash_table_search(instr_pos, instr);
+   return e ? (uint32_t)((uintptr_t)e->data - 1u) : UINT32_MAX;
 }
 
 struct apple9_key_nir {
@@ -99,35 +111,78 @@ agx_apple9_vir_key(const struct agx_apple9_vir_program *program,
       util_dynarray_append_array(key, uint8_t, program->publication,
                                  program->publication_capacity * sizeof(bool));
 
+   struct hash_table *block_ids = NULL;
+   struct hash_table *instr_pos = NULL;
+   struct hash_table *block_starts = NULL;
+   if (program->index_dirty) {
+      block_ids = _mesa_pointer_hash_table_create(NULL);
+      instr_pos = _mesa_pointer_hash_table_create(NULL);
+      block_starts = _mesa_pointer_hash_table_create(NULL);
+      if (!block_ids || !instr_pos || !block_starts) {
+         _mesa_hash_table_destroy(block_ids, NULL);
+         _mesa_hash_table_destroy(instr_pos, NULL);
+         _mesa_hash_table_destroy(block_starts, NULL);
+         return false;
+      }
+      uint32_t bi = 0;
+      uint32_t pos = 0;
+      for (const struct agx_apple9_block *b = program->blocks; b; b = b->next) {
+         _mesa_hash_table_insert(block_ids, b, (void *)(uintptr_t)(bi + 1u));
+         _mesa_hash_table_insert(block_starts, b, (void *)(uintptr_t)(pos + 1u));
+         for (const struct agx_apple9_vir_instr *I =
+                 agx_apple9_block_first_instr(b);
+              I; I = agx_apple9_instr_next(I)) {
+            _mesa_hash_table_insert(instr_pos, I, (void *)(uintptr_t)(pos + 1u));
+            pos++;
+         }
+         bi++;
+      }
+   }
+
    struct hash_table *nir_blocks = _mesa_pointer_hash_table_create(NULL);
-   if (!nir_blocks)
+   if (!nir_blocks) {
+      _mesa_hash_table_destroy(block_ids, NULL);
+      _mesa_hash_table_destroy(instr_pos, NULL);
+      _mesa_hash_table_destroy(block_starts, NULL);
       return false;
+   }
    for (const struct agx_apple9_block *b = program->blocks; b; b = b->next) {
       struct apple9_key_nir *k = b->nir ? apple9_key_nir_entry(nir_blocks, b->nir) : NULL;
       struct apple9_key_nir *e = b->nir_exit ? apple9_key_nir_entry(nir_blocks, b->nir_exit) : NULL;
       if ((b->nir && !k) || (b->nir_exit && !e)) {
          _mesa_hash_table_destroy(nir_blocks, NULL);
+         _mesa_hash_table_destroy(block_ids, NULL);
+         _mesa_hash_table_destroy(instr_pos, NULL);
+         _mesa_hash_table_destroy(block_starts, NULL);
          return false;
       }
+      uint32_t b_idx = apple9_block_ref_map(b, block_ids);
       if (k) {
          if (k->first == UINT32_MAX)
-            k->first = b->index;
-         k->last = b->index;
+            k->first = b_idx;
+         k->last = b_idx;
       }
       if (e && e->first_exit == UINT32_MAX)
-         e->first_exit = b->index;
+         e->first_exit = b_idx;
    }
 
    for (const struct agx_apple9_block *b = program->blocks; b; b = b->next) {
+      uint32_t b_idx = apple9_block_ref_map(b, block_ids);
+      uint32_t b_start = b->start_index;
+      if (block_starts) {
+         struct hash_entry *se = _mesa_hash_table_search(block_starts, b);
+         b_start = se ? (uint32_t)((uintptr_t)se->data - 1u) : 0u;
+      }
       const uint32_t fields[] = {
-         b->index, b->placed, b->start_index, b->cfg_active, b->loop_header,
+         b_idx, b->placed, b_start, b->cfg_active, b->loop_header,
          b->cfg_index, b->num_cfg_preds,
-         apple9_block_ref(b->cfg_succs[0]), apple9_block_ref(b->cfg_succs[1]),
+         apple9_block_ref_map(b->cfg_succs[0], block_ids),
+         apple9_block_ref_map(b->cfg_succs[1], block_ids),
          b->nir != NULL, b->nir_exit != NULL,
       };
       util_dynarray_append_array(key, uint8_t, fields, sizeof(fields));
       for (unsigned p = 0; p < b->num_cfg_preds; ++p)
-         util_dynarray_append(key, apple9_block_ref(b->cfg_preds[p]));
+         util_dynarray_append(key, apple9_block_ref_map(b->cfg_preds[p], block_ids));
       /* Earlier liveness, which publication lifetimes still consult. */
       const uint32_t live_words = b->live_in && b->live_out ? b->live_words : UINT32_MAX;
       util_dynarray_append(key, live_words);
@@ -145,22 +200,31 @@ agx_apple9_vir_key(const struct agx_apple9_vir_program *program,
    }
    _mesa_hash_table_destroy(nir_blocks, NULL);
 
-   for (unsigned i = 0; i < program->instruction_count; ++i) {
-      const struct agx_apple9_vir_instr *I = program->instructions[i];
-      struct agx_apple9_vir_instr copy = *I;
-      copy.branch_target = (void *)(uintptr_t)apple9_block_ref(I->branch_target);
-      copy.phi_block = (void *)(uintptr_t)apple9_block_ref(I->phi_block);
-      copy.phi_edge = (void *)(uintptr_t)apple9_instr_ref(I->phi_edge);
-      copy.phi_srcs = NULL;
-      copy.completion_consumer =
-         (void *)(uintptr_t)apple9_instr_ref(I->completion_consumer);
-      util_dynarray_append(key, apple9_block_ref(agx_apple9_instr_block(I)));
-      util_dynarray_append_array(key, uint8_t, &copy, sizeof(copy));
-      if (I->phi_srcs) {
-         util_dynarray_append_array(key, uint8_t, I->phi_srcs,
-                                    I->phi_src_count * sizeof(*I->phi_srcs));
+   for (const struct agx_apple9_block *b = program->blocks; b; b = b->next) {
+      for (const struct agx_apple9_vir_instr *I =
+              agx_apple9_block_first_instr(b);
+           I; I = agx_apple9_instr_next(I)) {
+         struct agx_apple9_vir_instr copy = *I;
+         copy.branch_target =
+            (void *)(uintptr_t)apple9_block_ref_map(I->branch_target, block_ids);
+         copy.phi_block =
+            (void *)(uintptr_t)apple9_block_ref_map(I->phi_block, block_ids);
+         copy.phi_edge =
+            (void *)(uintptr_t)apple9_instr_ref_map(I->phi_edge, instr_pos);
+         copy.phi_srcs = NULL;
+         copy.completion_consumer =
+            (void *)(uintptr_t)apple9_instr_ref_map(I->completion_consumer, instr_pos);
+         util_dynarray_append(key, apple9_block_ref_map(b, block_ids));
+         util_dynarray_append_array(key, uint8_t, &copy, sizeof(copy));
+         if (I->phi_srcs) {
+            util_dynarray_append_array(key, uint8_t, I->phi_srcs,
+                                       I->phi_src_count * sizeof(*I->phi_srcs));
+         }
       }
    }
+   _mesa_hash_table_destroy(block_ids, NULL);
+   _mesa_hash_table_destroy(instr_pos, NULL);
+   _mesa_hash_table_destroy(block_starts, NULL);
    return true;
 }
 
@@ -367,6 +431,12 @@ agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
    if (!program->dependencies_finalized) {
       if (reason)
          *reason = "Apple9 dependency metadata is stale after an IR edit";
+      return false;
+   }
+
+   if (program->index_dirty) {
+      if (reason)
+         *reason = "Apple9 VIR instruction index is stale after an IR edit";
       return false;
    }
 

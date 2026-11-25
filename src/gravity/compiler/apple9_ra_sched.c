@@ -111,6 +111,31 @@ split_src_tuple_width(const struct agx_apple9_vir_program *p,
    return 1;
 }
 
+/* After a pre-split lane eviction, VIR_SPLIT expands its operand list to one
+ * explicit SSA source per lane (nr_srcs >= dest_components > 1); before
+ * eviction it holds only the contiguous tuple base in src[0]. */
+static inline unsigned
+split_src_lane_count(const struct agx_apple9_vir_program *p,
+                     struct agx_apple9_vir_instr *const *defs,
+                     const struct agx_apple9_vir_instr *ins)
+{
+   if (ins->op != AGX_APPLE9_VIR_SPLIT || agx_apple9_vir_nr_srcs(ins) == 0)
+      return 0;
+   if (ins->dest_components > 1 &&
+       agx_apple9_vir_nr_srcs(ins) >= ins->dest_components)
+      return ins->dest_components;
+   return split_src_tuple_width(p, defs, ins);
+}
+
+static inline uint32_t
+split_src_lane_val(const struct agx_apple9_vir_instr *ins, unsigned lane)
+{
+   if (ins->dest_components > 1 &&
+       agx_apple9_vir_nr_srcs(ins) >= ins->dest_components)
+      return agx_apple9_vir_src(ins, lane);
+   return agx_apple9_vir_src(ins, 0) + lane;
+}
+
 static bool
 can_eliminate_instr(const struct agx_apple9_vir_program *p,
                     const BITSET_WORD *pub_defs,
@@ -270,6 +295,15 @@ apple9_ra_dce(struct agx_apple9_vir_program *p)
          continue;
 
       if (ins->op == AGX_APPLE9_VIR_SPLIT && agx_apple9_vir_nr_srcs(ins) >= 1) {
+         if (ins->dest_components > 1 &&
+             agx_apple9_vir_nr_srcs(ins) >= ins->dest_components) {
+            for (unsigned c = 0; c < ins->dest_components; ++c) {
+               mark_val_live_dce(p, agx_apple9_vir_src(ins, c), def_idx,
+                                 phi_src_head, phi_src_next, val_live, ins_live,
+                                 work, &work_top);
+            }
+            continue;
+         }
          uint32_t src0 = agx_apple9_vir_src(ins, 0);
          unsigned w = 1;
          if (src0 < vcount && def_idx[src0] != UINT32_MAX) {
@@ -367,25 +401,6 @@ flat_bitset_pack_sparse(struct u_sparse_bitset *dst, const BITSET_WORD *src,
 }
 
 static inline bool
-flat_bitset_merge_sparse(struct u_sparse_bitset *dst, const BITSET_WORD *src,
-                         size_t words)
-{
-   bool changed = false;
-   for (size_t w = 0; w < words; ++w) {
-      uint32_t word = src[w];
-      while (word) {
-         unsigned bit = u_bit_scan(&word);
-         uint32_t v = (uint32_t)(w * BITSET_WORDBITS + bit);
-         if (!u_sparse_bitset_test(dst, v)) {
-            u_sparse_bitset_set(dst, v);
-            changed = true;
-         }
-      }
-   }
-   return changed;
-}
-
-static inline bool
 flat_bitset_merge(BITSET_WORD *dst, const BITSET_WORD *src, size_t words)
 {
    bool changed = false;
@@ -406,6 +421,160 @@ flat_bitset_count(const BITSET_WORD *bits, size_t words)
    for (size_t w = 0; w < words; ++w)
       total += util_bitcount(bits[w]);
    return total;
+}
+
+static void
+flat_bitset_clear_instr_vals(const struct agx_apple9_vir_program *p,
+                             struct agx_apple9_vir_instr *const *defs,
+                             BITSET_WORD *bits,
+                             const struct agx_apple9_vir_instr *ins)
+{
+   if (ins->dest != AGX_APPLE9_VREG_INVALID && ins->dest_components > 0) {
+      for (unsigned c = 0; c < ins->dest_components; ++c) {
+         uint32_t d = ins->dest + c;
+         if (d < p->value_count)
+            BITSET_CLEAR(bits, d);
+      }
+   }
+   if (ins->op == AGX_APPLE9_VIR_ABI_RETURN) {
+      for (unsigned k = 0; k < p->live_out_count; ++k) {
+         uint32_t v = p->live_out[k];
+         if (v < p->value_count)
+            BITSET_CLEAR(bits, v);
+      }
+      return;
+   }
+   if (ins->op == AGX_APPLE9_VIR_SPLIT) {
+      unsigned w = split_src_lane_count(p, defs, ins);
+      for (unsigned c = 0; c < w; ++c) {
+         uint32_t v = split_src_lane_val(ins, c);
+         if (v < p->value_count)
+            BITSET_CLEAR(bits, v);
+      }
+      return;
+   }
+   const unsigned nr_srcs = agx_apple9_vir_nr_srcs(ins);
+   for (unsigned s = 0; s < nr_srcs; ++s) {
+      uint32_t v = agx_apple9_vir_src(ins, s);
+      if (v < p->value_count)
+         BITSET_CLEAR(bits, v);
+   }
+}
+
+static void
+flat_bitset_clear_block_vals(const struct agx_apple9_vir_program *p,
+                             struct agx_apple9_vir_instr *const *defs,
+                             BITSET_WORD *bits,
+                             struct u_sparse_bitset *live_out,
+                             struct agx_apple9_block *blk)
+{
+   U_SPARSE_BITSET_FOREACH_SET(live_out, v) {
+      BITSET_CLEAR(bits, v);
+   }
+   for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(blk);
+        I; I = agx_apple9_instr_next(I)) {
+      flat_bitset_clear_instr_vals(p, defs, bits, I);
+   }
+}
+
+static unsigned
+liveness_ins_update_sparse(const struct agx_apple9_vir_program *p,
+                           struct agx_apple9_vir_instr *const *defs,
+                           const BITSET_WORD *pub_defs,
+                           struct u_sparse_bitset *live,
+                           struct agx_apple9_vir_instr *ins,
+                           bool update_kill_mask, unsigned *cur_live)
+{
+   if (ins->op == AGX_APPLE9_VIR_PHI ||
+       ins->op == AGX_APPLE9_VIR_DEVICE_ATOMIC_RESULT) {
+      if (update_kill_mask)
+         ins->kill_mask = 0;
+      return 0;
+   }
+
+   unsigned unlive_defs = 0;
+   if (ins->dest != AGX_APPLE9_VREG_INVALID && ins->dest_components > 0) {
+      for (unsigned c = 0; c < ins->dest_components; ++c) {
+         uint32_t d = ins->dest + c;
+         if (!is_valid_gpr(p, pub_defs, d))
+            continue;
+         if (u_sparse_bitset_test(live, d)) {
+            u_sparse_bitset_clear(live, d);
+            if (cur_live)
+               (*cur_live)--;
+         } else if (c >= 8 || !(ins->dead_dest_mask & (1u << c))) {
+            unlive_defs++;
+         }
+      }
+   }
+
+   if (ins->op == AGX_APPLE9_VIR_ABI_RETURN) {
+      if (update_kill_mask)
+         ins->kill_mask = 0;
+      for (unsigned k = 0; k < p->live_out_count; ++k) {
+         if (p->live_out_reg[k] == AGX_APPLE9_PHYS_INVALID)
+            continue;
+         uint32_t v = p->live_out[k];
+         if (is_valid_gpr(p, pub_defs, v) && !u_sparse_bitset_test(live, v)) {
+            u_sparse_bitset_set(live, v);
+            if (cur_live)
+               (*cur_live)++;
+         }
+      }
+      return unlive_defs;
+   }
+
+   if (ins->op == AGX_APPLE9_VIR_SPLIT) {
+      uint16_t kill_mask = 0;
+      unsigned w = split_src_lane_count(p, defs, ins);
+      if (w > 0) {
+         bool any_valid = false;
+         bool any_live = false;
+         for (unsigned c = 0; c < w; ++c) {
+            uint32_t v = split_src_lane_val(ins, c);
+            if (!is_valid_gpr(p, pub_defs, v))
+               continue;
+            any_valid = true;
+            if (u_sparse_bitset_test(live, v))
+               any_live = true;
+         }
+         if (any_valid && !any_live)
+            kill_mask = 1u;
+         for (unsigned c = 0; c < w; ++c) {
+            uint32_t v = split_src_lane_val(ins, c);
+            if (is_valid_gpr(p, pub_defs, v) && !u_sparse_bitset_test(live, v)) {
+               u_sparse_bitset_set(live, v);
+               if (cur_live)
+                  (*cur_live)++;
+            }
+         }
+      }
+      if (update_kill_mask)
+         ins->kill_mask = kill_mask;
+      return unlive_defs;
+   }
+
+   const unsigned nr_srcs = agx_apple9_vir_nr_srcs(ins);
+   if (update_kill_mask) {
+      uint16_t kill_mask = 0;
+      for (unsigned s = 0; s < nr_srcs && s < AGX_APPLE9_MAX_VIR_SRCS; ++s) {
+         uint32_t v = agx_apple9_vir_src(ins, s);
+         if (is_valid_gpr(p, pub_defs, v) && !u_sparse_bitset_test(live, v))
+            kill_mask |= (uint16_t)(1u << s);
+      }
+      ins->kill_mask = kill_mask;
+   }
+
+   for (unsigned s = 0; s < nr_srcs; ++s) {
+      uint32_t v = agx_apple9_vir_src(ins, s);
+      if (is_valid_gpr(p, pub_defs, v) && !u_sparse_bitset_test(live, v)) {
+         u_sparse_bitset_set(live, v);
+         if (cur_live)
+            (*cur_live)++;
+      }
+   }
+
+   return unlive_defs;
 }
 
 static unsigned
@@ -459,13 +628,12 @@ liveness_ins_update_internal(const struct agx_apple9_vir_program *p,
 
    if (ins->op == AGX_APPLE9_VIR_SPLIT) {
       uint16_t kill_mask = 0;
-      if (agx_apple9_vir_nr_srcs(ins) >= 1) {
-         uint32_t src0 = agx_apple9_vir_src(ins, 0);
-         unsigned w = split_src_tuple_width(p, defs, ins);
+      unsigned w = split_src_lane_count(p, defs, ins);
+      if (w > 0) {
          bool any_valid = false;
          bool any_live = false;
          for (unsigned c = 0; c < w; ++c) {
-            uint32_t v = src0 + c;
+            uint32_t v = split_src_lane_val(ins, c);
             if (!is_valid_gpr(p, pub_defs, v))
                continue;
             any_valid = true;
@@ -475,7 +643,7 @@ liveness_ins_update_internal(const struct agx_apple9_vir_program *p,
          if (any_valid && !any_live)
             kill_mask = 1u;
          for (unsigned c = 0; c < w; ++c) {
-            uint32_t v = src0 + c;
+            uint32_t v = split_src_lane_val(ins, c);
             if (is_valid_gpr(p, pub_defs, v) && !BITSET_TEST(live, v)) {
                BITSET_SET(live, v);
                if (cur_live)
@@ -593,8 +761,7 @@ apple9_ra_liveness(struct agx_apple9_vir_program *p,
 
    /* Use contiguous dense flat BITSET_WORD tables across all blocks when the
     * total working set is <= 16 MiB (2M words each for live_in/live_out), and
-    * fall back to sparse per-block tables with flat intra-block scratch for
-    * pathological shaders. */
+    * fall back to pure u_sparse_bitset propagation for pathological shaders. */
    const uint64_t total_words = (uint64_t)num_blocks * (uint64_t)live_words;
    const bool use_flat_cfg = (total_words <= 2u * 1024u * 1024u);
    BITSET_WORD *live_in_flat = NULL;
@@ -611,15 +778,17 @@ apple9_ra_liveness(struct agx_apple9_vir_program *p,
       sparse_out = rzalloc_array(scratch_ctx, struct u_sparse_bitset, num_blocks);
    }
 
-   BITSET_WORD *work_live = ralloc_array(scratch_ctx, BITSET_WORD, live_words);
-   BITSET_WORD *edge_live = ralloc_array(scratch_ctx, BITSET_WORD, live_words);
+   BITSET_WORD *work_live =
+      use_flat_cfg ? ralloc_array(scratch_ctx, BITSET_WORD, live_words) : NULL;
+   BITSET_WORD *edge_live =
+      use_flat_cfg ? ralloc_array(scratch_ctx, BITSET_WORD, live_words) : NULL;
    struct agx_apple9_vir_instr **defs = NULL;
    BITSET_WORD *pub_defs = NULL;
    struct agx_apple9_block **cfg_blocks =
       rzalloc_array(scratch_ctx, struct agx_apple9_block *, num_blocks);
    if ((out && (!info->live_in || !info->live_out)) || !info->block_peak_gprs ||
-       !cfg_blocks || !work_live || !edge_live ||
-       (use_flat_cfg && (!live_in_flat || !live_out_flat)) ||
+       !cfg_blocks ||
+       (use_flat_cfg && (!live_in_flat || !live_out_flat || !work_live || !edge_live)) ||
        (!use_flat_cfg && (!sparse_in || !sparse_out)) ||
        !build_defs_and_pub_mask(p, scratch_ctx, &defs, &pub_defs)) {
       ralloc_free(scratch_ctx);
@@ -691,67 +860,93 @@ apple9_ra_liveness(struct agx_apple9_vir_program *p,
    }
 
    /* Backwards-may dataflow fixed point over the logical SSA CFG. */
+   void *sparse_ctx = out ? mem_ctx : scratch_ctx;
    while (!u_worklist_is_empty(&worklist)) {
       struct agx_apple9_block *blk =
          u_worklist_pop_head(&worklist, struct agx_apple9_block, cfg_index);
       const unsigned b = blk->cfg_index;
 
-      BITSET_WORD *b_live_in;
       if (use_flat_cfg) {
-         b_live_in = live_in_flat + (size_t)b * live_words;
+         BITSET_WORD *b_live_in = live_in_flat + (size_t)b * live_words;
          memcpy(b_live_in, live_out_flat + (size_t)b * live_words, live_bytes);
-      } else {
-         b_live_in = work_live;
-         flat_bitset_unpack_sparse(b_live_in, live_words, &sparse_out[b]);
-      }
 
-      for (struct agx_apple9_vir_instr *I = agx_apple9_block_last_instr(blk);
-           I; I = agx_apple9_instr_prev(I)) {
-         if (I->op != AGX_APPLE9_VIR_PHI) {
-            liveness_ins_update_internal(p, defs, pub_defs, b_live_in,
-                                         I, false, NULL);
-         }
-      }
-
-      if (!use_flat_cfg) {
-         u_sparse_bitset_clear_all(&sparse_in[b]);
-         flat_bitset_pack_sparse(&sparse_in[b], b_live_in, live_words);
-      }
-
-      /* Propagate live_in across each incoming edge, applying canonical
-       * VIR_PHI semantics in parallel: kill all phi dests, then gen each
-       * phi's operand for that specific predecessor index. */
-      for (unsigned p_idx = 0; p_idx < blk->num_cfg_preds; ++p_idx) {
-         struct agx_apple9_block *pred = blk->cfg_preds[p_idx];
-         assert(pred && pred->cfg_active);
-
-         memcpy(edge_live, b_live_in, live_bytes);
-
-         agx_apple9_foreach_phi(blk, phi) {
-            if (phi->dest != AGX_APPLE9_VREG_INVALID &&
-                is_valid_gpr(p, pub_defs, phi->dest))
-               BITSET_CLEAR(edge_live, phi->dest);
-         }
-
-         agx_apple9_foreach_phi(blk, phi) {
-            if (p_idx < agx_apple9_vir_nr_srcs(phi)) {
-               uint32_t v = agx_apple9_vir_src(phi, p_idx);
-               if (is_valid_gpr(p, pub_defs, v))
-                  BITSET_SET(edge_live, v);
+         for (struct agx_apple9_vir_instr *I = agx_apple9_block_last_instr(blk);
+              I; I = agx_apple9_instr_prev(I)) {
+            if (I->op != AGX_APPLE9_VIR_PHI) {
+               liveness_ins_update_internal(p, defs, pub_defs, b_live_in,
+                                            I, false, NULL);
             }
          }
 
-         bool changed;
-         if (use_flat_cfg) {
-            changed = flat_bitset_merge(
-               live_out_flat + (size_t)pred->cfg_index * live_words,
-               edge_live, live_words);
-         } else {
-            changed = flat_bitset_merge_sparse(&sparse_out[pred->cfg_index],
-                                               edge_live, live_words);
+         /* Propagate live_in across each incoming edge, applying canonical
+          * VIR_PHI semantics in parallel: kill all phi dests, then gen each
+          * phi's operand for that specific predecessor index. */
+         for (unsigned p_idx = 0; p_idx < blk->num_cfg_preds; ++p_idx) {
+            struct agx_apple9_block *pred = blk->cfg_preds[p_idx];
+            assert(pred && pred->cfg_active);
+
+            memcpy(edge_live, b_live_in, live_bytes);
+
+            agx_apple9_foreach_phi(blk, phi) {
+               if (phi->dest != AGX_APPLE9_VREG_INVALID &&
+                   is_valid_gpr(p, pub_defs, phi->dest))
+                  BITSET_CLEAR(edge_live, phi->dest);
+            }
+
+            agx_apple9_foreach_phi(blk, phi) {
+               if (p_idx < agx_apple9_vir_nr_srcs(phi)) {
+                  uint32_t v = agx_apple9_vir_src(phi, p_idx);
+                  if (is_valid_gpr(p, pub_defs, v))
+                     BITSET_SET(edge_live, v);
+               }
+            }
+
+            if (flat_bitset_merge(
+                   live_out_flat + (size_t)pred->cfg_index * live_words,
+                   edge_live, live_words))
+               u_worklist_push_tail(&worklist, pred, cfg_index);
          }
-         if (changed)
-            u_worklist_push_tail(&worklist, pred, cfg_index);
+      } else {
+         u_sparse_bitset_free(&sparse_in[b]);
+         u_sparse_bitset_dup_with_ctx(&sparse_in[b], &sparse_out[b],
+                                      sparse_ctx);
+
+         for (struct agx_apple9_vir_instr *I = agx_apple9_block_last_instr(blk);
+              I; I = agx_apple9_instr_prev(I)) {
+            if (I->op != AGX_APPLE9_VIR_PHI) {
+               liveness_ins_update_sparse(p, defs, pub_defs, &sparse_in[b],
+                                          I, false, NULL);
+            }
+         }
+
+         for (unsigned p_idx = 0; p_idx < blk->num_cfg_preds; ++p_idx) {
+            struct agx_apple9_block *pred = blk->cfg_preds[p_idx];
+            assert(pred && pred->cfg_active);
+
+            struct u_sparse_bitset edge_sparse;
+            u_sparse_bitset_dup_with_ctx(&edge_sparse, &sparse_in[b],
+                                         scratch_ctx);
+
+            agx_apple9_foreach_phi(blk, phi) {
+               if (phi->dest != AGX_APPLE9_VREG_INVALID &&
+                   is_valid_gpr(p, pub_defs, phi->dest))
+                  u_sparse_bitset_clear(&edge_sparse, phi->dest);
+            }
+
+            agx_apple9_foreach_phi(blk, phi) {
+               if (p_idx < agx_apple9_vir_nr_srcs(phi)) {
+                  uint32_t v = agx_apple9_vir_src(phi, p_idx);
+                  if (is_valid_gpr(p, pub_defs, v))
+                     u_sparse_bitset_set(&edge_sparse, v);
+               }
+            }
+
+            if (u_sparse_bitset_merge(&sparse_out[pred->cfg_index],
+                                      &edge_sparse))
+               u_worklist_push_tail(&worklist, pred, cfg_index);
+
+            u_sparse_bitset_free(&edge_sparse);
+         }
       }
    }
 
@@ -764,6 +959,7 @@ apple9_ra_liveness(struct agx_apple9_vir_program *p,
       if (!blk)
          continue;
 
+      unsigned block_peak;
       if (use_flat_cfg) {
          const BITSET_WORD *lo = live_out_flat + (size_t)b * live_words;
          if (out) {
@@ -773,24 +969,41 @@ apple9_ra_liveness(struct agx_apple9_vir_program *p,
             flat_bitset_pack_sparse(&info->live_out[b], lo, live_words);
          }
          memcpy(work_live, lo, live_bytes);
-      } else {
-         flat_bitset_unpack_sparse(work_live, live_words, &sparse_out[b]);
-      }
 
-      unsigned cur = flat_bitset_count(work_live, live_words);
-      unsigned block_peak = cur;
+         unsigned cur = flat_bitset_count(work_live, live_words);
+         block_peak = cur;
 
-      for (struct agx_apple9_vir_instr *I = agx_apple9_block_last_instr(blk);
-           I; I = agx_apple9_instr_prev(I)) {
-         if (I->op == AGX_APPLE9_VIR_PHI) {
-            I->kill_mask = 0;
-            continue;
+         for (struct agx_apple9_vir_instr *I = agx_apple9_block_last_instr(blk);
+              I; I = agx_apple9_instr_prev(I)) {
+            if (I->op == AGX_APPLE9_VIR_PHI) {
+               I->kill_mask = 0;
+               continue;
+            }
+            unsigned cur_after = cur;
+            unsigned unlive_defs = liveness_ins_update_internal(
+               p, defs, pub_defs, work_live, I, true, &cur);
+            block_peak = MAX2(block_peak, cur_after + unlive_defs);
+            block_peak = MAX2(block_peak, cur);
          }
-         unsigned cur_after = cur;
-         unsigned unlive_defs = liveness_ins_update_internal(
-            p, defs, pub_defs, work_live, I, true, &cur);
-         block_peak = MAX2(block_peak, cur_after + unlive_defs);
-         block_peak = MAX2(block_peak, cur);
+      } else {
+         struct u_sparse_bitset live_sparse;
+         u_sparse_bitset_dup_with_ctx(&live_sparse, &sparse_out[b], scratch_ctx);
+         unsigned cur = u_sparse_bitset_count(&live_sparse);
+         block_peak = cur;
+
+         for (struct agx_apple9_vir_instr *I = agx_apple9_block_last_instr(blk);
+              I; I = agx_apple9_instr_prev(I)) {
+            if (I->op == AGX_APPLE9_VIR_PHI) {
+               I->kill_mask = 0;
+               continue;
+            }
+            unsigned cur_after = cur;
+            unsigned unlive_defs = liveness_ins_update_sparse(
+               p, defs, pub_defs, &live_sparse, I, true, &cur);
+            block_peak = MAX2(block_peak, cur_after + unlive_defs);
+            block_peak = MAX2(block_peak, cur);
+         }
+         u_sparse_bitset_free(&live_sparse);
       }
 
       info->block_peak_gprs[b] = block_peak;
@@ -1530,18 +1743,15 @@ calc_pressure_delta(const struct agx_apple9_vir_program *p,
    }
 
    if (ins->op == AGX_APPLE9_VIR_SPLIT) {
-      if (agx_apple9_vir_nr_srcs(ins) >= 1) {
-         uint32_t src0 = agx_apple9_vir_src(ins, 0);
-         unsigned w = split_src_tuple_width(p, defs, ins);
-         for (unsigned c = 0; c < w; ++c) {
-            uint32_t v = src0 + c;
-            if (is_valid_gpr(p, pub_defs, v) && !BITSET_TEST(live, v)) {
-               d.all += 1;
-               if (val_max_gpr[v] <= 63)
-                  d.bank64 += 1;
-               if (val_max_gpr[v] <= 15)
-                  d.bank16 += 1;
-            }
+      unsigned w = split_src_lane_count(p, defs, ins);
+      for (unsigned c = 0; c < w; ++c) {
+         uint32_t v = split_src_lane_val(ins, c);
+         if (is_valid_gpr(p, pub_defs, v) && !BITSET_TEST(live, v)) {
+            d.all += 1;
+            if (val_max_gpr[v] <= 63)
+               d.bank64 += 1;
+            if (val_max_gpr[v] <= 15)
+               d.bank16 += 1;
          }
       }
       d.peak_all = MAX2(0, d.all);
@@ -1607,11 +1817,11 @@ create_vir_dag(const struct agx_apple9_vir_program *p,
 
       /* SSA read-after-write dependencies (including tuple components). */
       if (I->op == AGX_APPLE9_VIR_SPLIT && agx_apple9_vir_nr_srcs(I) >= 1) {
-         uint32_t src0 = agx_apple9_vir_src(I, 0);
-         unsigned w = split_src_tuple_width(p, defs, I);
+         unsigned w = split_src_lane_count(p, defs, I);
          for (unsigned c = 0; c < w; ++c) {
-            if (src0 + c < p->value_count)
-               add_data_dep(node, last_write[src0 + c]);
+            uint32_t v = split_src_lane_val(I, c);
+            if (v < p->value_count)
+               add_data_dep(node, last_write[v]);
          }
       } else {
          const unsigned nr_srcs = agx_apple9_vir_nr_srcs(I);
@@ -1964,6 +2174,7 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
                            struct agx_apple9_vir_instr *first_body,
                            struct agx_apple9_vir_instr *first_tail,
                            const BITSET_WORD *live_after_body,
+                           struct u_sparse_bitset *live_after_sparse,
                            BITSET_WORD *work_live, size_t live_bytes,
                            int32_t base_all, int32_t base_64, int32_t base_16,
                            bool latency, int32_t max_all_budget,
@@ -2044,7 +2255,13 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
       .last_pipe = APPLE9_RA_PIPE_NONE,
       .inflight_dev_loads = 0,
    };
-   memcpy(s.live, live_after_body, live_bytes);
+   if (live_after_sparse) {
+      U_SPARSE_BITSET_FOREACH_SET(live_after_sparse, v) {
+         BITSET_SET(s.live, v);
+      }
+   } else {
+      memcpy(s.live, live_after_body, live_bytes);
+   }
    if (latency) {
       for (unsigned i = 0; i < count; ++i) {
          if (dev_load_is_live(&s, orig[i]->instr))
@@ -2127,6 +2344,13 @@ run_block_schedule_attempt(const struct agx_apple9_vir_program *p,
    }
 
    assert(nr == count);
+   if (live_after_sparse) {
+      U_SPARSE_BITSET_FOREACH_SET(live_after_sparse, v) {
+         BITSET_CLEAR(s.live, v);
+      }
+      for (unsigned i = 0; i < count; ++i)
+         flat_bitset_clear_instr_vals(p, defs, s.live, orig[i]->instr);
+   }
    res.count = count;
    if (latency) {
       res.stalls = compute_schedule_stalls(sched_nodes, count, true, dep_pool,
@@ -2198,6 +2422,7 @@ run_block_sink_loads(const struct agx_apple9_vir_program *p,
                      struct agx_apple9_vir_instr *first_body,
                      struct agx_apple9_vir_instr *first_tail,
                      const BITSET_WORD *live_after_body,
+                     struct u_sparse_bitset *live_after_sparse,
                      BITSET_WORD *work_live, size_t live_bytes,
                      int32_t base_all, int32_t base_64, int32_t base_16,
                      struct vir_sched_node **last_write, void *attempt_ctx)
@@ -2295,7 +2520,13 @@ run_block_sink_loads(const struct agx_apple9_vir_program *p,
       return res;
 
    /* Measure exact peak pressure of the sunken schedule. */
-   memcpy(work_live, live_after_body, live_bytes);
+   if (live_after_sparse) {
+      U_SPARSE_BITSET_FOREACH_SET(live_after_sparse, v) {
+         BITSET_SET(work_live, v);
+      }
+   } else {
+      memcpy(work_live, live_after_body, live_bytes);
+   }
    int32_t cur_all = base_all, cur_64 = base_64, cur_16 = base_16;
    res.max_all = base_all;
    res.max_64 = base_64;
@@ -2314,6 +2545,14 @@ run_block_sink_loads(const struct agx_apple9_vir_program *p,
       res.max_16 = MAX2(res.max_16, cur_16);
       liveness_ins_update_internal(p, defs, pub_defs, work_live, ins, false, NULL);
       res.order[i] = ins;
+   }
+
+   if (live_after_sparse) {
+      U_SPARSE_BITSET_FOREACH_SET(live_after_sparse, v) {
+         BITSET_CLEAR(work_live, v);
+      }
+      for (unsigned i = 0; i < count; ++i)
+         flat_bitset_clear_instr_vals(p, defs, work_live, orig[i]->instr);
    }
 
    res.count = count;
@@ -2353,11 +2592,20 @@ refresh_block_liveness_and_kills(const struct agx_apple9_vir_program *p,
                                  const BITSET_WORD *pub_defs,
                                  struct apple9_ra_liveness_info *liveness,
                                  struct agx_apple9_block *blk,
-                                 BITSET_WORD *work_live, size_t live_words)
+                                 BITSET_WORD *work_live, size_t live_words,
+                                 bool sparse_clear)
 {
    unsigned b = blk->cfg_index;
-   flat_bitset_unpack_sparse(work_live, live_words, &liveness->live_out[b]);
-   unsigned cur = flat_bitset_count(work_live, live_words);
+   if (sparse_clear) {
+      flat_bitset_clear_block_vals(p, defs, work_live, &liveness->live_out[b],
+                                   blk);
+      U_SPARSE_BITSET_FOREACH_SET(&liveness->live_out[b], v) {
+         BITSET_SET(work_live, v);
+      }
+   } else {
+      flat_bitset_unpack_sparse(work_live, live_words, &liveness->live_out[b]);
+   }
+   unsigned cur = u_sparse_bitset_count(&liveness->live_out[b]);
    unsigned block_peak = cur;
 
    for (struct agx_apple9_vir_instr *I = agx_apple9_block_last_instr(blk);
@@ -2373,6 +2621,11 @@ refresh_block_liveness_and_kills(const struct agx_apple9_vir_program *p,
       block_peak = MAX2(block_peak, cur);
    }
 
+   if (sparse_clear) {
+      flat_bitset_clear_block_vals(p, defs, work_live, &liveness->live_out[b],
+                                   blk);
+   }
+
    liveness->block_peak_gprs[b] = block_peak;
 }
 
@@ -2384,7 +2637,7 @@ apply_vir_schedule(struct agx_apple9_vir_program *p,
                    unsigned count, struct agx_apple9_vir_instr *const *defs,
                    const BITSET_WORD *pub_defs,
                    struct apple9_ra_liveness_info *liveness,
-                   BITSET_WORD *work_live, size_t live_words)
+                   BITSET_WORD *work_live, size_t live_words, bool sparse_clear)
 {
    if (count <= 1)
       return false;
@@ -2421,7 +2674,7 @@ apply_vir_schedule(struct agx_apple9_vir_program *p,
    /* Intra-block reordering preserves live_in/live_out; refresh this block's
     * kill_mask and peak pressure directly from its unchanged live_out set. */
    refresh_block_liveness_and_kills(p, defs, pub_defs, liveness, blk,
-                                    work_live, live_words);
+                                    work_live, live_words, sparse_clear);
    return true;
 }
 
@@ -3209,15 +3462,19 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
 
    const size_t live_words = BITSET_WORDS(MAX2(p->value_count, 1u));
    const size_t live_bytes = live_words * sizeof(BITSET_WORD);
+   const bool sparse_clear =
+      (uint64_t)liveness.num_cfg_blocks * (uint64_t)live_words >
+      2u * 1024u * 1024u;
    struct agx_apple9_vir_instr **defs = NULL;
    BITSET_WORD *pub_defs = NULL;
    uint8_t *val_max_gpr = compute_value_max_gprs(p, mem_ctx);
    struct vir_sched_node **last_write =
       rzalloc_array(mem_ctx, struct vir_sched_node *, MAX2(p->value_count, 1u));
-   BITSET_WORD *live_after_body = ralloc_array(mem_ctx, BITSET_WORD, live_words);
-   BITSET_WORD *work_live = ralloc_array(mem_ctx, BITSET_WORD, live_words);
-   if (!val_max_gpr || !last_write || !live_after_body || !work_live ||
-       !build_defs_and_pub_mask(p, mem_ctx, &defs, &pub_defs)) {
+   BITSET_WORD *live_after_body =
+      sparse_clear ? NULL : ralloc_array(mem_ctx, BITSET_WORD, live_words);
+   BITSET_WORD *work_live = rzalloc_array(mem_ctx, BITSET_WORD, live_words);
+   if (!val_max_gpr || !last_write || (!sparse_clear && !live_after_body) ||
+       !work_live || !build_defs_and_pub_mask(p, mem_ctx, &defs, &pub_defs)) {
       ralloc_free(mem_ctx);
       apple9_ra_liveness_finish(&liveness);
       return false;
@@ -3273,34 +3530,60 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
 
       /* Compute exact live set at the end of the schedulable body by walking
        * backwards across the pinned tail from block live_out. */
-      flat_bitset_unpack_sparse(live_after_body, live_words,
-                                &liveness.live_out[blk->cfg_index]);
-      if (first_tail) {
-         for (struct agx_apple9_vir_instr *T = agx_apple9_block_last_instr(blk);
-              T; T = agx_apple9_instr_prev(T)) {
-            liveness_ins_update_internal(p, defs, pub_defs, live_after_body, T,
-                                         false, NULL);
-            if (T == first_tail)
-               break;
-         }
-      }
-
+      struct u_sparse_bitset live_after_sparse_storage;
+      struct u_sparse_bitset *live_after_sparse = NULL;
       int32_t base_all = 0, base_64 = 0, base_16 = 0;
-      for (size_t w = 0; w < live_words; ++w) {
-         uint32_t word = live_after_body[w];
-         while (word) {
-            unsigned bit = u_bit_scan(&word);
-            uint32_t v = (uint32_t)(w * BITSET_WORDBITS + bit);
+      if (sparse_clear) {
+         u_sparse_bitset_dup_with_ctx(&live_after_sparse_storage,
+                                      &liveness.live_out[blk->cfg_index],
+                                      blk_ctx);
+         if (first_tail) {
+            for (struct agx_apple9_vir_instr *T = agx_apple9_block_last_instr(blk);
+                 T; T = agx_apple9_instr_prev(T)) {
+               liveness_ins_update_sparse(p, defs, pub_defs,
+                                          &live_after_sparse_storage, T, false,
+                                          NULL);
+               if (T == first_tail)
+                  break;
+            }
+         }
+         live_after_sparse = &live_after_sparse_storage;
+         U_SPARSE_BITSET_FOREACH_SET(live_after_sparse, v) {
             base_all++;
             if (val_max_gpr[v] <= 63)
                base_64++;
             if (val_max_gpr[v] <= 15)
                base_16++;
+            BITSET_SET(work_live, v);
          }
+      } else {
+         flat_bitset_unpack_sparse(live_after_body, live_words,
+                                   &liveness.live_out[blk->cfg_index]);
+         if (first_tail) {
+            for (struct agx_apple9_vir_instr *T = agx_apple9_block_last_instr(blk);
+                 T; T = agx_apple9_instr_prev(T)) {
+               liveness_ins_update_internal(p, defs, pub_defs, live_after_body,
+                                            T, false, NULL);
+               if (T == first_tail)
+                  break;
+            }
+         }
+         for (size_t w = 0; w < live_words; ++w) {
+            uint32_t word = live_after_body[w];
+            while (word) {
+               unsigned bit = u_bit_scan(&word);
+               uint32_t v = (uint32_t)(w * BITSET_WORDBITS + bit);
+               base_all++;
+               if (val_max_gpr[v] <= 63)
+                  base_64++;
+               if (val_max_gpr[v] <= 15)
+                  base_16++;
+            }
+         }
+         memcpy(work_live, live_after_body, live_bytes);
       }
 
       /* Measure original peak pressure across the schedulable body. */
-      memcpy(work_live, live_after_body, live_bytes);
       int32_t cur_all = base_all, cur_64 = base_64, cur_16 = base_16;
       int32_t orig_all = base_all, orig_64 = base_64, orig_16 = base_16;
       struct agx_apple9_vir_instr *last_body =
@@ -3321,6 +3604,15 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                                       NULL);
          if (B == first_body)
             break;
+      }
+      if (sparse_clear) {
+         U_SPARSE_BITSET_FOREACH_SET(live_after_sparse, v) {
+            BITSET_CLEAR(work_live, v);
+         }
+         for (struct agx_apple9_vir_instr *B = first_body; B && B != first_tail;
+              B = agx_apple9_instr_next(B)) {
+            flat_bitset_clear_instr_vals(p, defs, work_live, B);
+         }
       }
 
       bool committed = false;
@@ -3345,8 +3637,9 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
             pres_ctx = ralloc_context(blk_ctx);
             pres = run_block_schedule_attempt(
                p, defs, pub_defs, val_max_gpr, first_body, first_tail,
-               live_after_body, work_live, live_bytes, base_all, base_64,
-               base_16, false, INT32_MAX, last_write, pres_ctx, NULL, NULL);
+               live_after_body, live_after_sparse, work_live, live_bytes,
+               base_all, base_64, base_16, false, INT32_MAX, last_write,
+               pres_ctx, NULL, NULL);
             if (pres.valid &&
                 bank_limits_respected(pres.max_64, pres.max_16, orig_64,
                                       orig_16) &&
@@ -3375,8 +3668,8 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                void *sink_ctx = ralloc_context(blk_ctx);
                struct vir_sched_result sink = run_block_sink_loads(
                   p, defs, pub_defs, val_max_gpr, first_body, first_tail,
-                  live_after_body, work_live, live_bytes, base_all, base_64,
-                  base_16, last_write, sink_ctx);
+                  live_after_body, live_after_sparse, work_live, live_bytes,
+                  base_all, base_64, base_16, last_write, sink_ctx);
                if (sink.valid &&
                    bank_limits_respected(sink.max_64, sink.max_16, orig_64,
                                          orig_16) &&
@@ -3434,9 +3727,9 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
          unsigned orig_stalls = 0, orig_dual_issue = 0;
          struct vir_sched_result lat = run_block_schedule_attempt(
             p, defs, pub_defs, val_max_gpr, first_body, first_tail,
-            live_after_body, work_live, live_bytes, base_all, base_64, base_16,
-            true, lat_limit, last_write, lat_ctx, &orig_stalls,
-            &orig_dual_issue);
+            live_after_body, live_after_sparse, work_live, live_bytes,
+            base_all, base_64, base_16, true, lat_limit, last_write, lat_ctx,
+            &orig_stalls, &orig_dual_issue);
 
          bool accept_lat = false;
          if (lat.valid) {
@@ -3468,12 +3761,14 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
          if (accept_lat) {
             any_reordered |= apply_vir_schedule(p, blk, last_entry, lat.order,
                                                 lat.count, defs, pub_defs,
-                                                &liveness, work_live, live_words);
+                                                &liveness, work_live,
+                                                live_words, sparse_clear);
             committed = true;
          } else if (have_pres) {
             any_reordered |= apply_vir_schedule(p, blk, last_entry, pres.order,
                                                 pres.count, defs, pub_defs,
-                                                &liveness, work_live, live_words);
+                                                &liveness, work_live,
+                                                live_words, sparse_clear);
             committed = true;
          }
 
@@ -3489,9 +3784,9 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
          unsigned orig_stalls = 0, orig_dual_issue = 0;
          struct vir_sched_result lat = run_block_schedule_attempt(
             p, defs, pub_defs, val_max_gpr, first_body, first_tail,
-            live_after_body, work_live, live_bytes, base_all, base_64, base_16,
-            true, INT32_MAX, last_write, lat_ctx, &orig_stalls,
-            &orig_dual_issue);
+            live_after_body, live_after_sparse, work_live, live_bytes,
+            base_all, base_64, base_16, true, INT32_MAX, last_write, lat_ctx,
+            &orig_stalls, &orig_dual_issue);
 
          bool accept_lat = false;
          if (lat.valid) {
@@ -3519,8 +3814,9 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                void *pres_ctx = ralloc_context(blk_ctx);
                struct vir_sched_result pres = run_block_schedule_attempt(
                   p, defs, pub_defs, val_max_gpr, first_body, first_tail,
-                  live_after_body, work_live, live_bytes, base_all, base_64,
-                  base_16, false, INT32_MAX, last_write, pres_ctx, NULL, NULL);
+                  live_after_body, live_after_sparse, work_live, live_bytes,
+                  base_all, base_64, base_16, false, INT32_MAX, last_write,
+                  pres_ctx, NULL, NULL);
                if (pres.valid &&
                    bank_limits_respected(pres.max_64, pres.max_16, orig_64,
                                          orig_16) &&
@@ -3530,7 +3826,8 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                   any_reordered |= apply_vir_schedule(p, blk, last_entry,
                                                       pres.order, pres.count,
                                                       defs, pub_defs, &liveness,
-                                                      work_live, live_words);
+                                                      work_live, live_words,
+                                                      sparse_clear);
                   committed = true;
                   overridden_by_pressure = true;
                }
@@ -3540,7 +3837,8 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
                any_reordered |= apply_vir_schedule(p, blk, last_entry,
                                                    lat.order, lat.count, defs,
                                                    pub_defs, &liveness,
-                                                   work_live, live_words);
+                                                   work_live, live_words,
+                                                   sparse_clear);
                committed = true;
             }
          }
@@ -3556,8 +3854,9 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
          void *pres_ctx = ralloc_context(blk_ctx);
          struct vir_sched_result pres = run_block_schedule_attempt(
             p, defs, pub_defs, val_max_gpr, first_body, first_tail,
-            live_after_body, work_live, live_bytes, base_all, base_64, base_16,
-            false, INT32_MAX, last_write, pres_ctx, NULL, NULL);
+            live_after_body, live_after_sparse, work_live, live_bytes,
+            base_all, base_64, base_16, false, INT32_MAX, last_write,
+            pres_ctx, NULL, NULL);
 
          if (pres.valid &&
              bank_limits_respected(pres.max_64, pres.max_16, orig_64, orig_16) &&
@@ -3566,7 +3865,7 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
             any_reordered |= apply_vir_schedule(p, blk, last_entry, pres.order,
                                                 pres.count, defs, pub_defs,
                                                 &liveness, work_live,
-                                                live_words);
+                                                live_words, sparse_clear);
          }
          ralloc_free(pres_ctx);
       }

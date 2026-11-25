@@ -3489,15 +3489,27 @@ hk_lower_explicit_io_nuw(nir_shader *nir, nir_variable_mode mode,
                if (!d) {
                   safe = false;
                } else if (nir_deref_mode_may_be(d, mode)) {
-                  if (!hk_deref_chain_is_nonneg_root(d, mode)) {
+                  if (!hk_deref_chain_is_nonneg_root(d, mode) ||
+                      (nir_intrinsic_access(intr) & ACCESS_CAN_SPECULATE) ||
+                      d->instr.block != block) {
                      safe = false;
-                  } else if (!(nir_intrinsic_access(intr) & ACCESS_CAN_SPECULATE)) {
+                  } else {
                      while (d && nir_deref_mode_is(d, mode) &&
                             d->instr.block == block &&
                             deref_seg[d->def.index] == seg) {
                         d->instr.pass_flags |= 0x2;
                         d = nir_deref_instr_parent(d);
                      }
+                  }
+               }
+            } else {
+               const unsigned num_srcs =
+                  nir_intrinsic_infos[intr->intrinsic].num_srcs;
+               for (unsigned s = 0; s < num_srcs; ++s) {
+                  nir_deref_instr *d = nir_src_as_deref(intr->src[s]);
+                  if (d && nir_deref_mode_may_be(d, mode)) {
+                     safe = false;
+                     break;
                   }
                }
             }

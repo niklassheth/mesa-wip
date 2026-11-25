@@ -6503,6 +6503,7 @@ TEST(Apple9Compiler, DirectLoopBreakDeferredExitWithLiveValuesValidates)
    ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, nullptr, &reason))
       << (reason ?: "");
    const uint8_t loop_update_keep_true[] = {0x8f, 0x04, 0x54, 0x02};
+   const uint8_t jmp_exec_any[] = {0x0f, 0x00, 0x54};
    const uint8_t loop_mask_pop[] = {0x0f, 0x06, 0x04, 0x02, 0x00, 0x00};
    const uint8_t unwind[] = {0x8f, 0x05, 0x54};
    EXPECT_EQ(apple9_binary_count_sequence(&compiled, loop_update_keep_true,
@@ -6512,6 +6513,27 @@ TEST(Apple9Compiler, DirectLoopBreakDeferredExitWithLiveValuesValidates)
                                           sizeof(loop_mask_pop)),
              1u);
    EXPECT_EQ(apple9_binary_count_sequence(&compiled, unwind, sizeof(unwind)), 0u);
+   /* Verify LOOP_MASK_POP is placed immediately at the loop-exit landing pad
+    * right after the backedge JMP_EXEC_ANY (10B) so no exit-edge copy or
+    * post-loop consumer executes while exiting lanes are still masked off. */
+   const uint8_t *bin = static_cast<const uint8_t *>(compiled.binary);
+   size_t backedge_off = SIZE_MAX;
+   size_t pop_off = SIZE_MAX;
+   for (size_t off = 0; off + sizeof(jmp_exec_any) <= compiled.info.binary_size; ++off) {
+      if (memcmp(bin + off, jmp_exec_any, sizeof(jmp_exec_any)) == 0)
+         backedge_off = off;
+   }
+   for (size_t off = 0; off + sizeof(loop_mask_pop) <= compiled.info.binary_size; ++off) {
+      if (memcmp(bin + off, loop_mask_pop, sizeof(loop_mask_pop)) == 0) {
+         pop_off = off;
+         break;
+      }
+   }
+   ASSERT_NE(backedge_off, SIZE_MAX);
+   ASSERT_NE(pop_off, SIZE_MAX);
+   EXPECT_EQ(pop_off, backedge_off + 10u)
+      << "LOOP_MASK_POP must immediately follow the 10B backedge before any exit-edge copies";
+   EXPECT_LT(pop_off + sizeof(loop_mask_pop), compiled.info.binary_size);
    free(compiled.binary);
    ralloc_free(b.shader);
 }

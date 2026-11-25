@@ -182,12 +182,12 @@ emit_repair_phi(struct repair_ctx *ctx, struct agx_apple9_block *block,
    if (!is_mem && orig_var < ctx->n && ctx->program->max_phys)
       ctx->program->max_phys[val] = ctx->program->max_phys[orig_var];
 
-   struct agx_apple9_vir_instr *first_non_prefix =
-      repair_block(ctx, block)->first_non_prefix;
-   if (first_non_prefix)
-      agx_apple9_vir_move_before(ctx->program, phi, first_non_prefix);
+   struct repair_block *rb = repair_block(ctx, block);
+   if (rb->first_non_prefix)
+      agx_apple9_vir_move_before(ctx->program, phi, rb->first_non_prefix);
    else
       agx_apple9_vir_move_to_block_start(ctx->program, phi, block);
+   rb->first_non_prefix = phi;
    _mesa_hash_table_insert(ctx->created_phis, phi, phi);
    *val_out = val;
    return phi;
@@ -690,6 +690,7 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
    free(remap);
    free(has_def);
    free(referenced);
+   agx_apple9_invalidate_uses(program);
    agx_apple9_vir_ensure_indexed(program);
    return true;
 }

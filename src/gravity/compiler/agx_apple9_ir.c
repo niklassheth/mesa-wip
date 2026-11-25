@@ -2756,17 +2756,19 @@ agx_apple9_vir_values_form_tuple(const struct agx_apple9_vir_program *program,
    if (components < 2 || components > 4)
       return false;
 
-   for (unsigned i = 0; i < program->instruction_count; ++i) {
-      const struct agx_apple9_vir_instr *instruction =
-         program->instructions[i];
-      if (instruction->dest != values[0] ||
-          instruction->dest_components != components)
-         continue;
+   for (const struct agx_apple9_block *blk = program->blocks; blk; blk = blk->next) {
+      for (const struct agx_apple9_vir_instr *instruction =
+              agx_apple9_block_first_instr(blk);
+           instruction; instruction = agx_apple9_instr_next(instruction)) {
+         if (instruction->dest != values[0] ||
+             instruction->dest_components != components)
+            continue;
 
-      bool exact = true;
-      for (unsigned c = 0; c < components; ++c)
-         exact &= values[c] == instruction->dest + c;
-      return exact;
+         bool exact = true;
+         for (unsigned c = 0; c < components; ++c)
+            exact &= values[c] == instruction->dest + c;
+         return exact;
+      }
    }
 
    return false;
@@ -2996,7 +2998,7 @@ agx_apple9_vir_emit_device_atomic(
 }
 
 /* The load setters below find a value's single definition, normally the
- * instruction just selected, so they search from the end of the program. */
+ * instruction just selected, so they search backwards across blocks. */
 bool
 agx_apple9_vir_set_device_load_contract(
    struct agx_apple9_vir_program *program, uint32_t value, uint8_t flags,
@@ -3006,18 +3008,21 @@ agx_apple9_vir_set_device_load_contract(
       if (flags & ~AGX_APPLE9_DEVICE_LOAD_HAS_NEXT)
          return false;
 
-      for (unsigned i = program->instruction_count; i-- > 0;) {
-         struct agx_apple9_vir_instr *instruction = program->instructions[i];
-         if (instruction->dest != value)
-            continue;
-         if (instruction->op != AGX_APPLE9_VIR_DEVICE_LOAD)
-            return false;
+      for (struct agx_apple9_block *blk = program->last_block; blk; blk = blk->prev) {
+         for (struct agx_apple9_vir_instr *instruction =
+                 agx_apple9_block_last_instr(blk);
+              instruction; instruction = agx_apple9_instr_prev(instruction)) {
+            if (instruction->dest != value)
+               continue;
+            if (instruction->op != AGX_APPLE9_VIR_DEVICE_LOAD)
+               return false;
 
-         instruction->device_load_flags = flags;
-         instruction->device_load_raw_token = 0;
-         instruction->producer_scoreboard_slot =
-            AGX_APPLE9_SCOREBOARD_SLOT_AUTO;
-         return true;
+            instruction->device_load_flags = flags;
+            instruction->device_load_raw_token = 0;
+            instruction->producer_scoreboard_slot =
+               AGX_APPLE9_SCOREBOARD_SLOT_AUTO;
+            return true;
+         }
       }
 
       return false;
@@ -3041,17 +3046,20 @@ agx_apple9_vir_set_device_load_raw_contract(
        !apple9_scalar_load_slot_for_token(raw_token, &scoreboard_slot))
       return false;
 
-   for (unsigned i = program->instruction_count; i-- > 0;) {
-      struct agx_apple9_vir_instr *instruction = program->instructions[i];
-      if (instruction->dest != value)
-         continue;
-      if (instruction->op != AGX_APPLE9_VIR_DEVICE_LOAD)
-         return false;
+   for (struct agx_apple9_block *blk = program->last_block; blk; blk = blk->prev) {
+      for (struct agx_apple9_vir_instr *instruction =
+              agx_apple9_block_last_instr(blk);
+           instruction; instruction = agx_apple9_instr_prev(instruction)) {
+         if (instruction->dest != value)
+            continue;
+         if (instruction->op != AGX_APPLE9_VIR_DEVICE_LOAD)
+            return false;
 
-      instruction->device_load_flags = flags;
-      instruction->device_load_raw_token = raw_token;
-      instruction->producer_scoreboard_slot = scoreboard_slot;
-      return true;
+         instruction->device_load_flags = flags;
+         instruction->device_load_raw_token = raw_token;
+         instruction->producer_scoreboard_slot = scoreboard_slot;
+         return true;
+      }
    }
 
    return false;
@@ -3063,20 +3071,22 @@ agx_apple9_vir_set_load_address(struct agx_apple9_vir_program *program,
 {
    if (address >= program->value_count || address + 1 >= program->value_count)
       return false;
-   for (unsigned i = program->instruction_count; i-- > 0;) {
-      struct agx_apple9_vir_instr *load = program->instructions[i];
-      if (load->dest != value || load->op != AGX_APPLE9_VIR_DEVICE_LOAD)
-         continue;
-      if (load->encoding != AGX_APPLE9_ENC_DEVICE_LOAD || load->nr_srcs != 1)
-         return false;
-      agx_apple9_invalidate_uses(program);
-      load->encoding = AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT;
-      load->nr_srcs = 3;
-      load->src[1] = address;
-      load->src[2] = address + 1;
-      load->immediate = 0;
-      load->memory_global = true;
-      return true;
+   for (struct agx_apple9_block *blk = program->last_block; blk; blk = blk->prev) {
+      for (struct agx_apple9_vir_instr *load = agx_apple9_block_last_instr(blk);
+           load; load = agx_apple9_instr_prev(load)) {
+         if (load->dest != value || load->op != AGX_APPLE9_VIR_DEVICE_LOAD)
+            continue;
+         if (load->encoding != AGX_APPLE9_ENC_DEVICE_LOAD || load->nr_srcs != 1)
+            return false;
+         agx_apple9_invalidate_uses(program);
+         load->encoding = AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT;
+         load->nr_srcs = 3;
+         load->src[1] = address;
+         load->src[2] = address + 1;
+         load->immediate = 0;
+         load->memory_global = true;
+         return true;
+      }
    }
    return false;
 }
@@ -3090,19 +3100,22 @@ agx_apple9_vir_set_device_load_index_kind(
        index_kind != AGX_APPLE9_DEVICE_LOAD_INDEX_LAST_USE_GPR)
       return false;
 
-   for (unsigned i = program->instruction_count; i-- > 0;) {
-      struct agx_apple9_vir_instr *instruction = program->instructions[i];
-      if (instruction->dest != value)
-         continue;
-      if (instruction->op != AGX_APPLE9_VIR_DEVICE_LOAD)
-         return false;
-      if ((instruction->encoding != AGX_APPLE9_ENC_DEVICE_LOAD &&
-           instruction->encoding != AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT) ||
-          (instruction->nr_srcs != 1 && instruction->nr_srcs != 3)) {
-         return false;
+   for (struct agx_apple9_block *blk = program->last_block; blk; blk = blk->prev) {
+      for (struct agx_apple9_vir_instr *instruction =
+              agx_apple9_block_last_instr(blk);
+           instruction; instruction = agx_apple9_instr_prev(instruction)) {
+         if (instruction->dest != value)
+            continue;
+         if (instruction->op != AGX_APPLE9_VIR_DEVICE_LOAD)
+            return false;
+         if ((instruction->encoding != AGX_APPLE9_ENC_DEVICE_LOAD &&
+              instruction->encoding != AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT) ||
+             (instruction->nr_srcs != 1 && instruction->nr_srcs != 3)) {
+            return false;
+         }
+         instruction->device_load_index_kind = index_kind;
+         return true;
       }
-      instruction->device_load_index_kind = index_kind;
-      return true;
    }
 
    return false;
@@ -3513,41 +3526,67 @@ bool
 agx_apple9_validate_mesh_control(const struct agx_apple9_vir_program *program,
                                 const char **reason)
 {
-   unsigned control = UINT_MAX;
+   const struct agx_apple9_vir_instr *control_ins = NULL;
+   const struct agx_apple9_block *control_blk = NULL;
    const char *error = NULL;
-   for (unsigned i = 0; i < program->instruction_count; ++i) {
-      const struct agx_apple9_vir_instr *ins = program->instructions[i];
-      if (ins->op != AGX_APPLE9_VIR_MESH_CONTROL)
-         continue;
-      if (control != UINT_MAX) {
-         error = "Apple9 multiple MESH_CONTROL instructions are unsafe";
+   for (const struct agx_apple9_block *blk = program->blocks; blk; blk = blk->next) {
+      for (const struct agx_apple9_vir_instr *ins =
+              agx_apple9_block_first_instr(blk);
+           ins; ins = agx_apple9_instr_next(ins)) {
+         if (ins->op != AGX_APPLE9_VIR_MESH_CONTROL)
+            continue;
+         if (control_ins != NULL) {
+            error = "Apple9 multiple MESH_CONTROL instructions are unsafe";
+            goto fail;
+         }
+         control_ins = ins;
+         control_blk = blk;
+         const nir_block *nir = blk->nir;
+         for (const nir_cf_node *parent = nir ? nir->cf_node.parent : NULL;
+              parent; parent = parent->parent) {
+            if (parent->type == nir_cf_node_loop) {
+               error = "Apple9 MESH_CONTROL inside a loop is unsafe";
+               goto fail;
+            }
+         }
+      }
+   }
+
+   if (control_ins == NULL)
+      return true;
+
+   /* Also cover directly authored VIR and physical blocks without NIR
+    * ancestry. A backward branch may repeat every instruction in its span. */
+   struct set *prefix_blocks = _mesa_pointer_set_create(NULL);
+   if (!prefix_blocks) {
+      error = "out of memory validating Apple9 MESH_CONTROL";
+      goto fail;
+   }
+   for (const struct agx_apple9_block *b = program->blocks; b; b = b->next) {
+      if (!_mesa_set_add(prefix_blocks, b)) {
+         _mesa_set_destroy(prefix_blocks, NULL);
+         error = "out of memory validating Apple9 MESH_CONTROL";
          goto fail;
       }
-      control = i;
-      const nir_block *nir = agx_apple9_instr_block(ins)->nir;
-      for (const nir_cf_node *parent = nir ? nir->cf_node.parent : NULL;
-           parent; parent = parent->parent) {
-         if (parent->type == nir_cf_node_loop) {
+      if (b == control_blk)
+         break;
+   }
+   for (const struct agx_apple9_block *blk = control_blk; blk; blk = blk->next) {
+      const struct agx_apple9_vir_instr *start =
+         blk == control_blk ? control_ins : agx_apple9_block_first_instr(blk);
+      for (const struct agx_apple9_vir_instr *ins = start; ins;
+           ins = agx_apple9_instr_next(ins)) {
+         if ((ins->op == AGX_APPLE9_VIR_JMP_EXEC_ANY ||
+              ins->op == AGX_APPLE9_VIR_JMP_EXEC_NONE) &&
+             ins->branch_target &&
+             _mesa_set_search(prefix_blocks, ins->branch_target)) {
+            _mesa_set_destroy(prefix_blocks, NULL);
             error = "Apple9 MESH_CONTROL inside a loop is unsafe";
             goto fail;
          }
       }
    }
-
-   if (control == UINT_MAX)
-      return true;
-
-   /* Also cover directly authored VIR and physical blocks without NIR
-    * ancestry. A backward branch may repeat every instruction in its span. */
-   for (unsigned i = control; i < program->instruction_count; ++i) {
-      const struct agx_apple9_vir_instr *ins = program->instructions[i];
-      if ((ins->op == AGX_APPLE9_VIR_JMP_EXEC_ANY ||
-           ins->op == AGX_APPLE9_VIR_JMP_EXEC_NONE) &&
-          ins->branch_target && ins->branch_target->start_index <= control) {
-         error = "Apple9 MESH_CONTROL inside a loop is unsafe";
-         goto fail;
-      }
-   }
+   _mesa_set_destroy(prefix_blocks, NULL);
    return true;
 
 fail:

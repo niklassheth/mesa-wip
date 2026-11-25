@@ -1513,7 +1513,8 @@ apple9_ra_validate_post_ra(const struct agx_apple9_vir_program *program,
                            struct apple9_ra_validate_error *err)
 {
    clear_err(err);
-   assert(!program->index_dirty);
+   if (program)
+      assert(!program->index_dirty);
 
    struct agx_apple9_block **blocks = NULL;
    unsigned num_blocks = 0;

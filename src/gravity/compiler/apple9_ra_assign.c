@@ -2599,6 +2599,7 @@ struct a9_blk_split_rec {
 struct a9_blk_collect_index {
    struct a9_blk_use_node *use_nodes;
    unsigned use_count;
+   unsigned use_cap;
    struct a9_blk_use_node *kill_nodes;
    unsigned kill_count;
    unsigned kill_cap;
@@ -2625,18 +2626,21 @@ a9_is_bypassable_collect(const struct a9_ra_ctx *rctx,
           !a9_is_pub_val(rctx->program, ins->dest);
 }
 
-static inline void
+static inline bool
 a9_blk_collect_index_add_kill(struct a9_ra_ctx *rctx,
                               struct a9_blk_collect_index *cidx,
                               uint32_t orig_v,
                               struct agx_apple9_vir_instr *ins, uint32_t pos)
 {
    if (orig_v >= rctx->orig_vcount)
-      return;
+      return true;
    uint32_t tail = rctx->blk_kill_tail[orig_v];
    if (tail != UINT32_MAX && cidx->kill_nodes[tail].ins == ins)
-      return;
-   assert(cidx->kill_count < cidx->kill_cap);
+      return true;
+   if (cidx->kill_count >= cidx->kill_cap) {
+      rctx->error = "per-block VIR_COLLECT kill index overflow";
+      return false;
+   }
    uint32_t id = cidx->kill_count++;
    cidx->kill_nodes[id].ins = ins;
    cidx->kill_nodes[id].pos = pos;
@@ -2648,6 +2652,27 @@ a9_blk_collect_index_add_kill(struct a9_ra_ctx *rctx,
       cidx->touched_kill_vars[cidx->touched_kill_count++] = orig_v;
    }
    rctx->blk_kill_tail[orig_v] = id;
+   return true;
+}
+
+static void
+a9_blk_collect_index_finish(struct a9_ra_ctx *rctx,
+                            struct a9_blk_collect_index *cidx)
+{
+   if (!cidx->ctx)
+      return;
+   for (unsigned i = 0; i < cidx->touched_use_count; ++i) {
+      uint32_t v = cidx->touched_use_vars[i];
+      rctx->blk_use_head[v] = UINT32_MAX;
+      rctx->blk_use_tail[v] = UINT32_MAX;
+   }
+   for (unsigned i = 0; i < cidx->touched_kill_count; ++i) {
+      uint32_t v = cidx->touched_kill_vars[i];
+      rctx->blk_kill_head[v] = UINT32_MAX;
+      rctx->blk_kill_tail[v] = UINT32_MAX;
+   }
+   ralloc_free(cidx->ctx);
+   memset(cidx, 0, sizeof(*cidx));
 }
 
 static bool
@@ -2657,12 +2682,14 @@ a9_blk_collect_index_build(struct a9_ra_ctx *rctx,
 {
    memset(cidx, 0, sizeof(*cidx));
 
-   unsigned collect_count = 0;
-   unsigned total_srcs = 0;
-   unsigned total_kills = 0;
-   unsigned split_count = 0;
+   uint64_t collect_count = 0;
+   uint64_t total_srcs = 0;
+   uint64_t total_kills = 0;
+   uint64_t split_count = 0;
+   uint64_t instr_count = 0;
    for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(block);
         ins; ins = agx_apple9_instr_next(ins)) {
+      instr_count++;
       if (ins->op == AGX_APPLE9_VIR_PHI)
          continue;
       if (a9_is_bypassable_collect(rctx, ins))
@@ -2677,6 +2704,15 @@ a9_blk_collect_index_build(struct a9_ra_ctx *rctx,
 
    if (collect_count == 0)
       return true;
+
+   uint64_t use_cap64 = MAX2(total_srcs, (uint64_t)1);
+   uint64_t kill_cap64 = MAX2(total_kills + collect_count * 4ull, (uint64_t)1);
+   if (instr_count >= UINT32_MAX || use_cap64 >= UINT32_MAX ||
+       kill_cap64 >= UINT32_MAX || collect_count >= UINT32_MAX ||
+       split_count >= UINT32_MAX) {
+      rctx->error = "per-block VIR_COLLECT index count overflow";
+      return false;
+   }
 
    const unsigned ov = MAX2(rctx->orig_vcount, 1u);
    if (!rctx->blk_use_head) {
@@ -2696,19 +2732,22 @@ a9_blk_collect_index_build(struct a9_ra_ctx *rctx,
    }
 
    cidx->ctx = ralloc_context(rctx->memctx);
-   cidx->kill_cap = MAX2(total_kills + collect_count * 4u, 1u);
-   cidx->collect_count = collect_count;
-   cidx->split_count = split_count;
+   cidx->use_cap = (unsigned)use_cap64;
+   cidx->kill_cap = (unsigned)kill_cap64;
+   cidx->collect_count = (unsigned)collect_count;
+   cidx->split_count = (unsigned)split_count;
    if (cidx->ctx) {
       cidx->use_nodes =
-         ralloc_array(cidx->ctx, struct a9_blk_use_node, MAX2(total_srcs, 1u));
+         ralloc_array(cidx->ctx, struct a9_blk_use_node, cidx->use_cap);
       cidx->kill_nodes =
          ralloc_array(cidx->ctx, struct a9_blk_use_node, cidx->kill_cap);
       cidx->splits =
-         ralloc_array(cidx->ctx, struct a9_blk_split_rec, MAX2(split_count, 1u));
-      cidx->collect_pos = ralloc_array(cidx->ctx, uint32_t, collect_count);
+         ralloc_array(cidx->ctx, struct a9_blk_split_rec,
+                      MAX2(cidx->split_count, 1u));
+      cidx->collect_pos =
+         ralloc_array(cidx->ctx, uint32_t, cidx->collect_count);
       cidx->touched_use_vars =
-         ralloc_array(cidx->ctx, uint32_t, MAX2(total_srcs, 1u));
+         ralloc_array(cidx->ctx, uint32_t, cidx->use_cap);
       cidx->touched_kill_vars =
          ralloc_array(cidx->ctx, uint32_t, cidx->kill_cap);
    }
@@ -2745,6 +2784,11 @@ a9_blk_collect_index_build(struct a9_ra_ctx *rctx,
             continue;
          uint32_t utail = rctx->blk_use_tail[v];
          if (utail == UINT32_MAX || cidx->use_nodes[utail].ins != ins) {
+            if (cidx->use_count >= cidx->use_cap) {
+               a9_blk_collect_index_finish(rctx, cidx);
+               rctx->error = "per-block VIR_COLLECT use index overflow";
+               return false;
+            }
             uint32_t id = cidx->use_count++;
             cidx->use_nodes[id].ins = ins;
             cidx->use_nodes[id].pos = pos;
@@ -2757,33 +2801,17 @@ a9_blk_collect_index_build(struct a9_ra_ctx *rctx,
             }
             rctx->blk_use_tail[v] = id;
          }
-         if (s < AGX_APPLE9_MAX_VIR_SRCS && agx_apple9_vir_src_killed(ins, s))
-            a9_blk_collect_index_add_kill(rctx, cidx, v, ins, pos);
+         if (s < AGX_APPLE9_MAX_VIR_SRCS && agx_apple9_vir_src_killed(ins, s)) {
+            if (!a9_blk_collect_index_add_kill(rctx, cidx, v, ins, pos)) {
+               a9_blk_collect_index_finish(rctx, cidx);
+               return false;
+            }
+         }
       }
    }
-   assert(ci == collect_count);
-   assert(si == split_count);
+   assert(ci == cidx->collect_count);
+   assert(si == cidx->split_count);
    return true;
-}
-
-static void
-a9_blk_collect_index_finish(struct a9_ra_ctx *rctx,
-                            struct a9_blk_collect_index *cidx)
-{
-   if (!cidx->ctx)
-      return;
-   for (unsigned i = 0; i < cidx->touched_use_count; ++i) {
-      uint32_t v = cidx->touched_use_vars[i];
-      rctx->blk_use_head[v] = UINT32_MAX;
-      rctx->blk_use_tail[v] = UINT32_MAX;
-   }
-   for (unsigned i = 0; i < cidx->touched_kill_count; ++i) {
-      uint32_t v = cidx->touched_kill_vars[i];
-      rctx->blk_kill_head[v] = UINT32_MAX;
-      rctx->blk_kill_tail[v] = UINT32_MAX;
-   }
-   ralloc_free(cidx->ctx);
-   memset(cidx, 0, sizeof(*cidx));
 }
 
 static bool
@@ -3313,10 +3341,15 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                            if (a9_resolve_cur(rctx, agx_apple9_vir_src(u, s)) == sv)
                               agx_apple9_vir_set_src_killed(u, s, true);
                         }
-                        a9_blk_collect_index_add_kill(rctx, &cidx, orig_sv, u,
-                                                      upos);
+                        if (!a9_blk_collect_index_add_kill(rctx, &cidx, orig_sv,
+                                                           u, upos)) {
+                           step2_ok = false;
+                           break;
+                        }
                      }
                   }
+                  if (!step2_ok)
+                     break;
                }
 
                if (src_killed_here && !last_dest_use) {
@@ -3328,6 +3361,8 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                }
                a9_assign_gpr_val(rctx, dv, base_r + k);
             }
+            if (!step2_ok)
+               break;
             agx_apple9_vir_remove(rctx->program, ins);
             continue;
          }
