@@ -1762,6 +1762,25 @@ apple9_convert_vertex_channel(nir_builder *b, nir_def *value,
                                                  : nir_u2u32(b, value);
    }
    unsigned bits = ch->size;
+   if (ch->normalized && !ch->pure_integer && (bits == 8 || bits == 16) &&
+       (ch->type == UTIL_FORMAT_TYPE_UNSIGNED ||
+        ch->type == UTIL_FORMAT_TYPE_SIGNED)) {
+      /* Match the vectorized VTX_LOAD_ARRAY{8,16}_U32 paths and exact Vulkan
+       * normalized division (0 ULP) using native hardware unpack. */
+      nir_def *u = nir_u2u32(b, value);
+      if (bits == 8) {
+         return nir_channel(
+            b,
+            ch->type == UTIL_FORMAT_TYPE_SIGNED ? nir_unpack_snorm_4x8(b, u)
+                                                : nir_unpack_unorm_4x8(b, u),
+            0);
+      }
+      return nir_channel(
+         b,
+         ch->type == UTIL_FORMAT_TYPE_SIGNED ? nir_unpack_snorm_2x16(b, u)
+                                             : nir_unpack_unorm_2x16(b, u),
+         0);
+   }
    if (ch->type == UTIL_FORMAT_TYPE_SIGNED) {
       value = nir_i2f32(b, nir_i2i32(b, value));
       if (ch->normalized)

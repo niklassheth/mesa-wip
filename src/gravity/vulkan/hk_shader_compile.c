@@ -1925,7 +1925,7 @@ hk_apple9_gather_fs_var_read_mask(const nir_shader *fs, uint8_t mask[32])
             if (loc >= VARYING_SLOT_VAR0 && loc < VARYING_SLOT_VAR0 + 32) {
                unsigned comp = nir_intrinsic_component(intr);
                mask[loc - VARYING_SLOT_VAR0] |=
-                  BITFIELD_MASK(intr->def.num_components) << comp;
+                  (uint8_t)(nir_def_components_read(&intr->def) << comp);
             }
          }
       }
@@ -1985,8 +1985,28 @@ hk_apple9_native_tess_fused_check(struct hk_device *dev,
       .fs_reads_clip_distance = key->fs_reads_clip_distance,
       .has_fs_inputs_mask = has_fs_mask,
    };
-   if (has_fs_mask)
+   struct hk_apple9_graphics_key stage_key = *key;
+   if (has_fs_mask && fs_source && !key->vertex.use_prolog && !key->is_library) {
+      nir_shader *fs_norm = nir_shader_clone(NULL, fs_source);
+      if (!fs_norm) {
+         ralloc_free(vs_norm);
+         ralloc_free(tcs_norm);
+         ralloc_free(tes_norm);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      if (hk_nir_tess_fused_pack_vbo_varyings(vs_norm, tcs_norm, tes_norm,
+                                              fs_norm, &key->vertex)) {
+         stage_key.vertex.outputs_flat =
+            fs_norm->info.inputs_read &
+            ~(fs_norm->info.perspective_varyings |
+              fs_norm->info.linear_varyings);
+         stage_key.vertex.outputs_linear = fs_norm->info.linear_varyings;
+      }
+      hk_apple9_gather_fs_var_read_mask(fs_norm, opts.fs_var_read_mask);
+      ralloc_free(fs_norm);
+   } else if (has_fs_mask) {
       hk_apple9_gather_fs_var_read_mask(fs_source, opts.fs_var_read_mask);
+   }
 
    nir_shader *obj_nir = NULL, *mesh_nir = NULL;
    struct hk_tess_fused_info fused_info = {0};
@@ -2028,7 +2048,6 @@ hk_apple9_native_tess_fused_check(struct hk_device *dev,
       return VK_SUCCESS;
    }
 
-   struct hk_apple9_graphics_key stage_key = *key;
    stage_key.native_stage_generated = true;
    stage_key.native_tess_fused = true;
    stage_key.native_object = true;
@@ -2899,14 +2918,36 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
    }
 
    bool has_fragment = false;
+   nir_shader *vs_stage_nir = NULL;
    nir_shader *fs_stage_nir = NULL;
    uint32_t tes_next_stage_mask = 0;
    for (unsigned i = 0; i < count; ++i) {
-      if (infos[i].stage == MESA_SHADER_FRAGMENT) {
+      if (infos[i].stage == MESA_SHADER_VERTEX) {
+         vs_stage_nir = infos[i].nir;
+      } else if (infos[i].stage == MESA_SHADER_FRAGMENT) {
          has_fragment = true;
          fs_stage_nir = infos[i].nir;
       } else if (infos[i].stage == MESA_SHADER_TESS_EVAL) {
          tes_next_stage_mask = infos[i].next_stage_mask;
+      }
+   }
+   /* For monolithic fused tessellation pipelines with statically-known,
+    * non-dynamic vertex input formats, pack unmodified narrow normalized VBO
+    * passthrough varyings into single flat u32 varyings on the native clone
+    * only (leaving fallback NIR untouched and paired via pair_id). */
+   if (native_mesh && key.native_tess_fused && vs_stage_nir && tcs_nir &&
+       tes_nir && has_fragment && fs_stage_nir && state &&
+       !(state->pipeline_flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) &&
+       !key.is_library && state->vi &&
+       !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_VI) &&
+       !key.vertex.use_prolog) {
+      if (hk_nir_tess_fused_pack_vbo_varyings(
+             vs_stage_nir, tcs_nir, tes_nir, fs_stage_nir, &key.vertex)) {
+         key.vertex.outputs_flat =
+            fs_stage_nir->info.inputs_read &
+            ~(fs_stage_nir->info.perspective_varyings |
+              fs_stage_nir->info.linear_varyings);
+         key.vertex.outputs_linear = fs_stage_nir->info.linear_varyings;
       }
    }
    if (has_fragment) {

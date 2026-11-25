@@ -1346,6 +1346,377 @@ fused_tess_suite(void)
 }
 
 static uint32_t
+f32_bits(float v)
+{
+   uint32_t u;
+   memcpy(&u, &v, sizeof(u));
+   return u;
+}
+
+static void
+fused_tess_vbo_pack_suite(void)
+{
+   /* 1. Exhaustive 0-ULP bit-exactness check for UNORM8, SNORM8, UNORM16,
+    *    SNORM16 roundtrip through pack/unpack_{u,s}norm_{4x8,2x16}. */
+   for (unsigned u = 0; u < 256; ++u) {
+      float f = (float)u / 255.0f;
+      unsigned packed = (unsigned)lrintf(fminf(fmaxf(f, 0.0f), 1.0f) * 255.0f);
+      CHECK(packed == u);
+      CHECK(f32_bits((float)packed / 255.0f) == f32_bits(f));
+
+      int8_t s = (int8_t)u;
+      float sf = fmaxf((float)s / 127.0f, -1.0f);
+      int spacked = (int)lrintf(fminf(fmaxf(sf, -1.0f), 1.0f) * 127.0f);
+      float sunpacked = fmaxf((float)spacked / 127.0f, -1.0f);
+      CHECK(f32_bits(sunpacked) == f32_bits(sf));
+   }
+   for (unsigned u = 0; u < 65536; ++u) {
+      float f = (float)u / 65535.0f;
+      unsigned packed = (unsigned)lrintf(fminf(fmaxf(f, 0.0f), 1.0f) * 65535.0f);
+      CHECK(packed == u);
+      CHECK(f32_bits((float)packed / 65535.0f) == f32_bits(f));
+
+      int16_t s = (int16_t)u;
+      float sf = fmaxf((float)s / 32767.0f, -1.0f);
+      int spacked = (int)lrintf(fminf(fmaxf(sf, -1.0f), 1.0f) * 32767.0f);
+      float sunpacked = fmaxf((float)spacked / 32767.0f, -1.0f);
+      CHECK(f32_bits(sunpacked) == f32_bits(sf));
+   }
+
+   /* 2. Full vec4, partial .xyz mask, swizzled B8G8R8A8_UNORM/SNORM,
+    *    cross-slot split components, TCS self-RMW chain, and R16G16_UNORM:
+    *    verify plane reduction, flat u32 packing, and TCS payload compaction. */
+   const enum pipe_format fmts[] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_B8G8R8A8_UNORM,
+      PIPE_FORMAT_R8G8B8A8_SNORM,
+      PIPE_FORMAT_B8G8R8A8_SNORM,
+   };
+   for (unsigned fi = 0; fi < ARRAY_SIZE(fmts); ++fi) {
+      /* Build VS: attr 0 (float4 pos), attr 1..3 (narrow norm vec4), attr 4 (R16G16_UNORM).
+       * Also split attr 1.zw + attr 2.xy across VAR1/VAR2 like nir_opt_varyings_bulk. */
+      nir_builder vb = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "vbo_pack_vs");
+      vb.shader->info.io_lowered = true;
+      nir_def *z = nir_imm_int(&vb, 0);
+      nir_def *p = nir_load_input(
+         &vb, 4, 32, z, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VERT_ATTRIB_GENERIC0, .num_slots = 1});
+      nir_store_output(
+         &vb, p, z, .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_def *a1 = nir_load_input(
+         &vb, 4, 32, z, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VERT_ATTRIB_GENERIC1, .num_slots = 1});
+      nir_def *a2 = nir_load_input(
+         &vb, 4, 32, z, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VERT_ATTRIB_GENERIC2, .num_slots = 1});
+      nir_def *a3 = nir_load_input(
+         &vb, 4, 32, z, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VERT_ATTRIB_GENERIC3, .num_slots = 1});
+      nir_def *a4 = nir_load_input(
+         &vb, 2, 32, z, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VERT_ATTRIB_GENERIC4, .num_slots = 1});
+      nir_store_output(
+         &vb, a1, z, .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_store_output(
+         &vb, a2, z, .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1});
+      nir_store_output(
+         &vb, a3, z, .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR2, .num_slots = 1});
+      nir_store_output(
+         &vb, a4, z, .write_mask = 0x3, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR3, .num_slots = 1});
+      nir_shader_gather_info(vb.shader, nir_shader_get_entrypoint(vb.shader));
+
+      /* Build TCS (pcp=1) with an identity self-RMW chain on VAR0. */
+      nir_builder cb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "vbo_pack_tcs");
+      cb.shader->info.io_lowered = true;
+      cb.shader->info.tess.tcs_vertices_out = 1;
+      nir_def *inv = nir_load_invocation_id(&cb);
+      nir_def *cz = nir_imm_int(&cb, 0);
+      nir_def *cp = nir_load_per_vertex_input(
+         &cb, 4, 32, inv, cz, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &cb, cp, inv, cz, .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_def *c0 = nir_load_per_vertex_input(
+         &cb, 4, 32, inv, cz, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &cb, nir_channel(&cb, c0, 0), inv, cz, .component = 0, .write_mask = 1,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_def *c0_old = nir_load_per_vertex_output(
+         &cb, 1, 32, inv, cz, .component = 0, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_def *c0_rmw = nir_vec4(&cb, c0_old, nir_channel(&cb, c0, 1),
+                                 nir_channel(&cb, c0, 2), nir_channel(&cb, c0, 3));
+      nir_store_per_vertex_output(
+         &cb, c0_rmw, inv, cz, .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      for (unsigned s = 1; s <= 3; ++s) {
+         unsigned nch = s == 3 ? 2 : 4;
+         nir_def *v = nir_load_per_vertex_input(
+            &cb, nch, 32, inv, cz, .dest_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_VAR0 + s, .num_slots = 1});
+         nir_store_per_vertex_output(
+            &cb, v, inv, cz, .write_mask = BITFIELD_MASK(nch),
+            .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_VAR0 + s, .num_slots = 1});
+      }
+      nir_push_if(&cb, nir_ieq_imm(&cb, inv, 0));
+      nir_store_output(
+         &cb, nir_imm_vec4(&cb, 1.0f, 1.0f, 1.0f, 1.0f), cz, .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+      nir_store_output(
+         &cb, nir_imm_vec2(&cb, 1.0f, 1.0f), cz, .write_mask = 0x3,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+      nir_pop_if(&cb, NULL);
+      nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+
+      /* Build TES: VAR0 = (smooth_uv.xy, c0.xy) [mixed slot!], VAR1 = c0.zw+c1.xy,
+       * VAR2 = c1.zw+c2.xy, VAR3 = (c2.z, c3.xy, smooth_w) [partial + R16G16!]. */
+      nir_builder eb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_EVAL, &agx_nir_options, "vbo_pack_tes");
+      eb.shader->info.io_lowered = true;
+      eb.shader->info.tess._primitive_mode = TESS_PRIMITIVE_QUADS;
+      eb.shader->info.tess.spacing = TESS_SPACING_EQUAL;
+      nir_def *ez = nir_imm_int(&eb, 0);
+      nir_def *tc = nir_load_tess_coord(&eb);
+      nir_def *ep = nir_load_per_vertex_input(
+         &eb, 4, 32, ez, ez, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_output(
+         &eb, nir_fadd(&eb, ep, nir_vec4(&eb, nir_channel(&eb, tc, 0),
+                                         nir_channel(&eb, tc, 1),
+                                         nir_imm_float(&eb, 0), nir_imm_float(&eb, 0))),
+         ez, .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_def *e0 = nir_load_per_vertex_input(
+         &eb, 4, 32, ez, ez, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_def *e1 = nir_load_per_vertex_input(
+         &eb, 4, 32, ez, ez, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1});
+      nir_def *e2 = nir_load_per_vertex_input(
+         &eb, 4, 32, ez, ez, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR2, .num_slots = 1});
+      nir_def *e3 = nir_load_per_vertex_input(
+         &eb, 2, 32, ez, ez, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR3, .num_slots = 1});
+      /* VAR0 = (tc.x, tc.y, e0.x, e0.y) */
+      nir_store_output(
+         &eb, nir_vec4(&eb, nir_channel(&eb, tc, 0), nir_channel(&eb, tc, 1),
+                       nir_channel(&eb, e0, 0), nir_channel(&eb, e0, 1)),
+         ez, .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      /* VAR1 = (e0.z, e0.w, e1.x, e1.y) */
+      nir_store_output(
+         &eb, nir_vec4(&eb, nir_channel(&eb, e0, 2), nir_channel(&eb, e0, 3),
+                       nir_channel(&eb, e1, 0), nir_channel(&eb, e1, 1)),
+         ez, .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1});
+      /* VAR2 = (e1.z, e1.w, e2.x, e2.y) */
+      nir_store_output(
+         &eb, nir_vec4(&eb, nir_channel(&eb, e1, 2), nir_channel(&eb, e1, 3),
+                       nir_channel(&eb, e2, 0), nir_channel(&eb, e2, 1)),
+         ez, .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR2, .num_slots = 1});
+      /* VAR3 = (e2.z, e3.x, e3.y, tc.x) -> 11 UNORM8/SNORM8 total + 2 UNORM16 + 3 smooth */
+      nir_store_output(
+         &eb, nir_vec4(&eb, nir_channel(&eb, e2, 2), nir_channel(&eb, e3, 0),
+                       nir_channel(&eb, e3, 1), nir_channel(&eb, tc, 0)),
+         ez, .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR3, .num_slots = 1});
+      nir_shader_gather_info(eb.shader, nir_shader_get_entrypoint(eb.shader));
+
+      /* Build FS reading all 16 components across VAR0..VAR3 as smooth float32. */
+      nir_builder fb = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "vbo_pack_fs");
+      fb.shader->info.io_lowered = true;
+      nir_def *bary = nir_load_barycentric_pixel(&fb, 32, .interp_mode = INTERP_MODE_SMOOTH);
+      nir_def *sum = nir_imm_vec4(&fb, 0, 0, 0, 0);
+      for (unsigned s = 0; s < 4; ++s) {
+         nir_def *v = nir_load_interpolated_input(
+            &fb, 4, 32, bary, nir_imm_int(&fb, 0), .dest_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_VAR0 + s, .num_slots = 1});
+         sum = nir_fadd(&fb, sum, v);
+      }
+      nir_store_output(
+         &fb, sum, nir_imm_int(&fb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = FRAG_RESULT_DATA0, .num_slots = 1});
+      nir_shader_gather_info(fb.shader, nir_shader_get_entrypoint(fb.shader));
+
+      struct agx_apple9_vertex_layout vlayout = {
+         .buffer_descriptor_ubo = HK_APPLE9_VERTEX_BUFFERS_BINDING,
+         .draw_params_ubo = HK_APPLE9_DRAW_PARAMS_BINDING,
+         .dynamic_stride = true,
+      };
+      vlayout.format[0] = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      vlayout.format[1] = fmts[fi];
+      vlayout.format[2] = fmts[fi];
+      vlayout.format[3] = fmts[fi];
+      vlayout.format[4] = PIPE_FORMAT_R16G16_UNORM;
+
+      /* Dynamic VI (use_prolog = true) MUST reject cleanly without mutating NIR. */
+      struct agx_apple9_vertex_layout dyn_vlayout = vlayout;
+      dyn_vlayout.use_prolog = true;
+      CHECK(!hk_nir_tess_fused_pack_vbo_varyings(
+         vb.shader, cb.shader, eb.shader, fb.shader, &dyn_vlayout));
+
+      /* Static VI packs 11 8-bit norms -> 3 flat u32 + 2 16-bit norms -> 1 flat u32!
+       * Total live varyings drop from 16 smooth -> 3 smooth + 4 flat = 7 (saving 9!). */
+      CHECK(hk_nir_tess_fused_pack_vbo_varyings(
+         vb.shader, cb.shader, eb.shader, fb.shader, &vlayout));
+      nir_validate_shader(vb.shader, "vbo_pack_vs");
+      nir_validate_shader(cb.shader, "vbo_pack_tcs");
+      nir_validate_shader(eb.shader, "vbo_pack_tes");
+      nir_validate_shader(fb.shader, "vbo_pack_fs");
+
+      /* Verify TES + FS compile cleanly and live varying count dropped by 9. */
+      struct hk_tess_fused_options opts = {
+         .vertex = vlayout,
+         .max_payload_bytes = 1024,
+         .has_fs_inputs_mask = true,
+      };
+      nir_foreach_block(blk, nir_shader_get_entrypoint(fb.shader)) {
+         nir_foreach_instr(ins, blk) {
+            if (ins->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(ins);
+            if (intr->intrinsic != nir_intrinsic_load_input &&
+                intr->intrinsic != nir_intrinsic_load_interpolated_input)
+               continue;
+            unsigned loc = nir_intrinsic_io_semantics(intr).location;
+            if (loc >= VARYING_SLOT_VAR0 && loc < VARYING_SLOT_VAR0 + 32)
+               opts.fs_var_read_mask[loc - VARYING_SLOT_VAR0] |=
+                  (uint8_t)(nir_def_components_read(&intr->def) <<
+                            nir_intrinsic_component(intr));
+         }
+      }
+      unsigned live_fs_scalars = 0;
+      for (unsigned s = 0; s < 32; ++s)
+         live_fs_scalars += util_bitcount(opts.fs_var_read_mask[s]);
+      CHECK(live_fs_scalars == 7u);
+
+      nir_shader *obj = NULL, *mesh = NULL;
+      struct hk_tess_fused_info info = {0};
+      const char *reason = NULL;
+      CHECK(hk_nir_tess_fused_lower(vb.shader, cb.shader, eb.shader, &opts,
+                                    &obj, &mesh, &info, &reason));
+      /* 4 POS + 7 varyings = 11 comps -> planes=12 -> V4/P2 (wg_rows=20, unbounded). */
+      CHECK(info.mesh_max_vertices == 4 && info.mesh_max_primitives == 2);
+      /* Exclusive R16G16_UNORM slot VAR3 was also compacted in TCS (2 floats -> 1 u32). */
+      ralloc_free(obj);
+      ralloc_free(mesh);
+      ralloc_free(vb.shader);
+      ralloc_free(cb.shader);
+      ralloc_free(eb.shader);
+      ralloc_free(fb.shader);
+   }
+
+   /* 3. Verify TCS->TES payload compaction shrinks payload_B by 12 B per exclusive vec4,
+    *    and verify float32 VBO passthrough is rejected cleanly. */
+   for (unsigned mode = 0; mode < 2; ++mode) {
+      bool is_unorm = (mode == 0);
+      nir_builder vb = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "vbo_pack_payload_vs");
+      vb.shader->info.io_lowered = true;
+      nir_def *a0 = nir_load_input(
+         &vb, 4, 32, nir_imm_int(&vb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VERT_ATTRIB_GENERIC0, .num_slots = 1});
+      nir_def *a1 = nir_load_input(
+         &vb, 4, 32, nir_imm_int(&vb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VERT_ATTRIB_GENERIC1, .num_slots = 1});
+      nir_store_output(&vb, a0, nir_imm_int(&vb, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_output(&vb, a1, nir_imm_int(&vb, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_shader_gather_info(vb.shader, nir_shader_get_entrypoint(vb.shader));
+
+      nir_shader *tcs = make_fused_tcs(1, 1, 1.0f, 1.0f, false, false, false,
+                                       TESS_SPACING_EQUAL, false, false);
+
+      nir_builder eb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_EVAL, &agx_nir_options, "vbo_pack_payload_tes");
+      eb.shader->info.io_lowered = true;
+      eb.shader->info.tess._primitive_mode = TESS_PRIMITIVE_QUADS;
+      eb.shader->info.tess.spacing = TESS_SPACING_EQUAL;
+      nir_def *epos = nir_load_per_vertex_input(
+         &eb, 4, 32, nir_imm_int(&eb, 0), nir_imm_int(&eb, 0),
+         .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_def *ev0 = nir_load_per_vertex_input(
+         &eb, 4, 32, nir_imm_int(&eb, 0), nir_imm_int(&eb, 0),
+         .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_store_output(&eb, epos, nir_imm_int(&eb, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_output(&eb, ev0, nir_imm_int(&eb, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_shader_gather_info(eb.shader, nir_shader_get_entrypoint(eb.shader));
+
+      nir_builder fb = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "vbo_pack_payload_fs");
+      fb.shader->info.io_lowered = true;
+      nir_def *bary = nir_load_barycentric_pixel(&fb, 32, .interp_mode = INTERP_MODE_SMOOTH);
+      nir_def *v = nir_load_interpolated_input(
+         &fb, 4, 32, bary, nir_imm_int(&fb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_store_output(
+         &fb, v, nir_imm_int(&fb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = FRAG_RESULT_DATA0, .num_slots = 1});
+      nir_shader_gather_info(fb.shader, nir_shader_get_entrypoint(fb.shader));
+
+      struct agx_apple9_vertex_layout vl = {
+         .buffer_descriptor_ubo = HK_APPLE9_VERTEX_BUFFERS_BINDING,
+         .draw_params_ubo = HK_APPLE9_DRAW_PARAMS_BINDING,
+         .dynamic_stride = true,
+      };
+      vl.format[0] = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      vl.format[1] = is_unorm ? PIPE_FORMAT_R8G8B8A8_UNORM
+                              : PIPE_FORMAT_R32G32B32A32_FLOAT;
+
+      struct hk_tess_fused_options opts = {.vertex = vl, .max_payload_bytes = 1024};
+      struct hk_tess_fused_info before_info = {0}, after_info = {0};
+      CHECK(hk_nir_tess_fused_lower(vb.shader, tcs, eb.shader, &opts, NULL,
+                                    NULL, &before_info, NULL));
+      if (is_unorm) {
+         CHECK(hk_nir_tess_fused_pack_vbo_varyings(vb.shader, tcs, eb.shader,
+                                                   fb.shader, &vl));
+         CHECK(hk_nir_tess_fused_lower(vb.shader, tcs, eb.shader, &opts, NULL,
+                                       NULL, &after_info, NULL));
+         /* 40 B header + 16 B POS + 16 B VAR0 = 72 B (aligned 80 B) ->
+          * 40 B header + 16 B POS + 4 B packed VAR0 = 60 B (aligned 64 B). */
+         CHECK(after_info.payload_B < before_info.payload_B);
+         CHECK(before_info.payload_B - after_info.payload_B == 16u);
+      } else {
+         CHECK(!hk_nir_tess_fused_pack_vbo_varyings(vb.shader, tcs, eb.shader,
+                                                    fb.shader, &vl));
+      }
+      ralloc_free(vb.shader);
+      ralloc_free(tcs);
+      ralloc_free(eb.shader);
+      ralloc_free(fb.shader);
+   }
+
+   printf("fused tessellation VBO pack suite: 0-ULP exhaustive + 4 norm formats + payload compaction + rejections passed\n");
+}
+
+static uint32_t
 ref_stitch_i(uint32_t n_out, uint32_t n_in_seg, uint32_t t)
 {
    uint32_t total = n_out + n_in_seg;
@@ -1874,6 +2245,7 @@ main(void)
    rejections();
    levels();
    fused_tess_suite();
+   fused_tess_vbo_pack_suite();
    fused_tess_topology_suite();
    /* Consuming entrypoint lowers in place without a second clone and frees on reject. */
    {

@@ -20603,6 +20603,67 @@ TEST(Apple9Compiler, VertexInputVectorizesFormatsAndFoldsExactRoundtrip)
    ralloc_free(b.shader);
 }
 
+TEST(Apple9Compiler, ScalarNormalizedVertexFetchUsesExactUnpack)
+{
+   /* Scalar and unaligned 8/16-bit normalized vertex fetches must use native
+    * unpack_{u,s}norm_{4x8,2x16} so they match vectorized loads and exact
+    * Vulkan division at 0 ULP (no reciprocal-multiply 1-ULP drift). */
+   const struct {
+      enum pipe_format fmt;
+      nir_op expected_op;
+      unsigned offset;
+   } cases[] = {
+      {PIPE_FORMAT_R8_UNORM, nir_op_unpack_unorm_4x8, 0},
+      {PIPE_FORMAT_R8G8_SNORM, nir_op_unpack_snorm_4x8, 0},
+      {PIPE_FORMAT_R8G8B8A8_UNORM, nir_op_unpack_unorm_4x8, 1},
+      {PIPE_FORMAT_R16_UNORM, nir_op_unpack_unorm_2x16, 0},
+      {PIPE_FORMAT_R16G16B16_SNORM, nir_op_unpack_snorm_2x16, 0},
+   };
+   for (const auto &tc : cases) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "scalar_norm_vfetch");
+      nir_def *v = nir_load_input(
+         &b, 4, 32, nir_imm_int(&b, 0), .base = 0, .dest_type = nir_type_float32,
+         .io_semantics = {.location = VERT_ATTRIB_GENERIC0, .num_slots = 1});
+      nir_store_output(&b, v, nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      b.shader->info.io_lowered = true;
+
+      agx_apple9_vertex_layout layout = {};
+      layout.buffer_descriptor_ubo = 66;
+      layout.dynamic_stride = true;
+      layout.format[0] = tc.fmt;
+      layout.offset[0] = tc.offset;
+
+      nir_shader *check_nir = nir_shader_clone(NULL, b.shader);
+      ASSERT_TRUE(agx_nir_lower_apple9_vertex_inputs(check_nir, &layout, false));
+      unsigned unpack_cnt = 0, fmul_cnt = 0;
+      nir_foreach_block(blk, nir_shader_get_entrypoint(check_nir)) {
+         nir_foreach_instr(ins, blk) {
+            if (ins->type != nir_instr_type_alu)
+               continue;
+            nir_op op = nir_instr_as_alu(ins)->op;
+            if (op == tc.expected_op)
+               unpack_cnt++;
+            if (op == nir_op_fmul)
+               fmul_cnt++;
+         }
+      }
+      EXPECT_GT(unpack_cnt, 0u);
+      EXPECT_EQ(fmul_cnt, 0u);
+      ralloc_free(check_nir);
+
+      agx_shader_part compiled = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_vertex_inputs(b.shader, &layout, &compiled, &reason))
+         << (reason ?: "");
+      EXPECT_GT(compiled.info.binary_size, 0u);
+      free(compiled.binary);
+      ralloc_free(b.shader);
+   }
+}
+
 TEST(Apple9Compiler, ExactIntFloatRoundtripDoesNotFoldFull32Bit)
 {
    /* A full 32-bit uint can exceed 2^24 and round in f32: f2u32(u2f32(u32))

@@ -3591,3 +3591,854 @@ hk_nir_tess_fused_lower(const nir_shader *vs_source,
       ralloc_free(mesh);
    return true;
 }
+
+/* =========================================================================
+ * Bit-Exact 0-ULP Lossless Narrow-VBO Passthrough Varying Packing
+ *
+ * For monolithic fused tessellation pipelines whose vertex attribute formats
+ * are statically fixed (!vertex->use_prolog), identify TES->FS varyings whose
+ * live components are unmodified patch-constant passthroughs of narrow
+ * normalized VBO attributes (UNORM8/SNORM8, or 2-component UNORM16/SNORM16).
+ *
+ * Each qualifying TES->FS varying slot packs its 2..4 live float32 channels
+ * into a single flat uint32 varying via pack_{u,s}norm_{4x8,2x16} and unpacks
+ * identically in the paired native FS via unpack_{u,s}norm_{4x8,2x16} over
+ * existing 32-bit ITER_FLAT hardware (0-ULP roundtrip with hardware vertex
+ * input decode, handling arbitrary format/component swizzles and partial masks).
+ * When a packed slot's TCS->TES per-vertex slot is exclusively consumed by
+ * that pack, packing is hoisted into TCS so the 0xe0/0xe1 task payload shrinks
+ * by 12 B per packed vec4 as well.
+ * ========================================================================= */
+
+enum vbo_norm_kind {
+   VBO_NORM_NONE = 0,
+   VBO_NORM_UNORM8,
+   VBO_NORM_SNORM8,
+   VBO_NORM_UNORM16,
+   VBO_NORM_SNORM16,
+};
+
+static enum vbo_norm_kind
+classify_vbo_norm_format(enum pipe_format fmt)
+{
+   switch (fmt) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8_UNORM:
+   case PIPE_FORMAT_R8G8_UNORM:
+   case PIPE_FORMAT_R8_UNORM:
+      return VBO_NORM_UNORM8;
+   case PIPE_FORMAT_R8G8B8A8_SNORM:
+   case PIPE_FORMAT_B8G8R8A8_SNORM:
+   case PIPE_FORMAT_R8G8B8_SNORM:
+   case PIPE_FORMAT_R8G8_SNORM:
+   case PIPE_FORMAT_R8_SNORM:
+      return VBO_NORM_SNORM8;
+   case PIPE_FORMAT_R16G16_UNORM:
+   case PIPE_FORMAT_R16G16B16A16_UNORM:
+   case PIPE_FORMAT_R16G16B16_UNORM:
+   case PIPE_FORMAT_R16_UNORM:
+      return VBO_NORM_UNORM16;
+   case PIPE_FORMAT_R16G16_SNORM:
+   case PIPE_FORMAT_R16G16B16A16_SNORM:
+   case PIPE_FORMAT_R16G16B16_SNORM:
+   case PIPE_FORMAT_R16_SNORM:
+      return VBO_NORM_SNORM16;
+   default:
+      return VBO_NORM_NONE;
+   }
+}
+
+static bool
+is_load_invocation_id(nir_def *def)
+{
+   nir_scalar s = nir_scalar_resolved(def, 0);
+   return nir_def_instr(s.def)->type == nir_instr_type_intrinsic &&
+          nir_instr_as_intrinsic(nir_def_instr(s.def))->intrinsic ==
+             nir_intrinsic_load_invocation_id;
+}
+
+static bool
+is_same_tcs_vertex(nir_def *a, nir_def *b)
+{
+   if (a == b)
+      return true;
+   if (is_load_invocation_id(a) && is_load_invocation_id(b))
+      return true;
+   nir_scalar sa = nir_scalar_resolved(a, 0);
+   nir_scalar sb = nir_scalar_resolved(b, 0);
+   return nir_scalar_is_const(sa) && nir_scalar_is_const(sb) &&
+          nir_scalar_as_uint(sa) == nir_scalar_as_uint(sb);
+}
+
+static void
+gather_info_preserving_clip_cull(nir_shader *nir)
+{
+   unsigned clip = nir->info.clip_distance_array_size;
+   unsigned cull = nir->info.cull_distance_array_size;
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   nir->info.clip_distance_array_size = clip;
+   nir->info.cull_distance_array_size = cull;
+}
+
+static nir_def *
+emit_vbo_norm_pack_n(nir_builder *b, enum vbo_norm_kind kind, unsigned count,
+                     nir_def *vals[4])
+{
+   if (kind == VBO_NORM_UNORM8 || kind == VBO_NORM_SNORM8) {
+      assert(count >= 2 && count <= 4);
+      nir_def *ch[4];
+      for (unsigned c = 0; c < 4; ++c)
+         ch[c] = c < count ? vals[c] : nir_imm_float(b, 0.0f);
+      nir_def *v4 = nir_vec4(b, ch[0], ch[1], ch[2], ch[3]);
+      return kind == VBO_NORM_SNORM8 ? nir_pack_snorm_4x8(b, v4)
+                                     : nir_pack_unorm_4x8(b, v4);
+   }
+   assert(count == 2);
+   nir_def *v2 = nir_vec2(b, vals[0], vals[1]);
+   return kind == VBO_NORM_SNORM16 ? nir_pack_snorm_2x16(b, v2)
+                                   : nir_pack_unorm_2x16(b, v2);
+}
+
+struct tes_comp_origin {
+   bool valid;
+   bool is_patch;
+   enum vbo_norm_kind kind;
+   unsigned tcs_loc;
+   unsigned tcs_comp;
+   unsigned cp_idx;
+};
+
+struct vbo_pack_bucket {
+   enum vbo_norm_kind kind;
+   unsigned count; /* 2..4 for 8-bit norms, 2 for 16-bit norms */
+   unsigned src_var[4];
+   unsigned src_comp[4];
+   struct tes_comp_origin origin[4];
+   unsigned dst_var;  /* VARYING_SLOT_VAR0 + dst_var */
+   unsigned dst_comp; /* 0..3 */
+   nir_intrinsic_instr *pack_store;
+};
+
+struct comp_pack_ref {
+   bool packed;
+   unsigned bucket_idx;
+   unsigned lane; /* 0..3 within unpacked vec */
+};
+
+bool
+hk_nir_tess_fused_pack_vbo_varyings(
+   nir_shader *vs, nir_shader *tcs, nir_shader *tes, nir_shader *fs,
+   const struct agx_apple9_vertex_layout *vertex)
+{
+   if (!vs || !tcs || !tes || !fs || !vertex || vertex->use_prolog)
+      return false;
+   if (!vs->info.io_lowered || !tcs->info.io_lowered || !tes->info.io_lowered ||
+       !fs->info.io_lowered)
+      return false;
+
+   /* Narrow identity TCS self-RMW output stores (common in DXIL/SPIR-V)
+    * before tracing so per-component RMW chains collapse to direct VS->TCS
+    * passthroughs. */
+   if (narrow_tcs_rmw_stores(tcs)) {
+      NIR_PASS(_, tcs, nir_opt_dce);
+      NIR_PASS(_, tcs, nir_opt_copy_prop);
+      NIR_PASS(_, tcs, nir_opt_constant_folding);
+      NIR_PASS(_, tcs, nir_opt_dce);
+   }
+
+   /* 1. Trace VS outputs back to statically-typed narrow normalized VBO loads. */
+   enum vbo_norm_kind vs_kind[VARYING_SLOT_MAX][4] = {{VBO_NORM_NONE}};
+   bool vs_bad[VARYING_SLOT_MAX][4] = {{false}};
+   nir_foreach_block(block, nir_shader_get_entrypoint(vs)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_output)
+            continue;
+         if (!nir_src_is_const(intr->src[1]))
+            return false;
+         uint64_t loc = (uint64_t)nir_intrinsic_io_semantics(intr).location +
+                        nir_src_as_uint(intr->src[1]);
+         if (loc >= VARYING_SLOT_MAX)
+            continue;
+         unsigned comp = nir_intrinsic_component(intr);
+         unsigned wmask = nir_intrinsic_write_mask(intr);
+         u_foreach_bit(i, wmask) {
+            unsigned c = comp + i;
+            if (c >= 4)
+               continue;
+            enum vbo_norm_kind k = VBO_NORM_NONE;
+            if (intr->src[0].ssa->bit_size == 32 &&
+                nir_intrinsic_src_type(intr) == nir_type_float32) {
+               nir_scalar s = nir_scalar_resolved(intr->src[0].ssa, i);
+               nir_instr *def_i = nir_def_instr(s.def);
+               if (def_i->type == nir_instr_type_intrinsic) {
+                  nir_intrinsic_instr *ld = nir_instr_as_intrinsic(def_i);
+                  if (ld->intrinsic == nir_intrinsic_load_input &&
+                      ld->def.bit_size == 32 &&
+                      nir_intrinsic_dest_type(ld) == nir_type_float32 &&
+                      nir_src_is_const(ld->src[0]) &&
+                      nir_src_as_uint(ld->src[0]) == 0) {
+                     unsigned in_loc = nir_intrinsic_io_semantics(ld).location;
+                     if (in_loc >= VERT_ATTRIB_GENERIC0 &&
+                         in_loc < VERT_ATTRIB_GENERIC0 + 16) {
+                        unsigned attr = in_loc - VERT_ATTRIB_GENERIC0;
+                        k = classify_vbo_norm_format(vertex->format[attr]);
+                     }
+                  }
+               }
+            }
+            if (k == VBO_NORM_NONE) {
+               vs_bad[loc][c] = true;
+            } else if (vs_kind[loc][c] == VBO_NORM_NONE) {
+               vs_kind[loc][c] = k;
+            } else if (vs_kind[loc][c] != k) {
+               vs_bad[loc][c] = true;
+            }
+         }
+      }
+   }
+
+   /* 2. Propagate narrow normalized value domains across TCS passthroughs. */
+   enum vbo_norm_kind tcs_pv_kind[VARYING_SLOT_MAX][4] = {{VBO_NORM_NONE}};
+   bool tcs_pv_bad[VARYING_SLOT_MAX][4] = {{false}};
+   enum vbo_norm_kind tcs_patch_kind[VARYING_SLOT_MAX][4] = {{VBO_NORM_NONE}};
+   bool tcs_patch_bad[VARYING_SLOT_MAX][4] = {{false}};
+   bool tcs_reads_pv_out[VARYING_SLOT_MAX] = {false};
+
+   nir_foreach_block(block, nir_shader_get_entrypoint(tcs)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_per_vertex_output) {
+            nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+            if (!nir_src_is_const(intr->src[1])) {
+               for (unsigned s = 0; s < sem.num_slots; ++s)
+                  if (sem.location + s < VARYING_SLOT_MAX)
+                     tcs_reads_pv_out[sem.location + s] = true;
+            } else {
+               unsigned loc = sem.location + nir_src_as_uint(intr->src[1]);
+               if (loc < VARYING_SLOT_MAX)
+                  tcs_reads_pv_out[loc] = true;
+            }
+            continue;
+         }
+         if (intr->intrinsic != nir_intrinsic_store_per_vertex_output &&
+             intr->intrinsic != nir_intrinsic_store_output)
+            continue;
+         bool is_pv = intr->intrinsic == nir_intrinsic_store_per_vertex_output;
+         nir_src *off_src = is_pv ? &intr->src[2] : &intr->src[1];
+         if (!nir_src_is_const(*off_src))
+            return false;
+         uint64_t loc = (uint64_t)nir_intrinsic_io_semantics(intr).location +
+                        nir_src_as_uint(*off_src);
+         if (loc >= VARYING_SLOT_MAX)
+            continue;
+         bool vtx_ok = !is_pv || is_load_invocation_id(intr->src[1].ssa) ||
+                       nir_src_is_const(intr->src[1]);
+         unsigned comp = nir_intrinsic_component(intr);
+         unsigned wmask = nir_intrinsic_write_mask(intr);
+         enum vbo_norm_kind (*dst_kind)[4] = is_pv ? tcs_pv_kind : tcs_patch_kind;
+         bool (*dst_bad)[4] = is_pv ? tcs_pv_bad : tcs_patch_bad;
+         u_foreach_bit(i, wmask) {
+            unsigned c = comp + i;
+            if (c >= 4)
+               continue;
+            enum vbo_norm_kind k = VBO_NORM_NONE;
+            if (vtx_ok && intr->src[0].ssa->bit_size == 32 &&
+                nir_intrinsic_src_type(intr) == nir_type_float32) {
+               nir_scalar s = nir_scalar_resolved(intr->src[0].ssa, i);
+               nir_instr *def_i = nir_def_instr(s.def);
+               if (def_i->type == nir_instr_type_intrinsic) {
+                  nir_intrinsic_instr *ld = nir_instr_as_intrinsic(def_i);
+                  if (ld->intrinsic == nir_intrinsic_load_per_vertex_input &&
+                      ld->def.bit_size == 32 &&
+                      nir_intrinsic_dest_type(ld) == nir_type_float32 &&
+                      nir_src_is_const(ld->src[1])) {
+                     uint64_t vs_loc =
+                        (uint64_t)nir_intrinsic_io_semantics(ld).location +
+                        nir_src_as_uint(ld->src[1]);
+                     unsigned vs_comp = nir_intrinsic_component(ld) + s.comp;
+                     if (vs_loc < VARYING_SLOT_MAX && vs_comp < 4 &&
+                         !vs_bad[vs_loc][vs_comp])
+                        k = vs_kind[vs_loc][vs_comp];
+                  }
+               }
+            }
+            if (k == VBO_NORM_NONE) {
+               dst_bad[loc][c] = true;
+            } else if (dst_kind[loc][c] == VBO_NORM_NONE) {
+               dst_kind[loc][c] = k;
+            } else if (dst_kind[loc][c] != k) {
+               dst_bad[loc][c] = true;
+            }
+         }
+      }
+   }
+
+   /* 3. Inspect FS inputs: gather exact per-component read masks and reject any
+    *    slot with indirect offsets, per-vertex loads, or non-float32 reads. */
+   uint8_t fs_read_mask[32] = {0};
+   bool fs_slot_bad[32] = {false};
+   nir_foreach_block(block, nir_shader_get_entrypoint(fs)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_input &&
+             intr->intrinsic != nir_intrinsic_load_interpolated_input &&
+             intr->intrinsic != nir_intrinsic_load_input_vertex &&
+             intr->intrinsic != nir_intrinsic_load_per_vertex_input)
+            continue;
+         nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+         nir_src *off = nir_get_io_offset_src(intr);
+         if (!off || !nir_src_is_const(*off)) {
+            for (unsigned s = 0; s < sem.num_slots; ++s) {
+               unsigned loc = sem.location + s;
+               if (loc >= VARYING_SLOT_VAR0 && loc < VARYING_SLOT_VAR0 + 32) {
+                  fs_slot_bad[loc - VARYING_SLOT_VAR0] = true;
+                  fs_read_mask[loc - VARYING_SLOT_VAR0] = 0xf;
+               }
+            }
+            continue;
+         }
+         unsigned loc = sem.location + nir_src_as_uint(*off);
+         if (loc < VARYING_SLOT_VAR0 || loc >= VARYING_SLOT_VAR0 + 32)
+            continue;
+         unsigned var = loc - VARYING_SLOT_VAR0;
+         if ((intr->intrinsic != nir_intrinsic_load_input &&
+              intr->intrinsic != nir_intrinsic_load_interpolated_input) ||
+             intr->def.bit_size != 32 ||
+             nir_intrinsic_dest_type(intr) != nir_type_float32) {
+            fs_slot_bad[var] = true;
+            continue;
+         }
+         unsigned comp = nir_intrinsic_component(intr);
+         nir_component_mask_t read = nir_def_components_read(&intr->def);
+         fs_read_mask[var] |= (uint8_t)(read << comp);
+      }
+   }
+
+   /* 4. Inspect TES outputs per-component: collect every live scalar component
+    *    that is unconditionally written (top-level CF, no early returns) with a
+    *    patch-constant TCS passthrough of a narrow normalized kind. */
+   struct tes_comp_origin origins[32][4] = {{{0}}};
+   uint8_t tes_written_any[32] = {0};
+   uint8_t tes_comp_bad[32] = {0};
+   bool tes_slot_readback[32] = {false};
+   nir_intrinsic_instr *tes_anchor_store = NULL;
+
+   nir_foreach_block(block, nir_shader_get_entrypoint(tes)) {
+      bool top_level = block->cf_node.parent->type == nir_cf_node_function;
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_jump &&
+             nir_instr_as_jump(instr)->type == nir_jump_return)
+            return false;
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_output) {
+            nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+            for (unsigned s = 0; s < sem.num_slots; ++s) {
+               unsigned loc = sem.location + s;
+               if (loc >= VARYING_SLOT_VAR0 && loc < VARYING_SLOT_VAR0 + 32)
+                  tes_slot_readback[loc - VARYING_SLOT_VAR0] = true;
+            }
+            continue;
+         }
+         if (intr->intrinsic != nir_intrinsic_store_output)
+            continue;
+         if (!nir_src_is_const(intr->src[1]))
+            return false;
+         uint64_t loc = (uint64_t)nir_intrinsic_io_semantics(intr).location +
+                        nir_src_as_uint(intr->src[1]);
+         if (loc < VARYING_SLOT_VAR0 || loc >= VARYING_SLOT_VAR0 + 32)
+            continue;
+         unsigned var = (unsigned)(loc - VARYING_SLOT_VAR0);
+         if (top_level)
+            tes_anchor_store = intr;
+         unsigned comp = nir_intrinsic_component(intr);
+         unsigned wmask = nir_intrinsic_write_mask(intr);
+         u_foreach_bit(i, wmask) {
+            unsigned c = comp + i;
+            if (c >= 4)
+               continue;
+            bool dup = !!(tes_written_any[var] & BITFIELD_BIT(c));
+            tes_written_any[var] |= BITFIELD_BIT(c);
+            if (!(fs_read_mask[var] & BITFIELD_BIT(c)))
+               continue;
+            if (!top_level || dup || intr->src[0].ssa->bit_size != 32 ||
+                nir_intrinsic_src_type(intr) != nir_type_float32) {
+               tes_comp_bad[var] |= BITFIELD_BIT(c);
+               continue;
+            }
+            nir_scalar s = nir_scalar_resolved(intr->src[0].ssa, i);
+            nir_instr *def_i = nir_def_instr(s.def);
+            if (def_i->type != nir_instr_type_intrinsic) {
+               tes_comp_bad[var] |= BITFIELD_BIT(c);
+               continue;
+            }
+            nir_intrinsic_instr *ld = nir_instr_as_intrinsic(def_i);
+            if (ld->intrinsic == nir_intrinsic_load_per_vertex_input &&
+                ld->def.bit_size == 32 &&
+                nir_intrinsic_dest_type(ld) == nir_type_float32 &&
+                nir_src_is_const(ld->src[0]) && nir_src_is_const(ld->src[1])) {
+               uint64_t tcs_loc =
+                  (uint64_t)nir_intrinsic_io_semantics(ld).location +
+                  nir_src_as_uint(ld->src[1]);
+               unsigned tcs_comp = nir_intrinsic_component(ld) + s.comp;
+               if (tcs_loc < VARYING_SLOT_MAX && tcs_comp < 4 &&
+                   !tcs_pv_bad[tcs_loc][tcs_comp] &&
+                   tcs_pv_kind[tcs_loc][tcs_comp] != VBO_NORM_NONE) {
+                  origins[var][c] = (struct tes_comp_origin){
+                     .valid = true,
+                     .is_patch = false,
+                     .kind = tcs_pv_kind[tcs_loc][tcs_comp],
+                     .tcs_loc = (unsigned)tcs_loc,
+                     .tcs_comp = tcs_comp,
+                     .cp_idx = nir_src_as_uint(ld->src[0]),
+                  };
+               } else {
+                  tes_comp_bad[var] |= BITFIELD_BIT(c);
+               }
+            } else if (ld->intrinsic == nir_intrinsic_load_input &&
+                       ld->def.bit_size == 32 &&
+                       nir_intrinsic_dest_type(ld) == nir_type_float32 &&
+                       nir_src_is_const(ld->src[0])) {
+               uint64_t tcs_loc =
+                  (uint64_t)nir_intrinsic_io_semantics(ld).location +
+                  nir_src_as_uint(ld->src[0]);
+               unsigned tcs_comp = nir_intrinsic_component(ld) + s.comp;
+               if (tcs_loc < VARYING_SLOT_MAX && tcs_comp < 4 &&
+                   !tcs_patch_bad[tcs_loc][tcs_comp] &&
+                   tcs_patch_kind[tcs_loc][tcs_comp] != VBO_NORM_NONE) {
+                  origins[var][c] = (struct tes_comp_origin){
+                     .valid = true,
+                     .is_patch = true,
+                     .kind = tcs_patch_kind[tcs_loc][tcs_comp],
+                     .tcs_loc = (unsigned)tcs_loc,
+                     .tcs_comp = tcs_comp,
+                  };
+               } else {
+                  tes_comp_bad[var] |= BITFIELD_BIT(c);
+               }
+            } else {
+               tes_comp_bad[var] |= BITFIELD_BIT(c);
+            }
+         }
+      }
+   }
+
+   if (!tes_anchor_store)
+      return false;
+
+   /* 5. Group all qualifying scalar components by normalized kind (handling
+    *    both whole-slot varyings and cross-slot components created by
+    *    nir_opt_varyings_bulk compaction) into packed flat u32 buckets of size
+    *    2..4 (8-bit) or 2 (16-bit). Single leftover scalars stay unpacked. */
+   struct vbo_pack_bucket buckets[64];
+   unsigned num_buckets = 0;
+   struct comp_pack_ref comp_ref[32][4] = {{{0}}};
+   uint8_t packed_mask[32] = {0};
+
+   const enum vbo_norm_kind kinds[4] = {
+      VBO_NORM_UNORM8, VBO_NORM_SNORM8, VBO_NORM_UNORM16, VBO_NORM_SNORM16,
+   };
+   for (unsigned ki = 0; ki < ARRAY_SIZE(kinds); ++ki) {
+      enum vbo_norm_kind kind = kinds[ki];
+      unsigned max_per =
+         (kind == VBO_NORM_UNORM8 || kind == VBO_NORM_SNORM8) ? 4u : 2u;
+      unsigned cand_var[128], cand_comp[128], ncand = 0;
+      for (unsigned var = 0; var < 32; ++var) {
+         if (fs_slot_bad[var] || tes_slot_readback[var])
+            continue;
+         uint8_t mask = fs_read_mask[var];
+         u_foreach_bit(c, mask) {
+            if (!(tes_comp_bad[var] & BITFIELD_BIT(c)) &&
+                origins[var][c].valid && origins[var][c].kind == kind) {
+               cand_var[ncand] = var;
+               cand_comp[ncand] = c;
+               ncand++;
+            }
+         }
+      }
+      unsigned idx = 0;
+      while (idx + 2 <= ncand && num_buckets < ARRAY_SIZE(buckets)) {
+         unsigned take = MIN2(max_per, ncand - idx);
+         /* Avoid leaving a single 1-scalar remainder when splitting 5 -> 3+2. */
+         if (max_per == 4 && ncand - idx == 5)
+            take = 3;
+         struct vbo_pack_bucket *bk = &buckets[num_buckets];
+         memset(bk, 0, sizeof(*bk));
+         bk->kind = kind;
+         bk->count = take;
+         for (unsigned j = 0; j < take; ++j) {
+            unsigned v = cand_var[idx + j];
+            unsigned c = cand_comp[idx + j];
+            bk->src_var[j] = v;
+            bk->src_comp[j] = c;
+            bk->origin[j] = origins[v][c];
+            comp_ref[v][c] = (struct comp_pack_ref){
+               .packed = true,
+               .bucket_idx = num_buckets,
+               .lane = j,
+            };
+            packed_mask[v] |= BITFIELD_BIT(c);
+         }
+         num_buckets++;
+         idx += take;
+      }
+   }
+
+   if (!num_buckets)
+      return false;
+
+   /* Allocate dedicated flat VAR slot(s) for the packed u32 words: any VAR slot
+    * that has 0 remaining unpacked live components (either newly vacated or
+    * previously unused) is available as a pure flat u32 container (up to 4
+    * packed buckets per VAR slot). */
+   uint8_t dst_used[32] = {0};
+   for (unsigned b = 0; b < num_buckets; ++b) {
+      bool placed = false;
+      for (unsigned var = 0; var < 32; ++var) {
+         if (fs_slot_bad[var] || tes_slot_readback[var])
+            continue;
+         if ((fs_read_mask[var] & ~packed_mask[var]) != 0)
+            continue;
+         if (dst_used[var] == 0xf)
+            continue;
+         unsigned c = ffs(~dst_used[var]) - 1;
+         dst_used[var] |= BITFIELD_BIT(c);
+         buckets[b].dst_var = var;
+         buckets[b].dst_comp = c;
+         placed = true;
+         break;
+      }
+      if (!placed)
+         return false;
+   }
+
+   /* 6. Rewrite TES: strip packed components from original stores (and any
+    *    dead components in fully vacated slots), then emit the packed flat
+    *    u32 stores at tes_anchor_store. */
+   nir_builder tb = nir_builder_at(nir_before_instr(&tes_anchor_store->instr));
+   for (unsigned b = 0; b < num_buckets; ++b) {
+      struct vbo_pack_bucket *bk = &buckets[b];
+      nir_def *vals[4] = {NULL};
+      for (unsigned j = 0; j < bk->count; ++j) {
+         const struct tes_comp_origin *o = &bk->origin[j];
+         if (o->is_patch) {
+            vals[j] = nir_load_input(
+               &tb, 1, 32, nir_imm_int(&tb, 0), .component = o->tcs_comp,
+               .dest_type = nir_type_float32,
+               .io_semantics = {.location = o->tcs_loc, .num_slots = 1});
+         } else {
+            vals[j] = nir_load_per_vertex_input(
+               &tb, 1, 32, nir_imm_int(&tb, o->cp_idx), nir_imm_int(&tb, 0),
+               .component = o->tcs_comp, .dest_type = nir_type_float32,
+               .io_semantics = {.location = o->tcs_loc, .num_slots = 1});
+         }
+      }
+      nir_def *packed = emit_vbo_norm_pack_n(&tb, bk->kind, bk->count, vals);
+      bk->pack_store = nir_store_output(
+         &tb, packed, nir_imm_int(&tb, 0), .component = bk->dst_comp,
+         .write_mask = 1, .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0 + bk->dst_var,
+                          .num_slots = 1});
+   }
+
+   nir_foreach_block(block, nir_shader_get_entrypoint(tes)) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_output)
+            continue;
+         bool is_new = false;
+         for (unsigned b = 0; b < num_buckets; ++b) {
+            if (intr == buckets[b].pack_store) {
+               is_new = true;
+               break;
+            }
+         }
+         if (is_new)
+            continue;
+         unsigned loc = nir_intrinsic_io_semantics(intr).location +
+                        nir_src_as_uint(intr->src[1]);
+         if (loc < VARYING_SLOT_VAR0 || loc >= VARYING_SLOT_VAR0 + 32)
+            continue;
+         unsigned var = loc - VARYING_SLOT_VAR0;
+         if (!packed_mask[var] && !dst_used[var])
+            continue;
+         unsigned comp = nir_intrinsic_component(intr);
+         unsigned wmask = nir_intrinsic_write_mask(intr);
+         unsigned keep_mask = 0;
+         u_foreach_bit(i, wmask) {
+            unsigned c = comp + i;
+            if (c < 4 && (fs_read_mask[var] & BITFIELD_BIT(c)) &&
+                !(packed_mask[var] & BITFIELD_BIT(c)))
+               keep_mask |= BITFIELD_BIT(i);
+         }
+         if (!keep_mask)
+            nir_instr_remove(instr);
+         else if (keep_mask != wmask)
+            nir_intrinsic_set_write_mask(intr, keep_mask);
+      }
+   }
+
+   /* 7. Rewrite FS: splice bit-exact hardware unpack channels into every load
+    *    touching packed components, preserving any remaining unpacked smooth
+    *    components in partially packed slots. */
+   nir_builder fb = nir_builder_create(nir_shader_get_entrypoint(fs));
+   nir_foreach_block(block, nir_shader_get_entrypoint(fs)) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_input &&
+             intr->intrinsic != nir_intrinsic_load_interpolated_input)
+            continue;
+         if (nir_intrinsic_dest_type(intr) != nir_type_float32)
+            continue;
+         nir_src *off = nir_get_io_offset_src(intr);
+         if (!off || !nir_src_is_const(*off))
+            continue;
+         unsigned loc =
+            nir_intrinsic_io_semantics(intr).location + nir_src_as_uint(*off);
+         if (loc < VARYING_SLOT_VAR0 || loc >= VARYING_SLOT_VAR0 + 32)
+            continue;
+         unsigned var = loc - VARYING_SLOT_VAR0;
+         if (!packed_mask[var])
+            continue;
+
+         unsigned comp = nir_intrinsic_component(intr);
+         bool touches_packed = false;
+         bool keeps_orig = false;
+         nir_component_mask_t read_bits = nir_def_components_read(&intr->def);
+         for (unsigned i = 0; i < intr->def.num_components; ++i) {
+            unsigned orig_c = comp + i;
+            if (!(read_bits & BITFIELD_BIT(i)))
+               continue;
+            if (orig_c < 4 && comp_ref[var][orig_c].packed)
+               touches_packed = true;
+            else
+               keeps_orig = true;
+         }
+         if (!touches_packed)
+            continue;
+
+         fb.cursor = keeps_orig ? nir_after_instr(instr) : nir_before_instr(instr);
+         nir_def *unpacked_cache[64] = {NULL};
+         nir_def *chs[4];
+         for (unsigned i = 0; i < intr->def.num_components; ++i) {
+            unsigned orig_c = comp + i;
+            if (!(read_bits & BITFIELD_BIT(i))) {
+               chs[i] = nir_undef(&fb, 1, 32);
+               continue;
+            }
+            if (orig_c < 4 && comp_ref[var][orig_c].packed) {
+               unsigned bi = comp_ref[var][orig_c].bucket_idx;
+               unsigned lane = comp_ref[var][orig_c].lane;
+               if (!unpacked_cache[bi]) {
+                  const struct vbo_pack_bucket *bk = &buckets[bi];
+                  nir_def *packed = nir_load_input(
+                     &fb, 1, 32, nir_imm_int(&fb, 0), .component = bk->dst_comp,
+                     .dest_type = nir_type_uint32,
+                     .io_semantics = {.location = VARYING_SLOT_VAR0 + bk->dst_var,
+                                      .num_slots = 1});
+                  switch (bk->kind) {
+                  case VBO_NORM_UNORM8:
+                     unpacked_cache[bi] = nir_unpack_unorm_4x8(&fb, packed);
+                     break;
+                  case VBO_NORM_SNORM8:
+                     unpacked_cache[bi] = nir_unpack_snorm_4x8(&fb, packed);
+                     break;
+                  case VBO_NORM_UNORM16:
+                     unpacked_cache[bi] = nir_unpack_unorm_2x16(&fb, packed);
+                     break;
+                  case VBO_NORM_SNORM16:
+                     unpacked_cache[bi] = nir_unpack_snorm_2x16(&fb, packed);
+                     break;
+                  default:
+                     UNREACHABLE("invalid vbo norm kind");
+                  }
+               }
+               chs[i] = nir_channel(&fb, unpacked_cache[bi], lane);
+            } else {
+               chs[i] = nir_channel(&fb, &intr->def, i);
+            }
+         }
+         nir_def *repl = nir_vec(&fb, chs, intr->def.num_components);
+         if (keeps_orig) {
+            nir_def_rewrite_uses_after(&intr->def, repl);
+         } else {
+            nir_def_rewrite_uses(&intr->def, repl);
+            nir_instr_remove(instr);
+         }
+      }
+   }
+
+   NIR_PASS(_, tes, nir_opt_dce);
+   NIR_PASS(_, fs, nir_opt_dce);
+
+   /* 8. Bonus TCS->TES task payload compaction: when all components of a
+    *    packed bucket come from one exclusive per-vertex TCS VAR slot, hoist
+    *    pack_* into TCS so the 0xe0/0xe1 task payload carries 1 u32 word
+    *    instead of 2..4 float words and runs pack_* once per patch. */
+   unsigned tes_pv_loads[VARYING_SLOT_MAX] = {0};
+   bool tes_indirect_pv_load = false;
+   nir_foreach_block(block, nir_shader_get_entrypoint(tes)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_per_vertex_input)
+            continue;
+         if (!nir_src_is_const(intr->src[1])) {
+            tes_indirect_pv_load = true;
+            continue;
+         }
+         unsigned loc = nir_intrinsic_io_semantics(intr).location +
+                        nir_src_as_uint(intr->src[1]);
+         if (loc < VARYING_SLOT_MAX)
+            tes_pv_loads[loc]++;
+      }
+   }
+
+   bool tcs_changed = false;
+   if (!tes_indirect_pv_load) {
+      for (unsigned b = 0; b < num_buckets; ++b) {
+         struct vbo_pack_bucket *bk = &buckets[b];
+         unsigned tcs_loc = VARYING_SLOT_MAX;
+         unsigned cp_idx = 0;
+         bool single_tcs_slot = true;
+         for (unsigned j = 0; j < bk->count; ++j) {
+            const struct tes_comp_origin *o = &bk->origin[j];
+            if (o->is_patch || o->tcs_loc < VARYING_SLOT_VAR0 ||
+                o->tcs_loc >= VARYING_SLOT_VAR0 + 32) {
+               single_tcs_slot = false;
+               break;
+            }
+            if (tcs_loc == VARYING_SLOT_MAX) {
+               tcs_loc = o->tcs_loc;
+               cp_idx = o->cp_idx;
+            } else if (o->tcs_loc != tcs_loc || o->cp_idx != cp_idx) {
+               single_tcs_slot = false;
+               break;
+            }
+         }
+         if (!single_tcs_slot || tcs_reads_pv_out[tcs_loc] ||
+             tes_pv_loads[tcs_loc] != bk->count)
+            continue;
+
+         nir_block *st_block = NULL;
+         nir_def *st_vtx = NULL;
+         nir_intrinsic_instr *last_tcs_st = NULL;
+         nir_scalar tcs_comp_scalar[4] = {{0}};
+         bool tcs_comp_seen[4] = {false};
+         bool tcs_slot_ok = true;
+         nir_foreach_block(block, nir_shader_get_entrypoint(tcs)) {
+            bool in_loop = false;
+            for (nir_cf_node *n = block->cf_node.parent; n; n = n->parent)
+               if (n->type == nir_cf_node_loop)
+                  in_loop = true;
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_store_per_vertex_output)
+                  continue;
+               unsigned loc = nir_intrinsic_io_semantics(intr).location +
+                              nir_src_as_uint(intr->src[2]);
+               if (loc != tcs_loc)
+                  continue;
+               if (in_loop) {
+                  tcs_slot_ok = false;
+                  break;
+               }
+               if (!st_block) {
+                  st_block = block;
+                  st_vtx = intr->src[1].ssa;
+               } else if (st_block != block ||
+                          !is_same_tcs_vertex(st_vtx, intr->src[1].ssa)) {
+                  tcs_slot_ok = false;
+                  break;
+               }
+               last_tcs_st = intr;
+               unsigned comp = nir_intrinsic_component(intr);
+               unsigned wmask = nir_intrinsic_write_mask(intr);
+               u_foreach_bit(i, wmask) {
+                  unsigned c = comp + i;
+                  if (c >= 4)
+                     continue;
+                  if (tcs_comp_seen[c]) {
+                     tcs_slot_ok = false;
+                     break;
+                  }
+                  tcs_comp_scalar[c] = nir_scalar_resolved(intr->src[0].ssa, i);
+                  tcs_comp_seen[c] = true;
+               }
+            }
+            if (!tcs_slot_ok)
+               break;
+         }
+         if (!tcs_slot_ok || !last_tcs_st)
+            continue;
+         for (unsigned j = 0; j < bk->count; ++j) {
+            if (!tcs_comp_seen[bk->origin[j].tcs_comp]) {
+               tcs_slot_ok = false;
+               break;
+            }
+         }
+         if (!tcs_slot_ok)
+            continue;
+
+         nir_builder cb = nir_builder_at(nir_before_instr(&last_tcs_st->instr));
+         nir_def *pack_vals[4] = {NULL};
+         for (unsigned j = 0; j < bk->count; ++j) {
+            nir_scalar s = tcs_comp_scalar[bk->origin[j].tcs_comp];
+            pack_vals[j] =
+               s.def->num_components == 1 ? s.def : nir_channel(&cb, s.def, s.comp);
+         }
+         nir_def *tcs_packed =
+            emit_vbo_norm_pack_n(&cb, bk->kind, bk->count, pack_vals);
+         nir_intrinsic_instr *new_tcs_st = nir_store_per_vertex_output(
+            &cb, tcs_packed, st_vtx, nir_imm_int(&cb, 0), .component = 0,
+            .write_mask = 1, .src_type = nir_type_uint32,
+            .io_semantics = {.location = tcs_loc, .num_slots = 1});
+         nir_foreach_instr_safe(instr, st_block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_per_vertex_output ||
+                intr == new_tcs_st)
+               continue;
+            unsigned loc = nir_intrinsic_io_semantics(intr).location +
+                           nir_src_as_uint(intr->src[2]);
+            if (loc == tcs_loc)
+               nir_instr_remove(instr);
+         }
+
+         tb.cursor = nir_before_instr(&bk->pack_store->instr);
+         nir_def *tes_packed = nir_load_per_vertex_input(
+            &tb, 1, 32, nir_imm_int(&tb, cp_idx), nir_imm_int(&tb, 0),
+            .component = 0, .dest_type = nir_type_uint32,
+            .io_semantics = {.location = tcs_loc, .num_slots = 1});
+         nir_src_rewrite(&bk->pack_store->src[0], tes_packed);
+         tes_pv_loads[tcs_loc] = 0;
+         tcs_changed = true;
+      }
+   }
+
+   if (tcs_changed) {
+      NIR_PASS(_, tcs, nir_opt_dce);
+      NIR_PASS(_, tes, nir_opt_dce);
+      gather_info_preserving_clip_cull(tcs);
+   }
+   gather_info_preserving_clip_cull(tes);
+   gather_info_preserving_clip_cull(fs);
+   return true;
+}

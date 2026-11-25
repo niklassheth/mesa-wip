@@ -130,6 +130,15 @@ void hk_nir_tess_fused_eval_counts(const struct hk_shader_info *info,
                                    uint32_t *out_max_child_wgs,
                                    uint32_t *out_max_patch_prims);
 
+/* Bit-exact lossless packing for statically-typed UNORM8/SNORM8 (and
+ * UNORM16/SNORM16) vertex-attribute passthroughs across monolithic
+ * VS -> TCS -> TES -> FS fused tessellation pipelines. Packs qualifying
+ * patch-constant TES->FS varyings into a single flat u32 varying (and compacts
+ * exclusive TCS->TES task payload slots) without altering fallback NIR. */
+bool hk_nir_tess_fused_pack_vbo_varyings(
+   nir_shader *vs, nir_shader *tcs, nir_shader *tes, nir_shader *fs,
+   const struct agx_apple9_vertex_layout *vertex);
+
 /* Zero-PREGFX fused OBJECT(VS+TCS) -> MESH(TES) lowering over per-parent
  * GET_SR 0xe0/0xe1 task payload. Clones all inputs without mutating them. */
 bool hk_nir_tess_fused_lower(const nir_shader *vs_source,

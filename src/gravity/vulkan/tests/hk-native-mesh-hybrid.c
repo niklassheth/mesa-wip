@@ -721,6 +721,235 @@ check_fragment_fixup(void)
    }
 }
 
+static void
+check_tess_vbo_pack_pairing(struct hk_device *dev)
+{
+   /* Build a monolithic VS + TCS + TES + FS pipeline with 3x UNORM8x4 +
+    * 1x B8G8R8A8_SNORM passthroughs + 5 smooth vec4 varyings (40 raw comps ->
+    * packed 28 comps, wg_rows = 36, unbounded!). Compare against dynamic VI
+    * (must not pack, distinct pair_id) and verify fallback FS stays untouched. */
+   blake3_hash packed_pair_id = {0}, dyn_pair_id = {0};
+   for (unsigned mode = 0; mode < 2; ++mode) {
+      const bool dynamic_vi = (mode == 1);
+      nir_shader *nirs[4];
+      /* VS: attr 0 = POS (float4), attr 1..4 = narrow norm vec4. */
+      {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_VERTEX, &agx_nir_options, "vbo_pair_vs");
+         b.shader->info.io_lowered = true;
+         nir_def *z = nir_imm_int(&b, 0);
+         nir_def *p = nir_load_input(
+            &b, 4, 32, z, .dest_type = nir_type_float32,
+            .io_semantics = {.location = VERT_ATTRIB_GENERIC0, .num_slots = 1});
+         nir_store_output(
+            &b, p, z, .write_mask = 0xf, .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         for (unsigned a = 0; a < 4; ++a) {
+            nir_def *v = nir_load_input(
+               &b, 4, 32, z, .dest_type = nir_type_float32,
+               .io_semantics = {.location = VERT_ATTRIB_GENERIC0 + 1 + a,
+                                .num_slots = 1});
+            nir_store_output(
+               &b, v, z, .write_mask = 0xf, .src_type = nir_type_float32,
+               .io_semantics = {.location = VARYING_SLOT_VAR0 + a,
+                                .num_slots = 1});
+         }
+         nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+         nirs[0] = b.shader;
+      }
+      /* TCS: pcp=1 passthrough. */
+      {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_TESS_CTRL, &agx_nir_options, "vbo_pair_tcs");
+         b.shader->info.io_lowered = true;
+         b.shader->info.tess.tcs_vertices_out = 1;
+         nir_def *inv = nir_load_invocation_id(&b);
+         nir_def *z = nir_imm_int(&b, 0);
+         nir_def *p = nir_load_per_vertex_input(
+            &b, 4, 32, inv, z, .dest_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         nir_store_per_vertex_output(
+            &b, p, inv, z, .write_mask = 0xf, .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         for (unsigned a = 0; a < 4; ++a) {
+            nir_def *v = nir_load_per_vertex_input(
+               &b, 4, 32, inv, z, .dest_type = nir_type_float32,
+               .io_semantics = {.location = VARYING_SLOT_VAR0 + a,
+                                .num_slots = 1});
+            nir_store_per_vertex_output(
+               &b, v, inv, z, .write_mask = 0xf, .src_type = nir_type_float32,
+               .io_semantics = {.location = VARYING_SLOT_VAR0 + a,
+                                .num_slots = 1});
+         }
+         nir_push_if(&b, nir_ieq_imm(&b, inv, 0));
+         nir_store_output(
+            &b, nir_imm_vec4(&b, 1, 1, 1, 1), z, .write_mask = 0xf,
+            .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER,
+                             .num_slots = 1});
+         nir_store_output(
+            &b, nir_imm_vec2(&b, 1, 1), z, .write_mask = 0x3,
+            .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER,
+                             .num_slots = 1});
+         nir_pop_if(&b, NULL);
+         nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+         nirs[1] = b.shader;
+      }
+      /* TES: 4 passthrough vec4s (VAR0..3) + 5 smooth tess-coord vec4s (VAR4..8). */
+      {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_TESS_EVAL, &agx_nir_options, "vbo_pair_tes");
+         b.shader->info.io_lowered = true;
+         b.shader->info.tess._primitive_mode = TESS_PRIMITIVE_QUADS;
+         b.shader->info.tess.spacing = TESS_SPACING_EQUAL;
+         nir_def *z = nir_imm_int(&b, 0);
+         nir_def *tc = nir_load_tess_coord(&b);
+         nir_def *p = nir_load_per_vertex_input(
+            &b, 4, 32, z, z, .dest_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         nir_store_output(
+            &b, nir_fadd(&b, p, nir_vec4(&b, nir_channel(&b, tc, 0),
+                                         nir_channel(&b, tc, 1),
+                                         nir_imm_float(&b, 0),
+                                         nir_imm_float(&b, 0))),
+            z, .write_mask = 0xf, .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         for (unsigned a = 0; a < 4; ++a) {
+            nir_def *v = nir_load_per_vertex_input(
+               &b, 4, 32, z, z, .dest_type = nir_type_float32,
+               .io_semantics = {.location = VARYING_SLOT_VAR0 + a,
+                                .num_slots = 1});
+            nir_store_output(
+               &b, v, z, .write_mask = 0xf, .src_type = nir_type_float32,
+               .io_semantics = {.location = VARYING_SLOT_VAR0 + a,
+                                .num_slots = 1});
+         }
+         for (unsigned s = 0; s < 5; ++s) {
+            nir_def *sm = nir_vec4(
+               &b, nir_fadd_imm(&b, nir_channel(&b, tc, 0), (float)(s + 1)),
+               nir_fadd_imm(&b, nir_channel(&b, tc, 1), (float)(s + 2)),
+               nir_fmul_imm(&b, nir_channel(&b, tc, 0), (float)(s + 3)),
+               nir_fmul_imm(&b, nir_channel(&b, tc, 1), (float)(s + 4)));
+            nir_store_output(
+               &b, sm, z, .write_mask = 0xf, .src_type = nir_type_float32,
+               .io_semantics = {.location = VARYING_SLOT_VAR0 + 4 + s,
+                                .num_slots = 1});
+         }
+         nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+         nirs[2] = b.shader;
+      }
+      /* FS: sums all 9 vec4 smooth varyings. */
+      {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_FRAGMENT, &agx_nir_options, "vbo_pair_fs");
+         b.shader->info.io_lowered = true;
+         nir_def *bary =
+            nir_load_barycentric_pixel(&b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+         nir_def *acc = nir_imm_vec4(&b, 0, 0, 0, 0);
+         for (unsigned s = 0; s < 9; ++s) {
+            nir_def *v = nir_load_interpolated_input(
+               &b, 4, 32, bary, nir_imm_int(&b, 0), .dest_type = nir_type_float32,
+               .io_semantics = {.location = VARYING_SLOT_VAR0 + s,
+                                .num_slots = 1});
+            acc = nir_fadd(&b, acc, v);
+         }
+         nir_store_output(
+            &b, acc, nir_imm_int(&b, 0), .write_mask = 0xf,
+            .src_type = nir_type_float32,
+            .io_semantics = {.location = FRAG_RESULT_DATA0, .num_slots = 1});
+         nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+         nirs[3] = b.shader;
+      }
+
+      struct vk_vertex_input_state vi = {
+         .attributes_valid = 0x1f,
+         .bindings_valid = 0x1,
+         .attributes = {
+            [0] = {.binding = 0, .offset = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT},
+            [1] = {.binding = 0, .offset = 16, .format = VK_FORMAT_R8G8B8A8_UNORM},
+            [2] = {.binding = 0, .offset = 20, .format = VK_FORMAT_R8G8B8A8_UNORM},
+            [3] = {.binding = 0, .offset = 24, .format = VK_FORMAT_R8G8B8A8_UNORM},
+            [4] = {.binding = 0, .offset = 28, .format = VK_FORMAT_B8G8R8A8_SNORM},
+         },
+      };
+      struct vk_render_pass_state rp = {
+         .color_attachment_count = 1,
+         .color_attachment_formats = {VK_FORMAT_R8G8B8A8_UNORM},
+      };
+      struct vk_graphics_pipeline_state state = {
+         .vi = dynamic_vi ? NULL : &vi,
+         .rp = &rp,
+      };
+      if (dynamic_vi)
+         BITSET_SET(state.dynamic, MESA_VK_DYNAMIC_VI);
+
+      struct vk_shader_compile_info infos[4] = {
+         {.stage = MESA_SHADER_VERTEX, .nir = nirs[0], .robustness = &vk_robustness_disabled},
+         {.stage = MESA_SHADER_TESS_CTRL, .nir = nirs[1], .robustness = &vk_robustness_disabled},
+         {.stage = MESA_SHADER_TESS_EVAL, .nir = nirs[2], .robustness = &vk_robustness_disabled},
+         {.stage = MESA_SHADER_FRAGMENT, .nir = nirs[3], .robustness = &vk_robustness_disabled},
+      };
+      struct vk_shader *out[4] = {0};
+      CHECK(hk_apple9_compile_graphics(dev, 4, infos, &state, NULL, NULL, NULL,
+                                       out) == VK_SUCCESS);
+
+      struct hk_api_shader *tes_api = container_of(out[2], struct hk_api_shader, vk);
+      struct hk_api_shader *fs_api = container_of(out[3], struct hk_api_shader, vk);
+      struct hk_api_shader *ntes = hk_api_shader_native(tes_api);
+      struct hk_api_shader *nfs = hk_api_shader_native(fs_api);
+
+      if (!dynamic_vi) {
+         CHECK(ntes && nfs);
+         const struct hk_shader *main = hk_native_producer_main(ntes);
+         CHECK(main->info.apple9_tess_fused);
+         /* 4 POS + 20 smooth + 4 flat u32 = 28 comps -> wg_rows = 36, unbounded! */
+         CHECK(main->info.apple9_native.layout.vertex_components == 28u);
+         uint64_t ring_max = 0;
+         CHECK(agx_apple9_mesh_ring_max_groups(&main->info.apple9_native.layout,
+                                               &ring_max));
+         CHECK(ring_max == UINT64_MAX);
+         /* Native TES and native FS must share exact pair_id and flat u32 layout. */
+         CHECK(!memcmp(ntes->apple9_native_pair_id, nfs->apple9_native_pair_id,
+                       sizeof(ntes->apple9_native_pair_id)));
+         CHECK(nfs->variants[0].b.info.apple9_varyings.count == 24u);
+         CHECK(nfs->variants[0].b.info.apple9_varyings.mask[VARYING_SLOT_VAR0] == 0xf);
+         CHECK(nfs->variants[0].b.info.apple9_varyings.group[VARYING_SLOT_VAR0] == 1);
+         for (unsigned s = 1; s < 4; ++s)
+            CHECK(nfs->variants[0].b.info.apple9_varyings.mask[VARYING_SLOT_VAR0 + s] == 0);
+         /* Fallback FS must remain completely untouched (all 9 VAR0..VAR8 smooth). */
+         for (unsigned s = 0; s < 9; ++s) {
+            CHECK(fs_api->variants[0].b.info.apple9_varyings.mask[VARYING_SLOT_VAR0 + s] == 0xf);
+            CHECK(fs_api->variants[0].b.info.apple9_varyings.group[VARYING_SLOT_VAR0 + s] == 0);
+         }
+         CHECK(fs_api->variants[0].b.info.apple9_varyings.count >= 36u);
+         memcpy(packed_pair_id, ntes->apple9_native_pair_id,
+                sizeof(packed_pair_id));
+         /* Cache serialization roundtrip preserves packed pair_id. */
+         struct hk_api_shader *tes_rt = roundtrip(dev, tes_api);
+         struct hk_api_shader *fs_rt = roundtrip(dev, fs_api);
+         CHECK(!memcmp(hk_api_shader_native(tes_rt)->apple9_native_pair_id,
+                       hk_api_shader_native(fs_rt)->apple9_native_pair_id,
+                       sizeof(packed_pair_id)));
+         hk_api_shader_destroy(&dev->vk, &tes_rt->vk, NULL);
+         hk_api_shader_destroy(&dev->vk, &fs_rt->vk, NULL);
+      } else {
+         /* Dynamic VI rejects fused VS/VBO packing cleanly (cannot use packed FS). */
+         CHECK(!ntes || !hk_native_producer_main(ntes)->info.apple9_tess_fused);
+         if (ntes)
+            memcpy(dyn_pair_id, ntes->apple9_native_pair_id, sizeof(dyn_pair_id));
+         CHECK(memcmp(packed_pair_id, dyn_pair_id, sizeof(packed_pair_id)) != 0);
+         for (unsigned s = 0; s < 9; ++s) {
+            CHECK(fs_api->variants[0].b.info.apple9_varyings.mask[VARYING_SLOT_VAR0 + s] == 0xf);
+            CHECK(fs_api->variants[0].b.info.apple9_varyings.group[VARYING_SLOT_VAR0 + s] == 0);
+         }
+         CHECK(fs_api->variants[0].b.info.apple9_varyings.count >= 36u);
+      }
+      for (unsigned s = 0; s < 4; ++s)
+         hk_api_shader_destroy(&dev->vk, out[s], NULL);
+   }
+}
+
 int
 main(void)
 {
@@ -756,6 +985,8 @@ main(void)
    for (unsigned v = 1; v <= 32; v = v == 1 ? 3 : v == 3 ? 32 : 33)
       compile_tess(dev, v, false, 0);
    if (hk_apple9_native_tess_enabled()) {
+      if (dev->dev.native_object.mp_payload_bytes)
+         check_tess_vbo_pack_pairing(dev);
       compile_tess(dev, 3, true, 0);
       unsigned count = compile_tess(dev, 3, false, 0);
       for (unsigned i = 1; i <= count; ++i)
