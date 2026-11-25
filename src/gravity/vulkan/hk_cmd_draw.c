@@ -1727,12 +1727,7 @@ hk_apple9_native_tess_state_eligible(struct hk_cmd_buffer *cmd,
           draw.b.count[1] == 1;
 }
 
-struct hk_apple9_fused_tess_chunk_plan {
-   uint32_t inst_chunk_cap;
-   uint32_t patch_chunk_cap;
-};
-
-static bool
+bool
 hk_apple9_native_tess_fused_chunk_plan(
    uint32_t patches_per_inst, uint32_t instances, uint32_t max_groups,
    uint32_t max_child_wgs_per_patch, uint32_t max_prims_per_patch,
@@ -1744,13 +1739,13 @@ hk_apple9_native_tess_fused_chunk_plan(
       return false;
    const uint32_t group_cap =
       MIN2(max_groups, HK_APPLE9_NATIVE_MAX_GROUP_TOTAL);
-   const uint64_t patch_prims = MAX2(max_prims_per_patch, 1u);
-   if (render_prim_cap && patch_prims > render_prim_cap)
-      return false;
-   const uint64_t tvb_patch_cap =
-      render_prim_cap ? render_prim_cap / patch_prims : UINT64_MAX;
 
    if (ring_max != UINT64_MAX) {
+      const uint64_t patch_prims = MAX2(max_prims_per_patch, 1u);
+      if (render_prim_cap && patch_prims > render_prim_cap)
+         return false;
+      const uint64_t tvb_patch_cap =
+         render_prim_cap ? render_prim_cap / patch_prims : UINT64_MAX;
       uint32_t grid[3];
       if (!hk_apple9_native_gs_fused_grid(patches_per_inst, instances, grid))
          return false;
@@ -1770,15 +1765,18 @@ hk_apple9_native_tess_fused_chunk_plan(
       return true;
    }
 
+   /* Unbounded (wg_rows <= 40, != 32) multi-parent fused OBJECT -> MESH
+    * tessellation draws do not apply the conservative 1M TVB primitive cap:
+    * only hardware object-grid limits (group_cap <= 1,048,575) and the
+    * max-chunk bound (HK_APPLE9_NATIVE_TESS_MAX_CHUNKS = 4) apply. */
    uint32_t single_grid[3];
-   if (patches_per_inst <= group_cap && patches_per_inst <= tvb_patch_cap &&
+   if (patches_per_inst <= group_cap &&
        hk_apple9_native_gs_fused_grid(patches_per_inst, 1, single_grid)) {
       uint64_t grid_xy = (uint64_t)single_grid[0] * single_grid[1];
       if (grid_xy <= group_cap) {
-         uint64_t by_prims = tvb_patch_cap / patches_per_inst;
          uint64_t by_grid = group_cap / grid_xy;
          uint32_t inst_cap = (uint32_t)MIN3(
-            (uint64_t)instances, MIN2(by_prims, by_grid),
+            (uint64_t)instances, by_grid,
             (uint64_t)HK_APPLE9_NATIVE_MAX_GROUP_COUNT);
          uint32_t check_grid[3];
          if (inst_cap &&
@@ -1799,8 +1797,8 @@ hk_apple9_native_tess_fused_chunk_plan(
 
    const uint64_t safe_group_cap =
       group_cap > 16 ? (uint64_t)group_cap - 16 : (uint64_t)group_cap;
-   const uint32_t patch_cap = (uint32_t)MIN3(
-      (uint64_t)patches_per_inst, safe_group_cap, tvb_patch_cap);
+   const uint32_t patch_cap =
+      (uint32_t)MIN2((uint64_t)patches_per_inst, safe_group_cap);
    if (!patch_cap)
       return false;
    uint32_t check_grid[3];
@@ -1994,6 +1992,8 @@ hk_apple9_launch_native_tess_fused(struct hk_cmd_buffer *cmd, uint32_t draw_id,
             cmd->apple9_draw_ring_rows = UINT64_MAX;
             cmd->apple9_draw_ring_limited = true;
          }
+         cmd->apple9_draw_unbounded_prims =
+            ring_max == UINT64_MAX && !cmd->apple9_draw_ring_limited;
          if (!hk_apple9_prepare_draw_ex(cmd, draw.indexed, true, true))
             return;
 
@@ -2311,6 +2311,7 @@ hk_apple9_launch_native_gs_fused(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          const uint64_t total_grid_groups =
             (uint64_t)grid_dims[0] * grid_dims[1] * grid_dims[2];
          cmd->apple9_draw_primitives = chunk_runs * prims_per_run * chunk_insts;
+         cmd->apple9_draw_unbounded_prims = false;
          if (!agx_apple9_mesh_ring_usage(layout, total_grid_groups,
                                          &cmd->apple9_draw_ring_rows,
                                          &cmd->apple9_draw_ring_limited)) {
@@ -2462,6 +2463,7 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
    const unsigned views = util_bitcount(gfx->render.view_mask ?: 1);
    cmd->apple9_draw_primitives =
       per_view_prims > UINT64_MAX / views ? UINT64_MAX : per_view_prims * views;
+   cmd->apple9_draw_unbounded_prims = false;
    /* Batched native renders defer the ordinary split until stage
     * selection: a native GS/TES draw may continue the render. Also defer when
     * a fused native GS draw is eligible so prepare_draw is never called with
@@ -3054,6 +3056,7 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          cmd->apple9_draw_primitives = draw_primitives;
          cmd->apple9_draw_ring_rows = draw_ring_rows;
          cmd->apple9_draw_ring_limited = draw_ring_limited;
+         cmd->apple9_draw_unbounded_prims = false;
          if (!hk_apple9_prepare_draw_ex(cmd, true, true, native_object))
             return;
          if (task) {
@@ -3180,6 +3183,7 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          overflow_min_groups = max_groups + 1;
    }
    cmd->apple9_draw_primitives = UINT64_MAX;
+   cmd->apple9_draw_unbounded_prims = false;
    if (!hk_apple9_prepare_draw(cmd, !direct || count_addr || task_dynamic, false))
       return;
    if (task_dynamic) {

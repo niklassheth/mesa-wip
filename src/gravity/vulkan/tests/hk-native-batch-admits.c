@@ -126,11 +126,13 @@ main(void)
    CHECK(!hk_apple9_native_stream_admits(&s, &(struct hk_apple9_draw_summary){
       .native = true, .ring_rows = 48, .ring_limited = true}, &enabled_unbounded));
 
-   /* Conservative primitive bound (TVB cap) when max_render_primitives > 0. */
+   /* Conservative primitive bound (TVB cap) when max_render_primitives > 0
+    * for bounded native renders (s.bounded_prims = true). */
    struct hk_apple9_native_profile b = {.blocks = true, .max_render_primitives = 1000};
    s = (struct hk_apple9_stream_summary){
       .native = true,
       .has_draws = true,
+      .bounded_prims = true,
       .primitives = 900,
    };
    CHECK(hk_apple9_native_stream_admits(&s, &(struct hk_apple9_draw_summary){
@@ -145,6 +147,65 @@ main(void)
    b.max_render_primitives = 0;
    CHECK(hk_apple9_native_stream_admits(&s, &(struct hk_apple9_draw_summary){
       .native = true, .primitives = UINT64_MAX}, &b));
+
+   /* Unbounded (wg_rows <= 40, != 32) multi-parent fused tessellation draws
+    * (e.g. 20,000 patches * 8192 worst-case = 163,840,000 > 1,000,000) merge
+    * into ordinary and unbounded native passes with 0 splits, and ordinary
+    * draws (including indirect) following them also stay in the same pass. */
+   const struct hk_apple9_draw_summary giant_tess = {
+      .native = true,
+      .unbounded_prims = true,
+      .primitives = 20000ull * 8192ull,
+      .ring_rows = 20000ull * 4096ull * 40ull,
+      .ring_limited = false,
+   };
+   struct hk_apple9_stream_summary ord_indirect = {
+      .native = false,
+      .has_draws = true,
+      .primitives = UINT64_MAX,
+   };
+   CHECK(hk_apple9_native_stream_admits(&ord_indirect, &giant_tess, &enabled_capped));
+   struct hk_apple9_stream_summary unb_stream = {
+      .native = true,
+      .has_draws = true,
+      .bounded_prims = false,
+      .primitives = UINT64_MAX,
+      .ring_rows = giant_tess.ring_rows,
+      .ring_limited = false,
+   };
+   CHECK(hk_apple9_native_stream_admits(&unb_stream, &giant_tess, &enabled_capped));
+   CHECK(hk_apple9_native_stream_admits(&unb_stream, &(struct hk_apple9_draw_summary){
+      .native = false, .primitives = UINT64_MAX}, &enabled_capped));
+   /* Appending a ring-limited draw onto that unbounded stream still enforces
+    * the 64 KiB (4096-row) ring budget and splits cleanly. */
+   CHECK(!hk_apple9_native_stream_admits(&unb_stream, &(struct hk_apple9_draw_summary){
+      .native = true, .primitives = 100, .ring_rows = 48, .ring_limited = true},
+      &enabled_capped));
+
+   /* Both native ordering directions between capped and exempt draws MUST split
+    * when combined primitives exceed max_render_primitives:
+    * 1) Capped native (900k, bounded_prims=true) + exempt tess (163.84M) -> split!
+    * 2) Exempt tess (163.84M accumulated in s.primitives) + capped native (100) -> split! */
+   struct hk_apple9_stream_summary capped_stream = {
+      .native = true,
+      .has_draws = true,
+      .bounded_prims = true,
+      .primitives = 900000,
+      .ring_rows = 40,
+      .ring_limited = false,
+   };
+   CHECK(!hk_apple9_native_stream_admits(&capped_stream, &giant_tess, &enabled_capped));
+   struct hk_apple9_stream_summary unb_accum = {
+      .native = true,
+      .has_draws = true,
+      .bounded_prims = false,
+      .primitives = giant_tess.primitives,
+      .ring_rows = giant_tess.ring_rows,
+      .ring_limited = false,
+   };
+   CHECK(!hk_apple9_native_stream_admits(&unb_accum, &(struct hk_apple9_draw_summary){
+      .native = true, .unbounded_prims = false, .primitives = 100,
+      .ring_rows = 40, .ring_limited = false}, &enabled_capped));
 
    printf("PASS\n");
    return 0;

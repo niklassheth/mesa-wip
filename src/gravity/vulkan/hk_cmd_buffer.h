@@ -543,8 +543,10 @@ struct hk_cs {
    /* Native dispatches (blocks) in the stream. */
    unsigned apple9_native_dispatches;
    /* Estimated binned primitives of the stream's native render (blocks
-    * and the ordinary draws between them). */
+    * and the ordinary draws between them), and whether any native block in
+    * this render is subject to the conservative TVB primitive cap. */
    uint64_t apple9_native_primitives;
+   bool apple9_native_bounded_prims;
    /* Cumulative 16-byte rows of the 64 KiB mesh output ring used by native
     * blocks in this render, and whether any block had wg_rows > 40. */
    uint64_t apple9_native_ring_rows;
@@ -819,9 +821,11 @@ struct hk_cmd_buffer {
     * render bound (hk_apple9_native_stream_admits); UINT64_MAX: unknown. */
    uint64_t apple9_draw_primitives;
    /* Hardware 64 KiB mesh output ring rows of the native draw being recorded,
-    * and whether its per-WG footprint exceeds the 40-row concurrent cap. */
+    * whether its per-WG footprint exceeds the 40-row concurrent cap, and
+    * whether it is exempt from the conservative 1M TVB primitive cap. */
    uint64_t apple9_draw_ring_rows;
    bool apple9_draw_ring_limited;
+   bool apple9_draw_unbounded_prims;
    struct hk_cs *apple9_prev_cs;
 
    /* Prepared ordinary draw state. Dynamic/shader/vertex state dirties this
@@ -1679,6 +1683,15 @@ uint64_t hk_apple9_ordinary_draw_primitives(const struct hk_cmd_buffer *cmd,
                                             struct agx_draw draw);
 bool hk_apple9_use_native_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw);
 bool hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw);
+struct hk_apple9_fused_tess_chunk_plan {
+   uint32_t inst_chunk_cap;
+   uint32_t patch_chunk_cap;
+};
+bool hk_apple9_native_tess_fused_chunk_plan(
+   uint32_t patches_per_inst, uint32_t instances, uint32_t max_groups,
+   uint32_t max_child_wgs_per_patch, uint32_t max_prims_per_patch,
+   uint64_t ring_max, uint64_t render_prim_cap,
+   struct hk_apple9_fused_tess_chunk_plan *out);
 enum hk_apple9_native_mesh_route
 hk_apple9_select_native_mesh_route(struct hk_cmd_buffer *cmd,
                                    const uint32_t *direct,

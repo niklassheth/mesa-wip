@@ -711,7 +711,7 @@ tess_fused_routes(struct hk_cmd_buffer *cmd)
    if (enabled) {
       /* Multi-patch, multi-instance, firstVertex, firstInstance, dynamic domain
        * origin, and U8/U16/U32 indexed draws are all admitted directly when
-       * chunking stays within HK_APPLE9_NATIVE_TESS_MAX_CHUNKS. */
+       * grid chunking stays within HK_APPLE9_NATIVE_TESS_MAX_CHUNKS. */
       draw.start = 12;
       draw.start_instance = 7;
       const uint64_t prim_cap = hk_apple9_native_render_primitives();
@@ -722,47 +722,52 @@ tess_fused_routes(struct hk_cmd_buffer *cmd)
       dyn->ts.domain_origin = VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
       CHECK(hk_apple9_use_native_tess(cmd, draw));
       dyn->ts.domain_origin = VK_TESSELLATION_DOMAIN_ORIGIN_UPPER_LEFT;
+      /* Unbounded (wg_rows <= 40, != 32) draws ignore the 1M primitive cap:
+       * 524288 * 32 * 2 still plans in 2 grid chunks -> admitted! */
       main->info.apple9_tess_max_patch_prims = 32;
-      /* 524288 * 32 * 2 needs 34 TVB-bounded chunks -> falls back to SW tess. */
-      CHECK(!hk_apple9_use_native_tess(cmd, draw));
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
 
-      /* Multi-chunk profitability cap boundary (dynamic worst-case tri patch:
-       * max_patch_prims = 6144 -> tvb_patch_cap = prim_cap / 6144). */
-      main->info.apple9_tess_max_patch_prims = 6144;
-      const uint32_t dyn_per_chunk = (uint32_t)(prim_cap / 6144);
-      CHECK(dyn_per_chunk > 0);
+      /* Unbounded giant 20,000-patch dynamic tessellation draw (worst-case
+       * 8192 prims/patch = 163.84M > 1M cap) plans 1 SINGLE chunk! */
+      main->info.apple9_tess_max_patch_prims = 8192;
       draw.b.count[1] = 1;
-      draw.b.count[0] = 4 * (dyn_per_chunk * HK_APPLE9_NATIVE_TESS_MAX_CHUNKS);
-      CHECK(hk_apple9_use_native_tess(cmd, draw));
-      draw.b.count[0] =
-         4 * (dyn_per_chunk * HK_APPLE9_NATIVE_TESS_MAX_CHUNKS + 1);
-      CHECK(!hk_apple9_use_native_tess(cmd, draw));
-      /* Giant >16k-patch dynamic draw (~124 chunks) cleanly falls back to SW. */
       draw.b.count[0] = 4 * 20000;
-      CHECK(!hk_apple9_use_native_tess(cmd, draw));
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      struct hk_apple9_fused_tess_chunk_plan plan = {0};
+      CHECK(hk_apple9_native_tess_fused_chunk_plan(
+         20000, 1, AGX_NATIVE_OBJECT_MAX_GROUPS, 4096, 8192, UINT64_MAX,
+         prim_cap, &plan));
+      CHECK(plan.inst_chunk_cap == 1 && plan.patch_chunk_cap == 20000);
 
-      /* Combined patch x instance chunking (2 patch chunks x 2 vs 3 insts). */
-      draw.b.count[0] = 4 * (dyn_per_chunk + 1);
-      draw.b.count[1] = 2;
-      CHECK(hk_apple9_use_native_tess(cmd, draw));
-      draw.b.count[1] = 3;
-      CHECK(!hk_apple9_use_native_tess(cmd, draw));
-
-      /* Instance-chunking boundary (inst_cap == 1 and inst_cap == 2 partial). */
-      main->info.apple9_tess_max_patch_prims = 1000;
-      const uint32_t inst_patches = (uint32_t)(prim_cap / 1000);
-      draw.b.count[0] = 4 * inst_patches;
-      draw.b.count[1] = HK_APPLE9_NATIVE_TESS_MAX_CHUNKS;
-      CHECK(hk_apple9_use_native_tess(cmd, draw));
-      draw.b.count[1] = HK_APPLE9_NATIVE_TESS_MAX_CHUNKS + 1;
-      CHECK(!hk_apple9_use_native_tess(cmd, draw));
-      draw.b.count[0] = 4 * (inst_patches / 2); /* inst_cap == 2 */
-      draw.b.count[1] = HK_APPLE9_NATIVE_TESS_MAX_CHUNKS * 2 - 1; /* 7 -> 4 */
-      CHECK(hk_apple9_use_native_tess(cmd, draw));
-      draw.b.count[1] = HK_APPLE9_NATIVE_TESS_MAX_CHUNKS * 2; /* 8 -> 4 */
-      CHECK(hk_apple9_use_native_tess(cmd, draw));
-      draw.b.count[1] = HK_APPLE9_NATIVE_TESS_MAX_CHUNKS * 2 + 1; /* 9 -> 5 */
-      CHECK(!hk_apple9_use_native_tess(cmd, draw));
+      /* Grid-overflow chunking boundary still enforces max_groups=1,048,575
+       * and HK_APPLE9_NATIVE_TESS_MAX_CHUNKS=4u (patch & instance chunking). */
+      const uint32_t safe_patch_cap = AGX_NATIVE_OBJECT_MAX_GROUPS - 16;
+      CHECK(hk_apple9_native_tess_fused_chunk_plan(
+         safe_patch_cap * HK_APPLE9_NATIVE_TESS_MAX_CHUNKS, 1,
+         AGX_NATIVE_OBJECT_MAX_GROUPS, 4096, 8192, UINT64_MAX, prim_cap,
+         &plan));
+      CHECK(plan.inst_chunk_cap == 1 && plan.patch_chunk_cap == safe_patch_cap);
+      CHECK(!hk_apple9_native_tess_fused_chunk_plan(
+         safe_patch_cap * HK_APPLE9_NATIVE_TESS_MAX_CHUNKS + 1, 1,
+         AGX_NATIVE_OBJECT_MAX_GROUPS, 4096, 8192, UINT64_MAX, prim_cap,
+         &plan));
+      /* Instance chunking on grid cap: 600,000 patches -> 1 inst/chunk -> 4 OK, 5 reject. */
+      CHECK(hk_apple9_native_tess_fused_chunk_plan(
+         600000, HK_APPLE9_NATIVE_TESS_MAX_CHUNKS,
+         AGX_NATIVE_OBJECT_MAX_GROUPS, 4096, 8192, UINT64_MAX, prim_cap,
+         &plan));
+      CHECK(plan.inst_chunk_cap == 1 && plan.patch_chunk_cap == 600000);
+      CHECK(!hk_apple9_native_tess_fused_chunk_plan(
+         600000, HK_APPLE9_NATIVE_TESS_MAX_CHUNKS + 1,
+         AGX_NATIVE_OBJECT_MAX_GROUPS, 4096, 8192, UINT64_MAX, prim_cap,
+         &plan));
+      /* Ring-bounded (ring_max != UINT64_MAX) still strictly enforces 1-chunk
+       * ring AND render_prim_cap limits. */
+      CHECK(!hk_apple9_native_tess_fused_chunk_plan(
+         200, 1, AGX_NATIVE_OBJECT_MAX_GROUPS, 1, 8192, 4096, prim_cap, &plan));
+      CHECK(hk_apple9_native_tess_fused_chunk_plan(
+         100, 1, AGX_NATIVE_OBJECT_MAX_GROUPS, 1, 8192, 4096, prim_cap, &plan));
+      CHECK(plan.inst_chunk_cap == 1 && plan.patch_chunk_cap == 100);
 
       /* Single-chunk unbounded draw stays admitted. */
       main->info.apple9_tess_max_patch_prims = 32;
@@ -855,6 +860,7 @@ mark_draw(struct hk_cs *cs, bool native)
    cs->stats.cmds++;
    if (native) {
       cs->apple9_native_mesh = true;
+      cs->apple9_native_bounded_prims = true;
       cs->apple9_native_dispatches++;
    }
 }

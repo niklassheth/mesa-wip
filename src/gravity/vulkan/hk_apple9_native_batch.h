@@ -38,6 +38,10 @@ struct hk_apple9_stream_summary {
    bool native;
    /* The stream already contains at least one draw (ordinary or native). */
    bool has_draws;
+   /* True if any native block in the render is subject to the conservative
+    * max_render_primitives TVB cap (false when all native draws so far are
+    * unbounded wg_rows <= 40, != 32 multi-parent fused tessellation). */
+   bool bounded_prims;
    /* Estimated binned primitives already in the render. */
    uint64_t primitives;
    /* Cumulative hardware 64 KiB mesh output ring rows of native blocks in the
@@ -48,6 +52,10 @@ struct hk_apple9_stream_summary {
 
 struct hk_apple9_draw_summary {
    bool native;
+   /* True when this native draw is exempt from the conservative 1M TVB
+    * primitive cap (unbounded wg_rows <= 40, != 32 multi-parent fused
+    * tessellation, validated across >4,375 native_tvb_refused partial renders). */
+   bool unbounded_prims;
    /* Estimated binned primitives of the draw (UINT64_MAX: unknown). */
    uint64_t primitives;
    /* Hardware 64 KiB mesh output ring rows of this native draw (UINT64_MAX:
@@ -67,7 +75,8 @@ hk_apple9_native_stream_admits(const struct hk_apple9_stream_summary *s,
       return true;
    if (!p->blocks)
       return false;
-   if (p->max_render_primitives &&
+   bool check_prims = s->bounded_prims || (d->native && !d->unbounded_prims);
+   if (p->max_render_primitives && check_prims &&
        (d->primitives > p->max_render_primitives ||
         s->primitives > p->max_render_primitives - d->primitives))
       return false;

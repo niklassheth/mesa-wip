@@ -1713,12 +1713,14 @@ hk_apple9_native_can_append(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    const struct hk_apple9_stream_summary stream = {
       .native = cs->apple9_native_mesh,
       .has_draws = has_draws,
+      .bounded_prims = cs->apple9_native_bounded_prims,
       .primitives = cs->apple9_native_primitives,
       .ring_rows = cs->apple9_native_ring_rows,
       .ring_limited = cs->apple9_native_ring_limited,
    };
    const struct hk_apple9_draw_summary draw = {
       .native = native,
+      .unbounded_prims = native && cmd->apple9_draw_unbounded_prims,
       .primitives = cmd->apple9_draw_primitives,
       .ring_rows = native ? cmd->apple9_draw_ring_rows : 0,
       .ring_limited = native && cmd->apple9_draw_ring_limited,
@@ -2162,6 +2164,8 @@ hk_apple9_record_draw_ex(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       cs->current += bytes - 4;
       cs->apple9_native_mesh = true;
       ++cs->apple9_native_dispatches;
+      if (!cmd->apple9_draw_unbounded_prims)
+         cs->apple9_native_bounded_prims = true;
       hk_apple9_add_native_primitives(cs, cmd->apple9_draw_primitives);
       hk_apple9_add_native_ring_rows(cs, cmd->apple9_draw_ring_rows,
                                      cmd->apple9_draw_ring_limited);
