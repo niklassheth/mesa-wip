@@ -1272,6 +1272,13 @@ struct a9_ra_ctx {
    /* Current block and instruction during local assignment. */
    struct agx_apple9_block *cur_block;
    struct agx_apple9_vir_instr *cur_instr;
+
+   /* Reusable per-block VIR_COLLECT bypass use/kill index (indexed by orig_v
+    * < orig_vcount, lazily allocated on memctx, reset in O(|B|) per block). */
+   uint32_t *blk_use_head;
+   uint32_t *blk_use_tail;
+   uint32_t *blk_kill_head;
+   uint32_t *blk_kill_tail;
 };
 
 static bool
@@ -2577,6 +2584,208 @@ a9_retire_async_for_instr(struct a9_ra_ctx *rctx,
  * Per-Block Dominance-Order Assignment
  * ========================================================================= */
 
+struct a9_blk_use_node {
+   struct agx_apple9_vir_instr *ins;
+   uint32_t pos;
+   uint32_t next;
+};
+
+struct a9_blk_split_rec {
+   uint32_t pos;
+   uint32_t base;
+   uint8_t comps;
+};
+
+struct a9_blk_collect_index {
+   struct a9_blk_use_node *use_nodes;
+   unsigned use_count;
+   struct a9_blk_use_node *kill_nodes;
+   unsigned kill_count;
+   unsigned kill_cap;
+   struct a9_blk_split_rec *splits;
+   unsigned split_count;
+   uint32_t *collect_pos;
+   unsigned collect_count;
+   unsigned collect_cursor;
+   uint32_t *touched_use_vars;
+   unsigned touched_use_count;
+   uint32_t *touched_kill_vars;
+   unsigned touched_kill_count;
+   void *ctx;
+};
+
+static inline bool
+a9_is_bypassable_collect(const struct a9_ra_ctx *rctx,
+                         const struct agx_apple9_vir_instr *ins)
+{
+   return ins->op == AGX_APPLE9_VIR_COLLECT &&
+          ins->dest != AGX_APPLE9_VREG_INVALID &&
+          ins->dest_components >= 2 && ins->dest_components <= 4 &&
+          ins->nr_srcs == ins->dest_components &&
+          !a9_is_pub_val(rctx->program, ins->dest);
+}
+
+static inline void
+a9_blk_collect_index_add_kill(struct a9_ra_ctx *rctx,
+                              struct a9_blk_collect_index *cidx,
+                              uint32_t orig_v,
+                              struct agx_apple9_vir_instr *ins, uint32_t pos)
+{
+   if (orig_v >= rctx->orig_vcount)
+      return;
+   uint32_t tail = rctx->blk_kill_tail[orig_v];
+   if (tail != UINT32_MAX && cidx->kill_nodes[tail].ins == ins)
+      return;
+   assert(cidx->kill_count < cidx->kill_cap);
+   uint32_t id = cidx->kill_count++;
+   cidx->kill_nodes[id].ins = ins;
+   cidx->kill_nodes[id].pos = pos;
+   cidx->kill_nodes[id].next = UINT32_MAX;
+   if (tail != UINT32_MAX) {
+      cidx->kill_nodes[tail].next = id;
+   } else {
+      rctx->blk_kill_head[orig_v] = id;
+      cidx->touched_kill_vars[cidx->touched_kill_count++] = orig_v;
+   }
+   rctx->blk_kill_tail[orig_v] = id;
+}
+
+static bool
+a9_blk_collect_index_build(struct a9_ra_ctx *rctx,
+                           struct agx_apple9_block *block,
+                           struct a9_blk_collect_index *cidx)
+{
+   memset(cidx, 0, sizeof(*cidx));
+
+   unsigned collect_count = 0;
+   unsigned total_srcs = 0;
+   unsigned total_kills = 0;
+   unsigned split_count = 0;
+   for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(block);
+        ins; ins = agx_apple9_instr_next(ins)) {
+      if (ins->op == AGX_APPLE9_VIR_PHI)
+         continue;
+      if (a9_is_bypassable_collect(rctx, ins))
+         collect_count++;
+      unsigned ns = agx_apple9_vir_nr_srcs(ins);
+      total_srcs += ns;
+      if (ins->kill_mask != 0)
+         total_kills += MIN2(ns, (unsigned)AGX_APPLE9_MAX_VIR_SRCS);
+      if (ins->op == AGX_APPLE9_VIR_SPLIT && ns >= 1)
+         split_count++;
+   }
+
+   if (collect_count == 0)
+      return true;
+
+   const unsigned ov = MAX2(rctx->orig_vcount, 1u);
+   if (!rctx->blk_use_head) {
+      rctx->blk_use_head = ralloc_array(rctx->memctx, uint32_t, ov);
+      rctx->blk_use_tail = ralloc_array(rctx->memctx, uint32_t, ov);
+      rctx->blk_kill_head = ralloc_array(rctx->memctx, uint32_t, ov);
+      rctx->blk_kill_tail = ralloc_array(rctx->memctx, uint32_t, ov);
+      if (!rctx->blk_use_head || !rctx->blk_use_tail ||
+          !rctx->blk_kill_head || !rctx->blk_kill_tail) {
+         rctx->error = "out of memory allocating VIR_COLLECT index";
+         return false;
+      }
+      memset(rctx->blk_use_head, 0xff, ov * sizeof(uint32_t));
+      memset(rctx->blk_use_tail, 0xff, ov * sizeof(uint32_t));
+      memset(rctx->blk_kill_head, 0xff, ov * sizeof(uint32_t));
+      memset(rctx->blk_kill_tail, 0xff, ov * sizeof(uint32_t));
+   }
+
+   cidx->ctx = ralloc_context(rctx->memctx);
+   cidx->kill_cap = MAX2(total_kills + collect_count * 4u, 1u);
+   cidx->collect_count = collect_count;
+   cidx->split_count = split_count;
+   if (cidx->ctx) {
+      cidx->use_nodes =
+         ralloc_array(cidx->ctx, struct a9_blk_use_node, MAX2(total_srcs, 1u));
+      cidx->kill_nodes =
+         ralloc_array(cidx->ctx, struct a9_blk_use_node, cidx->kill_cap);
+      cidx->splits =
+         ralloc_array(cidx->ctx, struct a9_blk_split_rec, MAX2(split_count, 1u));
+      cidx->collect_pos = ralloc_array(cidx->ctx, uint32_t, collect_count);
+      cidx->touched_use_vars =
+         ralloc_array(cidx->ctx, uint32_t, MAX2(total_srcs, 1u));
+      cidx->touched_kill_vars =
+         ralloc_array(cidx->ctx, uint32_t, cidx->kill_cap);
+   }
+   if (!cidx->ctx || !cidx->use_nodes || !cidx->kill_nodes || !cidx->splits ||
+       !cidx->collect_pos || !cidx->touched_use_vars ||
+       !cidx->touched_kill_vars) {
+      ralloc_free(cidx->ctx);
+      memset(cidx, 0, sizeof(*cidx));
+      rctx->error = "out of memory allocating per-block VIR_COLLECT index";
+      return false;
+   }
+
+   unsigned ci = 0;
+   unsigned si = 0;
+   uint32_t pos = 0;
+   for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(block);
+        ins; ins = agx_apple9_instr_next(ins), ++pos) {
+      if (ins->op == AGX_APPLE9_VIR_PHI)
+         continue;
+      if (a9_is_bypassable_collect(rctx, ins))
+         cidx->collect_pos[ci++] = pos;
+
+      unsigned ns = agx_apple9_vir_nr_srcs(ins);
+      if (ins->op == AGX_APPLE9_VIR_SPLIT && ns >= 1) {
+         cidx->splits[si].pos = pos;
+         cidx->splits[si].base = agx_apple9_vir_src(ins, 0);
+         cidx->splits[si].comps = ins->dest_components;
+         si++;
+      }
+
+      for (unsigned s = 0; s < ns; ++s) {
+         uint32_t v = agx_apple9_vir_src(ins, s);
+         if (v >= rctx->orig_vcount)
+            continue;
+         uint32_t utail = rctx->blk_use_tail[v];
+         if (utail == UINT32_MAX || cidx->use_nodes[utail].ins != ins) {
+            uint32_t id = cidx->use_count++;
+            cidx->use_nodes[id].ins = ins;
+            cidx->use_nodes[id].pos = pos;
+            cidx->use_nodes[id].next = UINT32_MAX;
+            if (utail != UINT32_MAX) {
+               cidx->use_nodes[utail].next = id;
+            } else {
+               rctx->blk_use_head[v] = id;
+               cidx->touched_use_vars[cidx->touched_use_count++] = v;
+            }
+            rctx->blk_use_tail[v] = id;
+         }
+         if (s < AGX_APPLE9_MAX_VIR_SRCS && agx_apple9_vir_src_killed(ins, s))
+            a9_blk_collect_index_add_kill(rctx, cidx, v, ins, pos);
+      }
+   }
+   assert(ci == collect_count);
+   assert(si == split_count);
+   return true;
+}
+
+static void
+a9_blk_collect_index_finish(struct a9_ra_ctx *rctx,
+                            struct a9_blk_collect_index *cidx)
+{
+   if (!cidx->ctx)
+      return;
+   for (unsigned i = 0; i < cidx->touched_use_count; ++i) {
+      uint32_t v = cidx->touched_use_vars[i];
+      rctx->blk_use_head[v] = UINT32_MAX;
+      rctx->blk_use_tail[v] = UINT32_MAX;
+   }
+   for (unsigned i = 0; i < cidx->touched_kill_count; ++i) {
+      uint32_t v = cidx->touched_kill_vars[i];
+      rctx->blk_kill_head[v] = UINT32_MAX;
+      rctx->blk_kill_tail[v] = UINT32_MAX;
+   }
+   ralloc_free(cidx->ctx);
+   memset(cidx, 0, sizeof(*cidx));
+}
+
 static bool
 a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
 {
@@ -2772,6 +2981,11 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
    }
 
    /* Step 2: Walk all non-PHI instructions in program order. */
+   struct a9_blk_collect_index cidx;
+   if (!a9_blk_collect_index_build(rctx, block, &cidx))
+      return false;
+
+   bool step2_ok = true;
    bool vacated_reserved = (bi != 0 || rctx->reserved == 0);
    for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(block),
         *next_ins = ins ? agx_apple9_instr_next(ins) : NULL;
@@ -2788,7 +3002,8 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
          unsigned r = ins->immediate;
          if (r >= AGX_APPLE9_GPR_COUNT) {
             rctx->error = "ENTRY_REG physical GPR out of range";
-            return false;
+            step2_ok = false;
+            break;
          }
          a9_assign_gpr_val(rctx, ins->dest, r);
          if (!(ins->dead_dest_mask & 1u)) {
@@ -2809,11 +3024,15 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
               ++r) {
             if (gpr_test(rctx->used_gprs, r) &&
                 rctx->reg_to_ssa[r] != AGX_APPLE9_VREG_INVALID) {
-               if (!a9_evict_register(rctx, r, empty_forbid, ins))
-                  return false;
+               if (!a9_evict_register(rctx, r, empty_forbid, ins)) {
+                  step2_ok = false;
+                  break;
+               }
                gpr_set(rctx->used_gprs, r);
             }
          }
+         if (!step2_ok)
+            break;
       }
 
       /* Rewrite source references through active split mapping.
@@ -2889,12 +3108,14 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                   rctx->pinned[1] = saved_pinned[1];
                   rctx->needs_spill_headroom = true;
                   rctx->error = "no free GPR for live VIR_SPLIT lane";
-                  return false;
+                  step2_ok = false;
+                  break;
                }
                if (moves > 0 && !a9_vacate_window(rctx, chosen, 1, ins)) {
                   rctx->pinned[0] = saved_pinned[0];
                   rctx->pinned[1] = saved_pinned[1];
-                  return false;
+                  step2_ok = false;
+                  break;
                }
                gpr_set(rctx->used_gprs, chosen);
                gpr_set(rctx->pinned, chosen);
@@ -2903,6 +3124,8 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
             }
             rctx->pinned[0] = saved_pinned[0];
             rctx->pinned[1] = saved_pinned[1];
+            if (!step2_ok)
+               break;
          }
          continue;
       }
@@ -2910,11 +3133,9 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
       /* Handle VIR_COLLECT zero-copy bypass when all source lanes already
        * occupy consecutive GPRs in a legal window and the tuple stays local
        * to this block. */
-      if (ins->op == AGX_APPLE9_VIR_COLLECT &&
-          ins->dest != AGX_APPLE9_VREG_INVALID &&
-          ins->dest_components >= 2 && ins->dest_components <= 4 &&
-          ins->nr_srcs == ins->dest_components &&
-          !a9_is_pub_val(rctx->program, ins->dest)) {
+      if (a9_is_bypassable_collect(rctx, ins)) {
+         assert(cidx.collect_cursor < cidx.collect_count);
+         const uint32_t cur_pos = cidx.collect_pos[cidx.collect_cursor++];
          unsigned w = ins->dest_components;
          bool can_bypass = true;
          unsigned base_r = AGX_APPLE9_PHYS_INVALID;
@@ -2942,48 +3163,52 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                can_bypass = false;
          }
          if (can_bypass && base_r + w <= rctx->bound) {
-            /* Ensure no consumer splits, returns, or clobbers the collected
-             * tuple (clobbered operands require a private copy so live sources
-             * are not overwritten by hardware). */
-            for (struct agx_apple9_vir_instr *u = next_ins; u && can_bypass;
-                 u = agx_apple9_instr_next(u)) {
-               unsigned uns = agx_apple9_vir_nr_srcs(u);
-               if (u->op == AGX_APPLE9_VIR_SPLIT ||
-                   u->op == AGX_APPLE9_VIR_ABI_RETURN) {
-                  for (unsigned s = 0; s < uns; ++s) {
-                     uint32_t usv = agx_apple9_vir_src(u, s);
-                     if (usv >= ins->dest && usv < ins->dest + w) {
-                        can_bypass = false;
-                        break;
-                     }
-                  }
-                  if (can_bypass && u->op == AGX_APPLE9_VIR_SPLIT && uns >= 1) {
-                     uint32_t base = agx_apple9_vir_src(u, 0);
-                     for (unsigned k = 0; k < w; ++k) {
-                        uint32_t orig_sv = rctx->orig_ssa[ins->src[k]];
-                        if (orig_sv >= base &&
-                            orig_sv < base + u->dest_components) {
-                           can_bypass = false;
-                           break;
-                        }
-                     }
-                  }
+            /* Ensure no later VIR_SPLIT reads a source tuple lane of this
+             * collect, and no consumer of the collected tuple splits, returns,
+             * or clobbers it. */
+            for (unsigned si = 0; si < cidx.split_count && can_bypass; ++si) {
+               const struct a9_blk_split_rec *sp = &cidx.splits[si];
+               if (sp->pos <= cur_pos)
                   continue;
+               for (unsigned k = 0; k < w; ++k) {
+                  uint32_t orig_sv = rctx->orig_ssa[ins->src[k]];
+                  if (orig_sv >= sp->base && orig_sv < sp->base + sp->comps) {
+                     can_bypass = false;
+                     break;
+                  }
                }
-               for (unsigned s = 0; s < uns && can_bypass; ) {
-                  unsigned sw = apple9_ra_source_width(u, s);
-                  const struct agx_apple9_operand_constraint *op_c =
-                     apple9_ra_source_constraint(u, s);
-                  if (op_c && (op_c->flags & AGX_APPLE9_OPERAND_CLOBBER)) {
-                     for (unsigned c = 0; c < sw && s + c < uns; ++c) {
-                        uint32_t usv = agx_apple9_vir_src(u, s + c);
-                        if (usv >= ins->dest && usv < ins->dest + w) {
-                           can_bypass = false;
-                           break;
+            }
+            for (unsigned k = 0; k < w && can_bypass; ++k) {
+               uint32_t dv = ins->dest + k;
+               if (dv >= rctx->orig_vcount)
+                  continue;
+               for (uint32_t id = rctx->blk_use_head[dv];
+                    id != UINT32_MAX && can_bypass;
+                    id = cidx.use_nodes[id].next) {
+                  if (cidx.use_nodes[id].pos <= cur_pos)
+                     continue;
+                  struct agx_apple9_vir_instr *u = cidx.use_nodes[id].ins;
+                  if (u->op == AGX_APPLE9_VIR_SPLIT ||
+                      u->op == AGX_APPLE9_VIR_ABI_RETURN) {
+                     can_bypass = false;
+                     break;
+                  }
+                  unsigned uns = agx_apple9_vir_nr_srcs(u);
+                  for (unsigned s = 0; s < uns && can_bypass; ) {
+                     unsigned sw = apple9_ra_source_width(u, s);
+                     const struct agx_apple9_operand_constraint *op_c =
+                        apple9_ra_source_constraint(u, s);
+                     if (op_c && (op_c->flags & AGX_APPLE9_OPERAND_CLOBBER)) {
+                        for (unsigned c = 0; c < sw && s + c < uns; ++c) {
+                           uint32_t usv = agx_apple9_vir_src(u, s + c);
+                           if (usv >= ins->dest && usv < ins->dest + w) {
+                              can_bypass = false;
+                              break;
+                           }
                         }
                      }
+                     s += sw;
                   }
-                  s += sw;
                }
             }
          } else {
@@ -3000,28 +3225,55 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                uint32_t dv = ins->dest + k;
                bool src_killed_here = agx_apple9_vir_src_killed(ins, k);
                struct agx_apple9_vir_instr *orig_kill_ins = NULL;
+               uint32_t orig_kill_pos = 0;
                struct agx_apple9_vir_instr *last_dest_use = NULL;
+               uint32_t last_dest_pos = 0;
                bool seen_orig_kill_before_last_dest = false;
 
-               for (struct agx_apple9_vir_instr *u = next_ins; u;
-                    u = agx_apple9_instr_next(u)) {
-                  unsigned uns = agx_apple9_vir_nr_srcs(u);
-                  bool u_had_orig_kill = false;
-                  bool u_used_dest = false;
-                  for (unsigned s = 0; s < uns && s < AGX_APPLE9_MAX_VIR_SRCS; ++s) {
-                     uint32_t usv = agx_apple9_vir_src(u, s);
-                     if (a9_resolve_cur(rctx, usv) == sv &&
-                         agx_apple9_vir_src_killed(u, s))
-                        u_had_orig_kill = true;
-                     if (usv == dv)
-                        u_used_dest = true;
+               if (dv < rctx->orig_vcount) {
+                  for (uint32_t id = rctx->blk_use_head[dv]; id != UINT32_MAX;
+                       id = cidx.use_nodes[id].next) {
+                     uint32_t upos = cidx.use_nodes[id].pos;
+                     if (upos <= cur_pos)
+                        continue;
+                     struct agx_apple9_vir_instr *u = cidx.use_nodes[id].ins;
+                     unsigned uns = agx_apple9_vir_nr_srcs(u);
+                     for (unsigned s = 0; s < uns && s < AGX_APPLE9_MAX_VIR_SRCS;
+                          ++s) {
+                        if (agx_apple9_vir_src(u, s) == dv) {
+                           last_dest_use = u;
+                           last_dest_pos = upos;
+                           break;
+                        }
+                     }
                   }
-                  if (u_had_orig_kill)
-                     orig_kill_ins = u;
-                  if (u_used_dest) {
-                     last_dest_use = u;
-                     if (orig_kill_ins)
-                        seen_orig_kill_before_last_dest = true;
+               }
+
+               if (orig_sv < rctx->orig_vcount) {
+                  for (uint32_t id = rctx->blk_kill_head[orig_sv];
+                       id != UINT32_MAX; id = cidx.kill_nodes[id].next) {
+                     uint32_t kpos = cidx.kill_nodes[id].pos;
+                     if (kpos <= cur_pos)
+                        continue;
+                     struct agx_apple9_vir_instr *ku = cidx.kill_nodes[id].ins;
+                     unsigned uns = agx_apple9_vir_nr_srcs(ku);
+                     bool ku_has_kill = false;
+                     for (unsigned s = 0; s < uns && s < AGX_APPLE9_MAX_VIR_SRCS;
+                          ++s) {
+                        if (a9_resolve_cur(rctx, agx_apple9_vir_src(ku, s)) == sv &&
+                            agx_apple9_vir_src_killed(ku, s)) {
+                           ku_has_kill = true;
+                           break;
+                        }
+                     }
+                     if (ku_has_kill) {
+                        if (!orig_kill_ins || kpos >= orig_kill_pos) {
+                           orig_kill_ins = ku;
+                           orig_kill_pos = kpos;
+                        }
+                        if (last_dest_use && kpos <= last_dest_pos)
+                           seen_orig_kill_before_last_dest = true;
+                     }
                   }
                }
 
@@ -3036,25 +3288,33 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                   }
                }
 
-               for (struct agx_apple9_vir_instr *u = next_ins; u;
-                    u = agx_apple9_instr_next(u)) {
-                  unsigned uns = agx_apple9_vir_nr_srcs(u);
-                  bool u_is_load =
-                     u->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT ||
-                     u->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_POINTER;
-                  for (unsigned s = 0; s < uns && s < AGX_APPLE9_MAX_VIR_SRCS; ++s) {
-                     if (agx_apple9_vir_src(u, s) == dv) {
-                        *agx_apple9_vir_src_ptr(u, s) = repl_sv;
-                        if (u_is_load)
-                           u->retain_mask |= (uint16_t)BITFIELD_BIT(s);
-                        if (!transfer_kill_to_last_dest || u != last_dest_use)
-                           agx_apple9_vir_set_src_killed(u, s, false);
-                     }
-                  }
-                  if (transfer_kill_to_last_dest && u == last_dest_use) {
+               if (dv < rctx->orig_vcount) {
+                  for (uint32_t id = rctx->blk_use_head[dv]; id != UINT32_MAX;
+                       id = cidx.use_nodes[id].next) {
+                     uint32_t upos = cidx.use_nodes[id].pos;
+                     if (upos <= cur_pos)
+                        continue;
+                     struct agx_apple9_vir_instr *u = cidx.use_nodes[id].ins;
+                     unsigned uns = agx_apple9_vir_nr_srcs(u);
+                     bool u_is_load =
+                        u->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT ||
+                        u->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_POINTER;
                      for (unsigned s = 0; s < uns && s < AGX_APPLE9_MAX_VIR_SRCS; ++s) {
-                        if (a9_resolve_cur(rctx, agx_apple9_vir_src(u, s)) == sv)
-                           agx_apple9_vir_set_src_killed(u, s, true);
+                        if (agx_apple9_vir_src(u, s) == dv) {
+                           *agx_apple9_vir_src_ptr(u, s) = repl_sv;
+                           if (u_is_load)
+                              u->retain_mask |= (uint16_t)BITFIELD_BIT(s);
+                           if (!transfer_kill_to_last_dest || u != last_dest_use)
+                              agx_apple9_vir_set_src_killed(u, s, false);
+                        }
+                     }
+                     if (transfer_kill_to_last_dest && u == last_dest_use) {
+                        for (unsigned s = 0; s < uns && s < AGX_APPLE9_MAX_VIR_SRCS; ++s) {
+                           if (a9_resolve_cur(rctx, agx_apple9_vir_src(u, s)) == sv)
+                              agx_apple9_vir_set_src_killed(u, s, true);
+                        }
+                        a9_blk_collect_index_add_kill(rctx, &cidx, orig_sv, u,
+                                                      upos);
                      }
                   }
                }
@@ -3079,14 +3339,18 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
 
       /* Place constrained machine sources first (relocating if needed). */
       if (ins->encoding != AGX_APPLE9_ENC_PSEUDO) {
-         if (!a9_assign_constrained_sources(rctx, ins))
-            return false;
+         if (!a9_assign_constrained_sources(rctx, ins)) {
+            step2_ok = false;
+            break;
+         }
       }
 
       /* Assign destination(s) (reusing killed source GPR when legal). */
       uint16_t reused_sources = 0;
-      if (!a9_assign_dest(rctx, ins, &reused_sources))
-         return false;
+      if (!a9_assign_dest(rctx, ins, &reused_sources)) {
+         step2_ok = false;
+         break;
+      }
 
       /* Release killed sources not taken over by the destination. */
       unsigned nr_srcs = agx_apple9_vir_nr_srcs(ins);
@@ -3157,6 +3421,10 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
          }
       }
    }
+
+   a9_blk_collect_index_finish(rctx, &cidx);
+   if (!step2_ok)
+      return false;
 
    /* If block 0 had only ENTRY_REGs (or pre-defined fixed inputs), still vacate
     * any live values occupying [0 .. reserved - 1] before leaving block 0. */

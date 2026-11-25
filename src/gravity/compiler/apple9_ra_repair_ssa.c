@@ -35,7 +35,8 @@ struct repair_block {
    /* Cached first non-entry-prefix instruction in this block for O(1) PHI placement. */
    struct agx_apple9_vir_instr *first_non_prefix;
 
-   /* Sparse map: original variable ID -> current SSA uint32_t value (+1). */
+   /* Sparse fallback map when num_blocks * num_redef exceeds the dense budget:
+    * original variable ID -> current SSA uint32_t value (+1). */
    struct hash_table_u64 *defs;
 
    /* Incomplete phis placed at an unsealed loop header. */
@@ -51,11 +52,19 @@ struct repair_ctx {
    /* Original value_count before repair began. */
    unsigned n;
 
+   /* Dense table [cfg_index * num_redef + redef_id[orig_var]] -> current SSA
+    * (AGX_APPLE9_VREG_INVALID if unset). NULL only if dense budget exceeded. */
+   uint32_t *redef_id;
+   uint32_t *defs_table;
+   unsigned num_redef;
+
    /* Per-block state indexed by cfg_index. */
    struct repair_block *blocks;
 
-   /* Optional map: RA_MEM SSA value -> (orig_var + 1). */
-   struct hash_table_u64 *homes;
+   /* Optional flat map: RA_MEM SSA value -> (orig_var + 1). */
+   uint32_t *homes;
+   unsigned homes_cap;
+   bool track_homes;
 
    /* Set of VIR_PHI instruction pointers created during this repair pass. */
    struct hash_table *created_phis;
@@ -70,16 +79,40 @@ repair_block(struct repair_ctx *ctx, const struct agx_apple9_block *block)
 }
 
 static void
+record_home(struct repair_ctx *ctx, uint32_t val, uint32_t orig_var)
+{
+   if (!ctx->track_homes)
+      return;
+   if (val >= ctx->homes_cap) {
+      unsigned new_cap = MAX2(val + 1u, MAX2(ctx->homes_cap * 2u, 64u));
+      uint32_t *nh = realloc(ctx->homes, new_cap * sizeof(*nh));
+      if (!nh) {
+         ctx->failed = true;
+         return;
+      }
+      memset(nh + ctx->homes_cap, 0, (new_cap - ctx->homes_cap) * sizeof(*nh));
+      ctx->homes = nh;
+      ctx->homes_cap = new_cap;
+   }
+   ctx->homes[val] = orig_var + 1u;
+}
+
+static void
 record_write(struct repair_ctx *ctx, struct agx_apple9_block *block,
              uint32_t orig_var, uint32_t val)
 {
    assert(orig_var < ctx->n);
-   if (ctx->homes && apple9_ra_value_is_mem(ctx->state, val)) {
-      _mesa_hash_table_u64_insert(ctx->homes, val,
-                                  (void *)(uintptr_t)(orig_var + 1u));
+   if (ctx->track_homes && apple9_ra_value_is_mem(ctx->state, val))
+      record_home(ctx, val, orig_var);
+   if (ctx->defs_table) {
+      uint32_t rid = ctx->redef_id[orig_var];
+      assert(rid < ctx->num_redef);
+      ctx->defs_table[(size_t)block->cfg_index * ctx->num_redef + rid] = val;
+   } else {
+      struct hash_table_u64 *defs = repair_block(ctx, block)->defs;
+      assert(defs != NULL);
+      _mesa_hash_table_u64_insert(defs, orig_var, (void *)(uintptr_t)(val + 1u));
    }
-   struct hash_table_u64 *defs = repair_block(ctx, block)->defs;
-   _mesa_hash_table_u64_insert(defs, orig_var, (void *)(uintptr_t)(val + 1u));
 }
 
 static uint32_t
@@ -173,9 +206,19 @@ resolve_read(struct repair_ctx *ctx, struct agx_apple9_block *block,
       return orig_var;
 
    struct repair_block *rb = repair_block(ctx, block);
-   void *local = _mesa_hash_table_u64_search(rb->defs, orig_var);
-   if (local)
-      return (uint32_t)((uintptr_t)local - 1u);
+   if (ctx->defs_table) {
+      uint32_t rid = ctx->redef_id[orig_var];
+      assert(rid < ctx->num_redef);
+      uint32_t local =
+         ctx->defs_table[(size_t)block->cfg_index * ctx->num_redef + rid];
+      if (local != AGX_APPLE9_VREG_INVALID)
+         return local;
+   } else {
+      assert(rb->defs != NULL);
+      void *local = _mesa_hash_table_u64_search(rb->defs, orig_var);
+      if (local)
+         return (uint32_t)((uintptr_t)local - 1u);
+   }
 
    unsigned nr_preds = block->num_cfg_preds;
    if (nr_preds == 0)
@@ -416,7 +459,7 @@ apple9_opt_trivial_phi(struct agx_apple9_vir_program *program,
 static bool
 apple9_reindex_ssa(struct agx_apple9_vir_program *program,
                    struct apple9_ra_spill_state *state,
-                   struct hash_table_u64 *homes)
+                   const uint32_t *homes, unsigned homes_cap)
 {
    unsigned old_count = program->value_count;
    if (!old_count) {
@@ -605,8 +648,7 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
                BITSET_SET(new_imm, nv);
                new_imm_val[nv] = state->imm_val[v];
             } else if (new_homes) {
-               void *ent = _mesa_hash_table_u64_search(homes, v);
-               new_homes[nv] = (uint32_t)(uintptr_t)ent;
+               new_homes[nv] = v < homes_cap ? homes[v] : 0u;
             }
          }
          new_width[nv] = apple9_ra_value_width(state, v);
@@ -696,11 +738,6 @@ apple9_ra_repair_ssa(struct agx_apple9_vir_program *program,
    }
 
    for (unsigned bi = 0; bi < num_blocks; ++bi) {
-      blocks[bi].defs = _mesa_hash_table_u64_create(memctx);
-      if (!blocks[bi].defs) {
-         ralloc_free(memctx);
-         return false;
-      }
       util_dynarray_init(&blocks[bi].incomplete_phis, memctx);
       for (struct agx_apple9_vir_instr *I =
               agx_apple9_block_first_instr(cfg_blocks[bi]);
@@ -712,16 +749,13 @@ apple9_ra_repair_ssa(struct agx_apple9_vir_program *program,
       }
    }
 
-   struct hash_table_u64 *homes =
-      (track_spill_homes && state) ? _mesa_hash_table_u64_create(memctx) : NULL;
    struct hash_table *created_phis = _mesa_pointer_hash_table_create(memctx);
 
    /* Detect direct sub-component uses of non-SPLIT multi-component defs. */
    BITSET_WORD *direct_lanes =
       rzalloc_array(memctx, BITSET_WORD, BITSET_WORDS(MAX2(n, 1u)));
    uint32_t *def_base = malloc(MAX2(n, 1u) * sizeof(uint32_t));
-   if (!created_phis || !direct_lanes || !def_base ||
-       (track_spill_homes && state && !homes)) {
+   if (!created_phis || !direct_lanes || !def_base) {
       free(def_base);
       ralloc_free(memctx);
       return false;
@@ -854,14 +888,70 @@ apple9_ra_repair_ssa(struct agx_apple9_vir_program *program,
       }
    }
 
+   /* Build compact dense index over only the redefined variables so per-block
+    * SSA definitions are a single flat array lookup instead of per-block u64
+    * hash tables (falling back to sparse hash tables only for extreme sizes). */
+   unsigned num_redef = 0;
+   {
+      unsigned v;
+      BITSET_FOREACH_SET(v, redefined, n)
+         num_redef++;
+   }
+
+   uint32_t *redef_id = NULL;
+   uint32_t *defs_table = NULL;
+   if (num_redef > 0) {
+      uint64_t table_elems = (uint64_t)num_blocks * num_redef;
+      if (table_elems <= 4ull * 1024ull * 1024ull) {
+         redef_id = malloc(n * sizeof(*redef_id));
+         defs_table = malloc((size_t)table_elems * sizeof(*defs_table));
+         if (redef_id && defs_table) {
+            memset(redef_id, 0xff, n * sizeof(*redef_id));
+            memset(defs_table, 0xff, (size_t)table_elems * sizeof(*defs_table));
+            unsigned id = 0;
+            unsigned v;
+            BITSET_FOREACH_SET(v, redefined, n)
+               redef_id[v] = id++;
+         } else {
+            free(redef_id);
+            free(defs_table);
+            redef_id = NULL;
+            defs_table = NULL;
+         }
+      }
+      if (!defs_table) {
+         for (unsigned bi = 0; bi < num_blocks; ++bi) {
+            blocks[bi].defs = _mesa_hash_table_u64_create(memctx);
+            if (!blocks[bi].defs) {
+               ralloc_free(memctx);
+               return false;
+            }
+         }
+      }
+   }
+
+   const bool want_homes = track_spill_homes && state;
+   uint32_t *homes = want_homes ? calloc(MAX2(n, 1u), sizeof(*homes)) : NULL;
+   if (want_homes && !homes) {
+      free(redef_id);
+      free(defs_table);
+      ralloc_free(memctx);
+      return false;
+   }
+
    struct repair_ctx rctx = {
       .program = program,
       .state = state,
       .cfg_blocks = cfg_blocks,
       .num_blocks = num_blocks,
       .n = n,
+      .redef_id = redef_id,
+      .defs_table = defs_table,
+      .num_redef = num_redef,
       .blocks = blocks,
       .homes = homes,
+      .homes_cap = want_homes ? MAX2(n, 1u) : 0u,
+      .track_homes = want_homes,
       .created_phis = created_phis,
       .failed = false,
    };
@@ -950,10 +1040,8 @@ apple9_ra_repair_ssa(struct agx_apple9_vir_program *program,
             } else {
                uint32_t handle = I->dest;
                if (!BITSET_TEST(redefined, handle)) {
-                  if (homes && apple9_ra_value_is_mem(state, handle)) {
-                     _mesa_hash_table_u64_insert(homes, handle,
-                                                 (void *)(uintptr_t)(handle + 1u));
-                  }
+                  if (rctx.track_homes && apple9_ra_value_is_mem(state, handle))
+                     record_home(&rctx, handle, handle);
                } else {
                   unsigned width = I->dest_components;
                   uint32_t fresh = alloc_ssa_like(&rctx, handle, width);
@@ -1031,13 +1119,18 @@ apple9_ra_repair_ssa(struct agx_apple9_vir_program *program,
       }
    }
 
+   free(redef_id);
+   free(defs_table);
+
    if (rctx.failed) {
+      free(rctx.homes);
       ralloc_free(memctx);
       return false;
    }
 
    apple9_opt_trivial_phi(program, cfg_blocks, num_blocks);
-   bool ok = apple9_reindex_ssa(program, state, homes);
+   bool ok = apple9_reindex_ssa(program, state, rctx.homes, rctx.homes_cap);
+   free(rctx.homes);
    ralloc_free(memctx);
    return ok;
 }
