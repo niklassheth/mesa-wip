@@ -118,11 +118,14 @@ main(void)
       .native = true,
       .has_draws = true,
       .ring_rows = 100000,
-      .ring_stride = 40,
+      .ring_stride_gcd = 40,
+      .ring_max_live_rows = 36,
+      .ring_stride_constant = true,
       .ring_limited = false,
    };
    CHECK(hk_apple9_native_stream_admits(&s, &(struct hk_apple9_draw_summary){
-      .native = true, .ring_rows = 100000, .ring_stride = 40,
+      .native = true, .ring_rows = 100000, .ring_stride_gcd = 40,
+      .ring_live_rows = 36, .ring_stride_constant = true,
       .ring_limited = false}, &enabled_unbounded));
    /* But appending a ring-limited draw onto that stream splits cleanly. */
    CHECK(!hk_apple9_native_stream_admits(&s, &(struct hk_apple9_draw_summary){
@@ -159,7 +162,9 @@ main(void)
       .unbounded_prims = true,
       .primitives = 20000ull * 8192ull,
       .ring_rows = 20000ull * 4096ull * 40ull,
-      .ring_stride = 164,
+      .ring_stride_gcd = 164,
+      .ring_live_rows = 124,
+      .ring_stride_constant = true,
       .ring_limited = false,
    };
    struct hk_apple9_stream_summary ord_indirect = {
@@ -174,40 +179,115 @@ main(void)
       .bounded_prims = false,
       .primitives = UINT64_MAX,
       .ring_rows = giant_tess.ring_rows,
-      .ring_stride = 164,
+      .ring_stride_gcd = 164,
+      .ring_max_live_rows = 124,
+      .ring_stride_constant = true,
       .ring_limited = false,
    };
    CHECK(hk_apple9_native_stream_admits(&unb_stream, &giant_tess, &enabled_capped));
    /* Mixed wrap-safe strides MUST split once combined occupancy wraps 4,096 rows
-    * (8 stride-8 WGs = 64 rows + wrapping stride-164 draw -> SPLIT), while
-    * small mixed-stride draws staying <= 4,096 rows still merge cleanly. */
+    * when gcd(s_gcd, d_gcd, 4096) < max_live_rows (e.g. stride-8 + stride-164 ->
+    * gcd_pow2 = 4 < 124 -> SPLIT), while small mixed-stride draws staying
+    * <= 4,096 rows still merge cleanly. */
    struct hk_apple9_stream_summary stride8_stream = {
       .native = true,
       .has_draws = true,
       .bounded_prims = true,
       .primitives = 16,
       .ring_rows = 64,
-      .ring_stride = 8,
+      .ring_stride_gcd = 8,
+      .ring_max_live_rows = 8,
+      .ring_stride_constant = true,
       .ring_limited = false,
    };
    struct hk_apple9_draw_summary stride164_small = {
       .native = true,
       .primitives = 100,
       .ring_rows = 1640,
-      .ring_stride = 164,
+      .ring_stride_gcd = 164,
+      .ring_live_rows = 124,
+      .ring_stride_constant = true,
       .ring_limited = false,
    };
    struct hk_apple9_draw_summary stride164_wrap = {
       .native = true,
       .primitives = 500,
       .ring_rows = 25 * 164,
-      .ring_stride = 164,
+      .ring_stride_gcd = 164,
+      .ring_live_rows = 124,
+      .ring_stride_constant = true,
       .ring_limited = false,
    };
    CHECK(hk_apple9_native_stream_classify(&stride8_stream, &stride164_small,
                                           &enabled_capped) ==
          HK_APPLE9_NATIVE_ADMIT_APPEND);
    CHECK(hk_apple9_native_stream_classify(&stride8_stream, &stride164_wrap,
+                                          &enabled_capped) ==
+         HK_APPLE9_NATIVE_ADMIT_SPLIT);
+
+   /* Power-of-2 GCD mixed-stride batching (G = gcd(s, d, 4096) >= max_live_rows):
+    * 1) Strides 256 (live=152) and 512 (live=224) share G=256 >= 224 -> APPEND!
+    * 2) Strides 256 (live=152) and 512 (live=300) have G=256 < 300 -> SPLIT!
+    * 3) Multi-bucket {256, 512} (gcd=256, constant=false, live=232) +
+    *    multi-bucket {512, 1024} (gcd=512, constant=false, live=256) share
+    *    G=256 >= 256 -> APPEND!
+    * 4) Non-pow2 mixed constant strides (164 + 228, G=4 < 196) -> SPLIT! */
+   struct hk_apple9_stream_summary pow2_256 = {
+      .native = true,
+      .has_draws = true,
+      .bounded_prims = false,
+      .ring_rows = 25600,
+      .ring_stride_gcd = 256,
+      .ring_max_live_rows = 152,
+      .ring_stride_constant = false,
+      .ring_limited = false,
+   };
+   struct hk_apple9_draw_summary pow2_512_ok = {
+      .native = true,
+      .unbounded_prims = true,
+      .ring_rows = 51200,
+      .ring_stride_gcd = 512,
+      .ring_live_rows = 224,
+      .ring_stride_constant = false,
+      .ring_limited = false,
+   };
+   struct hk_apple9_draw_summary pow2_512_boundary = {
+      .native = true,
+      .unbounded_prims = true,
+      .ring_rows = 51200,
+      .ring_stride_gcd = 512,
+      .ring_live_rows = 256,
+      .ring_stride_constant = false,
+      .ring_limited = false,
+   };
+   struct hk_apple9_draw_summary pow2_512_too_live = {
+      .native = true,
+      .unbounded_prims = true,
+      .ring_rows = 51200,
+      .ring_stride_gcd = 512,
+      .ring_live_rows = 300,
+      .ring_stride_constant = false,
+      .ring_limited = false,
+   };
+   CHECK(hk_apple9_native_stream_classify(&pow2_256, &pow2_512_ok,
+                                          &enabled_capped) ==
+         HK_APPLE9_NATIVE_ADMIT_APPEND);
+   CHECK(hk_apple9_native_stream_classify(&pow2_256, &pow2_512_boundary,
+                                          &enabled_capped) ==
+         HK_APPLE9_NATIVE_ADMIT_APPEND);
+   CHECK(hk_apple9_native_stream_classify(&pow2_256, &pow2_512_too_live,
+                                          &enabled_capped) ==
+         HK_APPLE9_NATIVE_ADMIT_SPLIT);
+   struct hk_apple9_draw_summary nonpow2_228 = {
+      .native = true,
+      .unbounded_prims = true,
+      .ring_rows = 22800,
+      .ring_stride_gcd = 228,
+      .ring_live_rows = 196,
+      .ring_stride_constant = true,
+      .ring_limited = false,
+   };
+   CHECK(hk_apple9_native_stream_classify(&unb_stream, &nonpow2_228,
                                           &enabled_capped) ==
          HK_APPLE9_NATIVE_ADMIT_SPLIT);
    CHECK(hk_apple9_native_stream_classify(&unb_stream, &giant_tess,

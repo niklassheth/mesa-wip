@@ -2740,7 +2740,11 @@ TEST(Apple9MeshNativeExpand, MultiVertexMultiPrimitiveTrianglesAndWorkgroups)
       EXPECT_EQ(info.layout.primitive_count_B, ALIGN_POT(c.max_p * 3, 16));
       EXPECT_EQ(info.layout.vertex_count_B, info.layout.primitive_count_B + 4);
       EXPECT_EQ(info.layout.vertex_pitch_B, ALIGN_POT(c.max_v, 4) * 4);
-      EXPECT_EQ(info.layout.vertex_components, c.write_var0 ? 5u : 4u);
+      unsigned raw_vc = c.write_var0 ? 5u : 4u;
+      bool expect_pad = info.layout.variable_idx_rows && c.write_var0 &&
+                        agx_apple9_mesh_ring_plan_solve(&info.layout, nullptr);
+      unsigned exp_vc = expect_pad ? 9u : raw_vc;
+      EXPECT_EQ(info.layout.vertex_components, exp_vc);
 
       auto audit = audit_publication(lowered);
       EXPECT_EQ(audit.controls, 1u);
@@ -2780,7 +2784,7 @@ TEST(Apple9MeshNativeExpand, MultiVertexMultiPrimitiveTrianglesAndWorkgroups)
       EXPECT_EQ(code.info.workgroup_size[0], c.physical);
       EXPECT_EQ(code.info.workgroup_size[1], 1u);
       EXPECT_EQ(code.info.workgroup_size[2], 1u);
-      EXPECT_EQ(code.info.apple9_varyings.count, c.write_var0 ? 1u : 0u);
+      EXPECT_EQ(code.info.apple9_varyings.count, exp_vc - 4u);
       free(code.binary);
       ralloc_free(nir);
    }
@@ -3742,14 +3746,23 @@ TEST(Apple9MeshNativeExpand, SafeU0BUnlocksWgRows32AndGt40)
          << "mode=" << mode << ": " << (reason ?: "");
       uint32_t safe_u0_b = 0, stride = 0;
       if (mode == 0) {
-         /* Dynamic P across 4-row / 8-row index buckets -> bounded only. */
+         /* Dynamic P across 4-row / 8-row index buckets: raw planes=8 (% 8 == 0)
+          * is padded to 9 components (planes=12, % 8 == 4), unlocking GCD
+          * multi-bucket U0_B(b=4)=84 (stride=256), U0_B(b=8)=40 (stride=128). */
          EXPECT_TRUE(info.layout.variable_idx_rows);
          EXPECT_EQ(info.layout.fixed_idx_rows, 0u);
-         EXPECT_FALSE(agx_apple9_mesh_safe_u0_b(&info.layout, &safe_u0_b, &stride));
+         EXPECT_EQ(info.layout.vertex_components, 9u);
+         struct agx_apple9_mesh_ring_plan plan = {};
+         ASSERT_TRUE(agx_apple9_mesh_ring_plan_solve(&info.layout, &plan));
+         EXPECT_EQ(plan.stride_gcd, 128u);
+         EXPECT_EQ(plan.max_stride, 256u);
+         EXPECT_EQ(agx_apple9_mesh_ring_plan_u0_b_for_bucket(&plan, 1), 84u);
+         EXPECT_EQ(agx_apple9_mesh_ring_plan_u0_b_for_bucket(&plan, 2), 40u);
       } else if (mode == 1) {
          /* Constant P=42 -> single 8-row bucket, rem == 0 exact divisor 128. */
          EXPECT_FALSE(info.layout.variable_idx_rows);
          EXPECT_EQ(info.layout.fixed_idx_rows, 8u);
+         EXPECT_EQ(info.layout.vertex_components, 8u);
          ASSERT_TRUE(agx_apple9_mesh_safe_u0_b(&info.layout, &safe_u0_b, &stride));
          EXPECT_EQ(safe_u0_b, 60u);
          EXPECT_EQ(stride, 128u);
@@ -3757,7 +3770,93 @@ TEST(Apple9MeshNativeExpand, SafeU0BUnlocksWgRows32AndGt40)
          /* Dynamic P under max_primitives=18 -> single 4-row bucket. */
          EXPECT_FALSE(info.layout.variable_idx_rows);
          EXPECT_EQ(info.layout.fixed_idx_rows, 4u);
+         EXPECT_EQ(info.layout.vertex_components, 8u);
          ASSERT_TRUE(agx_apple9_mesh_safe_u0_b(&info.layout, &safe_u0_b, &stride));
+      }
+      free(code.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(Apple9MeshNativeExpand, GcdMultiBucketSafeU0BAndHighU0B)
+{
+   /* 1. Q6_DYNP (V=16, P=42, comps=36 -> planes=36 % 8 == 4): zero extra
+    *    padding, G=256, U0_B(b=4)=28 (stride=256), U0_B(b=8)=56 (stride=512).
+    * 2. Multi-bucket >2 (V=48, P=60, comps=12 -> 3 buckets b=4,8,12): closed-
+    *    form modular formula, G=256, U0_B=[84,168,252], strides=[256,512,768].
+    * 3. Unsolvable even padded (V=32, P=42, comps=48 -> trial planes=52 fails
+    *    <= 2048): must NOT waste dummy padding planes (keeps exact 48 comps). */
+   const struct {
+      unsigned max_v, max_p, var_vec4s;
+      unsigned exp_vc;
+      bool exp_safe;
+      unsigned exp_gcd, exp_max_s;
+      unsigned exp_u0[3];
+   } cases[] = {
+      {16, 42, 8, 36, true, 256, 512, {28, 56, 0}},
+      {48, 60, 2, 12, true, 256, 768, {84, 168, 252}},
+      {32, 42, 11, 48, false, 0, 0, {0, 0, 0}},
+   };
+   for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ++ci) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_MESH, &agx_nir_options, "gcd_multi_bucket");
+      b.shader->info.io_lowered = true;
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.mesh.max_vertices_out = cases[ci].max_v;
+      b.shader->info.mesh.max_primitives_out = cases[ci].max_p;
+      b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      nir_def *gid = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+      nir_def *prim_cnt = nir_bcsel(
+         &b, nir_ieq_imm(&b, nir_iand_imm(&b, gid, 1), 0),
+         nir_imm_int(&b, 18), nir_imm_int(&b, cases[ci].max_p));
+      nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, cases[ci].max_v),
+                                         prim_cnt, nir_imm_int(&b, 0));
+      nir_store_per_vertex_output(
+         &b, nir_imm_vec4(&b, 0.0f, 0.0f, 0.5f, 1.0f), nir_imm_int(&b, 0),
+         nir_imm_int(&b, 0), .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      for (unsigned v = 0; v < cases[ci].var_vec4s; ++v) {
+         nir_store_per_vertex_output(
+            &b, nir_imm_vec4(&b, 1.0f, 0.0f, 0.0f, 1.0f), nir_imm_int(&b, 0),
+            nir_imm_int(&b, 0), .write_mask = 0xf, .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_VAR0 + v, .num_slots = 1});
+      }
+      nir_store_per_primitive_output(
+         &b, nir_imm_ivec3(&b, 0, 1, 2), nir_imm_int(&b, 0),
+         nir_imm_int(&b, 0), .write_mask = 0x7, .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+      nir_pop_if(&b, nullptr);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+
+      agx_apple9_native_mesh_options opts = {};
+      opts.physical_threads = 32;
+      opts.packed_index_publication = true;
+      opts.publication_rounds = true;
+      opts.attributes = true;
+
+      agx_shader_part code = {};
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_native_mesh(b.shader, true, &opts, &code,
+                                                 &info, &reason))
+         << "ci=" << ci << ": " << (reason ?: "");
+      EXPECT_TRUE(info.layout.variable_idx_rows);
+      EXPECT_EQ(info.layout.vertex_components, cases[ci].exp_vc);
+      struct agx_apple9_mesh_ring_plan plan = {};
+      EXPECT_EQ(agx_apple9_mesh_ring_plan_solve(&info.layout, &plan),
+                cases[ci].exp_safe);
+      if (cases[ci].exp_safe) {
+         EXPECT_EQ(plan.stride_gcd, cases[ci].exp_gcd);
+         EXPECT_EQ(plan.max_stride, cases[ci].exp_max_s);
+         for (unsigned k = 0; k < 3 && cases[ci].exp_u0[k]; ++k) {
+            EXPECT_EQ(agx_apple9_mesh_ring_plan_u0_b_for_bucket(&plan, k + 1),
+                      cases[ci].exp_u0[k]);
+         }
       }
       free(code.binary);
       ralloc_free(b.shader);

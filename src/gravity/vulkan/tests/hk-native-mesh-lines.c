@@ -12,8 +12,8 @@
 #define LANES 32
 #include "../../compiler/test/apple9-mesh-executor.h"
 
-static uint32_t channel_mask[8][8], scalar_mask[4];
-static uint32_t published[8][256];
+static uint32_t channel_mask[12][8], scalar_mask[4];
+static uint32_t published[12][256];
 static uint8_t indices[512];
 
 static bool
@@ -29,7 +29,7 @@ publication(struct machine *m, nir_intrinsic_instr *n, unsigned lane)
    CHECK(m->controls == ALL_LANES && offset + 4 * lane + 4 <= sizeof(m->local));
    if (n->intrinsic == nir_intrinsic_mesh_submit_channel_apple9_agx) {
       unsigned c = selector & 0xffff;
-      CHECK(c < 8 && first + lane < m->expected_vertices);
+      CHECK(c < 12 && first + lane < m->expected_vertices);
       CHECK(!(channel_mask[c][first / 32] & (1u << lane)));
       channel_mask[c][first / 32] |= 1u << lane;
       memcpy(&published[c][first + lane], m->local + offset + 4 * lane, 4);
@@ -172,7 +172,8 @@ check(unsigned max_v, unsigned max_p, unsigned logical,
    };
    CHECK(agx_apple9_mesh_state_build(state, &params));
    CHECK(state[10] == (max_p - 1 + ((DIV_ROUND_UP(max_p, 16) - 1) << 16)));
-   CHECK(state[11] == 0x400820 && state[13] == 1 + DIV_ROUND_UP(max_v, 4) * 8);
+   CHECK(state[11] == 0x400820 &&
+         state[13] == 1 + DIV_ROUND_UP(max_v, 4) * body.layout.vertex_components);
    printf("lines L%u V%u/%u P%u/%u: exact publication, binary %u\n",
           logical, vertices, max_v, primitives, max_p, part.info.binary_size);
    free(part.binary);

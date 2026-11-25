@@ -11,9 +11,13 @@ agx_apple9_mesh_state_build(uint32_t out[AGX_APPLE9_MESH_STATE_WORDS],
    if (!out || !p || !p->layout)
       return false;
    const struct agx_apple9_mesh_layout *l = p->layout;
-   /* Task payload and per-primitive outputs need separate completion and
-    * PPP contracts; state field encodings alone do not qualify them. */
-   if (p->task_payload_size_B || p->primitive_output.components ||
+   /* Per-primitive outputs still need a separate completion and PPP contract.
+    * Hardware OBJECT -> MESH payloads up to 16 KiB are encoded in words[9] as
+    * ceil(payload_bytes / 1024) (1..16 KiB slots inside the 512 KiB 0x1ca48
+    * payload aperture). */
+   if (p->task_payload_size_B > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES ||
+       (p->task_payload_size_B && !p->has_object_stage) ||
+       p->primitive_output.components ||
        p->primitive_output.stride_B || l->primitive_components ||
        l->primitive_stride_B)
       return false;
@@ -31,6 +35,10 @@ agx_apple9_mesh_state_build(uint32_t out[AGX_APPLE9_MESH_STATE_WORDS],
    /* Measured output contract, shared with body lowering. Rows cover the
     * cull region and the vertex/link planes, excluding indices/count header.
     * Culling and broader output classes still need normal completion support. */
+   uint32_t payload_kib =
+      p->has_object_stage
+         ? MAX2(1u, DIV_ROUND_UP(p->task_payload_size_B, 1024u))
+         : 0u;
    uint32_t words[AGX_APPLE9_MESH_STATE_WORDS] = {
       0x40000d2c,
       ((n + 1) << 8) | n,
@@ -41,7 +49,7 @@ agx_apple9_mesh_state_build(uint32_t out[AGX_APPLE9_MESH_STATE_WORDS],
       p->object_launch,
       0x01000000,
       p->mesh_launch,
-      p->has_object_stage,
+      payload_kib,
       (l->max_primitives - 1) |
          ((DIV_ROUND_UP(l->max_primitives, 16) - 1) << 16) |
          (l->culling ? BITFIELD_BIT(30) : 0),

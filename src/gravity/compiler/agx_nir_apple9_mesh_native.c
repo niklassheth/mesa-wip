@@ -1060,6 +1060,7 @@ agx_nir_lower_apple9_native_mesh(
       (nir->info.outputs_written & VARYING_BIT_LAYER);
    key.physical_threads = physical_threads;
    key.hw_payload = native_object_hw_payload;
+   key.pad_variable_idx_planes = options && options->attributes;
    if (!agx_nir_lower_apple9_mesh(nir, &key, info, reason))
       return false;
    if (native_object_payload) {
@@ -1287,25 +1288,42 @@ agx_nir_lower_apple9_native_mesh(
     * vertex count. */
    device_fence(&b);
    nir_def *u0_b = vertices;
-   uint32_t safe_u0_b = 0, safe_stride = 0;
-   if (agx_apple9_mesh_safe_u0_b(layout, &safe_u0_b, &safe_stride)) {
+   struct agx_apple9_mesh_ring_plan ring_plan;
+   if (agx_apple9_mesh_ring_plan_solve(layout, &ring_plan)) {
       if (layout->variable_idx_rows) {
-         /* Position-only (planes == 4) with variable index-row buckets:
-          * compensate U0_B at runtime by (max_idx_rows - runtime_idx_rows)
-          * vertices so every non-empty workgroup allocates exact constant
-          * safe_stride rows across the 4,096-row ring. */
+         /* Multi-bucket dynamic SetMeshOutputsEXT(v, p): select the per-bucket
+          * GCD-aligned U0_B(b) so every reachable index-row bucket advances the
+          * 4,096-row ring by a multiple of power-of-2 G >= max_live_rows with
+          * zero degenerate primitives. */
          nir_def *idx_bytes =
             nir_imul_imm(&b, primitives, layout->indices_per_primitive);
-         nir_def *runtime_idx_rows =
-            nir_ishl_imm(&b, nir_ushr_imm(&b, nir_iadd_imm(&b, idx_bytes, 63), 6),
-                         2);
-         nir_def *comp_u0_b =
-            nir_isub(&b, nir_imm_int(&b, safe_stride), runtime_idx_rows);
-         u0_b = nir_bcsel(&b, nir_ine_imm(&b, vertices, 0), comp_u0_b,
+         unsigned num_buckets = (unsigned)(agx_apple9_mesh_idx_rows(layout) / 4u);
+         nir_def *dyn_u0_b;
+         if (num_buckets == 2u) {
+            uint32_t u0_b1 =
+               agx_apple9_mesh_ring_plan_u0_b_for_bucket(&ring_plan, 1u);
+            uint32_t u0_b2 =
+               agx_apple9_mesh_ring_plan_u0_b_for_bucket(&ring_plan, 2u);
+            dyn_u0_b = nir_bcsel(&b, nir_ule_imm(&b, idx_bytes, 64),
+                                 nir_imm_int(&b, u0_b1),
+                                 nir_imm_int(&b, u0_b2));
+         } else {
+            nir_def *k =
+               nir_ushr_imm(&b, nir_iadd_imm(&b, idx_bytes, 63), 6);
+            nir_def *delta = nir_iand_imm(
+               &b,
+               nir_isub(&b, nir_imul_imm(&b, k, ring_plan.gcd_inv_neg),
+                        nir_imm_int(&b, ring_plan.quads)),
+               ring_plan.gcd_q_mask);
+            nir_def *q_b = nir_iadd_imm(&b, delta, ring_plan.quads);
+            dyn_u0_b = nir_ishl_imm(&b, q_b, 2);
+         }
+         u0_b = nir_bcsel(&b, nir_ine_imm(&b, vertices, 0), dyn_u0_b,
                           nir_imm_int(&b, 0));
-      } else if (safe_u0_b > 4u) {
+      } else if (ring_plan.const_u0_b > 4u) {
          u0_b = nir_bcsel(&b, nir_ine_imm(&b, vertices, 0),
-                          nir_imm_int(&b, safe_u0_b), nir_imm_int(&b, 0));
+                          nir_imm_int(&b, ring_plan.const_u0_b),
+                          nir_imm_int(&b, 0));
       }
    }
    nir_mesh_control_apple9_agx(&b, nir_u2u16(&b, primitives),

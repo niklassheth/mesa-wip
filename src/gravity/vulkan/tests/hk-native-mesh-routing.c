@@ -877,7 +877,9 @@ tess_fused_routes(struct hk_cmd_buffer *cmd)
 
       /* Payload, feature bit-28, indirect, and ring-limit gates. */
       CHECK(!hk_apple9_use_native_tess(cmd, agx_draw_indirect(0x1000)));
-      main->info.apple9_tess_payload_B = 1025;
+      main->info.apple9_tess_payload_B = AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      main->info.apple9_tess_payload_B = AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES + 1;
       CHECK(!hk_apple9_use_native_tess(cmd, draw));
       main->info.apple9_tess_payload_B = 192;
       dev->dev.params.features &= ~DRM_ASAHI_FEATURE_NATIVE_MESH;

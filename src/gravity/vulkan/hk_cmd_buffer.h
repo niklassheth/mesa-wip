@@ -548,10 +548,13 @@ struct hk_cs {
    uint64_t apple9_native_primitives;
    bool apple9_native_bounded_prims;
    /* Cumulative 16-byte rows of the 64 KiB mesh output ring used by native
-    * blocks in this render, active constant wrap-safe stride (0: none yet;
-    * UINT32_MAX: mixed strides), and whether any block is ring-limited. */
+    * blocks in this render, running GCD of wrap-safe strides (0: none yet or
+    * incompatible), worst-case single-WG live rows, whether every native block
+    * shares one constant stride, and whether any block is ring-limited. */
    uint64_t apple9_native_ring_rows;
-   uint32_t apple9_native_ring_stride;
+   uint32_t apple9_native_ring_stride_gcd;
+   uint32_t apple9_native_ring_max_live_rows;
+   bool apple9_native_ring_stride_constant;
    bool apple9_native_ring_limited;
    /* PPP state of the stream's last native block, for blocks that update
     * only what changed (enabled by default in native streams; any non-native
@@ -824,10 +827,13 @@ struct hk_cmd_buffer {
     * render bound (hk_apple9_native_stream_admits); UINT64_MAX: unknown. */
    uint64_t apple9_draw_primitives;
    /* Hardware 64 KiB mesh output ring rows of the native draw being recorded,
-    * its constant wrap-safe stride (0 when bounded/unknown), whether it is
-    * ring-limited, and whether it is exempt from the conservative 1M TVB cap. */
+    * the GCD of its wrap-safe strides (0 when bounded/unknown), its worst-case
+    * single-WG live rows, whether every WG uses one constant stride, whether it
+    * is ring-limited, and whether it is exempt from the conservative 1M TVB cap. */
    uint64_t apple9_draw_ring_rows;
-   uint32_t apple9_draw_ring_stride;
+   uint32_t apple9_draw_ring_stride_gcd;
+   uint32_t apple9_draw_ring_live_rows;
+   bool apple9_draw_ring_stride_constant;
    bool apple9_draw_ring_limited;
    bool apple9_draw_unbounded_prims;
    struct hk_cs *apple9_prev_cs;

@@ -33,6 +33,17 @@ struct hk_apple9_native_profile {
    uint64_t max_render_primitives;
 };
 
+static inline uint32_t
+hk_apple9_native_gcd_u32(uint32_t a, uint32_t b)
+{
+   while (b) {
+      uint32_t t = a % b;
+      a = b;
+      b = t;
+   }
+   return a;
+}
+
 struct hk_apple9_stream_summary {
    /* The stream already contains at least one native block. */
    bool native;
@@ -45,10 +56,15 @@ struct hk_apple9_stream_summary {
    /* Estimated binned primitives already in the render. */
    uint64_t primitives;
    /* Cumulative hardware 64 KiB mesh output ring rows of native blocks in the
-    * render, whether any block is ring-limited (lacks a wrap-safe U0_B), and
-    * the active wrap-safe stride (0: none yet; UINT32_MAX: mixed strides). */
+    * render, whether any block is ring-limited (lacks a wrap-safe U0_B plan),
+    * the running GCD of wrap-safe strides across all non-empty native blocks
+    * (0: none yet / incompatible), the worst-case single-WG live rows across
+    * those blocks, and whether all non-empty blocks share one exact constant
+    * wrap-safe stride. */
    uint64_t ring_rows;
-   uint32_t ring_stride;
+   uint32_t ring_stride_gcd;
+   uint32_t ring_max_live_rows;
+   bool ring_stride_constant;
    bool ring_limited;
 };
 
@@ -60,10 +76,13 @@ struct hk_apple9_draw_summary {
    /* Estimated binned primitives of the draw (UINT64_MAX: unknown). */
    uint64_t primitives;
    /* Hardware 64 KiB mesh output ring rows of this native draw (UINT64_MAX:
-    * unknown), its constant wrap-safe stride (0 when bounded/unknown), and
-    * whether its layout is ring-limited. */
+    * unknown), the GCD of its reachable wrap-safe strides (0 when bounded or
+    * unknown), its worst-case single-WG live rows, whether every WG in this
+    * draw uses one constant stride, and whether its layout is ring-limited. */
    uint64_t ring_rows;
-   uint32_t ring_stride;
+   uint32_t ring_stride_gcd;
+   uint32_t ring_live_rows;
+   bool ring_stride_constant;
    bool ring_limited;
 };
 
@@ -112,20 +131,37 @@ hk_apple9_native_stream_classify(const struct hk_apple9_stream_summary *s,
    if (!d->native)
       return HK_APPLE9_NATIVE_ADMIT_APPEND;
    /* Check whether combined native ring occupancy exceeds 4,096 rows (wraps
-    * the 64 KiB mesh output ring). Ring-limited layouts may never wrap;
-    * wrap-safe layouts may share a wrapping render pass only when every native
-    * draw in the pass uses the exact same constant wrap-safe stride so the
-    * ring pointer cannot drift into an unsafe remainder across dispatches. */
+    * the 64 KiB mesh output ring). Ring-limited layouts may never wrap.
+    * Wrap-safe layouts may share a wrapping render pass whenever EITHER:
+    * 1) All strides share a power-of-2 common divisor G | 4096 with
+    *    G >= max(s->ring_max_live_rows, d->ring_live_rows), so the ring
+    *    pointer always remains 0 mod G and leaves >= G >= live_rows before
+    *    row 4,096 regardless of draw/bucket interleaving; OR
+    * 2) Every draw in the pass shares the exact same constant wrap-safe stride
+    *    (each individually proven 4096 % stride == 0 || >= live_rows). */
    const bool wraps_ring =
       d->ring_rows > HK_APPLE9_NATIVE_RING_ROWS ||
       s->ring_rows > HK_APPLE9_NATIVE_RING_ROWS - d->ring_rows;
    if (s->ring_limited || d->ring_limited) {
       if (wraps_ring)
          return HK_APPLE9_NATIVE_ADMIT_SPLIT;
-   } else if (s->native && wraps_ring) {
-      if (!s->ring_stride || !d->ring_stride ||
-          s->ring_stride == UINT32_MAX ||
-          s->ring_stride != d->ring_stride)
+   } else if (s->native && s->ring_rows > 0 && d->ring_rows > 0 && wraps_ring) {
+      if (!s->ring_stride_gcd || !d->ring_stride_gcd)
+         return HK_APPLE9_NATIVE_ADMIT_SPLIT;
+      const uint32_t g =
+         hk_apple9_native_gcd_u32(s->ring_stride_gcd, d->ring_stride_gcd);
+      const uint32_t g_pow2 = g & (0u - g);
+      const uint32_t g_ring =
+         g_pow2 < HK_APPLE9_NATIVE_RING_ROWS ? g_pow2 : HK_APPLE9_NATIVE_RING_ROWS;
+      const uint32_t max_live =
+         s->ring_max_live_rows > d->ring_live_rows
+            ? s->ring_max_live_rows
+            : d->ring_live_rows;
+      const bool pow2_safe = max_live > 0 && g_ring >= max_live;
+      const bool same_const =
+         s->ring_stride_constant && d->ring_stride_constant &&
+         s->ring_stride_gcd == d->ring_stride_gcd;
+      if (!pow2_safe && !same_const)
          return HK_APPLE9_NATIVE_ADMIT_SPLIT;
    }
    return HK_APPLE9_NATIVE_ADMIT_APPEND;

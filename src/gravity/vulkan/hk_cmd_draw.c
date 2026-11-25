@@ -1944,15 +1944,21 @@ hk_apple9_set_draw_ring_usage(struct hk_cmd_buffer *cmd,
                                    &cmd->apple9_draw_ring_limited)) {
       cmd->apple9_draw_ring_rows = UINT64_MAX;
       cmd->apple9_draw_ring_limited = true;
-      cmd->apple9_draw_ring_stride = 0;
+      cmd->apple9_draw_ring_stride_gcd = 0;
+      cmd->apple9_draw_ring_live_rows = 0;
+      cmd->apple9_draw_ring_stride_constant = false;
       return;
    }
-   uint32_t stride = 0;
+   struct agx_apple9_mesh_ring_plan plan;
    if (!cmd->apple9_draw_ring_limited &&
-       agx_apple9_mesh_safe_u0_b(layout, NULL, &stride)) {
-      cmd->apple9_draw_ring_stride = stride;
+       agx_apple9_mesh_ring_plan_solve(layout, &plan)) {
+      cmd->apple9_draw_ring_stride_gcd = plan.stride_gcd;
+      cmd->apple9_draw_ring_live_rows = plan.max_live_rows;
+      cmd->apple9_draw_ring_stride_constant = plan.constant_stride;
    } else {
-      cmd->apple9_draw_ring_stride = 0;
+      cmd->apple9_draw_ring_stride_gcd = 0;
+      cmd->apple9_draw_ring_live_rows = 0;
+      cmd->apple9_draw_ring_stride_constant = false;
    }
 }
 
@@ -3142,7 +3148,9 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       hk_only_variant(native_task_api)->info.task.max_mesh_groups == UINT32_MAX;
    uint64_t draw_primitives = UINT64_MAX;
    uint64_t draw_ring_rows = UINT64_MAX;
-   uint32_t draw_ring_stride = 0;
+   uint32_t draw_ring_stride_gcd = 0;
+   uint32_t draw_ring_live_rows = 0;
+   bool draw_ring_stride_constant = false;
    bool draw_ring_limited = true;
    const uint32_t max_groups =
       native ? hk_apple9_native_mesh_max_groups(
@@ -3169,8 +3177,13 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          draw_ring_rows = UINT64_MAX;
          draw_ring_limited = true;
       } else if (!draw_ring_limited) {
-         agx_apple9_mesh_safe_u0_b(&native_main->info.apple9_native.layout,
-                                   NULL, &draw_ring_stride);
+         struct agx_apple9_mesh_ring_plan plan;
+         if (agx_apple9_mesh_ring_plan_solve(
+                &native_main->info.apple9_native.layout, &plan)) {
+            draw_ring_stride_gcd = plan.stride_gcd;
+            draw_ring_live_rows = plan.max_live_rows;
+            draw_ring_stride_constant = plan.constant_stride;
+         }
       }
    }
    if (debug_get_option_mesh_route_log()) {
@@ -3196,7 +3209,9 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       hk_foreach_view(cmd) {
          cmd->apple9_draw_primitives = draw_primitives;
          cmd->apple9_draw_ring_rows = draw_ring_rows;
-         cmd->apple9_draw_ring_stride = draw_ring_stride;
+         cmd->apple9_draw_ring_stride_gcd = draw_ring_stride_gcd;
+         cmd->apple9_draw_ring_live_rows = draw_ring_live_rows;
+         cmd->apple9_draw_ring_stride_constant = draw_ring_stride_constant;
          cmd->apple9_draw_ring_limited = draw_ring_limited;
          cmd->apple9_draw_unbounded_prims = false;
          if (!hk_apple9_prepare_draw_ex(cmd, true, true, native_object))

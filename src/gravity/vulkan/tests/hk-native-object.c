@@ -946,11 +946,15 @@ main(int argc, char **argv)
       destroy_pair(dev, t_rt, m_rt, f_rt);
       destroy_pair(dev, t, m, f);
 
-      /* Exact 1024 B hardware slot boundaries:
-       * 1008 B + 16 B child grid = 1024 B -> hw_payload=true (multi-parent Native).
-       * 1024 B without child grid = 1024 B -> hw_payload=true (multi-parent Native).
-       * 1024 B + 16 B child grid = 1040 B -> hw_payload=false (single-parent Native,
-       *   multi-parent cascades cleanly to Task Bridge!). */
+      /* Hardware 16 KiB payload boundaries (words[9] = ceil(payload / 1024)):
+       * 1008 B + 16 B child grid = 1024 B -> hw_payload=true (words[9]=1).
+       * 1024 B + 16 B child grid = 1040 B -> hw_payload=true (words[9]=2).
+       * 2048 B & 16384 B without child grid -> hw_payload=true (words[9]=2/16,
+       *   multi-parent Native OBJECT!).
+       * 16368 B + 16 B child grid = 16384 B -> hw_payload=true (words[9]=16).
+       * 16384 B + 16 B child grid = 16400 B > 16384 B -> hw_payload=false
+       *   (single-parent Native via args.payload, multi-parent cascades cleanly
+       *   to Task Bridge!). */
       compile_pair(dev, 32, 1008, 0, 4, false, true, &t, &m, &f);
       CHECK(hk_api_shader_native(t)->variants[0].info.apple9_native.key.hw_payload);
       cmd->state.gfx.shaders[MESA_SHADER_TASK] = t;
@@ -960,7 +964,7 @@ main(int argc, char **argv)
             HK_APPLE9_MESH_ROUTE_NATIVE);
       destroy_pair(dev, t, m, f);
 
-      compile_pair(dev, 32, 1024, 0, 4, false, false, &t, &m, &f);
+      compile_pair(dev, 32, 1024, 0, 4, false, true, &t, &m, &f);
       CHECK(hk_api_shader_native(t)->variants[0].info.apple9_native.key.hw_payload);
       cmd->state.gfx.shaders[MESA_SHADER_TASK] = t;
       cmd->state.gfx.shaders[MESA_SHADER_MESH] = m;
@@ -969,26 +973,26 @@ main(int argc, char **argv)
             HK_APPLE9_MESH_ROUTE_NATIVE);
       destroy_pair(dev, t, m, f);
 
-      compile_pair(dev, 32, 1024, 0, 4, false, true, &t, &m, &f);
-      CHECK(!hk_api_shader_native(t)->variants[0].info.apple9_native.key.hw_payload);
-      CHECK(hk_api_shader_task_bridge(t) && hk_api_shader_task_bridge(m) &&
-            hk_api_shader_task_bridge(f));
-      cmd->state.gfx.shaders[MESA_SHADER_TASK] = t;
-      cmd->state.gfx.shaders[MESA_SHADER_MESH] = m;
-      cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = f;
-      CHECK(hk_apple9_select_native_mesh_route(cmd, g1, 0) ==
-            HK_APPLE9_MESH_ROUTE_NATIVE);
-      CHECK(hk_apple9_select_native_mesh_route(cmd, g64, 0) ==
-            HK_APPLE9_MESH_ROUTE_TASK_BRIDGE);
-      destroy_pair(dev, t, m, f);
-
-      /* Oversized multi-parent payload (2048 B & 16384 B):
-       * Single-parent runs Zero-CDM Native OBJECT via args.payload (16 KiB);
-       * Multi-parent (groups=64) cascades to Task Bridge (NOT Emulated)! */
       for (unsigned pbytes = 2048; pbytes <= 16384; pbytes *= 8) {
          compile_pair(dev, 32, pbytes, 0, 4, false, false, &t, &m, &f);
+         CHECK(hk_api_shader_native(t)->variants[0].info.apple9_native.key.hw_payload);
+         cmd->state.gfx.shaders[MESA_SHADER_TASK] = t;
+         cmd->state.gfx.shaders[MESA_SHADER_MESH] = m;
+         cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = f;
+         CHECK(hk_apple9_select_native_mesh_route(cmd, g1024, 0) ==
+               HK_APPLE9_MESH_ROUTE_NATIVE);
+         check_vdm_recording(dev, t, m, f, g1024, 0, 32);
+         destroy_pair(dev, t, m, f);
+      }
+
+      /* Exact 16 KiB + 16 B child grid = 16400 B > 16384 B:
+       * Single-parent runs Zero-CDM Native OBJECT via args.payload;
+       * Multi-parent (groups=64) cascades to Task Bridge (NOT Emulated)! */
+      {
+         compile_pair(dev, 32, 16384, 0, 4, false, true, &t, &m, &f);
          CHECK(!hk_api_shader_native(t)->variants[0].info.apple9_native.key.hw_payload);
-         CHECK(hk_api_shader_task_bridge(t) && hk_api_shader_task_bridge(m));
+         CHECK(hk_api_shader_task_bridge(t) && hk_api_shader_task_bridge(m) &&
+               hk_api_shader_task_bridge(f));
          struct hk_api_shader *t2 = roundtrip_shader(dev, t);
          struct hk_api_shader *m2 = roundtrip_shader(dev, m);
          struct hk_api_shader *f2 = roundtrip_shader(dev, f);
@@ -1002,31 +1006,27 @@ main(int argc, char **argv)
          CHECK(hk_apple9_select_native_mesh_route(cmd, NULL, 0) ==
                HK_APPLE9_MESH_ROUTE_EMULATED);
          check_vdm_recording(dev, t2, m2, f2, g1, 0x1600000000ull, 32);
-         if (pbytes == 2048)
-            check_bridge_prepare_and_record(dev, t2, m2, f2);
+         check_bridge_prepare_and_record(dev, t2, m2, f2);
          struct blob m2_blob;
          blob_init(&m2_blob);
-         if (pbytes == 2048)
-            CHECK(m2->vk.ops->serialize(&dev->vk, &m2->vk, &m2_blob));
+         CHECK(m2->vk.ops->serialize(&dev->vk, &m2->vk, &m2_blob));
          destroy_pair(dev, t2, m2, f2);
          destroy_pair(dev, t, m, f);
-         if (pbytes == 2048) {
-            /* Truncated bridge subtree & OOM cleanup with zero live pairs. */
-            unsigned base_bos = live_bos;
-            const size_t cuts[] = {m2_blob.size - 1, m2_blob.size - 8,
-                                   (m2_blob.size * 3) / 4, m2_blob.size / 2};
-            for (unsigned ci = 0; ci < ARRAY_SIZE(cuts); ++ci) {
-               struct blob_reader r;
-               struct vk_shader *out_vk = NULL;
-               blob_reader_init(&r, m2_blob.data, cuts[ci]);
-               CHECK(hk_device_shader_ops.deserialize(&dev->vk, &r, 0, NULL,
-                                                      &out_vk) ==
-                     VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
-               CHECK(!out_vk);
-            }
-            CHECK(live_bos == base_bos);
-            check_dual_leaf_failure_cleanup(dev);
+         /* Truncated bridge subtree & OOM cleanup with zero live pairs. */
+         unsigned base_bos = live_bos;
+         const size_t cuts[] = {m2_blob.size - 1, m2_blob.size - 8,
+                                (m2_blob.size * 3) / 4, m2_blob.size / 2};
+         for (unsigned ci = 0; ci < ARRAY_SIZE(cuts); ++ci) {
+            struct blob_reader r;
+            struct vk_shader *out_vk = NULL;
+            blob_reader_init(&r, m2_blob.data, cuts[ci]);
+            CHECK(hk_device_shader_ops.deserialize(&dev->vk, &r, 0, NULL,
+                                                   &out_vk) ==
+                  VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+            CHECK(!out_vk);
          }
+         CHECK(live_bos == base_bos);
+         check_dual_leaf_failure_cleanup(dev);
          blob_finish(&m2_blob);
       }
 

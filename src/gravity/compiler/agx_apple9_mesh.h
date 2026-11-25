@@ -33,6 +33,12 @@ struct agx_apple9_mesh_key {
    /* Load the per-parent hardware payload VA from GET_SR 0xe0/0xe1 instead of
     * the draw-wide AGX_APPLE9_MESH_PAYLOAD_UNIFORM pointer. */
    bool hw_payload;
+   /* When variable_idx_rows is set and planes % 8 == 0, pad vertex_components
+    * by 1..4 unused varying scalars to reach planes % 8 == 4 so the GCD
+    * multi-bucket U0_B(b) solver can find a power-of-2 ring alignment G | 4096
+    * whenever a valid solution fits inside the 32 KiB local allocation and
+    * 128-component UVS limit. */
+   bool pad_variable_idx_planes;
 };
 
 #define AGX_APPLE9_MESH_KEY                                                    \
@@ -145,8 +151,32 @@ agx_apple9_mesh_plane_offset(const struct agx_apple9_mesh_layout *layout,
  * rem >= vtx_rows + idx_rows passes bit-exact across 16,384 workgroups). */
 #define AGX_APPLE9_MESH_RING_ROWS        4096u
 #define AGX_APPLE9_MESH_RING_HEADER_ROWS 8u
-#define AGX_APPLE9_MESH_SAFE_U0_B_MAX    256u
+/* MESH_CONTROL U0_B is a 16-bit auxiliary vertex count. Hardware qualification
+ * proved U0_B > 256 (e.g. U0_B = 496 on V=256/P=255 lines -> stride 1024).
+ * With planes >= 4 and idx_rows >= 4, stride <= 2048 bounds U0_B <= 2044. */
+#define AGX_APPLE9_MESH_SAFE_U0_B_MAX    2044u
 #define AGX_APPLE9_MESH_SAFE_STRIDE_MAX  2048u
+
+static inline uint32_t
+agx_apple9_mesh_gcd_u32(uint32_t a, uint32_t b)
+{
+   while (b) {
+      uint32_t t = a % b;
+      a = b;
+      b = t;
+   }
+   return a;
+}
+
+/* Modular multiplicative inverse of odd `a` modulo `mask + 1` (power of 2). */
+static inline uint32_t
+agx_apple9_mesh_inv_mod_pow2(uint32_t a, uint32_t mask)
+{
+   uint32_t inv = 1u;
+   for (unsigned i = 0; i < 4; ++i)
+      inv = (inv * (2u - a * inv)) & mask;
+   return inv;
+}
 
 static inline uint64_t
 agx_apple9_mesh_idx_rows(const struct agx_apple9_mesh_layout *layout)
@@ -160,37 +190,64 @@ agx_apple9_mesh_idx_rows(const struct agx_apple9_mesh_layout *layout)
    return DIV_ROUND_UP(idx_bytes, 64u) * 4u;
 }
 
+struct agx_apple9_mesh_ring_plan {
+   /* Constant U0_B when !variable_idx_rows; 0 when variable_idx_rows. */
+   uint32_t const_u0_b;
+   /* Largest physical ring stride across all reachable index-row buckets. */
+   uint32_t max_stride;
+   /* Greatest common divisor of all reachable physical ring strides.
+    * When !variable_idx_rows, equals max_stride (constant_stride = true).
+    * When variable_idx_rows, divisible by power-of-2 G | 4096 with
+    * G >= max_live_rows so arbitrary bucket sequences stay 0 mod G. */
+   uint32_t stride_gcd;
+   /* Worst-case live footprint (quads * planes + max_idx_rows) in rows. */
+   uint32_t max_live_rows;
+   /* Multi-bucket runtime solver parameters (when variable_idx_rows is true):
+    *   k   = DIV_ROUND_UP(primitives * indices_per_primitive, 64)  [1..max_b/4]
+    *   q_b = quads + (((k * gcd_inv_neg) - quads) & gcd_q_mask)
+    *   U0_B(b) = q_b * 4, yielding stride(b) = q_b * planes + 4 * k == 0 mod G. */
+   uint32_t quads;
+   uint32_t gcd_q_mask;
+   uint32_t gcd_inv_neg;
+   bool constant_stride;
+};
+
+static inline uint32_t
+agx_apple9_mesh_ring_plan_u0_b_for_bucket(
+   const struct agx_apple9_mesh_ring_plan *plan, uint32_t bucket_k)
+{
+   if (!plan)
+      return 0;
+   if (plan->const_u0_b || !plan->gcd_q_mask) {
+      if (plan->const_u0_b)
+         return plan->const_u0_b;
+   }
+   uint32_t delta = ((bucket_k * plan->gcd_inv_neg) - plan->quads) & plan->gcd_q_mask;
+   return (plan->quads + delta) * 4u;
+}
+
 static inline bool
-agx_apple9_mesh_safe_u0_b(const struct agx_apple9_mesh_layout *layout,
-                          uint32_t *out_u0_b, uint32_t *out_stride)
+agx_apple9_mesh_ring_plan_solve(const struct agx_apple9_mesh_layout *layout,
+                                struct agx_apple9_mesh_ring_plan *out_plan)
 {
    if (!layout)
       return false;
    if (!layout->max_vertices) {
-      if (out_u0_b)
-         *out_u0_b = 0;
-      if (out_stride)
-         *out_stride = 0;
+      if (out_plan) {
+         *out_plan = (struct agx_apple9_mesh_ring_plan){
+            .constant_stride = true,
+         };
+      }
       return true;
    }
    uint64_t n =
       layout->vertex_components
          ? (uint64_t)layout->vertex_components + (layout->primitive_components != 0)
          : 4u;
-   if (n > 256 || layout->max_vertices > AGX_APPLE9_MESH_SAFE_U0_B_MAX)
+   if (n > 256 || layout->max_vertices > 256u)
       return false;
    uint64_t quads = ((uint64_t)layout->max_vertices + 3u) / 4u;
    uint64_t planes = (n + 3u) & ~UINT64_C(3);
-   /* Runtime primitive counts spanning multiple 64-byte index-row buckets
-    * produce distinct per-workgroup ring strides whose linear combinations can
-    * wrap mid-vertex-block (verified on T8132 silicon with alternating P=18/42
-    * at comps=8). For position-only layouts (planes == 4), completion can
-    * compensate U0_B at runtime by (max_idx_rows - runtime_idx_rows) vertices
-    * so every non-empty workgroup allocates the exact same constant stride;
-    * wider layouts (planes > 4) cannot absorb a 4-row index delta in multiples
-    * of planes and fall back to bounded non-wrapping admission. */
-   if (layout->variable_idx_rows && planes != 4u)
-      return false;
    uint64_t idx_rows =
       (!layout->variable_idx_rows && layout->fixed_idx_rows)
          ? (uint64_t)layout->fixed_idx_rows
@@ -202,23 +259,106 @@ agx_apple9_mesh_safe_u0_b(const struct agx_apple9_mesh_layout *layout,
    if (live_rows > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
       return false;
 
-   for (uint64_t q = quads; q <= AGX_APPLE9_MESH_SAFE_U0_B_MAX / 4u; ++q) {
-      if (layout->variable_idx_rows &&
-          q * 4u + (idx_rows - 4u) > AGX_APPLE9_MESH_SAFE_U0_B_MAX)
-         break;
-      uint64_t stride = q * planes + idx_rows;
-      if (stride > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
-         break;
-      uint64_t rem = AGX_APPLE9_MESH_RING_ROWS % stride;
-      if (rem == 0 || rem >= live_rows) {
-         if (out_u0_b)
-            *out_u0_b = q == quads ? layout->max_vertices : (uint32_t)(q * 4u);
-         if (out_stride)
-            *out_stride = (uint32_t)stride;
+   if (!layout->variable_idx_rows) {
+      for (uint64_t q = quads; q <= AGX_APPLE9_MESH_SAFE_U0_B_MAX / 4u; ++q) {
+         uint64_t stride = q * planes + idx_rows;
+         if (stride > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
+            break;
+         uint64_t rem = AGX_APPLE9_MESH_RING_ROWS % stride;
+         if (rem == 0 || rem >= live_rows) {
+            if (out_plan) {
+               *out_plan = (struct agx_apple9_mesh_ring_plan){
+                  .const_u0_b =
+                     q == quads ? layout->max_vertices : (uint32_t)(q * 4u),
+                  .max_stride = (uint32_t)stride,
+                  .stride_gcd = (uint32_t)stride,
+                  .max_live_rows = (uint32_t)live_rows,
+                  .quads = (uint32_t)quads,
+                  .constant_stride = true,
+               };
+            }
+            return true;
+         }
+      }
+      return false;
+   }
+
+   /* Variable index-row buckets (max_idx_rows > 4 with dynamic primitive
+    * counts): solve for a power-of-2 ring alignment G | 4096 with
+    * G >= live_rows such that every reachable bucket b in {4, 8, ..., idx_rows}
+    * has stride(b) = q_b * planes + b == 0 (mod G). This requires planes % 8 == 4
+    * so (planes / 4) is odd and invertible modulo M = G / 4. */
+   if ((planes & 7u) != 4u)
+      return false;
+
+   uint32_t p_odd = (uint32_t)(planes / 4u);
+   uint32_t num_buckets = (uint32_t)(idx_rows / 4u);
+   uint32_t g = 4u;
+   while (g < live_rows)
+      g <<= 1;
+
+   for (; g <= AGX_APPLE9_MESH_SAFE_STRIDE_MAX; g <<= 1) {
+      uint32_t m = g / 4u;
+      uint32_t mask = m - 1u;
+      uint32_t inv = agx_apple9_mesh_inv_mod_pow2(p_odd, mask);
+      uint32_t inv_neg = (0u - inv) & mask;
+      uint32_t min_s = UINT32_MAX, max_s = 0, gcd_s = 0;
+      bool ok = true;
+      for (uint32_t k = 1u; k <= num_buckets; ++k) {
+         uint32_t delta = ((k * inv_neg) - (uint32_t)quads) & mask;
+         uint64_t q_b = quads + delta;
+         uint64_t stride = q_b * planes + (uint64_t)k * 4u;
+         if (q_b * 4u > AGX_APPLE9_MESH_SAFE_U0_B_MAX ||
+             stride > AGX_APPLE9_MESH_SAFE_STRIDE_MAX) {
+            ok = false;
+            break;
+         }
+         uint32_t s32 = (uint32_t)stride;
+         if (s32 < min_s)
+            min_s = s32;
+         if (s32 > max_s)
+            max_s = s32;
+         gcd_s = gcd_s ? agx_apple9_mesh_gcd_u32(gcd_s, s32) : s32;
+      }
+      if (ok) {
+         if (out_plan) {
+            *out_plan = (struct agx_apple9_mesh_ring_plan){
+               .const_u0_b = 0,
+               .max_stride = max_s,
+               .stride_gcd = gcd_s,
+               .max_live_rows = (uint32_t)live_rows,
+               .quads = (uint32_t)quads,
+               .gcd_q_mask = mask,
+               .gcd_inv_neg = inv_neg,
+               .constant_stride = (min_s == max_s),
+            };
+         }
          return true;
       }
    }
    return false;
+}
+
+static inline bool
+agx_apple9_mesh_safe_u0_b(const struct agx_apple9_mesh_layout *layout,
+                          uint32_t *out_u0_b, uint32_t *out_stride)
+{
+   struct agx_apple9_mesh_ring_plan plan;
+   if (!agx_apple9_mesh_ring_plan_solve(layout, &plan))
+      return false;
+   if (out_u0_b) {
+      if (!layout->max_vertices) {
+         *out_u0_b = 0;
+      } else if (layout->variable_idx_rows) {
+         uint32_t max_k = (uint32_t)(agx_apple9_mesh_idx_rows(layout) / 4u);
+         *out_u0_b = agx_apple9_mesh_ring_plan_u0_b_for_bucket(&plan, max_k);
+      } else {
+         *out_u0_b = plan.const_u0_b;
+      }
+   }
+   if (out_stride)
+      *out_stride = plan.max_stride;
+   return true;
 }
 
 struct agx_apple9_mesh_body_info {

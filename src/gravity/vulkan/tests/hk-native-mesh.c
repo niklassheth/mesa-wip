@@ -148,7 +148,17 @@ check_contract(bool object, unsigned attributes)
                                            packet, groups, scalar, true));
       CHECK(!memcmp(before, command, sizeof(command)));
       state.task_payload_size_B = 4;
+      CHECK(agx_apple9_mesh_state_build(packet, &state) && packet[9] == 1);
+      state.task_payload_size_B = 2048;
+      CHECK(agx_apple9_mesh_state_build(packet, &state) && packet[9] == 2);
+      state.task_payload_size_B = 16384;
+      CHECK(agx_apple9_mesh_state_build(packet, &state) && packet[9] == 16);
+      state.task_payload_size_B = 16388;
       CHECK(!agx_apple9_mesh_state_build(packet, &state));
+      state.task_payload_size_B = 4;
+      state.has_object_stage = false;
+      CHECK(!agx_apple9_mesh_state_build(packet, &state));
+      state.has_object_stage = true;
       state.task_payload_size_B = 0;
       state.primitive_output.components = 1;
       CHECK(!agx_apple9_mesh_state_build(packet, &state));
@@ -409,18 +419,52 @@ check_mesh_ring_fits(void)
       };
       CHECK(agx_apple9_mesh_safe_u0_b(&v128c8, &u0, &st) && u0 == 168 && st == 344);
 
-      /* Position-only (planes == 4) with variable_idx_rows stays unbounded via
-       * runtime U0_B compensation to a single constant stride. */
+      /* Position-only (planes == 4) with variable_idx_rows uses unified
+       * power-of-2 GCD alignment (G=64 for V32/P42, G=32 for V24/P31). */
       struct agx_apple9_mesh_layout pos_var_idx = {
          .max_vertices = 32, .max_primitives = 42, .indices_per_primitive = 3,
          .vertex_components = 4, .variable_idx_rows = true,
       };
-      CHECK(agx_apple9_mesh_safe_u0_b(&pos_var_idx, &u0, &st) && u0 == 44 && st == 52);
+      struct agx_apple9_mesh_ring_plan plan;
+      CHECK(agx_apple9_mesh_ring_plan_solve(&pos_var_idx, &plan));
+      CHECK(plan.stride_gcd == 64 && plan.max_stride == 64 &&
+            agx_apple9_mesh_ring_plan_u0_b_for_bucket(&plan, 1) == 60 &&
+            agx_apple9_mesh_ring_plan_u0_b_for_bucket(&plan, 2) == 56);
+      CHECK(agx_apple9_mesh_safe_u0_b(&pos_var_idx, &u0, &st) && u0 == 56 && st == 64);
       struct agx_apple9_mesh_layout gs4_var_idx = {
          .max_vertices = 24, .max_primitives = 31, .indices_per_primitive = 3,
          .vertex_components = 4, .variable_idx_rows = true,
       };
       CHECK(agx_apple9_mesh_safe_u0_b(&gs4_var_idx, &u0, &st) && u0 == 24 && st == 32);
+
+      /* Silicon-proven GCD multi-bucket U0_B(b) (Q6_DYNP: V=16, P=42, comps=36):
+       * planes=36 (% 8 == 4), live_rows=152 <= G=256:
+       * b=4 -> U0_B=28 (stride=256), b=8 -> U0_B=56 (stride=512), unbounded! */
+      struct agx_apple9_mesh_layout q6_dynp = {
+         .max_vertices = 16, .max_primitives = 42, .indices_per_primitive = 3,
+         .vertex_components = 36, .variable_idx_rows = true,
+      };
+      CHECK(agx_apple9_mesh_ring_plan_solve(&q6_dynp, &plan));
+      CHECK(plan.stride_gcd == 256 && plan.max_stride == 512 &&
+            plan.max_live_rows == 152 && !plan.constant_stride &&
+            agx_apple9_mesh_ring_plan_u0_b_for_bucket(&plan, 1) == 28 &&
+            agx_apple9_mesh_ring_plan_u0_b_for_bucket(&plan, 2) == 56);
+      uint64_t q6_max = 0;
+      CHECK(agx_apple9_mesh_ring_max_groups(&q6_dynp, &q6_max) &&
+            q6_max == UINT64_MAX);
+
+      /* Silicon-proven U0_B > 256 (V=256, P=255 lines, comps=8, fixed_idx=32):
+       * live_rows = 64*8 + 32 = 544 -> smallest wrap-safe U0_B = 280 > 256
+       * (stride = 70*8 + 32 = 592, rem = 4096 % 592 = 544 == live_rows), unbounded! */
+      struct agx_apple9_mesh_layout max_lines = {
+         .max_vertices = 256, .max_primitives = 255, .indices_per_primitive = 2,
+         .vertex_components = 8, .fixed_idx_rows = 32,
+      };
+      CHECK(agx_apple9_mesh_safe_u0_b(&max_lines, &u0, &st) &&
+            u0 == 280 && st == 592);
+      uint64_t lines_max = 0;
+      CHECK(agx_apple9_mesh_ring_max_groups(&max_lines, &lines_max) &&
+            lines_max == UINT64_MAX);
    }
 
    /* Huge footprints exceeding the 2048-row safe-stride ceiling remain bounded
@@ -572,10 +616,14 @@ check_batch_ring_budget(void)
    s = base_stream;
    d = base_draw;
    s.ring_rows = rows;
-   s.ring_stride = 164;
+   s.ring_stride_gcd = 164;
+   s.ring_max_live_rows = 132;
+   s.ring_stride_constant = true;
    s.ring_limited = false;
    d.ring_rows = rows;
-   d.ring_stride = 164;
+   d.ring_stride_gcd = 164;
+   d.ring_live_rows = 132;
+   d.ring_stride_constant = true;
    d.ring_limited = false;
    CHECK(hk_apple9_native_stream_admits(&s, &d, &profile));
    d.ring_rows = 2056;

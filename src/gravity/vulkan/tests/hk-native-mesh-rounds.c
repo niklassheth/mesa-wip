@@ -170,7 +170,11 @@ check(unsigned logical, unsigned v, unsigned p, bool attributes, bool prim,
       CHECK(body.logical_size[0] == logical);
       CHECK(part.info.workgroup_size[0] == expected && !part.info.scratch_size);
       CHECK(hk_apple9_native_shader_valid(&part.info, &body, HK_APPLE9_NATIVE_MESH));
-      CHECK(body.layout.vertex_components == (attributes ? 7 : 4) + prim);
+      unsigned raw_vc = (attributes ? 7 : 4) + prim;
+      CHECK(body.layout.vertex_components == raw_vc ||
+            (body.layout.variable_idx_rows &&
+             (ALIGN_POT(raw_vc, 4u) & 7u) == 0u &&
+             body.layout.vertex_components == ALIGN_POT(raw_vc, 4u) + 1u));
       /* Uploads cannot reinterpret the binary under another width or size. */
       struct agx_apple9_mesh_body_info stale = body;
       stale.key.physical_threads = expected == 16 ? 32 : 16;

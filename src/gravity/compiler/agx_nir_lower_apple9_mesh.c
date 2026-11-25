@@ -395,6 +395,55 @@ validate(nir_shader *nir, const struct agx_apple9_mesh_key *key,
       u_foreach_bit(c, primitive[slot])
          layout->primitive_component[slot][c] = layout->primitive_components++;
    }
+   /* Multi-bucket dynamic primitive counts (variable_idx_rows) require
+    * planes % 8 == 4 so (planes / 4) is odd and invertible modulo every
+    * power-of-2 ring alignment G | 4096. When planes % 8 == 0, pad
+    * vertex_components to (planes + 1) using unused VAR scalar planes
+    * whenever a GCD multi-bucket ring plan exists and the padded layout still
+    * fits in both the 32 KiB local allocation and 128-component UVS limit. */
+   if (key->pad_variable_idx_planes && layout->variable_idx_rows &&
+       !layout->primitive_components && !layout->culling &&
+       layout->max_vertices > 0) {
+      unsigned planes = ALIGN_POT(layout->vertex_components, 4u);
+      if ((planes & 7u) == 0u) {
+         unsigned target = planes + 1u;
+         unsigned padded_local_B =
+            layout->position_B + layout->vertex_pitch_B * target;
+         unsigned padded_shared_off = ALIGN_POT(padded_local_B, 16);
+         struct agx_apple9_mesh_layout trial = *layout;
+         trial.vertex_components = target;
+         if (target <= 4u + AGX_APPLE9_MAX_VARYING_COMPONENTS &&
+             padded_local_B <= AGX_APPLE9_MAX_SHARED_BYTES &&
+             ALIGN_POT(nir->info.shared_size, 4) <=
+                AGX_APPLE9_MAX_SHARED_BYTES - padded_shared_off &&
+             agx_apple9_mesh_ring_plan_solve(&trial, NULL)) {
+            for (unsigned slot = VARYING_SLOT_VAR0 + 31;
+                 layout->vertex_components < target &&
+                 slot >= VARYING_SLOT_VAR0;
+                 --slot) {
+               if (vertex[slot] || primitive[slot])
+                  continue;
+               for (unsigned c = 0;
+                    layout->vertex_components < target && c < 4; ++c) {
+                  layout->vertex_component[slot][c] =
+                     layout->vertex_components++;
+               }
+            }
+            for (unsigned slot = VARYING_SLOT_VAR0 + 31;
+                 layout->vertex_components < target &&
+                 slot >= VARYING_SLOT_VAR0;
+                 --slot) {
+               for (unsigned c = 0;
+                    layout->vertex_components < target && c < 4; ++c) {
+                  if ((vertex[slot] | primitive[slot]) & BITFIELD_BIT(c))
+                     continue;
+                  layout->vertex_component[slot][c] =
+                     layout->vertex_components++;
+               }
+            }
+         }
+      }
+   }
    layout->primitive_stride_B = layout->primitive_components * 4;
    /* Primitive attributes have a separate device record. The local output
     * contract reserves one linking plane when such records are present. */

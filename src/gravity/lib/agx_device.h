@@ -80,7 +80,7 @@ int agx_bind_timestamps(struct agx_device *dev, struct agx_bo *bo,
  * the kernel's per-render 0x1ca48 multi-cluster payload aperture whenever
  * DRM_ASAHI_FEATURE_NATIVE_MESH is advertised. */
 #define AGX_NATIVE_OBJECT_MAX_PAYLOAD_BYTES  16384u
-#define AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES   1024u
+#define AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES   16384u
 #define AGX_NATIVE_OBJECT_MAX_THREADS        32u
 #define AGX_NATIVE_OBJECT_MAX_SHARED_BYTES   32768u
 #define AGX_NATIVE_OBJECT_MAX_GROUPS         ((1u << 20) - 1)

@@ -1717,7 +1717,9 @@ hk_apple9_native_can_append(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .bounded_prims = cs->apple9_native_bounded_prims,
       .primitives = cs->apple9_native_primitives,
       .ring_rows = cs->apple9_native_ring_rows,
-      .ring_stride = cs->apple9_native_ring_stride,
+      .ring_stride_gcd = cs->apple9_native_ring_stride_gcd,
+      .ring_max_live_rows = cs->apple9_native_ring_max_live_rows,
+      .ring_stride_constant = cs->apple9_native_ring_stride_constant,
       .ring_limited = cs->apple9_native_ring_limited,
    };
    const struct hk_apple9_draw_summary draw = {
@@ -1725,7 +1727,9 @@ hk_apple9_native_can_append(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .unbounded_prims = native && cmd->apple9_draw_unbounded_prims,
       .primitives = cmd->apple9_draw_primitives,
       .ring_rows = native ? cmd->apple9_draw_ring_rows : 0,
-      .ring_stride = native ? cmd->apple9_draw_ring_stride : 0,
+      .ring_stride_gcd = native ? cmd->apple9_draw_ring_stride_gcd : 0,
+      .ring_live_rows = native ? cmd->apple9_draw_ring_live_rows : 0,
+      .ring_stride_constant = native && cmd->apple9_draw_ring_stride_constant,
       .ring_limited = native && cmd->apple9_draw_ring_limited,
    };
    const struct hk_apple9_native_profile profile = hk_apple9_native_profile(dev);
@@ -2000,6 +2004,11 @@ hk_apple9_prepare_native_mesh_ex(
              i ? AGX_APPLE9_LAUNCH_TASK : AGX_APPLE9_LAUNCH_MESH, &p[i]))
          return false;
    }
+   const uint32_t hw_payload_B =
+      object->info.apple9_native.key.hw_payload
+         ? object->info.apple9_native.task_payload_stride_B +
+              (object->info.apple9_native.writes_child_grid ? 16u : 0u)
+         : 0u;
    struct agx_apple9_mesh_state_parameters params = {
       .layout = &mesh->info.apple9_native.layout,
       .mesh_launch = agx_usc_addr(&dev->dev, launch.gpu) / 64,
@@ -2007,6 +2016,7 @@ hk_apple9_prepare_native_mesh_ex(
          &dev->dev, launch.gpu + AGX_APPLE9_GRAPHICS_LAUNCH_SIZE) / 64,
       .threads = mesh->b.info.workgroup_size[0],
       .has_object_stage = true,
+      .task_payload_size_B = hw_payload_B,
    };
    return agx_apple9_mesh_state_build(state, &params);
 }
@@ -2073,19 +2083,33 @@ hk_apple9_add_native_primitives(struct hk_cs *cs, uint64_t primitives)
 
 static inline void
 hk_apple9_add_native_ring_rows(struct hk_cs *cs, uint64_t rows, bool limited,
-                               uint32_t stride)
+                               uint32_t stride_gcd, uint32_t live_rows,
+                               bool stride_constant)
 {
+   const bool first_nonempty = cs->apple9_native_ring_rows == 0;
    cs->apple9_native_ring_rows =
       rows > UINT64_MAX - cs->apple9_native_ring_rows
          ? UINT64_MAX
          : cs->apple9_native_ring_rows + rows;
    cs->apple9_native_ring_limited |= limited;
    if (rows > 0) {
-      uint32_t eff = (!limited && stride) ? stride : UINT32_MAX;
-      if (!cs->apple9_native_ring_stride)
-         cs->apple9_native_ring_stride = eff;
-      else if (cs->apple9_native_ring_stride != eff)
-         cs->apple9_native_ring_stride = UINT32_MAX;
+      const uint32_t eff = (!limited && stride_gcd) ? stride_gcd : 0;
+      if (first_nonempty) {
+         cs->apple9_native_ring_stride_gcd = eff;
+         cs->apple9_native_ring_max_live_rows = live_rows;
+         cs->apple9_native_ring_stride_constant =
+            eff != 0 && stride_constant;
+      } else {
+         cs->apple9_native_ring_stride_constant =
+            cs->apple9_native_ring_stride_constant && eff != 0 &&
+            stride_constant && cs->apple9_native_ring_stride_gcd == eff;
+         cs->apple9_native_ring_stride_gcd =
+            (cs->apple9_native_ring_stride_gcd && eff)
+               ? hk_apple9_native_gcd_u32(cs->apple9_native_ring_stride_gcd, eff)
+               : 0;
+         if (live_rows > cs->apple9_native_ring_max_live_rows)
+            cs->apple9_native_ring_max_live_rows = live_rows;
+      }
    }
 }
 
@@ -2163,7 +2187,9 @@ hk_apple9_record_draw_ex(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       hk_apple9_add_native_primitives(cs, cmd->apple9_draw_primitives);
       hk_apple9_add_native_ring_rows(cs, cmd->apple9_draw_ring_rows,
                                      cmd->apple9_draw_ring_limited,
-                                     cmd->apple9_draw_ring_stride);
+                                     cmd->apple9_draw_ring_stride_gcd,
+                                     cmd->apple9_draw_ring_live_rows,
+                                     cmd->apple9_draw_ring_stride_constant);
       if (debug_get_option_native_batch_log())
          fprintf(stderr, "HK_NATIVE_BATCH stream=%" PRIx64 " dispatch=%u\n",
                  cs->addr, cs->apple9_native_dispatches);
