@@ -2070,6 +2070,11 @@ hk_apple9_native_tess_check(const nir_shader *source,
    bool production = key->native_stages & HK_APPLE9_NATIVE_TES_BIT;
    if (!production && !hk_apple9_native_tess_enabled())
       return VK_SUCCESS;
+   if (key->fs_reads_primitive_id) {
+      if (reason)
+         *reason = "native unfused TES does not export fragment PrimitiveID";
+      return VK_SUCCESS;
+   }
    if (production &&
        ((source->info.tess._primitive_mode != TESS_PRIMITIVE_TRIANGLES &&
          source->info.tess._primitive_mode != TESS_PRIMITIVE_QUADS) ||
@@ -3880,7 +3885,10 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
             key.native_object_hw_payload = true;
          }
       } else {
-         result = hk_apple9_native_tess_check(tes, &key, &native, &reason);
+         struct hk_apple9_graphics_key tes_key = key;
+         if (!has_fs_mask)
+            tes_key.fs_reads_primitive_id = true;
+         result = hk_apple9_native_tess_check(tes, &tes_key, &native, &reason);
       }
    }
 

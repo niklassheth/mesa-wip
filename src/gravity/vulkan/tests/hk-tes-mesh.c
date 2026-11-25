@@ -1716,7 +1716,7 @@ fused_tess_vbo_pack_suite(void)
       ralloc_free(fb.shader);
    }
 
-   printf("fused tessellation VBO pack suite: 0-ULP exhaustive + 4 norm formats + payload compaction + rejections passed\n");
+   printf("fused tessellation VBO pack suite: host uint->unorm/snorm pack/unpack equivalence + 4 norm formats + payload compaction + rejections passed\n");
 }
 
 static void
@@ -2367,6 +2367,8 @@ ref_eval_1d_fxp(enum gl_tess_spacing spacing, uint32_t n, float f, uint32_t k)
       uint32_t loc_ceil = j * inv_ceil;
       q_half = (loc_floor * (65536u - frac) + loc_ceil * frac + 32768u) >> 16;
    }
+   if (q_half > 32768u)
+      q_half = 32768u;
    return flip ? 65536u - q_half : q_half;
 }
 
@@ -2429,12 +2431,13 @@ ref_tri_ring_uv(enum gl_tess_spacing spacing, uint32_t r, uint32_t e, uint32_t k
    }
    uint32_t s_r = ni - r2;
    uint32_t perp_raw = ref_eval_1d_fxp(spacing, ni, fi, r);
-   uint32_t perp_fxp = (perp_raw * 0xaaaau + 32768u) >> 16;
+   uint32_t half_perp = perp_raw / 3u;
+   uint32_t perp_fxp = half_perp << 1;
    uint32_t e_c = k == s_r ? (e == 2 ? 0 : e + 1) : e;
    uint32_t k_c = k == s_r ? 0 : k;
    uint32_t q = e_c == 1 ? r + k_c : (ni - r - k_c);
    uint32_t param_fxp = ref_eval_1d_fxp(spacing, ni, fi, q);
-   uint32_t tmp_fxp = param_fxp - ((perp_fxp + 1u) >> 1);
+   uint32_t tmp_fxp = param_fxp - half_perp;
    uint32_t u_fxp = e_c == 0 ? perp_fxp : tmp_fxp;
    uint32_t v_fxp = e_c == 0 ? tmp_fxp : (e_c == 1 ? perp_fxp : 65536u - tmp_fxp - perp_fxp);
    uv[0] = (float)u_fxp * (1.0f / 65536.0f);
@@ -2640,10 +2643,9 @@ fused_tess_topology_suite(void)
                                  float v0 = ref_eval_1d(sp, n_in[1], f_in[1], oy + 1 + qy);
                                  float v1 = ref_eval_1d(sp, n_in[1], f_in[1], oy + 2 + qy);
                                  double cr = (double)(u1 - u0) * (double)(v1 - v0);
-                                 /* Allow 1-FXP-LSB (1/65536) rounding on degenerate
-                               * frac==0 sliver edges matching tessellator.h's
-                               * (fxpPerpParam + 1) / 2 inner-ring formula. */
-                              CHECK(cr >= -2e-5);
+                                 /* Strictly non-negative CW winding (zero folds,
+                               * even at degenerate frac == 0 boundaries). */
+                              CHECK(cr >= 0.0);
                                  area += cr;
                               }
                            }
@@ -2740,10 +2742,9 @@ fused_tess_topology_suite(void)
                                     ((double)vbuf[d][1] - vbuf[a][1]) -
                                  ((double)vbuf[b][1] - vbuf[a][1]) *
                                     ((double)vbuf[d][0] - vbuf[a][0]);
-                              /* Allow 1-FXP-LSB (1/65536) rounding on degenerate
-                               * frac==0 sliver edges matching tessellator.h's
-                               * (fxpPerpParam + 1) / 2 inner-ring formula. */
-                              CHECK(cr >= -2e-5);
+                              /* Strictly non-negative CW winding (zero folds,
+                               * even at degenerate frac == 0 boundaries). */
+                              CHECK(cr >= 0.0);
                               area += 0.5 * cr;
                            }
                         }
@@ -2843,14 +2844,15 @@ fused_tess_astra_regression_suite(void)
    }
 
    /* F2: Triangle equal-spacing (3,3,3 / 3) inner ring corner must match
-    * tessellator.h bit-for-bit: (14563, 36409)/65536, NOT (14563, 36410)/65536. */
+    * tessellator.h bit-for-bit using exact even 2 * floor(perp / 3) = 14562:
+    * (14562, 36410)/65536, with exact corner equality across edge 2 -> edge 0. */
    {
       const uint32_t n_out[3] = {3, 3, 3};
       const float f_out[3] = {3.0f, 3.0f, 3.0f};
       float uv0[2], uv2_end[2];
       ref_tri_ring_uv(TESS_SPACING_EQUAL, 1, 0, 0, n_out, f_out, 3, 3.0f, uv0);
       ref_tri_ring_uv(TESS_SPACING_EQUAL, 1, 2, 1, n_out, f_out, 3, 3.0f, uv2_end);
-      CHECK(uv0[0] == 14563.0f / 65536.0f && uv0[1] == 36409.0f / 65536.0f);
+      CHECK(uv0[0] == 14562.0f / 65536.0f && uv0[1] == 36410.0f / 65536.0f);
       CHECK(f32_bits(uv0[0]) == f32_bits(uv2_end[0]) &&
             f32_bits(uv0[1]) == f32_bits(uv2_end[1]));
    }
@@ -2946,6 +2948,23 @@ fused_tess_astra_regression_suite(void)
       ralloc_free(tes_e);
       ralloc_free(tcs_o);
       ralloc_free(tes_o);
+      /* Unfused native TES must decline fs_reads_primitive_id so FS never binds
+       * hardware rasterizer ID 0x60 instead of the input patch ID. */
+      {
+         nir_shader *tes_pos = make_fused_tes(TESS_PRIMITIVE_QUADS,
+                                              TESS_SPACING_EQUAL, false, false,
+                                              1, 0, 0, 0, false, false);
+         struct hk_apple9_graphics_key ukey = {
+            .native_stages = HK_APPLE9_NATIVE_TES_BIT,
+            .fs_reads_primitive_id = true,
+         };
+         bool supported = true;
+         const char *reason = NULL;
+         CHECK(hk_apple9_native_tess_check(tes_pos, &ukey, &supported, &reason) ==
+               VK_SUCCESS);
+         CHECK(!supported && reason && strstr(reason, "PrimitiveID"));
+         ralloc_free(tes_pos);
+      }
    }
 
    /* F6: TCS control barrier and memory-only barrier on nir_var_shader_out
@@ -3060,15 +3079,16 @@ fused_tess_astra_regression_suite(void)
    }
 
    /* F7 / M3: Dynamic SetMeshOutputsEXT(ubo.v, 1) on T32 V=16 P=1 comps=8
-    * (and V=32 P=32 comps=4) emits constant safe U0_B (24 and 44) into
-    * MESH_CONTROL for every non-empty WG, eliminating the 32-row runtime hole. */
+    * (and V=32 P=32 comps=4, safe across both idx_rows=4 and idx_rows=8)
+    * emits constant safe U0_B (24 and 68) into MESH_CONTROL for every
+    * non-empty WG, eliminating runtime stride holes. */
    {
       const struct {
          unsigned max_v, max_p, extra_vec4;
          uint32_t expected_u0_b;
       } f7_cases[] = {
          {16, 1, 1, 24},
-         {32, 32, 0, 44},
+         {32, 32, 0, 68},
       };
       for (unsigned i = 0; i < ARRAY_SIZE(f7_cases); ++i) {
          nir_builder mb = nir_builder_init_simple_shader(

@@ -1707,7 +1707,7 @@ hk_apple9_native_can_append(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    bool has_draws = cs->current != cs->start;
-   if (!cs->apple9_native_mesh && !(has_draws && native))
+   if (!cs->apple9_native_mesh && !native)
       return true;
    if (!hk_apple9_native_mesh_available_device(dev))
       return false;
@@ -1717,6 +1717,7 @@ hk_apple9_native_can_append(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .bounded_prims = cs->apple9_native_bounded_prims,
       .primitives = cs->apple9_native_primitives,
       .ring_rows = cs->apple9_native_ring_rows,
+      .ring_stride = cs->apple9_native_ring_stride,
       .ring_limited = cs->apple9_native_ring_limited,
    };
    const struct hk_apple9_draw_summary draw = {
@@ -1724,10 +1725,14 @@ hk_apple9_native_can_append(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .unbounded_prims = native && cmd->apple9_draw_unbounded_prims,
       .primitives = cmd->apple9_draw_primitives,
       .ring_rows = native ? cmd->apple9_draw_ring_rows : 0,
+      .ring_stride = native ? cmd->apple9_draw_ring_stride : 0,
       .ring_limited = native && cmd->apple9_draw_ring_limited,
    };
    const struct hk_apple9_native_profile profile = hk_apple9_native_profile(dev);
-   return hk_apple9_native_stream_admits(&stream, &draw, &profile);
+   enum hk_apple9_native_admit_result res =
+      hk_apple9_native_stream_classify(&stream, &draw, &profile);
+   assert(res != HK_APPLE9_NATIVE_ADMIT_REJECT);
+   return res == HK_APPLE9_NATIVE_ADMIT_APPEND;
 }
 
 bool
@@ -2067,13 +2072,21 @@ hk_apple9_add_native_primitives(struct hk_cs *cs, uint64_t primitives)
 }
 
 static inline void
-hk_apple9_add_native_ring_rows(struct hk_cs *cs, uint64_t rows, bool limited)
+hk_apple9_add_native_ring_rows(struct hk_cs *cs, uint64_t rows, bool limited,
+                               uint32_t stride)
 {
    cs->apple9_native_ring_rows =
       rows > UINT64_MAX - cs->apple9_native_ring_rows
          ? UINT64_MAX
          : cs->apple9_native_ring_rows + rows;
    cs->apple9_native_ring_limited |= limited;
+   if (rows > 0) {
+      uint32_t eff = (!limited && stride) ? stride : UINT32_MAX;
+      if (!cs->apple9_native_ring_stride)
+         cs->apple9_native_ring_stride = eff;
+      else if (cs->apple9_native_ring_stride != eff)
+         cs->apple9_native_ring_stride = UINT32_MAX;
+   }
 }
 
 static bool
@@ -2149,7 +2162,8 @@ hk_apple9_record_draw_ex(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          cs->apple9_native_bounded_prims = true;
       hk_apple9_add_native_primitives(cs, cmd->apple9_draw_primitives);
       hk_apple9_add_native_ring_rows(cs, cmd->apple9_draw_ring_rows,
-                                     cmd->apple9_draw_ring_limited);
+                                     cmd->apple9_draw_ring_limited,
+                                     cmd->apple9_draw_ring_stride);
       if (debug_get_option_native_batch_log())
          fprintf(stderr, "HK_NATIVE_BATCH stream=%" PRIx64 " dispatch=%u\n",
                  cs->addr, cs->apple9_native_dispatches);

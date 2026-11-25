@@ -174,23 +174,34 @@ agx_apple9_mesh_safe_u0_b(const struct agx_apple9_mesh_layout *layout,
       return false;
    uint64_t quads = ((uint64_t)layout->max_vertices + 3u) / 4u;
    uint64_t planes = (n + 3u) & ~UINT64_C(3);
-   uint64_t idx_rows = agx_apple9_mesh_idx_rows(layout);
-   if (idx_rows >= AGX_APPLE9_MESH_RING_ROWS)
+   uint64_t max_idx_rows = agx_apple9_mesh_idx_rows(layout);
+   if (max_idx_rows >= AGX_APPLE9_MESH_RING_ROWS)
       return false;
    uint64_t vtx_rows = quads * planes;
-   if (vtx_rows + idx_rows > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
+   if (vtx_rows + max_idx_rows > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
       return false;
 
    for (uint64_t q = quads; q <= AGX_APPLE9_MESH_SAFE_U0_B_MAX / 4u; ++q) {
-      uint64_t stride = q * planes + idx_rows;
-      if (stride > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
+      uint64_t max_stride = q * planes + max_idx_rows;
+      if (max_stride > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
          break;
-      uint64_t rem = AGX_APPLE9_MESH_RING_ROWS % stride;
-      if (rem == 0 || rem >= vtx_rows) {
+      /* Require the remainder condition for every reachable index-row class
+       * idx in {4, 8, ..., max_idx_rows} so dynamic runtime SetMeshOutputsEXT
+       * primitive counts cannot drop into an unsafe remainder band. */
+      bool all_safe = true;
+      for (uint64_t idx = 4u; idx <= max_idx_rows; idx += 4u) {
+         uint64_t stride = q * planes + idx;
+         uint64_t rem = AGX_APPLE9_MESH_RING_ROWS % stride;
+         if (rem != 0 && rem < vtx_rows) {
+            all_safe = false;
+            break;
+         }
+      }
+      if (all_safe) {
          if (out_u0_b)
             *out_u0_b = q == quads ? layout->max_vertices : (uint32_t)(q * 4u);
          if (out_stride)
-            *out_stride = (uint32_t)stride;
+            *out_stride = (uint32_t)max_stride;
          return true;
       }
    }

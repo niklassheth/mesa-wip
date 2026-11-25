@@ -1909,6 +1909,27 @@ hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw)
 
 DEBUG_GET_ONCE_BOOL_OPTION(tess_route_log, "HK_APPLE9_TESS_ROUTE_LOG", false)
 
+static inline void
+hk_apple9_set_draw_ring_usage(struct hk_cmd_buffer *cmd,
+                              const struct agx_apple9_mesh_layout *layout,
+                              uint64_t groups)
+{
+   if (!agx_apple9_mesh_ring_usage(layout, groups, &cmd->apple9_draw_ring_rows,
+                                   &cmd->apple9_draw_ring_limited)) {
+      cmd->apple9_draw_ring_rows = UINT64_MAX;
+      cmd->apple9_draw_ring_limited = true;
+      cmd->apple9_draw_ring_stride = 0;
+      return;
+   }
+   uint32_t stride = 0;
+   if (!cmd->apple9_draw_ring_limited &&
+       agx_apple9_mesh_safe_u0_b(layout, NULL, &stride)) {
+      cmd->apple9_draw_ring_stride = stride;
+   } else {
+      cmd->apple9_draw_ring_stride = 0;
+   }
+}
+
 /* Zero-PREGFX fused OBJECT(VS+TCS) -> MESH(TES) launch: executes 100% inside
  * the active render pass with zero CDM dispatches, zero tessellation heap
  * round-trip, and zero HK_READS_INTERNAL tiling barrier. */
@@ -1989,12 +2010,7 @@ hk_apple9_launch_native_tess_fused(struct hk_cmd_buffer *cmd, uint32_t draw_id,
             est_child_wgs && chunk_total_patches > UINT64_MAX / est_child_wgs
                ? UINT64_MAX
                : chunk_total_patches * est_child_wgs;
-         if (!agx_apple9_mesh_ring_usage(layout, chunk_child_wgs,
-                                         &cmd->apple9_draw_ring_rows,
-                                         &cmd->apple9_draw_ring_limited)) {
-            cmd->apple9_draw_ring_rows = UINT64_MAX;
-            cmd->apple9_draw_ring_limited = true;
-         }
+         hk_apple9_set_draw_ring_usage(cmd, layout, chunk_child_wgs);
          cmd->apple9_draw_unbounded_prims =
             ring_max == UINT64_MAX && !cmd->apple9_draw_ring_limited;
          if (!hk_apple9_prepare_draw_ex(cmd, draw.indexed, true, true))
@@ -2319,12 +2335,7 @@ hk_apple9_launch_native_gs_fused(struct hk_cmd_buffer *cmd, uint32_t draw_id,
             (uint64_t)grid_dims[0] * grid_dims[1] * grid_dims[2];
          cmd->apple9_draw_primitives = chunk_runs * prims_per_run * chunk_insts;
          cmd->apple9_draw_unbounded_prims = false;
-         if (!agx_apple9_mesh_ring_usage(layout, total_grid_groups,
-                                         &cmd->apple9_draw_ring_rows,
-                                         &cmd->apple9_draw_ring_limited)) {
-            cmd->apple9_draw_ring_rows = UINT64_MAX;
-            cmd->apple9_draw_ring_limited = true;
-         }
+         hk_apple9_set_draw_ring_usage(cmd, layout, total_grid_groups);
          if (!hk_apple9_prepare_draw(cmd, draw.indexed, true))
             return;
 
@@ -2571,12 +2582,7 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
       uint64_t gs_groups =
          (uint64_t)hk_apple9_native_gs_groups(cmd, draw_) * draw_.b.count[1];
       cmd->apple9_draw_primitives = gs_layout->max_primitives * gs_groups;
-      if (!agx_apple9_mesh_ring_usage(gs_layout, gs_groups,
-                                      &cmd->apple9_draw_ring_rows,
-                                      &cmd->apple9_draw_ring_limited)) {
-         cmd->apple9_draw_ring_rows = UINT64_MAX;
-         cmd->apple9_draw_ring_limited = true;
-      }
+      hk_apple9_set_draw_ring_usage(cmd, gs_layout, gs_groups);
       /* The software VS writes every vertex of every instance. The grid
        * bound keeps that buffer small today; check it as fallback does. */
       if (!hk_sw_vs_outputs_fit(cmd, draw_))
@@ -2606,12 +2612,7 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
             ? DIV_ROUND_UP(2u * 64u * 64u, HK_APPLE9_NATIVE_GS_PACK)
             : 2u * 64u * 64u;
       cmd->apple9_draw_primitives = 2 * 64 * 64;
-      if (!agx_apple9_mesh_ring_usage(&tes_body->layout, max_tes_groups,
-                                      &cmd->apple9_draw_ring_rows,
-                                      &cmd->apple9_draw_ring_limited)) {
-         cmd->apple9_draw_ring_rows = UINT64_MAX;
-         cmd->apple9_draw_ring_limited = true;
-      }
+      hk_apple9_set_draw_ring_usage(cmd, &tes_body->layout, max_tes_groups);
       if (hk_apple9_prepare_draw(cmd, true, true))
          hk_apple9_launch_native_tess(cmd, draw_id, draw_);
       return;
@@ -3056,6 +3057,7 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       hk_only_variant(native_task_api)->info.task.max_mesh_groups == UINT32_MAX;
    uint64_t draw_primitives = UINT64_MAX;
    uint64_t draw_ring_rows = UINT64_MAX;
+   uint32_t draw_ring_stride = 0;
    bool draw_ring_limited = true;
    if (native) {
       uint64_t native_groups = UINT64_MAX;
@@ -3072,6 +3074,9 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                                       &draw_ring_limited)) {
          draw_ring_rows = UINT64_MAX;
          draw_ring_limited = true;
+      } else if (!draw_ring_limited) {
+         agx_apple9_mesh_safe_u0_b(&native_main->info.apple9_native.layout,
+                                   NULL, &draw_ring_stride);
       }
    }
    if (debug_get_option_mesh_route_log()) {
@@ -3099,6 +3104,7 @@ hk_apple9_draw_mesh(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       hk_foreach_view(cmd) {
          cmd->apple9_draw_primitives = draw_primitives;
          cmd->apple9_draw_ring_rows = draw_ring_rows;
+         cmd->apple9_draw_ring_stride = draw_ring_stride;
          cmd->apple9_draw_ring_limited = draw_ring_limited;
          cmd->apple9_draw_unbounded_prims = false;
          if (!hk_apple9_prepare_draw_ex(cmd, true, true, native_object))

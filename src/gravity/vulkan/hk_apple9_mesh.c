@@ -272,7 +272,7 @@ bool
 hk_apple9_native_stage_available_device(struct hk_device *dev,
                                         mesa_shader_stage stage)
 {
-   if (!dev || !agx_has_native_mesh(&dev->dev))
+   if (!hk_apple9_native_mesh_available_device(dev))
       return false;
    if (stage == MESA_SHADER_GEOMETRY && hk_apple9_native_gs_enabled())
       return true;

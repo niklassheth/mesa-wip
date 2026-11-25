@@ -45,8 +45,10 @@ struct hk_apple9_stream_summary {
    /* Estimated binned primitives already in the render. */
    uint64_t primitives;
    /* Cumulative hardware 64 KiB mesh output ring rows of native blocks in the
-    * render, and whether any block is ring-limited (lacks a wrap-safe U0_B). */
+    * render, whether any block is ring-limited (lacks a wrap-safe U0_B), and
+    * the active wrap-safe stride (0: none yet; UINT32_MAX: mixed strides). */
    uint64_t ring_rows;
+   uint32_t ring_stride;
    bool ring_limited;
 };
 
@@ -58,8 +60,10 @@ struct hk_apple9_draw_summary {
    /* Estimated binned primitives of the draw (UINT64_MAX: unknown). */
    uint64_t primitives;
    /* Hardware 64 KiB mesh output ring rows of this native draw (UINT64_MAX:
-    * unknown), and whether its layout is ring-limited. */
+    * unknown), its constant wrap-safe stride (0 when bounded/unknown), and
+    * whether its layout is ring-limited. */
    uint64_t ring_rows;
+   uint32_t ring_stride;
    bool ring_limited;
 };
 
@@ -107,12 +111,21 @@ hk_apple9_native_stream_classify(const struct hk_apple9_stream_summary *s,
       return HK_APPLE9_NATIVE_ADMIT_SPLIT;
    if (!d->native)
       return HK_APPLE9_NATIVE_ADMIT_APPEND;
-   /* When either the open render or the incoming native block is ring-limited,
-    * enforce that combined ring occupancy stays within the 64 KiB (4096-row)
-    * mesh output ring without assuming an implicit cross-block hardware drain. */
+   /* Check whether combined native ring occupancy exceeds 4,096 rows (wraps
+    * the 64 KiB mesh output ring). Ring-limited layouts may never wrap;
+    * wrap-safe layouts may share a wrapping render pass only when every native
+    * draw in the pass uses the exact same constant wrap-safe stride so the
+    * ring pointer cannot drift into an unsafe remainder across dispatches. */
+   const bool wraps_ring =
+      d->ring_rows > HK_APPLE9_NATIVE_RING_ROWS ||
+      s->ring_rows > HK_APPLE9_NATIVE_RING_ROWS - d->ring_rows;
    if (s->ring_limited || d->ring_limited) {
-      if (d->ring_rows > HK_APPLE9_NATIVE_RING_ROWS ||
-          s->ring_rows > HK_APPLE9_NATIVE_RING_ROWS - d->ring_rows)
+      if (wraps_ring)
+         return HK_APPLE9_NATIVE_ADMIT_SPLIT;
+   } else if (s->native && wraps_ring) {
+      if (!s->ring_stride || !d->ring_stride ||
+          s->ring_stride == UINT32_MAX ||
+          s->ring_stride != d->ring_stride)
          return HK_APPLE9_NATIVE_ADMIT_SPLIT;
    }
    return HK_APPLE9_NATIVE_ADMIT_APPEND;
@@ -123,23 +136,6 @@ hk_apple9_native_stream_admits(const struct hk_apple9_stream_summary *s,
                                const struct hk_apple9_draw_summary *d,
                                const struct hk_apple9_native_profile *p)
 {
-   /* An empty stream always starts cleanly; an ordinary stream receiving an
-    * ordinary draw is never constrained by native-mesh admission. */
-   if (!s->native && !(s->has_draws && d->native))
-      return true;
-   if (!p->blocks)
-      return false;
-   bool check_prims = s->bounded_prims || (d->native && !d->unbounded_prims);
-   if (p->max_render_primitives && check_prims &&
-       (d->primitives > p->max_render_primitives ||
-        s->primitives > p->max_render_primitives - d->primitives))
-      return false;
-   if (!d->native)
-      return true;
-   if (s->ring_limited || d->ring_limited) {
-      if (d->ring_rows > HK_APPLE9_NATIVE_RING_ROWS ||
-          s->ring_rows > HK_APPLE9_NATIVE_RING_ROWS - d->ring_rows)
-         return false;
-   }
-   return true;
+   return hk_apple9_native_stream_classify(s, d, p) ==
+          HK_APPLE9_NATIVE_ADMIT_APPEND;
 }

@@ -56,6 +56,13 @@ with tempfile.TemporaryDirectory(prefix='hk-native-stage-') as tmp:
             assert (root/arm/(name+'.fallback')).read_bytes()==(root/'default'/(name+'.fallback')).read_bytes(),('fallback program/state',arm,name)
             if arm == 'on':
                 assert (root/arm/(name+'.bin')).read_bytes()==new
+            elif arm == 'logical-negative':
+                # Logical-off open under a physical-on device tags the serialized
+                # header (bit 7 of native_flags) so a later logical-on open never
+                # consumes an emulation-only cache entry, while keeping fallback
+                # bytes identical to default (verified above).
+                ln_bin = (root/arm/(name+'.bin')).read_bytes()
+                assert ln_bin != new and ln_bin[:5] == old[:5] and (ln_bin[5] & 0x80) == 0x80 and ln_bin[6:] == old[6:], ('logical-negative cache isolation', name)
             elif arm in ('gs','tes') and row['case'].startswith(arm+'-'):
                 assert (rows[name]['native']=='1') == expected
                 if expected:

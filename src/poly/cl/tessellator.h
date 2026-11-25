@@ -461,6 +461,9 @@ PlacePointIn1D(private const TESS_FACTOR_CONTEXT *TessFactorCtx, bool odd,
       fxpLocationOnFloorHalfTessFactor * (FXP_ONE - TessFactorCtx->fxpHalfTessFactorFraction) +
       fxpLocationOnCeilHalfTessFactor * (TessFactorCtx->fxpHalfTessFactorFraction);
    fxpLocation = (fxpLocation + FXP_ONE_HALF /*round*/) >> FXP_FRACTION_BITS; // get back to n.16
+   // Enforce the <= 0.5 invariant even when invNumSegments rounded up (e.g.
+   // 3 * floatToFixed(1/6) = 32769 > 32768 at frac == 0).
+   fxpLocation = min(fxpLocation, (FXP)FXP_ONE_HALF);
    if (bFlip) {
       fxpLocation = FXP_ONE - fxpLocation;
    }
@@ -1036,12 +1039,12 @@ poly_tess_tri_process(constant struct poly_tess_params *p, uint32_t patch,
          FXP fxpPerpParam = PlacePointIn1D(
             &insideTessFactorCtx, insideTessFactorOdd, perpendicularAxisPoint);
 
-         // Map location to the right size in
-         // barycentric space. We know this fixed
-         // point math won't over/underflow
-         fxpPerpParam *= FXP_TWO_THIRDS;
-         fxpPerpParam = (fxpPerpParam + FXP_ONE_HALF /*round*/) >>
-                        FXP_FRACTION_BITS; // get back to n.16
+         // Map location to the right size in barycentric space using exact even
+         // 2 * floor(perp / 3) so edge-2's implicit v = 1 - tmp - perp matches
+         // edge-0's corner v = (1 - perp_raw) - perp / 2 without 1-LSB winding
+         // flips on degenerate frac == 0 segments (e.g. 0x40400001).
+         FXP fxpHalfPerp = fxpPerpParam / 3;
+         fxpPerpParam = fxpHalfPerp << 1;
 
          for (int edge = 0; edge < TRI_EDGES; edge++) {
             int odd = edge & 0x1;
@@ -1056,15 +1059,8 @@ poly_tess_tri_process(constant struct poly_tess_params *p, uint32_t patch,
 
                FXP fxpParam =
                   PlacePointIn1D(&insideTessFactorCtx, insideTessFactorOdd, q);
-               // edge0 VW, has perpendicular parameter U constant
-               // edge1 WU, has perpendicular parameter V constant
-               // edge2 UV, has perpendicular parameter W constant
-               // reciprocal is the rate of change of edge-parallel parameters
-               // as they are pushed into the triangle
-               const unsigned int deriv = 2;
-
                // we know this fixed point math won't over/underflow
-               FXP tmp = fxpParam - (fxpPerpParam + 1 /*round*/) / deriv;
+               FXP tmp = fxpParam - fxpHalfPerp;
 
                DefinePoint(&ctx.Point[pointOffset],
                            edge > 0 ? tmp : fxpPerpParam,

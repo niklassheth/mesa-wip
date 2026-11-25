@@ -2056,7 +2056,8 @@ nir_eval_1d_fxp(nir_builder *b, enum gl_tess_spacing spacing, nir_def *n,
 
    nir_def *q_half = nir_bcsel(
       b, j_is_0, nir_imm_int(b, 0),
-      nir_bcsel(b, j_is_mid, nir_imm_int(b, HK_TESS_FXP_ONE_HALF), q_mid));
+      nir_bcsel(b, j_is_mid, nir_imm_int(b, HK_TESS_FXP_ONE_HALF),
+                nir_umin(b, q_mid, nir_imm_int(b, HK_TESS_FXP_ONE_HALF))));
    return nir_bcsel(b, flip,
                     nir_isub(b, nir_imm_int(b, HK_TESS_FXP_ONE), q_half),
                     q_half);
@@ -3140,15 +3141,17 @@ nir_tri_ring_uv(nir_builder *b, enum gl_tess_spacing spacing, nir_def *r,
       nir_def *is_center = nir_ieq(b, r2, n_in);
       nir_def *s_r = nir_usub_sat(b, n_in, r2);
       nir_def *perp_raw = nir_eval_1d_fxp(b, spacing, n_in, f_in, r);
-      nir_def *perp_fxp = nir_ushr_imm(
-         b,
-         nir_iadd_imm(b, nir_imul_imm(b, perp_raw, HK_TESS_FXP_TWO_THIRDS),
-                      HK_TESS_FXP_ONE_HALF),
-         16);
+      /* Exact floor(perp_raw / 3) via umul_high(x, 0xaaaaaaab) >> 1 so
+       * perp_fxp = 2 * half_perp is even and 3 * half_perp <= perp_raw,
+       * matching tessellator.h bit-for-bit with strictly non-negative winding
+       * across all degenerate frac == 0 boundaries (e.g. 0x40400001). */
+      nir_def *half_perp = nir_ushr_imm(
+         b, nir_umul_high(b, perp_raw, nir_imm_int(b, 0xaaaaaaabu)), 1);
+      nir_def *perp_fxp = nir_ishl_imm(b, half_perp, 1);
       /* Canonicalize ring endpoints (k == s_r) to the next edge's start
        * ((e + 1) % 3, k = 0) and evaluate the exact fallback tessellator.h
-       * formula fxpParam - (fxpPerpParam + 1) / 2 so every interior vertex
-       * and corner matches the SW fallback bit-for-bit. */
+       * formula fxpParam - fxpHalfPerp so every interior vertex and corner
+       * matches the SW fallback bit-for-bit. */
       nir_def *at_end = nir_ieq(b, k, s_r);
       nir_def *e_c = nir_bcsel(
          b, at_end,
@@ -3160,7 +3163,6 @@ nir_tri_ring_uv(nir_builder *b, enum gl_tess_spacing spacing, nir_def *r,
          b, nir_ieq_imm(b, e_c, 1), nir_iadd(b, r, k_c),
          nir_usub_sat(b, nir_usub_sat(b, n_in, r), k_c));
       nir_def *param_fxp = nir_eval_1d_fxp(b, spacing, n_in, f_in, q);
-      nir_def *half_perp = nir_ushr_imm(b, nir_iadd_imm(b, perp_fxp, 1), 1);
       nir_def *tmp_fxp = nir_usub_sat(b, param_fxp, half_perp);
       nir_def *u_gen = nir_bcsel(b, nir_ieq_imm(b, e_c, 0), perp_fxp, tmp_fxp);
       nir_def *v_gen = nir_bcsel(
@@ -3209,11 +3211,17 @@ emit_quad_cell_tri(nir_builder *b, nir_def *prim_idx, nir_def *v00, nir_def *v10
       nir_ior(b, nir_iand(b, nir_ult(b, gx2p1, qu), nir_ult(b, gy2p1, qv)),
               nir_iand(b, nir_ult(b, qu, gx2p1), nir_ult(b, qv, gy2p1))),
       nir_iand(b, nir_ieq(b, gx2p1, qu), nir_ine(b, gy2p1, qv)));
-   nir_def *t0_c = nir_bcsel(b, diag_00_11, v11, v01);
-   nir_def *t1_a = nir_bcsel(b, diag_00_11, v00, v10);
-   emit_triangle_prim(b, prim_idx, nir_bcsel(b, is_t1, t1_a, v00),
-                      nir_bcsel(b, is_t1, v11, v10),
-                      nir_bcsel(b, is_t1, v01, t0_c), flip_winding);
+   /* Match tessellator.h cyclic vertex order (provoking vertex v01 for
+    * !diag_00_11 center cells: (v01, v00, v10) and (v01, v10, v11); v00 for
+    * diag_00_11 cells: (v00, v10, v11) and (v00, v11, v01)). */
+   nir_def *a = nir_bcsel(b, diag_00_11, v00, v01);
+   nir_def *b_v = nir_bcsel(
+      b, is_t1, nir_bcsel(b, diag_00_11, v11, v10),
+      nir_bcsel(b, diag_00_11, v10, v00));
+   nir_def *c_v = nir_bcsel(
+      b, is_t1, nir_bcsel(b, diag_00_11, v01, v11),
+      nir_bcsel(b, diag_00_11, v11, v10));
+   emit_triangle_prim(b, prim_idx, a, b_v, c_v, flip_winding);
 }
 
 struct tes_lower_state {

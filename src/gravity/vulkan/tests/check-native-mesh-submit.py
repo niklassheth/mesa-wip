@@ -42,6 +42,19 @@ def read_gpu(directory, index, address, size):
     return data
 
 
+def read_gpu_prefix(directory, prefix, address, max_size):
+    matches = sorted(directory.glob(f'{prefix}.bo.*.bin'))
+    require(matches, f'{directory}: no BO dump for {prefix}')
+    for path in matches:
+        base = int(path.name.split('.bo.')[1].split('.')[0], 16)
+        length = path.stat().st_size
+        if base <= address < base + length:
+            with path.open('rb') as f:
+                f.seek(address - base)
+                return f.read(min(max_size, base + length - address))
+    raise SystemExit(f'{directory}: GPU address {address:#x} not found in BO dumps')
+
+
 def check(directory, native, expected):
     files = sorted(directory.glob('*.commands.bin'))
     require(files, f'{directory}: no submissions')
@@ -57,13 +70,26 @@ def check(directory, native, expected):
                 require(size == 240, f'{path}: unexpected render UAPI size {size}')
                 flags, = struct.unpack_from('<I', data, pos)
                 address, = struct.unpack_from('<Q', data, pos + 8)
-                header, = struct.unpack('<I', read_gpu(
-                    directory, path.name.split('.')[0], address, 4))
-                # Ordinary-prefix renders merged with a native suffix start with
-                # an ordinary VDM packet (0x4000002e) while setting bit 28.
+                vdm = read_gpu_prefix(directory, path.name.split('.')[0], address, 16384)
+                require(len(vdm) >= 4, f'{path}: short VDM read')
+                words = struct.unpack_from(f'<{len(vdm) // 4}I', vdm)
+                header = words[0]
+                # Ordinary-prefix renders merged with a native suffix may start
+                # with an ordinary VDM packet (0x4000002e), but the stream MUST
+                # contain at least one native mesh packet (0x40000d2c) before
+                # stream termination (0xc0000000) when native=True, and zero
+                # native mesh packets when native=False.
                 valid_headers = (0x40000d2c, 0x4000002e) if native else (0x4000002e,)
                 require(header in valid_headers,
                         f'{path}: unexpected producer packet {header:#x}')
+                has_native_pkt = False
+                for w in words:
+                    if w == 0x40000d2c:
+                        has_native_pkt = True
+                    elif w == 0xc0000000:
+                        break
+                require(has_native_pkt == native,
+                        f'{path}: VDM stream native packet presence {has_native_pkt} != expected {native}')
                 require(flags == expected,
                         f'{path}: render flags {flags:#010x}, expected {expected:#010x}')
                 require(not ((flags & NATIVE_MESH) and (flags & FEW)),

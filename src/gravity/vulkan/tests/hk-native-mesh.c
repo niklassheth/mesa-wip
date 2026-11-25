@@ -526,8 +526,10 @@ check_batch_ring_budget(void)
    s = base_stream;
    d = base_draw;
    s.ring_rows = rows;
+   s.ring_stride = 164;
    s.ring_limited = false;
    d.ring_rows = rows;
+   d.ring_stride = 164;
    d.ring_limited = false;
    CHECK(hk_apple9_native_stream_admits(&s, &d, &profile));
    d.ring_rows = 2056;

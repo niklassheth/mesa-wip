@@ -37,11 +37,14 @@ shader(mesa_shader_stage stage)
 int
 main(void)
 {
+   struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
    struct hk_device *dev = calloc(1, sizeof(*dev));
    struct hk_cmd_buffer *cmd = calloc(1, sizeof(*cmd));
-   CHECK(dev && cmd);
-   dev->dev.chip = AGX_CHIP_G16G;
-   dev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
+   CHECK(pdev && dev && cmd);
+   pdev->dev.chip = dev->dev.chip = AGX_CHIP_G16G;
+   pdev->dev.params.features = dev->dev.params.features =
+      DRM_ASAHI_FEATURE_NATIVE_MESH;
+   dev->vk.physical = &pdev->vk;
    cmd->vk.base.device = &dev->vk;
    cmd->vk.state = MESA_VK_COMMAND_BUFFER_STATE_RECORDING;
    struct hk_graphics_state *gfx = &cmd->state.gfx;
@@ -98,6 +101,7 @@ main(void)
    free(gs); free(ng); free(vs); free(nv); free(fs); free(nf);
    free(cmd);
    free(dev);
+   free(pdev);
    puts("native routing sees index size and restart from command buffer state");
    return 0;
 }

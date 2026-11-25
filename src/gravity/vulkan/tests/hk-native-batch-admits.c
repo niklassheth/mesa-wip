@@ -113,15 +113,17 @@ main(void)
    /* An ordinary draw uses 0 mesh ring rows and still shares the render pass. */
    CHECK(hk_apple9_native_stream_admits(&s, &d_ord, &enabled_unbounded));
 
-   /* Two unbounded (wg_rows <= 40) draws batch freely past 4096 cumulative rows. */
+   /* Two unbounded same-stride draws batch freely past 4096 cumulative rows. */
    s = (struct hk_apple9_stream_summary){
       .native = true,
       .has_draws = true,
       .ring_rows = 100000,
+      .ring_stride = 40,
       .ring_limited = false,
    };
    CHECK(hk_apple9_native_stream_admits(&s, &(struct hk_apple9_draw_summary){
-      .native = true, .ring_rows = 100000, .ring_limited = false}, &enabled_unbounded));
+      .native = true, .ring_rows = 100000, .ring_stride = 40,
+      .ring_limited = false}, &enabled_unbounded));
    /* But appending a ring-limited draw onto that stream splits cleanly. */
    CHECK(!hk_apple9_native_stream_admits(&s, &(struct hk_apple9_draw_summary){
       .native = true, .ring_rows = 48, .ring_limited = true}, &enabled_unbounded));
@@ -157,6 +159,7 @@ main(void)
       .unbounded_prims = true,
       .primitives = 20000ull * 8192ull,
       .ring_rows = 20000ull * 4096ull * 40ull,
+      .ring_stride = 164,
       .ring_limited = false,
    };
    struct hk_apple9_stream_summary ord_indirect = {
@@ -171,9 +174,45 @@ main(void)
       .bounded_prims = false,
       .primitives = UINT64_MAX,
       .ring_rows = giant_tess.ring_rows,
+      .ring_stride = 164,
       .ring_limited = false,
    };
    CHECK(hk_apple9_native_stream_admits(&unb_stream, &giant_tess, &enabled_capped));
+   /* Mixed wrap-safe strides MUST split once combined occupancy wraps 4,096 rows
+    * (8 stride-8 WGs = 64 rows + wrapping stride-164 draw -> SPLIT), while
+    * small mixed-stride draws staying <= 4,096 rows still merge cleanly. */
+   struct hk_apple9_stream_summary stride8_stream = {
+      .native = true,
+      .has_draws = true,
+      .bounded_prims = true,
+      .primitives = 16,
+      .ring_rows = 64,
+      .ring_stride = 8,
+      .ring_limited = false,
+   };
+   struct hk_apple9_draw_summary stride164_small = {
+      .native = true,
+      .primitives = 100,
+      .ring_rows = 1640,
+      .ring_stride = 164,
+      .ring_limited = false,
+   };
+   struct hk_apple9_draw_summary stride164_wrap = {
+      .native = true,
+      .primitives = 500,
+      .ring_rows = 25 * 164,
+      .ring_stride = 164,
+      .ring_limited = false,
+   };
+   CHECK(hk_apple9_native_stream_classify(&stride8_stream, &stride164_small,
+                                          &enabled_capped) ==
+         HK_APPLE9_NATIVE_ADMIT_APPEND);
+   CHECK(hk_apple9_native_stream_classify(&stride8_stream, &stride164_wrap,
+                                          &enabled_capped) ==
+         HK_APPLE9_NATIVE_ADMIT_SPLIT);
+   CHECK(hk_apple9_native_stream_classify(&unb_stream, &giant_tess,
+                                          &enabled_capped) ==
+         HK_APPLE9_NATIVE_ADMIT_APPEND);
    CHECK(hk_apple9_native_stream_admits(&unb_stream, &(struct hk_apple9_draw_summary){
       .native = false, .primitives = UINT64_MAX}, &enabled_capped));
    /* Appending a ring-limited draw onto that unbounded stream still enforces
