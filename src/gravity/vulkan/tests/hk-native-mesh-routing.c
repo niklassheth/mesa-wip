@@ -204,18 +204,31 @@ routes(struct hk_cmd_buffer *cmd)
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.cull_primitive = false;
    gfx->shaders[MESA_SHADER_FRAGMENT] = NULL;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
-   /* Hardware 64 KiB mesh output ring gate: V=128, n=8 (264 rows/WG) admits up
-    * to 15 direct workgroups (and indirect draws via GPU max_groups=15 +
-    * emulated overflow fallback), while a single-WG ring overflow (V=256,
-    * n=128) has max_groups=0 and falls back even for indirect draws. */
+   /* Hardware 64 KiB mesh output ring gate:
+    * - V=128, n=8, P=32 (vtx_rows=256, idx_rows=8) has a wrap-safe U0_B stride
+    *   so direct and indirect draws of any grid size stay native/unbounded.
+    * - V=256, n=28, P=32 (vtx_rows=1792, idx_rows=8, already at max U0_B=256
+    *   with 4096 % 1800 = 496 < 1792) has no safe U0_B and admits at most
+    *   4096 / 1800 = 2 workgroups (indirect uses GPU max_groups=2 + emulated
+    *   overflow fallback).
+    * - A single-WG ring overflow (V=256, n=128) has max_groups=0 and falls
+    *   back even for indirect draws. */
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_vertices = 128;
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.vertex_components = 8;
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_primitives = 32;
-   const uint32_t ring_fit[] = {15, 1, 1}, ring_wrap[] = {16, 1, 1},
-                  ring_32[] = {32, 1, 1}, ring_64[] = {64, 1, 1};
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.indices_per_primitive = 3;
+   const uint32_t ring_16[] = {16, 1, 1}, ring_64[] = {64, 1, 1};
+   CHECK(hk_apple9_use_native_mesh(cmd, ring_16, 0));
+   CHECK(hk_apple9_use_native_mesh(cmd, ring_64, 0));
+   CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0));
+   CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
+
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_vertices = 256;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.vertex_components = 28;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_primitives = 32;
+   const uint32_t ring_fit[] = {2, 1, 1}, ring_wrap[] = {3, 1, 1};
    CHECK(hk_apple9_use_native_mesh(cmd, ring_fit, 0));
    CHECK(!hk_apple9_use_native_mesh(cmd, ring_wrap, 0));
-   CHECK(!hk_apple9_use_native_mesh(cmd, ring_32, 0));
    CHECK(!hk_apple9_use_native_mesh(cmd, ring_64, 0));
    CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0));
    CHECK(hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
@@ -223,10 +236,10 @@ routes(struct hk_cmd_buffer *cmd)
    nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.vertex_components = 128;
    CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0));
    CHECK(!hk_apple9_use_native_mesh(cmd, NULL, 0x1000));
-   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_vertices = 128;
-   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.vertex_components = 8;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.max_vertices = 256;
+   nm->variants[HK_MESH_VARIANT_MAIN].info.apple9_native.layout.vertex_components = 28;
    /* Multi-axis product crossing the same threshold falls back too. */
-   const uint32_t ring_2d_fit[] = {3, 5, 1}, ring_2d_wrap[] = {4, 4, 1};
+   const uint32_t ring_2d_fit[] = {1, 2, 1}, ring_2d_wrap[] = {2, 2, 1};
    CHECK(hk_apple9_use_native_mesh(cmd, ring_2d_fit, 0));
    CHECK(!hk_apple9_use_native_mesh(cmd, ring_2d_wrap, 0));
    /* Direct predicated draws honor the same known-grid ring cap. */
@@ -374,11 +387,16 @@ gs_routes(struct hk_cmd_buffer *cmd)
       main->info.apple9_native.layout.max_vertices = 4;
       main->info.apple9_native.layout.max_primitives = 2;
       CHECK(hk_apple9_use_native_gs(cmd, draw));
-      /* Hardware 64 KiB mesh output ring gate also protects native GS. */
-      main->info.apple9_native.layout.vertex_components = 128; /* 136 rows/WG -> 30 groups */
-      draw.b.count[0] = 3 * 30;
-      CHECK(hk_apple9_use_native_gs(cmd, draw));
+      /* Hardware 64 KiB mesh output ring gate also protects native GS:
+       * V=4, n=128 is now unbounded via safe-stride U0_B (stride=260, rem=196 >= 128),
+       * while n=260 exceeds safe U0_B and stays bounded by 4096 / (260 + 8) = 15 groups. */
+      main->info.apple9_native.layout.vertex_components = 128;
       draw.b.count[0] = 3 * 31;
+      CHECK(hk_apple9_use_native_gs(cmd, draw));
+      main->info.apple9_native.layout.vertex_components = 260;
+      draw.b.count[0] = 3 * 15;
+      CHECK(hk_apple9_use_native_gs(cmd, draw));
+      draw.b.count[0] = 3 * 16;
       CHECK(!hk_apple9_use_native_gs(cmd, draw));
       draw.b.count[0] = 3;
       main->info.apple9_native.layout.vertex_components = 0;
@@ -494,12 +512,20 @@ task_routes(struct hk_cmd_buffer *cmd)
    direct[0] = 2; direct[1] = direct[2] = 1;
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
    /* Task bridge multiplies parent grid by max_mesh_groups before checking the
-    * 64 KiB mesh output ring (V=128, n=8 -> 15 safe groups). */
+    * 64 KiB mesh output ring: V=128, n=8 is unbounded via safe-stride U0_B,
+    * while V=256, n=28, P=32 has no safe U0_B (max_groups=2). */
    m->info.apple9_native.layout.max_vertices = 128;
    m->info.apple9_native.layout.vertex_components = 8;
-   direct[0] = 5; direct[1] = direct[2] = 1; /* 5 * 3 = 15 groups */
+   m->info.apple9_native.layout.max_primitives = 32;
+   m->info.apple9_native.layout.indices_per_primitive = 3;
+   direct[0] = 6; direct[1] = direct[2] = 1; /* 6 * 3 = 18 groups, safe U0_B */
    CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
-   direct[0] = 6; /* 6 * 3 = 18 groups > 15 */
+   m->info.apple9_native.layout.max_vertices = 256;
+   m->info.apple9_native.layout.vertex_components = 28;
+   t->info.task.max_mesh_groups = 2;
+   direct[0] = 1; direct[1] = direct[2] = 1; /* 1 * 2 = 2 groups <= 2 */
+   CHECK(hk_apple9_use_native_mesh(cmd, direct, 0));
+   direct[0] = 2; /* 2 * 2 = 4 groups > 2 */
    CHECK(!hk_apple9_use_native_mesh(cmd, direct, 0));
    gfx->shaders[MESA_SHADER_TASK] = gfx->shaders[MESA_SHADER_MESH] = NULL;
    free(mesh); free(task);
@@ -624,11 +650,13 @@ tess_routes(struct hk_cmd_buffer *cmd)
          CHECK(hk_apple9_use_native_tess(cmd, draw));
       }
       /* Hardware 64 KiB mesh output ring gate also protects native TES:
-       * V=3 with <= 32 components stays <= 40 rows/WG; 36 components (44 rows)
-       * exceeds the ring for a densely tessellated patch (8192 max groups). */
-      main->info.apple9_native.layout.vertex_components = 32;
-      CHECK(hk_apple9_use_native_tess(cmd, draw));
+       * V=3 with <= 128 components is now unbounded via safe-stride U0_B,
+       * while 260 components exceeds safe U0_B and cannot fit 8192 max groups. */
       main->info.apple9_native.layout.vertex_components = 36;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      main->info.apple9_native.layout.vertex_components = 128;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      main->info.apple9_native.layout.vertex_components = 260;
       CHECK(!hk_apple9_use_native_tess(cmd, draw));
       main->info.apple9_native.layout.vertex_components = 0;
       gfx->shaders[MESA_SHADER_TESS_EVAL] = ng;
@@ -821,21 +849,25 @@ tess_fused_routes(struct hk_cmd_buffer *cmd)
       CHECK(!hk_apple9_use_native_tess(cmd, draw));
       dev->dev.params.features |= DRM_ASAHI_FEATURE_NATIVE_MESH;
 
-      /* Ring-limited high-varying tier (V=4, n=40 -> 48 rows -> 85 safe WGs)
-       * and wg_rows == 32 exact-wrap tier (V=4, n=24 -> 32 rows -> 128 WGs)
-       * stay single-chunk only. */
+      /* V=4, n=40 and V=4, n=24 (wg_rows == 32) are now unbounded via
+       * safe-stride U0_B; V=256, n=28, P=32 has no safe U0_B (max_groups=2)
+       * and stays single-chunk only. */
       main->info.apple9_native.layout.max_vertices = 4;
       main->info.apple9_native.layout.max_primitives = 2;
+      main->info.apple9_native.layout.indices_per_primitive = 3;
       main->info.apple9_native.layout.vertex_components = 40;
       draw.b.count[1] = 1;
-      draw.b.count[0] = 4 * 85;
-      CHECK(hk_apple9_use_native_tess(cmd, draw));
       draw.b.count[0] = 4 * 86;
-      CHECK(!hk_apple9_use_native_tess(cmd, draw));
-      main->info.apple9_native.layout.vertex_components = 24;
-      draw.b.count[0] = 4 * 128;
       CHECK(hk_apple9_use_native_tess(cmd, draw));
+      main->info.apple9_native.layout.vertex_components = 24;
       draw.b.count[0] = 4 * 129;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      main->info.apple9_native.layout.max_vertices = 256;
+      main->info.apple9_native.layout.max_primitives = 32;
+      main->info.apple9_native.layout.vertex_components = 28;
+      draw.b.count[0] = 4 * 2;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      draw.b.count[0] = 4 * 3;
       CHECK(!hk_apple9_use_native_tess(cmd, draw));
    }
 
@@ -992,6 +1024,123 @@ transitions(struct hk_cmd_buffer *cmd)
       CHECK(cmd->vk.record_result == VK_SUCCESS);
       cmd->state.gfx.render.view_mask = 0;
       hk_cmd_buffer_end_graphics(cmd);
+
+      /* M1: Large ordinary draws (>= 0x80000000 vertices) must never narrow to
+       * negative int and undercount strips, fans, or adjacency topologies. */
+      {
+         struct agx_draw huge_v = {.b = agx_3d(0x80000000u, 1, 1)};
+         cmd->vk.dynamic_graphics_state.rs.polygon_mode = VK_POLYGON_MODE_FILL;
+         cmd->vk.dynamic_graphics_state.ia.primitive_topology =
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+         CHECK(hk_apple9_ordinary_draw_primitives(cmd, huge_v) == 0x7ffffffeu);
+         cmd->vk.dynamic_graphics_state.ia.primitive_topology =
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+         CHECK(hk_apple9_ordinary_draw_primitives(cmd, huge_v) == 0x7ffffffeu);
+         cmd->vk.dynamic_graphics_state.ia.primitive_topology =
+            VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+         CHECK(hk_apple9_ordinary_draw_primitives(cmd, huge_v) == 0x7fffffffu);
+         cmd->vk.dynamic_graphics_state.ia.primitive_topology =
+            VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
+         CHECK(hk_apple9_ordinary_draw_primitives(cmd, huge_v) == 0x7ffffffdu);
+         cmd->vk.dynamic_graphics_state.ia.primitive_topology =
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+         CHECK(hk_apple9_ordinary_draw_primitives(cmd, huge_v) ==
+               1u + (0x80000000u - 6u) / 2u);
+         /* Huge ordinary prefix followed by capped native draw MUST split. */
+         cmd->vk.dynamic_graphics_state.ia.primitive_topology =
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+         cmd->apple9_draw_primitives =
+            hk_apple9_ordinary_draw_primitives(cmd, huge_v);
+         CHECK(hk_apple9_prepare_draw(cmd, false, false));
+         struct hk_cs *cs_big_ord = cmd->current_cs.gfx;
+         mark_draw(cs_big_ord, false);
+         cs_big_ord->apple9_native_primitives = cmd->apple9_draw_primitives;
+         cmd->apple9_draw_primitives = 10;
+         CHECK(hk_apple9_prepare_draw(cmd, true, true));
+         CHECK(cmd->current_cs.gfx != cs_big_ord);
+         /* Capped native followed by huge ordinary strip MUST split too. */
+         struct hk_cs *cs_nat2 = cmd->current_cs.gfx;
+         mark_draw(cs_nat2, true);
+         cs_nat2->apple9_native_primitives = 10;
+         cmd->apple9_draw_primitives =
+            hk_apple9_ordinary_draw_primitives(cmd, huge_v);
+         CHECK(hk_apple9_prepare_draw(cmd, false, false));
+         CHECK(cmd->current_cs.gfx != cs_nat2);
+         hk_cmd_buffer_end_graphics(cmd);
+      }
+
+      /* M4: Late splits (depth-bias representation change, scissor overflow,
+       * and memory-writing draw after a hoisted barrier) must commit sample
+       * locations onto the newly created stream so a subsequent draw with
+       * different sample locations splits cleanly. */
+      {
+         struct vk_sample_locations_state sl_a = {
+            .per_pixel = 1,
+            .grid_size = {1, 1},
+            .locations = {{0.25f, 0.25f}},
+         };
+         struct vk_sample_locations_state sl_b = {
+            .per_pixel = 1,
+            .grid_size = {1, 1},
+            .locations = {{0.75f, 0.75f}},
+         };
+         cmd->vk.dynamic_graphics_state.ms.rasterization_samples = 1;
+         cmd->vk.dynamic_graphics_state.ms.sample_locations_enable = true;
+         cmd->vk.dynamic_graphics_state.ms.sample_locations = &sl_a;
+         cmd->vk.dynamic_graphics_state.rs.depth_bias.enable = true;
+         cmd->vk.dynamic_graphics_state.rs.depth_bias.representation =
+            VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT;
+         cmd->apple9_draw_primitives = 10;
+
+         /* (a) Depth-bias representation change split. */
+         CHECK(hk_apple9_prepare_draw(cmd, false, false));
+         struct hk_cs *cs_a = cmd->current_cs.gfx;
+         CHECK(cs_a->has_sample_locations);
+         uint32_t pos_a = cs_a->ppp_multisamplectl;
+         mark_draw(cs_a, false);
+         cmd->vk.dynamic_graphics_state.rs.depth_bias.representation =
+            VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT;
+         CHECK(hk_apple9_prepare_draw(cmd, false, false));
+         struct hk_cs *cs_b = cmd->current_cs.gfx;
+         CHECK(cs_b != cs_a);
+         CHECK(cs_b->has_sample_locations && cs_b->ppp_multisamplectl == pos_a);
+         mark_draw(cs_b, false);
+         /* Changing sample positions on the next draw MUST split cs_b. */
+         cmd->vk.dynamic_graphics_state.ms.sample_locations = &sl_b;
+         CHECK(hk_apple9_prepare_draw(cmd, false, false));
+         struct hk_cs *cs_c = cmd->current_cs.gfx;
+         CHECK(cs_c != cs_b && cs_c->has_sample_locations &&
+               cs_c->ppp_multisamplectl != pos_a);
+         mark_draw(cs_c, false);
+
+         /* (b) Memory-writing draw after a hoisted barrier split. */
+         struct hk_api_shader *writer_mesh = shader(MESA_SHADER_MESH);
+         writer_mesh->writes_memory = true;
+         cmd->state.gfx.shaders[MESA_SHADER_MESH] = writer_mesh;
+         cs_c->merge_hoisted = true;
+         cmd->vk.dynamic_graphics_state.ms.sample_locations = &sl_a;
+         CHECK(hk_apple9_prepare_draw(cmd, false, false));
+         struct hk_cs *cs_d = cmd->current_cs.gfx;
+         CHECK(cs_d != cs_c && cs_d->has_sample_locations &&
+               cs_d->ppp_multisamplectl == pos_a);
+
+         /* M5: Shader writes from MESA_SHADER_MESH / MESA_SHADER_TASK invalidate
+          * cmd->feedback_raw on both native and emulated graphics preparation. */
+         util_dynarray_append(&cmd->feedback_raw, UINT64_C(0xdeadbeef));
+         CHECK(cmd->feedback_raw.size == sizeof(uint64_t));
+         CHECK(hk_apple9_prepare_draw_ex(cmd, true, true, false));
+         CHECK(cmd->feedback_raw.size == 0);
+         util_dynarray_append(&cmd->feedback_raw, UINT64_C(0xdeadbeef));
+         CHECK(hk_apple9_prepare_draw_ex(cmd, false, false, false));
+         CHECK(cmd->feedback_raw.size == 0);
+
+         cmd->state.gfx.shaders[MESA_SHADER_MESH] = NULL;
+         free(writer_mesh);
+         cmd->vk.dynamic_graphics_state.ms.sample_locations_enable = false;
+         cmd->vk.dynamic_graphics_state.ms.sample_locations = NULL;
+         cmd->vk.dynamic_graphics_state.rs.depth_bias.enable = false;
+         hk_cmd_buffer_end_graphics(cmd);
+      }
    }
 
    /* Under the isolation kill switch (disable_native_blocks = true), every

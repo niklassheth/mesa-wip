@@ -3745,7 +3745,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * Only the broader research P1 interface defers these inputs to linking.
     * Delaying them for every enabled device would change excluded shaders. */
    bool native_primitive_inputs =
-      hk_apple9_native_mesh_available(hk_device_physical(dev)) &&
+      hk_apple9_native_mesh_available_device(dev) &&
       hk_apple9_native_mesh_enabled();
    if (nir->info.stage == MESA_SHADER_FRAGMENT && !native_primitive_inputs) {
       /* The emulated path reads records; research P1 uses flat channels. */

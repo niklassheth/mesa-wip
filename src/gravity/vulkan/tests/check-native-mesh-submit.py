@@ -14,8 +14,10 @@ from pathlib import Path
 import struct
 
 FEW = 1 << 30
+NATIVE_MESH = 1 << 28
 PROCESS_EMPTY_TILES = 1 << 1
 CONSERVATIVE_FLAGS = PROCESS_EMPTY_TILES
+NATIVE_FLAGS = PROCESS_EMPTY_TILES | NATIVE_MESH
 
 
 def require(condition, message):
@@ -57,10 +59,15 @@ def check(directory, native, expected):
                 address, = struct.unpack_from('<Q', data, pos + 8)
                 header, = struct.unpack('<I', read_gpu(
                     directory, path.name.split('.')[0], address, 4))
-                require(header == (0x40000d2c if native else 0x4000002e),
+                # Ordinary-prefix renders merged with a native suffix start with
+                # an ordinary VDM packet (0x4000002e) while setting bit 28.
+                valid_headers = (0x40000d2c, 0x4000002e) if native else (0x4000002e,)
+                require(header in valid_headers,
                         f'{path}: unexpected producer packet {header:#x}')
                 require(flags == expected,
                         f'{path}: render flags {flags:#010x}, expected {expected:#010x}')
+                require(not ((flags & NATIVE_MESH) and (flags & FEW)),
+                        f'{path}: NATIVE_MESH and FEW_PRIMITIVES are mutually exclusive')
                 renders.append(flags)
             pos += size
     require(len(renders) == 1, f'{directory}: expected one render, found {len(renders)}')
@@ -72,15 +79,15 @@ def main():
     parser.add_argument('--native', type=Path, required=True)
     parser.add_argument('--vertex', type=Path, required=True)
     parser.add_argument('--h1', type=Path,
-                        help='Optional original H1 capture; verifies the conservative flags')
+                        help='Optional original H1 capture; verifies bit-28 flags')
     parser.add_argument('--vertex-five', type=Path)
     args = parser.parse_args()
     rows = []
     if args.h1:
-        rows.append(check(args.h1, True, CONSERVATIVE_FLAGS))
-    # Mesh output counts are shader-generated and remain unknown, even for
-    # the currently admitted one-group fixture. Keep the whole render ineligible.
-    rows.append(check(args.native, True, CONSERVATIVE_FLAGS))
+        rows.append(check(args.h1, True, NATIVE_FLAGS))
+    # Native mesh renders set DRM_ASAHI_RENDER_NATIVE_MESH (bit 28) and never
+    # combine it with FEW_PRIMITIVES (bit 30).
+    rows.append(check(args.native, True, NATIVE_FLAGS))
     # The positive control prevents a blanket disabling of the optimization.
     rows.append(check(args.vertex, False, CONSERVATIVE_FLAGS | FEW))
     if args.vertex_five:

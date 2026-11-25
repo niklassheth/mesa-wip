@@ -6,7 +6,7 @@
  * (or would acquire) a native Apple9 object/mesh dispatch. With opaque
  * DRM_ASAHI_RENDER_NATIVE_MESH (bit 28), the kernel does not parse VDM streams
  * on the CPU, so only genuine hardware invariants (cumulative 64 KiB mesh
- * output ring occupancy for wg_rows > 40 shaders, optional conservative TVB
+ * output ring occupancy for ring-limited shaders, optional conservative TVB
  * primitive cap, and the per-draw isolation kill switch) can force a split.
  */
 #pragma once
@@ -40,12 +40,12 @@ struct hk_apple9_stream_summary {
    bool has_draws;
    /* True if any native block in the render is subject to the conservative
     * max_render_primitives TVB cap (false when all native draws so far are
-    * unbounded wg_rows <= 40, != 32 multi-parent fused tessellation). */
+    * unbounded multi-parent fused tessellation). */
    bool bounded_prims;
    /* Estimated binned primitives already in the render. */
    uint64_t primitives;
    /* Cumulative hardware 64 KiB mesh output ring rows of native blocks in the
-    * render, and whether any block had wg_rows > 40 (ring-limited). */
+    * render, and whether any block is ring-limited (lacks a wrap-safe U0_B). */
    uint64_t ring_rows;
    bool ring_limited;
 };
@@ -53,16 +53,70 @@ struct hk_apple9_stream_summary {
 struct hk_apple9_draw_summary {
    bool native;
    /* True when this native draw is exempt from the conservative 1M TVB
-    * primitive cap (unbounded wg_rows <= 40, != 32 multi-parent fused
-    * tessellation, validated across >4,375 native_tvb_refused partial renders). */
+    * primitive cap (unbounded multi-parent fused tessellation). */
    bool unbounded_prims;
    /* Estimated binned primitives of the draw (UINT64_MAX: unknown). */
    uint64_t primitives;
    /* Hardware 64 KiB mesh output ring rows of this native draw (UINT64_MAX:
-    * unknown), and whether its per-WG footprint exceeds the 40-row safe cap. */
+    * unknown), and whether its layout is ring-limited. */
    uint64_t ring_rows;
    bool ring_limited;
 };
+
+enum hk_apple9_native_admit_result {
+   HK_APPLE9_NATIVE_ADMIT_APPEND = 0,
+   HK_APPLE9_NATIVE_ADMIT_SPLIT,
+   HK_APPLE9_NATIVE_ADMIT_REJECT,
+};
+
+/* Whether a single draw fits inside a fresh native render pass on its own.
+ * Callers selecting native vs fallback must enforce this before recording
+ * so splitting an open render never admits an individually oversized draw. */
+static inline bool
+hk_apple9_native_draw_fits_alone(const struct hk_apple9_draw_summary *d,
+                                 const struct hk_apple9_native_profile *p)
+{
+   if (!d->native)
+      return true;
+   if (p->max_render_primitives && !d->unbounded_prims &&
+       d->primitives > p->max_render_primitives)
+      return false;
+   if (d->ring_limited && d->ring_rows > HK_APPLE9_NATIVE_RING_ROWS)
+      return false;
+   return true;
+}
+
+static inline enum hk_apple9_native_admit_result
+hk_apple9_native_stream_classify(const struct hk_apple9_stream_summary *s,
+                                 const struct hk_apple9_draw_summary *d,
+                                 const struct hk_apple9_native_profile *p)
+{
+   if (!hk_apple9_native_draw_fits_alone(d, p))
+      return HK_APPLE9_NATIVE_ADMIT_REJECT;
+   /* An empty stream always starts cleanly once the draw fits alone; an
+    * ordinary stream receiving an ordinary draw is never constrained by
+    * native-mesh admission. */
+   if (!s->native && !(s->has_draws && d->native))
+      return HK_APPLE9_NATIVE_ADMIT_APPEND;
+   if (!p->blocks)
+      return HK_APPLE9_NATIVE_ADMIT_SPLIT;
+   bool check_prims = s->bounded_prims || (d->native && !d->unbounded_prims);
+   if (p->max_render_primitives && check_prims &&
+       (d->primitives > p->max_render_primitives ||
+        s->primitives > p->max_render_primitives - d->primitives))
+      return HK_APPLE9_NATIVE_ADMIT_SPLIT;
+   if (!d->native)
+      return HK_APPLE9_NATIVE_ADMIT_APPEND;
+   /* When either the open render or the incoming native block is ring-limited,
+    * enforce that combined ring occupancy stays within the 64 KiB (4096-row)
+    * mesh output ring without assuming an implicit cross-block hardware drain. */
+   if (s->ring_limited || d->ring_limited) {
+      if (d->ring_rows > HK_APPLE9_NATIVE_RING_ROWS ||
+          s->ring_rows > HK_APPLE9_NATIVE_RING_ROWS - d->ring_rows)
+         return HK_APPLE9_NATIVE_ADMIT_SPLIT;
+   }
+   return HK_APPLE9_NATIVE_ADMIT_APPEND;
+}
 
 static inline bool
 hk_apple9_native_stream_admits(const struct hk_apple9_stream_summary *s,
@@ -82,9 +136,6 @@ hk_apple9_native_stream_admits(const struct hk_apple9_stream_summary *s,
       return false;
    if (!d->native)
       return true;
-   /* When either the open render or the incoming native block has wg_rows > 40,
-    * enforce that combined ring occupancy stays within the 64 KiB (4096-row)
-    * mesh output ring without assuming an implicit cross-block hardware drain. */
    if (s->ring_limited || d->ring_limited) {
       if (d->ring_rows > HK_APPLE9_NATIVE_RING_ROWS ||
           s->ring_rows > HK_APPLE9_NATIVE_RING_ROWS - d->ring_rows)

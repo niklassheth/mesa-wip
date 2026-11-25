@@ -1892,6 +1892,9 @@ hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw)
       body->layout.max_vertices == 3 * HK_APPLE9_NATIVE_GS_PACK
          ? DIV_ROUND_UP(2u * 64u * 64u, HK_APPLE9_NATIVE_GS_PACK)
          : 2u * 64u * 64u;
+   const uint64_t prim_cap = hk_apple9_native_render_primitives();
+   if (prim_cap && 2u * 64u * 64u > prim_cap)
+      return false;
    return hk_apple9_native_stage_class(
              MESA_SHADER_TESS_EVAL, body->key.physical_threads,
              body->layout.max_vertices, body->layout.max_primitives) &&
@@ -2206,6 +2209,11 @@ hk_apple9_use_native_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    if (!hk_apple9_native_gs_state_eligible(cmd, draw))
       return false;
    const uint32_t gs_groups = hk_apple9_native_gs_groups(cmd, draw);
+   const uint64_t gs_total_groups = (uint64_t)gs_groups * draw.b.count[1];
+   const uint64_t prim_cap = hk_apple9_native_render_primitives();
+   if (prim_cap && body->layout.max_primitives &&
+       gs_total_groups > prim_cap / body->layout.max_primitives)
+      return false;
    return (hk_apple9_native_gs_enabled() || hk_apple9_native_stage_class(
              MESA_SHADER_GEOMETRY, body->key.physical_threads,
              body->layout.max_vertices, body->layout.max_primitives)) &&
@@ -2218,8 +2226,7 @@ hk_apple9_use_native_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
           /* GS invocations multiply the groups beyond the draw-only bound. */
           hk_apple9_native_mesh_grid_valid(
              (const uint32_t[]){gs_groups, draw.b.count[1], 1}) &&
-          agx_apple9_mesh_ring_fits(&body->layout,
-                                    (uint64_t)gs_groups * draw.b.count[1]);
+          agx_apple9_mesh_ring_fits(&body->layout, gs_total_groups);
 }
 
 DEBUG_GET_ONCE_BOOL_OPTION(gs_route_log, "HK_APPLE9_GS_ROUTE_LOG", false)
@@ -2418,6 +2425,45 @@ hk_draw_complete_from_state(const struct hk_cmd_buffer *cmd, struct agx_draw dra
    return draw;
 }
 
+/* Unsigned 64-bit decomposed primitive count matching
+ * u_decomposed_prims_for_vertices() without signed int narrowing for
+ * vertex counts >= 0x80000000. */
+static uint64_t
+hk_apple9_decomposed_prims_u64(enum mesa_prim primitive, uint64_t vertices)
+{
+   switch (primitive) {
+   case MESA_PRIM_POINTS:
+      return vertices;
+   case MESA_PRIM_LINES:
+      return vertices / 2u;
+   case MESA_PRIM_LINE_LOOP:
+      return vertices >= 2u ? vertices : 0u;
+   case MESA_PRIM_LINE_STRIP:
+      return vertices >= 2u ? vertices - 1u : 0u;
+   case MESA_PRIM_TRIANGLES:
+      return vertices / 3u;
+   case MESA_PRIM_TRIANGLE_STRIP:
+   case MESA_PRIM_TRIANGLE_FAN:
+      return vertices >= 3u ? vertices - 2u : 0u;
+   case MESA_PRIM_LINES_ADJACENCY:
+      return vertices / 4u;
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      return vertices >= 4u ? vertices - 3u : 0u;
+   case MESA_PRIM_TRIANGLES_ADJACENCY:
+      return vertices / 6u;
+   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
+      return vertices >= 6u ? 1u + (vertices - 6u) / 2u : 0u;
+   case MESA_PRIM_QUADS:
+      return vertices / 4u;
+   case MESA_PRIM_QUAD_STRIP:
+      return vertices >= 4u ? (vertices - 2u) / 2u : 0u;
+   case MESA_PRIM_POLYGON:
+      return vertices >= 3u ? 1u : 0u;
+   default:
+      return vertices;
+   }
+}
+
 uint64_t
 hk_apple9_ordinary_draw_primitives(const struct hk_cmd_buffer *cmd,
                                    struct agx_draw draw)
@@ -2429,10 +2475,13 @@ hk_apple9_ordinary_draw_primitives(const struct hk_cmd_buffer *cmd,
    if (agx_is_indirect(draw.b) || gfx->shaders[MESA_SHADER_GEOMETRY] ||
        gfx->shaders[MESA_SHADER_TESS_EVAL])
       return UINT64_MAX;
+   uint64_t base_prims = hk_apple9_decomposed_prims_u64(
+      vk_topology_to_mesa(dyn->ia.primitive_topology), draw.b.count[0]);
+   uint64_t instances = draw.b.count[1];
    uint64_t prims =
-      (uint64_t)u_decomposed_prims_for_vertices(
-         vk_topology_to_mesa(dyn->ia.primitive_topology), draw.b.count[0]) *
-      draw.b.count[1];
+      (instances && base_prims > UINT64_MAX / instances)
+         ? UINT64_MAX
+         : base_prims * instances;
    /* Point/wireframe polygon modes can expand each triangle up to 3x. */
    if (dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL)
       prims = prims > UINT64_MAX / 3 ? UINT64_MAX : prims * 3;
@@ -2488,15 +2537,6 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
       (producer == MESA_SHADER_GEOMETRY
           ? hk_apple9_native_gs_common_state_eligible(cmd, draw_)
           : hk_apple9_native_tess_common_state_eligible(cmd, draw_));
-   if (cmd->feedback_raw.size) {
-      for (unsigned stage = 0; stage <= MESA_SHADER_MESH; stage++) {
-         if (cmd->state.gfx.shaders[stage] &&
-             cmd->state.gfx.shaders[stage]->writes_memory) {
-            hk_feedback_invalidate(cmd);
-            break;
-         }
-      }
-   }
    if (producer == MESA_SHADER_GEOMETRY && source &&
        debug_get_option_gs_route_log()) {
       fprintf(stderr, "HK_GS_SELECT candidate=%u prefer=%u state=%u leaf=%u vs_leaf=%u vs_writes=%u\n",
@@ -2757,8 +2797,10 @@ hk_apple9_native_mesh_max_groups(const struct agx_apple9_mesh_layout *layout)
    if (!agx_apple9_mesh_ring_max_groups(layout, &ring_max))
       return 0;
    uint32_t max_prims = MAX2(layout->max_primitives, 1u);
-   uint64_t limit = MIN2((uint64_t)HK_APPLE9_NATIVE_MAX_GROUP_TOTAL,
-                         hk_apple9_native_render_primitives() / max_prims);
+   uint64_t prim_cap = hk_apple9_native_render_primitives();
+   uint64_t limit = HK_APPLE9_NATIVE_MAX_GROUP_TOTAL;
+   if (prim_cap)
+      limit = MIN2(limit, prim_cap / max_prims);
    limit = MIN2(limit, ring_max);
    return (uint32_t)limit;
 }
@@ -2887,16 +2929,18 @@ hk_apple9_native_mesh_leaves_eligible(struct hk_cmd_buffer *cmd,
                   return false;
             }
          }
-      } else if (groups * main->info.apple9_native.layout.max_primitives >
-                    hk_apple9_native_render_primitives() ||
-                 !agx_apple9_mesh_ring_fits(&main->info.apple9_native.layout,
-                                            groups)) {
-         /* A single native draw whose declared geometry could reach the TVB cap
-          * would lose work in its mesh-mode render; emulate it instead
-          * (ordinary renders recover through a partial render). Likewise fall
-          * back when the draw's vertex planes can wrap the 64 KiB hardware
-          * mesh output ring. */
-         return false;
+      } else {
+         const uint64_t prim_cap = hk_apple9_native_render_primitives();
+         const uint32_t max_prims = main->info.apple9_native.layout.max_primitives;
+         if ((prim_cap && max_prims && groups > prim_cap / max_prims) ||
+             !agx_apple9_mesh_ring_fits(&main->info.apple9_native.layout, groups)) {
+            /* A single native draw whose declared geometry could reach the TVB cap
+             * would lose work in its mesh-mode render; emulate it instead
+             * (ordinary renders recover through a partial render). Likewise fall
+             * back when the draw's vertex planes can wrap the 64 KiB hardware
+             * mesh output ring. */
+            return false;
+         }
       }
    } else {
       /* Taskless indirect/indirect-count draws have unknown runtime group

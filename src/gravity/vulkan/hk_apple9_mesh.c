@@ -225,9 +225,7 @@ hk_apple9_native_mesh_available_device(struct hk_device *dev)
       }
       return false;
    }
-   if (hk_apple9_native_mesh_enabled())
-      return true;
-   return hk_apple9_native_index_enabled(hk_device_physical(dev));
+   return hk_apple9_native_mesh_available(hk_device_physical(dev));
 }
 
 bool

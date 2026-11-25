@@ -407,7 +407,7 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
 {
    bool native = shader->info.apple9_native_stage != HK_APPLE9_NATIVE_NONE;
    if ((shader->b.info.apple9_body_only || native) &&
-       !(hk_apple9_native_mesh_available(hk_device_physical(dev)) &&
+       !(hk_apple9_native_mesh_available_device(dev) &&
          shader->info.stage == (shader->info.apple9_native_stage ==
                                    HK_APPLE9_NATIVE_OBJECT
                                       ? MESA_SHADER_TASK : MESA_SHADER_MESH) &&
@@ -2189,7 +2189,7 @@ hk_apple9_compile_native_mesh(struct hk_device *dev, nir_shader *nir,
    object->info.apple9_native_stage = HK_APPLE9_NATIVE_OBJECT;
    hk_assert_final_push_mask(generated, object);
    compiled = agx_compile_apple9_native_object(
-      generated, hk_apple9_native_mesh_available(hk_device_physical(dev)),
+      generated, hk_apple9_native_mesh_available_device(dev),
       &k, &object->b,
       &object->info.apple9_native, reason);
    object->code_ptr = object->b.binary;
@@ -2245,7 +2245,7 @@ hk_apple9_compile_native_object(struct hk_device *dev, nir_shader *nir,
       .hw_payload = key->native_object_hw_payload,
    };
    bool compiled = agx_compile_apple9_native_object_ex(
-      nir, hk_apple9_native_mesh_available(hk_device_physical(dev)),
+      nir, hk_apple9_native_mesh_available_device(dev),
       &k, &opts, &shader->b, &shader->info.apple9_native, reason);
    shader->code_ptr = shader->b.binary;
    shader->code_size = shader->b.info.binary_size;
@@ -3802,7 +3802,7 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
    bool bridge_fallback = false;
    VkResult result = VK_SUCCESS;
    const char *reason = NULL;
-   if (!hk_apple9_native_mesh_available(hk_device_physical(dev))) {
+   if (!hk_apple9_native_mesh_available_device(dev)) {
       /* Kernel does not advertise DRM_ASAHI_FEATURE_NATIVE_MESH (or native
        * paths are disabled): skip all native compilation probes cleanly. */
    } else if (mesh && task && !per_vertex && !key.polygon_points) {

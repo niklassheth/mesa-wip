@@ -90,10 +90,10 @@ static uint64_t hk_compiler_env_hash_value;
 static once_flag hk_compiler_env_hash_once = ONCE_FLAG_INIT;
 
 /* Environment knobs whose value changes generated code: their values key the
- * shader caches. Keep this list next to the knobs; in test builds
- * (HK_ENABLE_TEST_ENV_VARS), any other AGX_* or HK_APPLE9_* variable (traces,
- * dumps, statistics, runtime switches, or a codegen knob missing here) keys
- * the caches by name only, while shipping builds ignore unlisted variables.
+ * shader caches. Keep this list next to the knobs; any other AGX_* or
+ * HK_APPLE9_* variable (traces, dumps, statistics, runtime switches, or a
+ * codegen knob missing here) keys the caches by name only, so output paths
+ * never split them while an unlisted knob still does, conservatively.
  * AGX_MESA_DEBUG is keyed by its active codegen bits rather than raw text so
  * non-codegen or compiled-out flags never split the cache.
  */
@@ -787,7 +787,7 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
       stage == MESA_SHADER_TASK;
    if (blob->overrun ||
        (obj->apple9_native_leaf &&
-        (!hk_apple9_native_mesh_available(hk_device_physical(dev)) ||
+        (!hk_apple9_native_mesh_available_device(dev) ||
          (stage != MESA_SHADER_MESH && stage != MESA_SHADER_FRAGMENT &&
           !gs_leaf && !tess_leaf && !task_leaf)))) {
       hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);

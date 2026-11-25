@@ -474,6 +474,7 @@ compile_gs(struct hk_device *dev, unsigned vertices, bool reject,
                                        16, vertices, vertices - 2, NULL, NULL,
                                        NULL));
    bool native =
+      hk_apple9_native_mesh_available_device(dev) &&
       ((fused_enabled && fused_fits) ||
        (!fused_enabled && policy_native && vertices <= 4)) &&
       !reject;
@@ -649,8 +650,11 @@ compile_tess(struct hk_device *dev, unsigned vertices, bool reject,
    VkResult result =
       hk_apple9_compile_graphics(dev, 4, infos, NULL, NULL, NULL, NULL, out);
    unsigned compiled_allocations = allocations;
-   bool native = (hk_apple9_native_tess_enabled() ||
-       (hk_apple9_native_stage_policy(hk_device_physical(dev)) & HK_APPLE9_NATIVE_TES_BIT)) && vertices <= 32 && !reject;
+   bool native =
+      hk_apple9_native_mesh_available_device(dev) &&
+      (hk_apple9_native_tess_enabled() ||
+       (hk_apple9_native_stage_policy(hk_device_physical(dev)) & HK_APPLE9_NATIVE_TES_BIT)) &&
+      vertices <= 32 && !reject;
    if (failure) {
       CHECK(result == VK_ERROR_OUT_OF_DEVICE_MEMORY);
       CHECK(!out[0] && !out[1] && !out[2] && !out[3]);

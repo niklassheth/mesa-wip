@@ -294,7 +294,8 @@ pipeline(struct hk_device *dev, mesa_shader_stage producer, unsigned vertices,
    uint64_t ns=cpu_time_ns()-start;
    unsigned stage_bit = producer == MESA_SHADER_GEOMETRY
       ? HK_APPLE9_NATIVE_GS_BIT : HK_APPLE9_NATIVE_TES_BIT;
-   bool expected=(hk_apple9_native_stage_policy(hk_device_physical(dev)) & stage_bit) &&
+   bool expected=hk_apple9_native_mesh_available_device(dev) &&
+      (hk_apple9_native_stage_policy(hk_device_physical(dev)) & stage_bit) &&
       (negative == 0 || negative == 13) &&
       (producer==MESA_SHADER_TESS_EVAL || vertices<=4);
    for(unsigned i=0;i<count;i++) {
@@ -365,7 +366,8 @@ main(int argc, char **argv)
             struct blob_reader reader; blob_reader_init(&reader, data, size);
             struct vk_shader *copy = NULL;
             VkResult result = hk_deserialize_api_shader(&dev->vk, &reader, 0, NULL, &copy);
-            CHECK(result == ((policy & bit) ? VK_SUCCESS : VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT));
+            bool accept_cache = hk_apple9_native_mesh_available_device(dev) && (policy & bit);
+            CHECK(result == (accept_cache ? VK_SUCCESS : VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT));
             if (copy) hk_api_shader_destroy(&dev->vk, copy, NULL);
             free(data);
          }
@@ -383,7 +385,7 @@ main(int argc, char **argv)
    /* Eager cache reload and native/rejection transitions. */
    compile_gs(dev,3,false,0);compile_gs(dev,4,false,0);compile_gs(dev,5,false,0);
    compile_tess(dev,3,false,0);compile_tess(dev,32,false,0);
-   if(policy) {
+   if(hk_apple9_native_mesh_available_device(dev) && policy) {
       compile_gs(dev,3,true,0);compile_tess(dev,3,true,0);
    }
    fclose(ledger);

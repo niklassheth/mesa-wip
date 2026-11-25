@@ -54,7 +54,7 @@ with tempfile.TemporaryDirectory(prefix='hk-native-stage-') as tmp:
         for arm,rows in results.items():
             assert rows.keys()==off.keys()
             assert (root/arm/(name+'.fallback')).read_bytes()==(root/'default'/(name+'.fallback')).read_bytes(),('fallback program/state',arm,name)
-            if arm in ('on','logical-negative'):
+            if arm == 'on':
                 assert (root/arm/(name+'.bin')).read_bytes()==new
             elif arm in ('gs','tes') and row['case'].startswith(arm+'-'):
                 assert (rows[name]['native']=='1') == expected

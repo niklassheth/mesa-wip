@@ -15,6 +15,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_apple9_mesh.h"
 #include "hk_device.h"
+#include "hk_feedback.h"
 #include "hk_physical_device.h"
 #include "hk_image.h"
 #include "hk_image_view.h"
@@ -1741,59 +1742,30 @@ hk_apple9_prepare_draw_ex(struct hk_cmd_buffer *cmd, bool reads_buffers,
       return false;
 
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
-   const struct hk_rendering_state *render = &cmd->state.gfx.render;
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   const struct hk_rendering_state *render = &gfx->render;
 
-   /* Under opaque DRM_ASAHI_RENDER_NATIVE_MESH, ordinary and native draws
-    * share one render pass in any order unless a hardware invariant (64 KiB
-    * mesh ring budget, conservative TVB primitive cap, or the isolation kill
-    * switch) requires splitting into a fresh render pass. */
-   if ((cs->apple9_native_mesh || (native_mesh && cs->current != cs->start)) &&
-       !hk_apple9_native_can_append(cmd, cs, native_mesh)) {
-      hk_cs_end_hint(cmd, HK_CS_END_RENDER_SPLIT);
-      hk_cmd_buffer_end_graphics(cmd);
-      cs = hk_cmd_buffer_get_cs(cmd, false);
-      if (!cs)
-         return false;
-   }
+   /* ---- Phase 1: Pure read-only split decisions (zero mutation of `cs`) ----
+    * Evaluate every render-split condition against the current stream before
+    * committing any per-render state (sample positions, depth-bias
+    * representation, write/read classes) so a late split can never leave the
+    * freshly created stream missing committed state. */
+   const bool split_native =
+      (cs->apple9_native_mesh || (native_mesh && cs->current != cs->start)) &&
+      !hk_apple9_native_can_append(cmd, cs, native_mesh);
 
-   /* A draw that selects a new occlusion segment in a stream without free
-    * segments ends that stream (hk_occlusion_prepare_draw). Do it here,
-    * before this function commits render state (depth bias representation,
-    * sample positions, write and read classes) to the stream, so that state
-    * lands on the stream the draw records into. Later splits here start
-    * streams with free segments.
-    */
-   const struct hk_graphics_state *ogfx = &cmd->state.gfx;
-   if (ogfx->occlusion.segment_dirty && ogfx->occlusion.active_count &&
-       cs->occlusion_segments == HK_OCCLUSION_SEGMENTS) {
-      perf_debug(cmd, "Splitting control stream for occlusion segments");
-      hk_cs_end_hint(cmd, HK_CS_END_QUERY);
-      hk_cmd_buffer_end_graphics(cmd);
-      cs = hk_cmd_buffer_get_cs(cmd, false);
-      if (!cs)
-         return false;
-   }
+   const bool split_occlusion =
+      gfx->occlusion.segment_dirty && gfx->occlusion.active_count &&
+      cs->occlusion_segments == HK_OCCLUSION_SEGMENTS;
 
-   /* Sample positions are render state (the per-render multisample control),
-    * so the first application draw of a render commits them and a draw with
-    * other positions starts a new render. That lets them vary within a
-    * subpass (variableSampleLocations, reported to Zink only). Meta draws
-    * neither commit nor change them.
-    */
+   uint32_t sample_positions = 0;
+   bool split_samples = false;
    if (!cmd->in_meta) {
       unsigned samples = MAX2(render->tilebuffer.nr_samples ?:
                               dyn->ms.rasterization_samples, 1);
-      uint32_t positions = hk_apple9_draw_sample_positions(dyn, samples);
-      if (cs->has_sample_locations && cs->ppp_multisamplectl != positions) {
-         perf_debug(cmd, "Splitting Apple9 render: sample positions changed");
-         hk_cs_end_hint(cmd, HK_CS_END_RENDER_SPLIT);
-         hk_cmd_buffer_end_graphics(cmd);
-         cs = hk_cmd_buffer_get_cs(cmd, false);
-         if (!cs)
-            return false;
-      }
-      cs->has_sample_locations = true;
-      cs->ppp_multisamplectl = positions;
+      sample_positions = hk_apple9_draw_sample_positions(dyn, samples);
+      split_samples =
+         cs->has_sample_locations && cs->ppp_multisamplectl != sample_positions;
    }
 
    unsigned views = util_bitcount(render->view_mask ?: 1);
@@ -1804,31 +1776,15 @@ hk_apple9_prepare_draw_ex(struct hk_cmd_buffer *cmd, bool reads_buffers,
       dyn->rs.depth_bias.representation ==
          VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT;
 
-   bool overflow =
+   const bool split_overflow =
       cs->scissor.size / AGX_SCISSOR_LENGTH + viewports * views > UINT16_MAX ||
       (bias && cs->depth_bias.size / AGX_DEPTH_BIAS_LENGTH + views > UINT16_MAX);
-   bool change_bias = bias && !u_tristate_set(&cs->cr.dbias_is_int, dbias_is_int);
-   if (unlikely(overflow || change_bias)) {
-      perf_debug(cmd, "Splitting Apple9 render: %s",
-                 overflow ? "scissor/depth bias overflow" : "depth bias representation");
-      /* The existing partial-render background, EOT and ZLS state stores and
-       * reloads attachments. Only the final stream uses the API store ops.
-       */
-      hk_cs_end_hint(cmd, HK_CS_END_RENDER_SPLIT);
-      hk_cmd_buffer_end_graphics(cmd);
-      cs = hk_cmd_buffer_get_cs(cmd, false);
-      if (!cs)
-         return false;
-      if (bias) {
-         bool success = u_tristate_set(&cs->cr.dbias_is_int, dbias_is_int);
-         assert(success);
-         (void)success;
-      }
-   }
+   const bool split_bias =
+      bias && cs->cr.dbias_is_int != U_TRISTATE_UNSET &&
+      cs->cr.dbias_is_int != u_tristate_make(dbias_is_int);
 
    /* A stream that continued across a hoisted image barrier must not write
     * memory: tiles of its earlier passes may still read what it writes. */
-   const struct hk_graphics_state *gfx = &cmd->state.gfx;
    bool writes = gfx->xfb_enabled;
    for (unsigned s = 0; s < MESA_SHADER_FRAGMENT + 1 && !writes; ++s) {
       if (s != MESA_SHADER_COMPUTE && gfx->shaders[s])
@@ -1836,20 +1792,45 @@ hk_apple9_prepare_draw_ex(struct hk_cmd_buffer *cmd, bool reads_buffers,
    }
    writes |= gfx->shaders[MESA_SHADER_TASK] && gfx->shaders[MESA_SHADER_TASK]->writes_memory;
    writes |= gfx->shaders[MESA_SHADER_MESH] && gfx->shaders[MESA_SHADER_MESH]->writes_memory;
-   if (unlikely(writes && cs->merge_hoisted)) {
-      perf_debug(cmd, "Splitting Apple9 render: memory writes after a hoisted barrier");
-      hk_cs_end_hint(cmd, HK_CS_END_RENDER_SPLIT);
+   const bool split_hoisted = writes && cs->merge_hoisted;
+
+   if (unlikely(split_native || split_occlusion || split_samples ||
+                split_overflow || split_bias || split_hoisted)) {
+      if (split_occlusion && !split_native) {
+         perf_debug(cmd, "Splitting control stream for occlusion segments");
+         hk_cs_end_hint(cmd, HK_CS_END_QUERY);
+      } else {
+         if (split_samples)
+            perf_debug(cmd, "Splitting Apple9 render: sample positions changed");
+         else if (split_overflow || split_bias)
+            perf_debug(cmd, "Splitting Apple9 render: %s",
+                       split_overflow ? "scissor/depth bias overflow"
+                                      : "depth bias representation");
+         else if (split_hoisted)
+            perf_debug(cmd, "Splitting Apple9 render: memory writes after a hoisted barrier");
+         /* The existing partial-render background, EOT and ZLS state stores and
+          * reloads attachments. Only the final stream uses the API store ops. */
+         hk_cs_end_hint(cmd, HK_CS_END_RENDER_SPLIT);
+      }
       hk_cmd_buffer_end_graphics(cmd);
       cs = hk_cmd_buffer_get_cs(cmd, false);
       if (!cs)
          return false;
-      if (bias) {
-         bool success = u_tristate_set(&cs->cr.dbias_is_int, dbias_is_int);
-         assert(success);
-         (void)success;
-      }
+   }
+
+   /* ---- Phase 2: Commit all per-render state to the final stream ---- */
+   if (!cmd->in_meta) {
+      cs->has_sample_locations = true;
+      cs->ppp_multisamplectl = sample_positions;
+   }
+   if (bias) {
+      bool success = u_tristate_set(&cs->cr.dbias_is_int, dbias_is_int);
+      assert(success);
+      (void)success;
    }
    cs->merge_writes |= writes;
+   if (writes && cmd->feedback_raw.size)
+      hk_feedback_invalidate(cmd);
 
    /* What the draw's pre-rasterization work reads. hk-internal pre-raster
     * work (tessellation, geometry, transform feedback, native task bridge)

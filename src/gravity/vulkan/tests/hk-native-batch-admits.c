@@ -207,6 +207,31 @@ main(void)
       .native = true, .unbounded_prims = false, .primitives = 100,
       .ring_rows = 40, .ring_limited = false}, &enabled_capped));
 
+   /* M2: Standalone admission distinguishes REJECT (cannot fit alone even in
+    * a fresh empty stream) from SPLIT (fits alone, must start a fresh stream). */
+   struct hk_apple9_draw_summary oversized_capped =
+      native_draw(HK_APPLE9_NATIVE_RENDER_PRIMITIVES + 1, 40, false);
+   CHECK(!hk_apple9_native_draw_fits_alone(&oversized_capped, &enabled_capped));
+   CHECK(hk_apple9_native_stream_classify(&empty, &oversized_capped,
+                                          &enabled_capped) ==
+         HK_APPLE9_NATIVE_ADMIT_REJECT);
+   CHECK(hk_apple9_native_draw_fits_alone(&oversized_capped, &enabled_unbounded));
+   struct hk_apple9_draw_summary oversized_ring =
+      native_draw(10, HK_APPLE9_NATIVE_RING_ROWS + 1, true);
+   CHECK(!hk_apple9_native_draw_fits_alone(&oversized_ring, &enabled_unbounded));
+   CHECK(hk_apple9_native_stream_classify(&empty, &oversized_ring,
+                                          &enabled_unbounded) ==
+         HK_APPLE9_NATIVE_ADMIT_REJECT);
+   struct hk_apple9_draw_summary fits_alone =
+      native_draw(200000, 40, false);
+   CHECK(hk_apple9_native_draw_fits_alone(&fits_alone, &enabled_capped));
+   CHECK(hk_apple9_native_stream_classify(&capped_stream, &fits_alone,
+                                          &enabled_capped) ==
+         HK_APPLE9_NATIVE_ADMIT_SPLIT);
+   CHECK(hk_apple9_native_stream_classify(&empty, &fits_alone,
+                                          &enabled_capped) ==
+         HK_APPLE9_NATIVE_ADMIT_APPEND);
+
    printf("PASS\n");
    return 0;
 }
