@@ -76,15 +76,41 @@ choose_meshlet_shape(unsigned vertex_components)
       };
    }
    if (planes <= 32) {
-      /* Golden single-4-row-bucket packed shape (20*3 <= 64 B, zero degenerate
-       * padding, safe U0_B=28..36, 17..53 WGs/pipe): packs up to 8 tess=1 tris,
-       * 4 tess=2 tris, 6 tess=1 quads, or 1 tess=4 tri (15V/16P) in one WG. */
+      /* Compare the two single-4-row-bucket packed shapes (V=24/P=20 vs
+       * V=16/P=18) by ring vertex efficiency max_v / safe_stride using the
+       * hardware safe-stride helper (tie-breaking toward V=24/P=20 for higher
+       * patch packing). Both are unbounded across planes 8..32. */
+      const struct agx_apple9_mesh_layout l24 = {
+         .max_vertices = 24,
+         .max_primitives = 20,
+         .indices_per_primitive = 3,
+         .vertex_components = planes,
+      };
+      const struct agx_apple9_mesh_layout l16 = {
+         .max_vertices = 16,
+         .max_primitives = 18,
+         .indices_per_primitive = 3,
+         .vertex_components = planes,
+      };
+      uint32_t s24 = 0, s16 = 0;
+      bool ok24 = agx_apple9_mesh_safe_u0_b(&l24, NULL, &s24);
+      bool ok16 = agx_apple9_mesh_safe_u0_b(&l16, NULL, &s16);
+      if (ok24 && (!ok16 || (uint64_t)24u * s16 >= (uint64_t)16u * s24)) {
+         return (struct tess_meshlet_shape){
+            .max_v = 24,
+            .max_p = 20,
+            .tile_w = 3,
+            .tile_h = 3,
+            .p_strip = 20,
+            .allow_whole_patch = true,
+         };
+      }
       return (struct tess_meshlet_shape){
-         .max_v = 24,
-         .max_p = 20,
+         .max_v = 16,
+         .max_p = 18,
          .tile_w = 3,
          .tile_h = 3,
-         .p_strip = 20,
+         .p_strip = 14,
          .allow_whole_patch = true,
       };
    }
@@ -2478,8 +2504,10 @@ match_if_inv_eq_const(const nir_if *nif, bool in_then, unsigned *const_out)
       bool want_eq = (alu->op == nir_op_ieq) == in_then;
       if (!want_eq)
          return false;
-      nir_scalar s0 = nir_scalar_resolved(alu->src[0].src.ssa, alu->src[0].swizzle[0]);
-      nir_scalar s1 = nir_scalar_resolved(alu->src[1].src.ssa, alu->src[1].swizzle[0]);
+      nir_scalar s0 =
+         nir_scalar_resolved(alu->src[0].src.ssa, alu->src[0].swizzle[cond.comp]);
+      nir_scalar s1 =
+         nir_scalar_resolved(alu->src[1].src.ssa, alu->src[1].swizzle[cond.comp]);
       bool i0 = nir_def_instr(s0.def)->type == nir_instr_type_intrinsic &&
                 nir_instr_as_intrinsic(nir_def_instr(s0.def))->intrinsic ==
                    nir_intrinsic_load_invocation_id;
@@ -2500,8 +2528,10 @@ match_if_inv_eq_const(const nir_if *nif, bool in_then, unsigned *const_out)
       bool want_lt = (alu->op == nir_op_ult) == in_then;
       if (!want_lt)
          return false;
-      nir_scalar s0 = nir_scalar_resolved(alu->src[0].src.ssa, alu->src[0].swizzle[0]);
-      nir_scalar s1 = nir_scalar_resolved(alu->src[1].src.ssa, alu->src[1].swizzle[0]);
+      nir_scalar s0 =
+         nir_scalar_resolved(alu->src[0].src.ssa, alu->src[0].swizzle[cond.comp]);
+      nir_scalar s1 =
+         nir_scalar_resolved(alu->src[1].src.ssa, alu->src[1].swizzle[cond.comp]);
       bool i0 = nir_def_instr(s0.def)->type == nir_instr_type_intrinsic &&
                 nir_instr_as_intrinsic(nir_def_instr(s0.def))->intrinsic ==
                    nir_intrinsic_load_invocation_id;
@@ -2541,6 +2571,18 @@ block_enclosing_inv_const(nir_block *block, unsigned out_v, unsigned *const_out)
    return false;
 }
 
+static bool
+tcs_barrier_is_external(const nir_intrinsic_instr *intr)
+{
+   assert(intr->intrinsic == nir_intrinsic_barrier);
+   nir_variable_mode modes = nir_intrinsic_memory_modes(intr);
+   if (modes & ~(nir_var_shader_out | nir_var_mem_shared))
+      return true;
+   if (modes != 0 && nir_intrinsic_memory_scope(intr) > SCOPE_WORKGROUP)
+      return true;
+   return false;
+}
+
 static nir_shader *
 build_tcs_cull_clone(const nir_shader *tcs, bool single_inv,
                      unsigned single_inv_id)
@@ -2556,7 +2598,8 @@ build_tcs_cull_clone(const nir_shader *tcs, bool single_inv,
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
          if (intr->intrinsic == nir_intrinsic_store_per_vertex_output) {
             nir_instr_remove(instr);
-         } else if (single_inv && intr->intrinsic == nir_intrinsic_barrier) {
+         } else if (single_inv && intr->intrinsic == nir_intrinsic_barrier &&
+                    !tcs_barrier_is_external(intr)) {
             nir_instr_remove(instr);
          } else if (single_inv &&
                     intr->intrinsic == nir_intrinsic_load_invocation_id) {
@@ -2592,15 +2635,20 @@ analyze_tcs_passthrough(const nir_shader *vs_source, const nir_shader *vs,
        vs->info.writes_memory)
       return false;
 
-   /* Reject if VS still carries unlowered load_constant backed by VS constant_data. */
-   if (vs->constant_data_size > 0) {
-      nir_foreach_block(block, nir_shader_get_entrypoint((nir_shader *)vs)) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_intrinsic &&
-                nir_instr_as_intrinsic(instr)->intrinsic ==
-                   nir_intrinsic_load_constant)
-               return false;
-         }
+   /* Reject if VS carries unlowered load_constant backed by VS constant_data
+    * or atomic/volatile reads whose second evaluation in MESH could observe a
+    * different value than OBJECT saw for the same control point. */
+   nir_foreach_block(block, nir_shader_get_entrypoint((nir_shader *)vs)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (vs->constant_data_size > 0 &&
+             intr->intrinsic == nir_intrinsic_load_constant)
+            return false;
+         if (nir_intrinsic_has_access(intr) &&
+             (nir_intrinsic_access(intr) & (ACCESS_ATOMIC | ACCESS_VOLATILE)))
+            return false;
       }
    }
 
@@ -2728,6 +2776,11 @@ analyze_tcs_passthrough(const nir_shader *vs_source, const nir_shader *vs,
             ralloc_free(cull);
             return false;
          }
+         if (intr->intrinsic == nir_intrinsic_barrier &&
+             tcs_barrier_is_external(intr) &&
+             nir_intrinsic_execution_scope(intr) != SCOPE_NONE) {
+            single_ok = false;
+         }
          if (intr->intrinsic == nir_intrinsic_load_invocation_id)
             uses_inv_id = true;
          if (intr->intrinsic == nir_intrinsic_store_output ||
@@ -2747,7 +2800,7 @@ analyze_tcs_passthrough(const nir_shader *vs_source, const nir_shader *vs,
    }
    ralloc_free(cull);
 
-   if (!uses_inv_id) {
+   if (single_ok && !uses_inv_id) {
       out->single_inv_patch_main = true;
       out->single_inv_id = 0;
    } else if (single_ok) {
@@ -3391,15 +3444,15 @@ build_object_shader(nir_shader *vs, nir_shader *tcs,
          nir_pop_if(&b, NULL);
       }
       nir_pop_if(&b, NULL);
-   } else if (pl->payload_B > HK_TESS_PAYLOAD_HEADER_B) {
-      unsigned body_B = pl->payload_B - HK_TESS_PAYLOAD_HEADER_B;
-      unsigned iters = DIV_ROUND_UP(body_B, 32u * 4u);
+   } else if (pl->tcs_copy_B > 0) {
+      unsigned body_end = HK_TESS_PAYLOAD_HEADER_B + pl->tcs_copy_B;
+      unsigned iters = DIV_ROUND_UP(pl->tcs_copy_B, 32u * 4u);
       nir_push_if(&b, patch_in_bounds);
       for (unsigned it = 0; it < iters; ++it) {
          nir_def *off =
             nir_iadd_imm(&b, nir_ishl_imm(&b, lane, 2),
                          HK_TESS_PAYLOAD_HEADER_B + it * 128u);
-         nir_push_if(&b, nir_ult_imm(&b, off, pl->payload_B));
+         nir_push_if(&b, nir_ult_imm(&b, off, body_end));
          nir_store_task_payload(&b, nir_imm_int(&b, 0), off, .align_mul = 4,
                                 .write_mask = 1);
          nir_pop_if(&b, NULL);
@@ -3672,13 +3725,44 @@ build_object_shader(nir_shader *vs, nir_shader *tcs,
    return obj;
 }
 
+/* Append one order-preserving child-WG segment (u16 desc + u16 end_wg) into
+ * the packed u32 arrays at mp_bin_desc_off / mp_large_end_off. */
+static void
+emit_mp_seg_record(nir_builder *b, const struct tess_payload_layout *pl,
+                   nir_variable *n_segs_v, nir_variable *d_lo_v,
+                   nir_variable *e_lo_v, nir_def *desc, nir_def *end_wg)
+{
+   nir_def *ns = nir_load_var(b, n_segs_v);
+   nir_push_if(b, nir_ieq_imm(b, nir_iand_imm(b, ns, 1), 0));
+   {
+      nir_store_var(b, d_lo_v, desc, 1);
+      nir_store_var(b, e_lo_v, end_wg, 1);
+   }
+   nir_push_else(b, NULL);
+   {
+      nir_def *word_off = nir_ishl_imm(b, nir_ushr_imm(b, ns, 1), 2);
+      nir_def *dword = nir_ior(b, nir_load_var(b, d_lo_v),
+                               nir_ishl_imm(b, desc, 16));
+      nir_def *eword = nir_ior(b, nir_load_var(b, e_lo_v),
+                               nir_ishl_imm(b, end_wg, 16));
+      nir_store_task_payload(
+         b, dword, nir_iadd_imm(b, word_off, pl->mp_bin_desc_off),
+         .align_mul = 4, .write_mask = 1);
+      nir_store_task_payload(
+         b, eword, nir_iadd_imm(b, word_off, pl->mp_large_end_off),
+         .align_mul = 4, .write_mask = 1);
+   }
+   nir_pop_if(b, NULL);
+   nir_store_var(b, n_segs_v, nir_iadd_imm(b, ns, 1), 1);
+}
+
 /* Multi-Patch OBJECT(VS+TCS) builder (K = 2..16 patches per OBJECT WG):
  *  - Tier 1 (General TCS): runs K patches in parallel (K * out_v <= 32),
- *    stages TCS outputs in SHM, culls + compacts via subgroupBallot, copies
- *    ONLY surviving patches into 0xe0/0xe1 task payload.
+ *    stages TCS outputs in SHM, culls + compacts in strict input order via
+ *    subgroupBallot, copies ONLY surviving patches into 0xe0/0xe1 task payload.
  *  - Tier 2 (Passthrough TCS): strips per-vertex TCS stores, DCEs non-cull VS
- *    outputs, runs K <= 16 patches in parallel, compacts surviving patches
- *    into compact 40 B descriptors + bin_desc + large_wg_end (<= 720 B). */
+ *    outputs, runs K <= 16 patches in parallel, compacts surviving patches in
+ *    input order into compact 40 B descriptors + seg_desc + seg_wg_end (<= 720 B). */
 static nir_shader *
 build_object_shader_mp(nir_shader *vs, nir_shader *tcs_in,
                        enum tess_primitive_mode domain,
@@ -4138,29 +4222,23 @@ build_object_shader_mp(nir_shader *vs, nir_shader *tcs_in,
    }
    nir_pop_if(&b, p3_if);
 
-   /* Uniform 32-lane subgroupBallot compaction. */
+   /* Uniform 32-lane order-preserving subgroupBallot compaction: preserves
+    * strict Vulkan input patch order across mixed small and large patches. */
    nir_def *is_small = nir_load_var(&b, is_small_var);
    nir_def *is_large = nir_load_var(&b, is_large_var);
-   nir_def *small_mask = nir_ballot(&b, 1, 32, is_small);
-   nir_def *large_mask = nir_ballot(&b, 1, 32, is_large);
-   nir_def *n_small = nir_bit_count(&b, small_mask);
-   nir_def *n_large = nir_bit_count(&b, large_mask);
-   nir_def *surv = nir_iadd(&b, n_small, n_large);
+   nir_def *is_alive = nir_ior(&b, is_small, is_large);
+   nir_def *surv_mask = nir_ballot(&b, 1, 32, is_alive);
+   nir_def *surv = nir_bit_count(&b, surv_mask);
 
    /* Fast early exit on 100%-culled OBJECT WGs: ZERO 0xe0/0xe1 payload writes! */
    nir_if *any_surv = nir_push_if(&b, nir_ine_imm(&b, surv, 0));
    any_surv->control = nir_selection_control_dont_flatten;
    {
-      nir_def *is_alive = nir_ior(&b, is_small, is_large);
       nir_push_if(&b, is_alive);
       {
          nir_def *lt_mask =
             nir_iadd_imm(&b, nir_ishl(&b, nir_imm_int(&b, 1), lane), -1);
-         nir_def *dst_small = nir_bit_count(&b, nir_iand(&b, small_mask, lt_mask));
-         nir_def *dst_large =
-            nir_iadd(&b, n_small,
-                     nir_bit_count(&b, nir_iand(&b, large_mask, lt_mask)));
-         nir_def *dst_slot = nir_bcsel(&b, is_small, dst_small, dst_large);
+         nir_def *dst_slot = nir_bit_count(&b, nir_iand(&b, surv_mask, lt_mask));
 
          /* Write compacted 40 B patch_meta[dst_slot] directly to 0xe0/0xe1. */
          nir_def *mbase = nir_iadd_imm(
@@ -4191,13 +4269,16 @@ build_object_shader_mp(nir_shader *vs, nir_shader *tcs_in,
                .write_mask = 3);
          }
 
-         /* Record compact metadata in SHM for lane-0 bin packing & Tier 1 copy. */
+         /* Record compact metadata in SHM (16 B/slot):
+          * (v_small or large_wgs, p_small, orig_lane, is_small ? 1 : 0). */
          nir_def *cbase =
             nir_iadd_imm(&b, nir_ishl_imm(&b, dst_slot, 4), shm_compact_off_B);
+         nir_def *sm_flag =
+            nir_bcsel(&b, is_small, nir_imm_int(&b, 1), nir_imm_int(&b, 0));
          nir_store_shared(&b,
-                          nir_vec3(&b, nir_load_var(&b, v_or_w_var),
-                                   nir_load_var(&b, p_cnt_var), lane),
-                          cbase, .align_mul = 4, .write_mask = 7);
+                          nir_vec4(&b, nir_load_var(&b, v_or_w_var),
+                                   nir_load_var(&b, p_cnt_var), lane, sm_flag),
+                          cbase, .align_mul = 4, .write_mask = 15);
       }
       nir_pop_if(&b, NULL);
 
@@ -4245,178 +4326,140 @@ build_object_shader_mp(nir_shader *vs, nir_shader *tcs_in,
          nir_pop_loop(&b, cp_loop);
       }
 
-      /* Lane 0: greedy bin-packing of small patches + large_wg_end prefix sum
-       * + 16 B MP_HDR write. */
+      /* Lane 0: order-preserving segment packing — consecutive small patches
+       * pack into shared child MESH WGs, flushing any open small bin before
+       * each large multi-WG patch so Vulkan primitive order is strictly exact. */
       nir_if *l0_if = nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
       l0_if->control = nir_selection_control_dont_flatten;
       {
-         nir_variable *n_bins_v =
-            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_nbins");
-         nir_variable *pair_lo_v =
-            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_plo");
-         nir_store_var(&b, n_bins_v, nir_imm_int(&b, 0), 1);
-         nir_store_var(&b, pair_lo_v, nir_imm_int(&b, 0), 1);
+         nir_variable *n_segs_v =
+            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_nsegs");
+         nir_variable *acc_v =
+            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_acc");
+         nir_variable *d_lo_v =
+            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_dlo");
+         nir_variable *e_lo_v =
+            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_elo");
+         nir_variable *i_v =
+            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_si");
+         nir_variable *bstart_v =
+            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_bs");
+         nir_variable *bcnt_v =
+            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_bc");
+         nir_variable *curv_v =
+            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_cv");
+         nir_variable *curp_v =
+            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_cp");
+         nir_store_var(&b, n_segs_v, nir_imm_int(&b, 0), 1);
+         nir_store_var(&b, acc_v, nir_imm_int(&b, 0), 1);
+         nir_store_var(&b, d_lo_v, nir_imm_int(&b, 0), 1);
+         nir_store_var(&b, e_lo_v, nir_imm_int(&b, 0), 1);
+         nir_store_var(&b, i_v, nir_imm_int(&b, 0), 1);
+         nir_store_var(&b, bstart_v, nir_imm_int(&b, 0), 1);
+         nir_store_var(&b, bcnt_v, nir_imm_int(&b, 0), 1);
+         nir_store_var(&b, curv_v, nir_imm_int(&b, 0), 1);
+         nir_store_var(&b, curp_v, nir_imm_int(&b, 0), 1);
 
-         nir_push_if(&b, nir_ine_imm(&b, n_small, 0));
+         nir_loop *seg_loop = nir_push_loop(&b);
          {
-            nir_variable *i_v =
-               nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_bi");
-            nir_variable *bstart_v =
-               nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_bs");
-            nir_variable *bcnt_v =
-               nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_bc");
-            nir_variable *curv_v =
-               nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_cv");
-            nir_variable *curp_v =
-               nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_cp");
-            nir_store_var(&b, i_v, nir_imm_int(&b, 0), 1);
-            nir_store_var(&b, bstart_v, nir_imm_int(&b, 0), 1);
-            nir_store_var(&b, bcnt_v, nir_imm_int(&b, 0), 1);
-            nir_store_var(&b, curv_v, nir_imm_int(&b, 0), 1);
-            nir_store_var(&b, curp_v, nir_imm_int(&b, 0), 1);
+            nir_def *i = nir_load_var(&b, i_v);
+            nir_push_if(&b, nir_uge(&b, i, surv));
+            nir_jump(&b, nir_jump_break);
+            nir_pop_if(&b, NULL);
 
-            nir_loop *bin_loop = nir_push_loop(&b);
+            nir_def *cbase =
+               nir_iadd_imm(&b, nir_ishl_imm(&b, i, 4), shm_compact_off_B);
+            nir_def *c = nir_load_shared(&b, 4, 32, cbase, .align_mul = 4);
+            nir_def *vw = nir_channel(&b, c, 0);
+            nir_def *pp = nir_channel(&b, c, 1);
+            nir_def *is_sm = nir_ine_imm(&b, nir_channel(&b, c, 3), 0);
+
+            nir_push_if(&b, is_sm);
             {
-               nir_def *i = nir_load_var(&b, i_v);
-               nir_push_if(&b, nir_uge(&b, i, n_small));
-               nir_jump(&b, nir_jump_break);
-               nir_pop_if(&b, NULL);
-
-               nir_def *cbase =
-                  nir_iadd_imm(&b, nir_ishl_imm(&b, i, 4), shm_compact_off_B);
-               nir_def *vp_pp = nir_load_shared(&b, 2, 32, cbase, .align_mul = 4);
-               nir_def *vp = nir_channel(&b, vp_pp, 0);
-               nir_def *pp = nir_channel(&b, vp_pp, 1);
-
                nir_def *bcnt = nir_load_var(&b, bcnt_v);
                nir_def *curv = nir_load_var(&b, curv_v);
                nir_def *curp = nir_load_var(&b, curp_v);
                nir_def *overflow = nir_iand(
                   &b, nir_ine_imm(&b, bcnt, 0),
                   nir_ior(&b,
-                          nir_ugt_imm(&b, nir_iadd(&b, curv, vp), shape->max_v),
+                          nir_ugt_imm(&b, nir_iadd(&b, curv, vw), shape->max_v),
                           nir_ugt_imm(&b, nir_iadd(&b, curp, pp), shape->max_p)));
                nir_push_if(&b, overflow);
                {
-                  /* Flush current bin. */
-                  nir_def *nb = nir_load_var(&b, n_bins_v);
+                  nir_def *new_acc = nir_iadd_imm(&b, nir_load_var(&b, acc_v), 1);
+                  nir_store_var(&b, acc_v, new_acc, 1);
                   nir_def *desc = nir_ior(&b, nir_load_var(&b, bstart_v),
                                           nir_ishl_imm(&b, bcnt, 5));
-                  nir_push_if(&b, nir_ieq_imm(&b, nir_iand_imm(&b, nb, 1), 0));
-                  {
-                     nir_store_var(&b, pair_lo_v, desc, 1);
-                  }
-                  nir_push_else(&b, NULL);
-                  {
-                     nir_def *word = nir_ior(&b, nir_load_var(&b, pair_lo_v),
-                                             nir_ishl_imm(&b, desc, 16));
-                     nir_def *off = nir_iadd_imm(
-                        &b, nir_ishl_imm(&b, nir_ushr_imm(&b, nb, 1), 2),
-                        pl->mp_bin_desc_off);
-                     nir_store_task_payload(&b, word, off, .align_mul = 4,
-                                            .write_mask = 1);
-                  }
-                  nir_pop_if(&b, NULL);
-                  nir_store_var(&b, n_bins_v, nir_iadd_imm(&b, nb, 1), 1);
+                  emit_mp_seg_record(&b, pl, n_segs_v, d_lo_v, e_lo_v, desc,
+                                     new_acc);
                   nir_store_var(&b, bstart_v, i, 1);
                   nir_store_var(&b, bcnt_v, nir_imm_int(&b, 1), 1);
-                  nir_store_var(&b, curv_v, vp, 1);
+                  nir_store_var(&b, curv_v, vw, 1);
                   nir_store_var(&b, curp_v, pp, 1);
                }
                nir_push_else(&b, NULL);
                {
+                  nir_push_if(&b, nir_ieq_imm(&b, bcnt, 0));
+                  nir_store_var(&b, bstart_v, i, 1);
+                  nir_pop_if(&b, NULL);
                   nir_store_var(&b, bcnt_v, nir_iadd_imm(&b, bcnt, 1), 1);
-                  nir_store_var(&b, curv_v, nir_iadd(&b, curv, vp), 1);
+                  nir_store_var(&b, curv_v, nir_iadd(&b, curv, vw), 1);
                   nir_store_var(&b, curp_v, nir_iadd(&b, curp, pp), 1);
                }
                nir_pop_if(&b, NULL);
-               nir_store_var(&b, i_v, nir_iadd_imm(&b, i, 1), 1);
-            }
-            nir_pop_loop(&b, bin_loop);
-
-            /* Flush final bin. */
-            nir_def *nb = nir_load_var(&b, n_bins_v);
-            nir_def *desc = nir_ior(&b, nir_load_var(&b, bstart_v),
-                                    nir_ishl_imm(&b, nir_load_var(&b, bcnt_v), 5));
-            nir_push_if(&b, nir_ieq_imm(&b, nir_iand_imm(&b, nb, 1), 0));
-            {
-               nir_def *off = nir_iadd_imm(
-                  &b, nir_ishl_imm(&b, nir_ushr_imm(&b, nb, 1), 2),
-                  pl->mp_bin_desc_off);
-               nir_store_task_payload(&b, desc, off, .align_mul = 4,
-                                      .write_mask = 1);
             }
             nir_push_else(&b, NULL);
             {
-               nir_def *word = nir_ior(&b, nir_load_var(&b, pair_lo_v),
-                                       nir_ishl_imm(&b, desc, 16));
-               nir_def *off = nir_iadd_imm(
-                  &b, nir_ishl_imm(&b, nir_ushr_imm(&b, nb, 1), 2),
-                  pl->mp_bin_desc_off);
-               nir_store_task_payload(&b, word, off, .align_mul = 4,
-                                      .write_mask = 1);
+               /* Large multi-WG patch: flush any open small bin first, then
+                * emit a large segment (count == 0 in bits 5..9). */
+               nir_def *bcnt = nir_load_var(&b, bcnt_v);
+               nir_push_if(&b, nir_ine_imm(&b, bcnt, 0));
+               {
+                  nir_def *acc1 = nir_iadd_imm(&b, nir_load_var(&b, acc_v), 1);
+                  nir_store_var(&b, acc_v, acc1, 1);
+                  nir_def *bdesc = nir_ior(&b, nir_load_var(&b, bstart_v),
+                                           nir_ishl_imm(&b, bcnt, 5));
+                  emit_mp_seg_record(&b, pl, n_segs_v, d_lo_v, e_lo_v, bdesc,
+                                     acc1);
+                  nir_store_var(&b, bcnt_v, nir_imm_int(&b, 0), 1);
+                  nir_store_var(&b, curv_v, nir_imm_int(&b, 0), 1);
+                  nir_store_var(&b, curp_v, nir_imm_int(&b, 0), 1);
+               }
+               nir_pop_if(&b, NULL);
+               nir_def *acc2 = nir_iadd(&b, nir_load_var(&b, acc_v), vw);
+               nir_store_var(&b, acc_v, acc2, 1);
+               emit_mp_seg_record(&b, pl, n_segs_v, d_lo_v, e_lo_v, i, acc2);
             }
             nir_pop_if(&b, NULL);
-            nir_store_var(&b, n_bins_v, nir_iadd_imm(&b, nb, 1), 1);
+            nir_store_var(&b, i_v, nir_iadd_imm(&b, i, 1), 1);
+         }
+         nir_pop_loop(&b, seg_loop);
+
+         /* Flush trailing open small bin if present. */
+         nir_def *rem_bcnt = nir_load_var(&b, bcnt_v);
+         nir_push_if(&b, nir_ine_imm(&b, rem_bcnt, 0));
+         {
+            nir_def *acc_f = nir_iadd_imm(&b, nir_load_var(&b, acc_v), 1);
+            nir_store_var(&b, acc_v, acc_f, 1);
+            nir_def *fdesc = nir_ior(&b, nir_load_var(&b, bstart_v),
+                                     nir_ishl_imm(&b, rem_bcnt, 5));
+            emit_mp_seg_record(&b, pl, n_segs_v, d_lo_v, e_lo_v, fdesc, acc_f);
          }
          nir_pop_if(&b, NULL);
 
-         /* Append large patches via large_wg_end[] prefix sum. */
-         nir_def *n_bins = nir_load_var(&b, n_bins_v);
-         nir_variable *acc_v =
-            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_acc");
-         nir_variable *j_v =
-            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_lj");
-         nir_variable *lplo_v =
-            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_lplo");
-         nir_store_var(&b, acc_v, n_bins, 1);
-         nir_store_var(&b, j_v, nir_imm_int(&b, 0), 1);
-         nir_store_var(&b, lplo_v, nir_imm_int(&b, 0), 1);
-
-         nir_push_if(&b, nir_ine_imm(&b, n_large, 0));
+         /* Flush trailing odd u16 segment entry if n_segs is odd. */
+         nir_def *n_segs = nir_load_var(&b, n_segs_v);
+         nir_push_if(&b, nir_ine_imm(&b, nir_iand_imm(&b, n_segs, 1), 0));
          {
-            nir_loop *l_loop = nir_push_loop(&b);
-            {
-               nir_def *j = nir_load_var(&b, j_v);
-               nir_push_if(&b, nir_uge(&b, j, n_large));
-               nir_jump(&b, nir_jump_break);
-               nir_pop_if(&b, NULL);
-
-               nir_def *slot = nir_iadd(&b, n_small, j);
-               nir_def *w_j = nir_load_shared(
-                  &b, 1, 32,
-                  nir_iadd_imm(&b, nir_ishl_imm(&b, slot, 4), shm_compact_off_B),
-                  .align_mul = 4);
-               nir_def *acc = nir_iadd(&b, nir_load_var(&b, acc_v), w_j);
-               nir_store_var(&b, acc_v, acc, 1);
-               nir_push_if(&b, nir_ieq_imm(&b, nir_iand_imm(&b, j, 1), 0));
-               {
-                  nir_store_var(&b, lplo_v, acc, 1);
-               }
-               nir_push_else(&b, NULL);
-               {
-                  nir_def *word = nir_ior(&b, nir_load_var(&b, lplo_v),
-                                          nir_ishl_imm(&b, acc, 16));
-                  nir_def *off = nir_iadd_imm(
-                     &b, nir_ishl_imm(&b, nir_ushr_imm(&b, j, 1), 2),
-                     pl->mp_large_end_off);
-                  nir_store_task_payload(&b, word, off, .align_mul = 4,
-                                         .write_mask = 1);
-               }
-               nir_pop_if(&b, NULL);
-               nir_store_var(&b, j_v, nir_iadd_imm(&b, j, 1), 1);
-            }
-            nir_pop_loop(&b, l_loop);
-
-            nir_push_if(&b, nir_ine_imm(&b, nir_iand_imm(&b, n_large, 1), 0));
-            {
-               nir_def *off = nir_iadd_imm(
-                  &b, nir_ishl_imm(&b, nir_ushr_imm(&b, n_large, 1), 2),
-                  pl->mp_large_end_off);
-               nir_store_task_payload(&b, nir_load_var(&b, lplo_v), off,
-                                      .align_mul = 4, .write_mask = 1);
-            }
-            nir_pop_if(&b, NULL);
+            nir_def *word_off = nir_ishl_imm(&b, nir_ushr_imm(&b, n_segs, 1), 2);
+            nir_store_task_payload(
+               &b, nir_load_var(&b, d_lo_v),
+               nir_iadd_imm(&b, word_off, pl->mp_bin_desc_off), .align_mul = 4,
+               .write_mask = 1);
+            nir_store_task_payload(
+               &b, nir_load_var(&b, e_lo_v),
+               nir_iadd_imm(&b, word_off, pl->mp_large_end_off), .align_mul = 4,
+               .write_mask = 1);
          }
          nir_pop_if(&b, NULL);
 
@@ -4424,10 +4467,9 @@ build_object_shader_mp(nir_shader *vs, nir_shader *tcs_in,
          nir_def *gflags = nir_bcsel(
             &b, nir_ine_imm(&b, flip_winding, 0),
             nir_imm_int(&b, HK_TESS_FLAG_FLIP_WINDING), nir_imm_int(&b, 0));
-         nir_def *packed_counts = nir_ior(
-            &b, nir_ior(&b, n_bins, nir_ishl_imm(&b, n_large, 8)),
-            nir_ior(&b, nir_ishl_imm(&b, n_small, 16),
-                    nir_ishl_imm(&b, gflags, 24)));
+         nir_def *packed_counts =
+            nir_ior(&b, nir_ior(&b, n_segs, nir_ishl_imm(&b, surv, 8)),
+                    nir_ishl_imm(&b, gflags, 24));
          nir_store_task_payload(
             &b,
             nir_vec4(&b, packed_counts, instance_id, nir_imm_int(&b, 0),
@@ -6123,9 +6165,7 @@ build_mesh_shader_mp(nir_shader *tes, nir_shader *vs_tes,
       nir_load_task_payload(&b, 2, 32, nir_imm_int(&b, 0), .align_mul = 4);
    nir_def *packed_counts = nir_channel(&b, hdr, 0);
    nir_def *instance_id = nir_channel(&b, hdr, 1);
-   nir_def *n_packed_bins = nir_iand_imm(&b, packed_counts, 0xff);
-   nir_def *n_large = nir_iand_imm(&b, nir_ushr_imm(&b, packed_counts, 8), 0xff);
-   nir_def *n_small = nir_iand_imm(&b, nir_ushr_imm(&b, packed_counts, 16), 0xff);
+   nir_def *n_segs = nir_iand_imm(&b, packed_counts, 0xff);
    nir_def *flip_winding = nir_ine_imm(
       &b, nir_iand_imm(&b, nir_ushr_imm(&b, packed_counts, 24),
                        HK_TESS_FLAG_FLIP_WINDING),
@@ -6160,19 +6200,61 @@ build_mesh_shader_mp(nir_shader *tes, nir_shader *vs_tes,
    const unsigned prim_iters = DIV_ROUND_UP(shape->max_p, 32u);
    assert(prim_iters <= 2u);
 
-   /* ---- Branch 1 (wg_id < n_packed_bins): Packed Small Patches ---- */
-   nir_if *br_packed = nir_push_if(&b, nir_ult(&b, wg_id, n_packed_bins));
+   /* Unified order-preserving segment lookup (<= K <= 16 iterations): find the
+    * unique segment s with prev_end <= wg_id < seg_wg_end[s]. */
+   nir_variable *seg_i_v =
+      nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_segi");
+   nir_variable *seg_prev_v =
+      nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_segp");
+   nir_variable *seg_found_v =
+      nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_segf");
+   nir_store_var(&b, seg_i_v, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, seg_prev_v, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, seg_found_v, nir_imm_int(&b, 0), 1);
+
+   nir_loop *seg_scan = nir_push_loop(&b);
+   {
+      nir_def *si = nir_load_var(&b, seg_i_v);
+      nir_push_if(&b, nir_uge(&b, si, n_segs));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, NULL);
+
+      nir_def *le_off = nir_iadd_imm(
+         &b, nir_ishl_imm(&b, nir_ushr_imm(&b, si, 1), 2),
+         pl->mp_large_end_off);
+      nir_def *le_word =
+         nir_load_task_payload(&b, 1, 32, le_off, .align_mul = 4);
+      nir_def *end_s = nir_iand_imm(
+         &b, nir_ushr(&b, le_word, nir_ishl_imm(&b, nir_iand_imm(&b, si, 1), 4)),
+         0xffff);
+      nir_push_if(&b, nir_ult(&b, wg_id, end_s));
+      {
+         nir_store_var(&b, seg_found_v, si, 1);
+         nir_jump(&b, nir_jump_break);
+      }
+      nir_pop_if(&b, NULL);
+      nir_store_var(&b, seg_prev_v, end_s, 1);
+      nir_store_var(&b, seg_i_v, nir_iadd_imm(&b, si, 1), 1);
+   }
+   nir_pop_loop(&b, seg_scan);
+
+   nir_def *seg_idx = nir_load_var(&b, seg_found_v);
+   nir_def *bd_off = nir_iadd_imm(
+      &b, nir_ishl_imm(&b, nir_ushr_imm(&b, seg_idx, 1), 2),
+      pl->mp_bin_desc_off);
+   nir_def *bd_word = nir_load_task_payload(&b, 1, 32, bd_off, .align_mul = 4);
+   nir_def *bd = nir_iand_imm(
+      &b, nir_ushr(&b, bd_word, nir_ishl_imm(&b, nir_iand_imm(&b, seg_idx, 1), 4)),
+      0xffff);
+   nir_def *seg_start = nir_iand_imm(&b, bd, 0x1f);
+   nir_def *seg_cnt = nir_iand_imm(&b, nir_ushr_imm(&b, bd, 5), 0x1f);
+
+   /* ---- Branch 1 (seg_cnt != 0): Packed Consecutive Small Patches ---- */
+   nir_if *br_packed = nir_push_if(&b, nir_ine_imm(&b, seg_cnt, 0));
    br_packed->control = nir_selection_control_dont_flatten;
    {
-      nir_def *bd_off = nir_iadd_imm(
-         &b, nir_ishl_imm(&b, nir_ushr_imm(&b, wg_id, 1), 2),
-         pl->mp_bin_desc_off);
-      nir_def *bd_word = nir_load_task_payload(&b, 1, 32, bd_off, .align_mul = 4);
-      nir_def *bd = nir_iand_imm(
-         &b, nir_ushr(&b, bd_word, nir_ishl_imm(&b, nir_iand_imm(&b, wg_id, 1), 4)),
-         0xffff);
-      nir_def *b_start = nir_iand_imm(&b, bd, 0x1f);
-      nir_def *b_cnt = nir_iand_imm(&b, nir_ushr_imm(&b, bd, 5), 0x1f);
+      nir_def *b_start = seg_start;
+      nir_def *b_cnt = seg_cnt;
       nir_store_var(&b, bin_start_var, b_start, 1);
       nir_store_var(&b, bin_count_var, b_cnt, 1);
 
@@ -6394,47 +6476,11 @@ build_mesh_shader_mp(nir_shader *tes, nir_shader *vs_tes,
       }
       nir_pop_if(&b, v_if);
    }
-   /* ---- Branch 2 (wg_id >= n_packed_bins): Multi-WG Large Patch ---- */
+   /* ---- Branch 2 (seg_cnt == 0): Multi-WG Large Patch ---- */
    nir_push_else(&b, br_packed);
    {
-      nir_variable *j_v =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_lj");
-      nir_variable *prev_v =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_lprev");
-      nir_variable *found_v =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_lfound");
-      nir_store_var(&b, j_v, nir_imm_int(&b, 0), 1);
-      nir_store_var(&b, prev_v, n_packed_bins, 1);
-      nir_store_var(&b, found_v, nir_imm_int(&b, 0), 1);
-
-      nir_loop *lscan = nir_push_loop(&b);
-      {
-         nir_def *j = nir_load_var(&b, j_v);
-         nir_push_if(&b, nir_uge(&b, j, n_large));
-         nir_jump(&b, nir_jump_break);
-         nir_pop_if(&b, NULL);
-
-         nir_def *le_off = nir_iadd_imm(
-            &b, nir_ishl_imm(&b, nir_ushr_imm(&b, j, 1), 2),
-            pl->mp_large_end_off);
-         nir_def *le_word =
-            nir_load_task_payload(&b, 1, 32, le_off, .align_mul = 4);
-         nir_def *end_j = nir_iand_imm(
-            &b, nir_ushr(&b, le_word, nir_ishl_imm(&b, nir_iand_imm(&b, j, 1), 4)),
-            0xffff);
-         nir_push_if(&b, nir_ult(&b, wg_id, end_j));
-         {
-            nir_store_var(&b, found_v, j, 1);
-            nir_jump(&b, nir_jump_break);
-         }
-         nir_pop_if(&b, NULL);
-         nir_store_var(&b, prev_v, end_j, 1);
-         nir_store_var(&b, j_v, nir_iadd_imm(&b, j, 1), 1);
-      }
-      nir_pop_loop(&b, lscan);
-
-      nir_def *pslot = nir_iadd(&b, n_small, nir_load_var(&b, found_v));
-      nir_def *local_wg = nir_isub(&b, wg_id, nir_load_var(&b, prev_v));
+      nir_def *pslot = seg_start;
+      nir_def *local_wg = nir_isub(&b, wg_id, nir_load_var(&b, seg_prev_v));
       nir_store_var(&b, v_pslot_var, pslot, 1);
       nir_store_var(&b, v_lp_var, nir_imm_int(&b, 0), 1);
       nir_store_var(&b, bin_start_var, pslot, 1);
@@ -7496,16 +7542,9 @@ hk_nir_tess_fused_lower(const nir_shader *vs_source,
    struct tess_payload_layout pl;
    compute_payload_layout(tes, out_v, &pl);
    unsigned max_payload =
-      options && options->max_payload_bytes ? options->max_payload_bytes : 1024u;
-   if (pl.payload_B > max_payload ||
-       pl.payload_B > AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES) {
-      ralloc_free(vs);
-      ralloc_free(tcs);
-      ralloc_free(tes);
-      if (reason)
-         *reason = "fused tess per-parent payload exceeds hardware slot stride";
-      return false;
-   }
+      MIN2(options && options->max_payload_bytes ? options->max_payload_bytes
+                                                 : 1024u,
+           (unsigned)AGX_APPLE9_MAX_TASK_PAYLOAD_BYTES);
 
    struct tess_meshlet_shape shape = choose_meshlet_shape(vertex_components);
 
@@ -7692,6 +7731,14 @@ hk_nir_tess_fused_lower(const nir_shader *vs_source,
    }
 
    configure_multipatch_layout(&pl, selected_tier, selected_k);
+   if (pl.payload_B > max_payload) {
+      ralloc_free(vs);
+      ralloc_free(tcs);
+      ralloc_free(tes);
+      if (reason)
+         *reason = "fused tess per-parent payload exceeds hardware slot stride";
+      return false;
+   }
 
    nir_shader *vs_tes = NULL;
    if (selected_tier == 2 && pl.pv_stride_B > 0) {
