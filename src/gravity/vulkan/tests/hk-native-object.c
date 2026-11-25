@@ -1153,6 +1153,60 @@ main(int argc, char **argv)
          }
          pdev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
          dev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
+
+         /* Retained non-native companion (apple9_fs_native_per_vertex) MUST
+          * remain uploaded and executable after logical-on -> logical-off
+          * binary import, even while optional native leaves are stripped. */
+         {
+            nir_builder fb = nir_builder_init_simple_shader(
+               MESA_SHADER_FRAGMENT, &agx_nir_options, "fs_pv_compat");
+            fb.shader->info.internal = false;
+            fb.shader->info.separate_shader = true;
+            nir_def *bary = nir_load_barycentric_coord_pixel(
+               &fb, 32, .interp_mode = INTERP_MODE_SMOOTH);
+            nir_def *col = nir_pad_vec4(&fb, bary);
+            nir_store_output(
+               &fb, col, nir_imm_int(&fb, 0), .write_mask = 15,
+               .src_type = nir_type_float32,
+               .io_semantics = {.location = FRAG_RESULT_DATA0, .num_slots = 1});
+            nir_shader_gather_info(fb.shader, nir_shader_get_entrypoint(fb.shader));
+            struct vk_shader_compile_info finfo = {
+               .stage = MESA_SHADER_FRAGMENT,
+               .nir = fb.shader,
+               .robustness = &vk_robustness_disabled,
+            };
+            struct vk_shader *fs_vk = NULL;
+            CHECK(hk_device_shader_ops.compile(&dev->vk, 1, &finfo, NULL, NULL,
+                                               NULL, &fs_vk) == VK_SUCCESS);
+            struct hk_api_shader *fs_src =
+               container_of(fs_vk, struct hk_api_shader, vk);
+            CHECK(fs_src->apple9_fs_native_per_vertex);
+            CHECK(fs_src->apple9_fs_native_per_vertex->variants[0].code_size > 0);
+            CHECK(fs_src->apple9_fs_native_per_vertex->variants[0].apple9_body);
+            struct blob fblob;
+            blob_init(&fblob);
+            CHECK(fs_vk->ops->serialize(&dev->vk, fs_vk, &fblob));
+            hk_api_shader_destroy(&dev->vk, fs_vk, NULL);
+
+            dev->dev.params.features = 0;
+            struct blob_reader fr;
+            struct vk_shader *fs_imp_vk = NULL;
+            blob_reader_init(&fr, fblob.data, fblob.size);
+            CHECK(hk_device_shader_ops.deserialize(&dev->vk, &fr, 0, NULL,
+                                                   &fs_imp_vk) == VK_SUCCESS);
+            CHECK(fs_imp_vk && fr.current == fr.end && !fr.overrun);
+            struct hk_api_shader *fs_imp =
+               container_of(fs_imp_vk, struct hk_api_shader, vk);
+            CHECK(fs_imp->variants[0].code_size > 0);
+            CHECK(fs_imp->apple9_fs_native_per_vertex);
+            CHECK(fs_imp->apple9_fs_native_per_vertex->variants[0].code_size > 0);
+            CHECK(fs_imp->apple9_fs_native_per_vertex->variants[0].apple9_body);
+            CHECK(!hk_api_shader_native(fs_imp));
+            hk_api_shader_destroy(&dev->vk, fs_imp_vk, NULL);
+            blob_finish(&fblob);
+            dev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
+         }
+         CHECK(live_bos == base_bos);
       }
    }
 

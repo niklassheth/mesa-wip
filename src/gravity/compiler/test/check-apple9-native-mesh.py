@@ -131,7 +131,10 @@ def check_program(rows, channels=None):
                 cmp_b = (((word >> 52) & 1) | (((code[3] >> 1) & 0x3f) << 1) |
                          (((word >> 20) & 1) << 7))
                 assert cmp_b == 0, (cmp_b, r)
-                # if_true and if_false must be integer immediates (0 / safe_u0_b).
+                # if_true and if_false must be integer immediates (0 / safe_u0_b),
+                # with integer literal mode (bit 18 == 1) and no abs/neg modifiers.
+                assert ((word >> 18) & 1) == 1
+                assert ((word >> 35) & 3) == 0 and ((word >> 67) & 3) == 0
                 assert ((word >> 37) & 1) == 1 and ((word >> 38) & 1) == 0
                 assert ((word >> 47) & 1) == 1
                 assert ((word >> 69) & 1) == 1 and ((word >> 70) & 1) == 0

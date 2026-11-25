@@ -715,6 +715,11 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
       blob_skip_bytes(blob, data_size);
       if (blob->overrun)
          return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      if (shader->info.apple9_native_stage != HK_APPLE9_NATIVE_NONE &&
+          !hk_apple9_native_shader_valid(&shader->b.info,
+                                         &shader->info.apple9_native,
+                                         shader->info.apple9_native_stage))
+         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       shader->code_size = 0;
       shader->data_size = 0;
       return VK_SUCCESS;
@@ -818,9 +823,15 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
    }
 
+   /* Only strip optional child native leaves when logical-off imports a
+    * physical-on binary. Retained non-native companions (apple9_gs_polygon_points,
+    * apple9_fs_native_per_vertex) have apple9_native_leaf == false and must
+    * still be uploaded so ordinary draws can select them. */
+   const bool strip_this_leaf =
+      drop_native_leaf && !allow_native && obj->apple9_native_leaf;
    hk_foreach_variant(obj, shader) {
-      VkResult result = hk_deserialize_shader(
-         dev, blob, shader, !(drop_native_leaf && !allow_native));
+      VkResult result =
+         hk_deserialize_shader(dev, blob, shader, !strip_this_leaf);
 
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
@@ -968,7 +979,8 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
       }
       obj->apple9_gs_polygon_points =
          container_of(gs_pp, struct hk_api_shader, vk);
-      if (gs_pp->stage != MESA_SHADER_GEOMETRY) {
+      if (gs_pp->stage != MESA_SHADER_GEOMETRY ||
+          obj->apple9_gs_polygon_points->apple9_native_leaf) {
          hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       }
@@ -990,7 +1002,8 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
       }
       obj->apple9_fs_native_per_vertex =
          container_of(fs_pv, struct hk_api_shader, vk);
-      if (fs_pv->stage != MESA_SHADER_FRAGMENT) {
+      if (fs_pv->stage != MESA_SHADER_FRAGMENT ||
+          obj->apple9_fs_native_per_vertex->apple9_native_leaf) {
          hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       }
