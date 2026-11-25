@@ -39,7 +39,11 @@
 #define HK_TESS_PAYLOAD_HEADER_B 40u
 #define HK_TESS_MP_HDR_B         16u /* packed_counts, instance_id, pad[2] */
 #define HK_TESS_MP_MAX_K         16u
-#define HK_TESS_MP_TIER1_MAX_K   8u
+#define HK_TESS_MP_TIER1_MAX_K   16u
+/* Keep Tier 1 multi-patch hardware payload <= 4 KiB (words[9] <= 4) so the
+ * 512 KiB 0x1ca48 aperture retains >= 128 concurrent parent WGs while packing
+ * up to K = 32 / out_v (K = 10 for 3-CP tris, K = 8 for 4-CP quads). */
+#define HK_TESS_MP_TIER1_MAX_PAYLOAD_B 4096u
 #define HK_TESS_SHM_LEVELS_B     24u /* 6 x float: outer[0..3], inner[0..1] */
 
 #define HK_TESS_FLAG_FLIP_WINDING (1u << 0)
@@ -63,59 +67,57 @@ static struct tess_meshlet_shape
 choose_meshlet_shape(unsigned vertex_components)
 {
    unsigned planes = ALIGN_POT(vertex_components, 4);
-   if (planes <= 4) {
-      /* Position-only (planes == 4): runtime U0_B compensation keeps dynamic P
-       * wrap-safe across 8 index rows; fits tess4 tri (19V/24P) & quad (25V/32P). */
-      return (struct tess_meshlet_shape){
-         .max_v = 32,
-         .max_p = 42,
-         .tile_w = 5,
-         .tile_h = 4,
-         .p_strip = 30,
-         .allow_whole_patch = true,
+   unsigned planes_odd = (planes & 7u) == 0u ? planes + 4u : planes;
+
+   /* Prefer widened multi-bucket shapes (V=32/P=42 first, then V=24/P=42)
+    * whenever GCD power-of-2 multi-bucket U0_B(b) keeps max_stride <= 512
+    * (>= 8 concurrent WGs in the 64 KiB output ring, zero degenerate tris,
+    * whole-patch tess=4 in 1 WG, and power-of-2 stride GCD for zero-split
+    * mixed-stride render-pass batching). */
+   if (planes_odd <= 4u + AGX_APPLE9_MAX_VARYING_COMPONENTS) {
+      const struct agx_apple9_mesh_layout l32 = {
+         .max_vertices = 32,
+         .max_primitives = 42,
+         .indices_per_primitive = 3,
+         .vertex_components = planes_odd,
+         .variable_idx_rows = true,
       };
-   }
-   if (planes <= 32) {
-      /* Compare the two single-4-row-bucket packed shapes (V=24/P=20 vs
-       * V=16/P=18) by ring vertex efficiency max_v / safe_stride using the
-       * hardware safe-stride helper (tie-breaking toward V=24/P=20 for higher
-       * patch packing). Both are unbounded across planes 8..32. */
+      struct agx_apple9_mesh_ring_plan plan32;
+      if (agx_apple9_mesh_ring_plan_solve(&l32, &plan32) &&
+          plan32.max_stride <= 512u) {
+         return (struct tess_meshlet_shape){
+            .max_v = 32,
+            .max_p = 42,
+            .tile_w = 5,
+            .tile_h = 4,
+            .p_strip = 30,
+            .allow_whole_patch = true,
+         };
+      }
+
       const struct agx_apple9_mesh_layout l24 = {
          .max_vertices = 24,
-         .max_primitives = 20,
+         .max_primitives = 42,
          .indices_per_primitive = 3,
-         .vertex_components = planes,
+         .vertex_components = planes_odd,
+         .variable_idx_rows = true,
       };
-      const struct agx_apple9_mesh_layout l16 = {
-         .max_vertices = 16,
-         .max_primitives = 18,
-         .indices_per_primitive = 3,
-         .vertex_components = planes,
-      };
-      uint32_t s24 = 0, s16 = 0;
-      bool ok24 = agx_apple9_mesh_safe_u0_b(&l24, NULL, &s24);
-      bool ok16 = agx_apple9_mesh_safe_u0_b(&l16, NULL, &s16);
-      if (ok24 && (!ok16 || (uint64_t)24u * s16 >= (uint64_t)16u * s24)) {
+      struct agx_apple9_mesh_ring_plan plan24;
+      if (agx_apple9_mesh_ring_plan_solve(&l24, &plan24) &&
+          plan24.max_stride <= 512u) {
          return (struct tess_meshlet_shape){
             .max_v = 24,
-            .max_p = 20,
+            .max_p = 42,
             .tile_w = 3,
             .tile_h = 3,
             .p_strip = 20,
             .allow_whole_patch = true,
          };
       }
-      return (struct tess_meshlet_shape){
-         .max_v = 16,
-         .max_p = 18,
-         .tile_w = 3,
-         .tile_h = 3,
-         .p_strip = 14,
-         .allow_whole_patch = true,
-      };
    }
+
    if (planes <= 68) {
-      /* Wider varying payloads (planes 36..68): single 4-row index bucket with
+      /* Wider varying payloads (planes 40..68): single 4-row index bucket with
        * safe-stride U0_B keeps ring concurrency high and unbounded. */
       return (struct tess_meshlet_shape){
          .max_v = 16,
@@ -5553,8 +5555,16 @@ nir_tri_ring_pos_at(nir_builder *b, nir_def *r, nir_def *t_in_ring,
    nir_def *so_in = nir_usub_sat(b, ni, nir_ishl_imm(b, r, 1));
    nir_def *si_in = nir_usub_sat(b, so_in, nir_imm_int(b, 2));
    nir_def *t_edge = nir_umax(b, nir_iadd(b, so_in, si_in), nir_imm_int(b, 1));
-   nir_def *e_in = nir_umin(b, nir_udiv(b, t_in_ring, t_edge), nir_imm_int(b, 2));
-   nir_def *t_in = nir_usub_sat(b, t_in_ring, nir_imul(b, e_in, t_edge));
+   /* Quotient is in {0, 1, 2}: avoid 32-bit udiv in the per-primitive path. */
+   nir_def *t_edge2 = nir_ishl_imm(b, t_edge, 1);
+   nir_def *ge1 = nir_uge(b, t_in_ring, t_edge);
+   nir_def *ge2 = nir_uge(b, t_in_ring, t_edge2);
+   nir_def *e_in = nir_bcsel(
+      b, ge2, nir_imm_int(b, 2),
+      nir_bcsel(b, ge1, nir_imm_int(b, 1), nir_imm_int(b, 0)));
+   nir_def *t_in = nir_bcsel(
+      b, ge2, nir_isub(b, t_in_ring, t_edge2),
+      nir_bcsel(b, ge1, nir_isub(b, t_in_ring, t_edge), t_in_ring));
    nir_def *ob_in = nir_imul(b, e_in, so_in);
    nir_def *ib_in = nir_imul(b, e_in, si_in);
 
@@ -5711,8 +5721,16 @@ emit_tri_multi_wg(nir_builder *b, enum gl_tess_spacing spacing,
                    nir_isub(b, pos, s01)));
       nir_def *s_r =
          nir_umax(b, nir_usub_sat(b, ni, nir_ishl_imm(b, r, 1)), nir_imm_int(b, 1));
-      nir_def *e_in = nir_udiv(b, pos, s_r);
-      nir_def *k_in = nir_umod(b, pos, s_r);
+      /* Interior triangle ring has 3*s_r vertices (edge index in {0, 1, 2}). */
+      nir_def *s_r2 = nir_ishl_imm(b, s_r, 1);
+      nir_def *v_ge1 = nir_uge(b, pos, s_r);
+      nir_def *v_ge2 = nir_uge(b, pos, s_r2);
+      nir_def *e_in = nir_bcsel(
+         b, v_ge2, nir_imm_int(b, 2),
+         nir_bcsel(b, v_ge1, nir_imm_int(b, 1), nir_imm_int(b, 0)));
+      nir_def *k_in = nir_bcsel(
+         b, v_ge2, nir_isub(b, pos, s_r2),
+         nir_bcsel(b, v_ge1, nir_isub(b, pos, s_r), pos));
       nir_def *is_r0 = nir_ieq_imm(b, r, 0);
       nir_def *e = nir_bcsel(b, is_r0, e_r0, e_in);
       nir_def *ke = nir_bcsel(b, is_r0, k_r0, k_in);
@@ -7347,7 +7365,7 @@ hk_nir_tess_fused_lower(const nir_shader *vs_source,
       const unsigned min_v = domain == TESS_PRIMITIVE_QUADS ? 4u : 3u;
       const unsigned mesh_out_est_B =
          ALIGN_POT(shape.max_p * 3u, 16) + 16u +
-         ALIGN_POT(shape.max_v, 4) * 4u * (vertex_components + 2u) +
+         ALIGN_POT(shape.max_v, 4) * 4u * (vertex_components + 6u) +
          shape.max_v * 4u * cull_size;
       unsigned k_max =
          pt_info.single_inv_patch_main
@@ -7396,9 +7414,11 @@ hk_nir_tess_fused_lower(const nir_shader *vs_source,
 
       const unsigned per_patch_t1 =
          HK_TESS_PAYLOAD_HEADER_B + pl.tcs_copy_B + (pl.has_raw_levels ? 24u : 0u);
+      const unsigned t1_max_payload =
+         MIN2(max_payload, HK_TESS_MP_TIER1_MAX_PAYLOAD_B);
       unsigned k_max = MIN2(HK_TESS_MP_TIER1_MAX_K, 32u / out_v);
       for (unsigned k = k_max; k >= 2; --k) {
-         if (calc_mp_payload_bytes(k, per_patch_t1) > max_payload)
+         if (calc_mp_payload_bytes(k, per_patch_t1) > t1_max_payload)
             continue;
          unsigned pcp_try =
             !t1_vs_any ? 32u : MIN2(32u, MAX3(out_v, max_const_vidx, 4u));

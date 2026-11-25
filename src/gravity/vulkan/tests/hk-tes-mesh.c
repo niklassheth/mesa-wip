@@ -871,11 +871,11 @@ fused_tess_suite(void)
       }
    }
 
-   /* 2. Adaptive meshlet tiers (V32/P42, V24/P20, V16/P18, V8/P6) + FS-linked
+   /* 2. Adaptive meshlet tiers (V32/P42, V24/P42, V16/P18, V8/P6) + FS-linked
     * varying DCE + ClipDistance[2] + CullDistance[1] (Elden Ring Triangle
     * shape) + raw tess levels + patch constants. */
    {
-      /* 8 comps (POS + 1 vec4) -> golden packed V24/P20 (Tier 1 because raw
+      /* 8 comps (POS + 1 vec4) -> widened V32/P42 (Tier 1 because raw
        * levels + patch constants are read by TES). */
       nir_shader *vs = make_fused_vs(1, false);
       nir_shader *tcs = make_fused_tcs(3, 1, 3.0f, 3.0f, true, true, false,
@@ -885,7 +885,7 @@ fused_tess_suite(void)
                                        1, 0, 0, true, true);
       struct hk_tess_fused_info info = {0};
       compile_fused_tess_pair(vs, tcs, tes, &base_opts, &info);
-      CHECK(info.mesh_max_vertices == 24 && info.mesh_max_primitives == 20);
+      CHECK(info.mesh_max_vertices == 32 && info.mesh_max_primitives == 42);
       CHECK(info.multipatch_tier == 1 && info.patches_per_group >= 2);
       CHECK(info.max_child_wgs_per_patch == 1);
       CHECK(info.max_prims_per_patch == 13);
@@ -895,9 +895,9 @@ fused_tess_suite(void)
       compiled++;
    }
    {
-      /* 12 comps (POS + 2 vec4) selects V16/P18 (16/64 > 24/100) and 16 comps
-       * (POS + 3 vec4) selects golden packed V24/P20 (24/148 > 16/100); with FS
-       * mask reading 0 vars -> V32/P42! */
+      /* 12 comps (POS + 2 vec4) -> V32/P42 (G=128, strides [256, 128]);
+       * 16 comps (POS + 3 vec4) -> V24/P42 (G=128, strides [384, 128]);
+       * with FS mask reading 0 vars -> V32/P42 (G=64, strides [64, 64])! */
       nir_shader *vs = make_fused_vs(0, false);
       nir_shader *tcs = make_fused_tcs(1, 0, 1.0f, 1.0f, false, false, false,
                                        TESS_SPACING_EQUAL, false, false);
@@ -905,14 +905,14 @@ fused_tess_suite(void)
                                        false, false, 1, 2, 0, 0, false, false);
       struct hk_tess_fused_info info = {0};
       compile_fused_tess_pair(vs, tcs, tes, &base_opts, &info);
-      CHECK(info.mesh_max_vertices == 16 && info.mesh_max_primitives == 18);
+      CHECK(info.mesh_max_vertices == 32 && info.mesh_max_primitives == 42);
       CHECK(info.multipatch_tier == 2 && info.patches_per_group == 16);
       CHECK(info.max_child_wgs_per_patch == 1 && info.max_prims_per_patch == 2);
 
       nir_shader *tes16 = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
                                          false, false, 1, 3, 0, 0, false, false);
       compile_fused_tess_pair(vs, tcs, tes16, &base_opts, &info);
-      CHECK(info.mesh_max_vertices == 24 && info.mesh_max_primitives == 20);
+      CHECK(info.mesh_max_vertices == 24 && info.mesh_max_primitives == 42);
       CHECK(info.max_child_wgs_per_patch == 1 && info.max_prims_per_patch == 2);
       ralloc_free(tes16);
 
@@ -927,8 +927,8 @@ fused_tess_suite(void)
    }
    {
       /* Elden Ring Triangle shape: 3->3 CPs, FracOdd, CW, Clip[2] + Cull[1] + 4 vec4
-       * (4 + 16 + 2 = 22 comps -> planes = 24 -> golden V24/P20, Tier 2 K=16,
-       * unbounded via safe-stride U0_B!). */
+       * (4 + 16 + 2 = 22 comps -> planes = 24 -> padded to 28 -> V32/P42,
+       * Tier 2 K=16, unbounded via GCD multi-bucket U0_B(b)!). */
       nir_shader *vs = make_fused_vs(4, true);
       nir_shader *tcs = make_fused_tcs(3, 4, 4.0f, 4.0f, true, false, true,
                                        TESS_SPACING_FRACTIONAL_ODD, false, true);
@@ -937,7 +937,7 @@ fused_tess_suite(void)
                                        3, 4, 2, 1, false, false);
       struct hk_tess_fused_info info = {0};
       compile_fused_tess_pair(vs, tcs, tes, &base_opts, &info);
-      CHECK(info.mesh_max_vertices == 24 && info.mesh_max_primitives == 20);
+      CHECK(info.mesh_max_vertices == 32 && info.mesh_max_primitives == 42);
       CHECK(info.multipatch_tier == 2 && info.patches_per_group == 16);
       CHECK(!info.constant_tess_levels);
       CHECK(info.max_child_wgs_per_patch > 0 && info.max_child_wgs_per_patch <= 4096);
@@ -947,10 +947,10 @@ fused_tess_suite(void)
       compiled++;
    }
    {
-      /* Golden V=24/P=20 meshlets across planes == 24 (21..24 live vertex
-       * components) and wider payloads (planes == 36..68 -> V16/P18,
-       * planes == 72..128 -> V8/P6): safe-stride U0_B keeps all shapes
-       * unbounded without dummy varying padding. */
+      /* Widened V=32/P=42 meshlets across raw planes == 24 (21..24 live vertex
+       * components): GCD plane padding lifts planes 24 -> 28 (25 comps) for
+       * G=256, strides=[256, 512], unbounded! Wider payloads: planes 40..68 ->
+       * V16/P18, planes 72..128 -> V8/P6. */
       for (unsigned live_user = 17; live_user <= 20; ++live_user) {
          nir_shader *vs = make_fused_vs(5, false);
          nir_shader *tcs = make_fused_tcs(1, 5, 1.0f, 1.0f, false, false, false,
@@ -966,7 +966,7 @@ fused_tess_suite(void)
          const char *r = NULL;
          CHECK(hk_nir_tess_fused_lower(vs, tcs, tes, &mask_opts, &obj, &mesh,
                                        &info, &r));
-         CHECK(info.mesh_max_vertices == 24 && info.mesh_max_primitives == 20);
+         CHECK(info.mesh_max_vertices == 32 && info.mesh_max_primitives == 42);
          hk_apple9_lower_prerast_sysvals(mesh, MESA_SHADER_COMPUTE);
          struct agx_apple9_native_mesh_options mopts = {
             .physical_threads = AGX_APPLE9_NATIVE_SERIAL_THREADS,
@@ -981,13 +981,15 @@ fused_tess_suite(void)
          struct agx_apple9_mesh_body_info body = {0};
          CHECK(agx_compile_apple9_native_mesh(mesh, true, &mopts, &part, &body,
                                               &r));
-         CHECK(body.layout.vertex_components == 4u + live_user);
-         CHECK(part.info.apple9_varyings.count == live_user);
+         CHECK(body.layout.vertex_components == 25u);
+         CHECK(part.info.apple9_varyings.count == 21u);
          CHECK(hk_apple9_native_shader_valid(&part.info, &body,
                                              HK_APPLE9_NATIVE_MESH));
-         uint32_t safe_u0 = 0, safe_stride = 0;
-         CHECK(agx_apple9_mesh_safe_u0_b(&body.layout, &safe_u0, &safe_stride));
-         CHECK(safe_u0 == 32u && safe_stride == 196u);
+         struct agx_apple9_mesh_ring_plan plan;
+         CHECK(agx_apple9_mesh_ring_plan_solve(&body.layout, &plan));
+         CHECK(plan.stride_gcd == 256u && plan.max_stride == 512u &&
+               agx_apple9_mesh_ring_plan_u0_b_for_bucket(&plan, 1) == 36u &&
+               agx_apple9_mesh_ring_plan_u0_b_for_bucket(&plan, 2) == 72u);
          uint64_t ring_max = 0;
          CHECK(agx_apple9_mesh_ring_max_groups(&body.layout, &ring_max));
          CHECK(ring_max == UINT64_MAX);
@@ -999,11 +1001,11 @@ fused_tess_suite(void)
          ralloc_free(tes);
          compiled++;
       }
-      /* Wider varying payloads: 36 comps (planes=36) -> V16/P18, 72 comps -> V8/P6. */
+      /* Wider varying payloads: 40 comps (planes=40) -> V16/P18, 72 comps -> V8/P6. */
       const struct {
          unsigned extra_vars, exp_v, exp_p;
       } wide_cases[] = {
-         {8, 16, 18},  /* 4 + 32 = 36 comps -> planes 36 -> V16/P18 */
+         {9, 16, 18},  /* 4 + 36 = 40 comps -> planes 40 -> V16/P18 */
          {17, 8, 6},   /* 4 + 68 = 72 comps -> planes 72 -> V8/P6 */
       };
       for (unsigned wi = 0; wi < ARRAY_SIZE(wide_cases); ++wi) {
@@ -1644,9 +1646,10 @@ fused_tess_vbo_pack_suite(void)
       const char *reason = NULL;
       CHECK(hk_nir_tess_fused_lower(vb.shader, cb.shader, eb.shader, &opts,
                                     &obj, &mesh, &info, &reason));
-      /* 4 POS + 7 varyings = 11 comps -> planes=12 -> V16/P18 (16/64 > 24/100)
-       * and Tier 2 K=16 (recognizing hoisted narrow-VBO pack_* passthroughs!). */
-      CHECK(info.mesh_max_vertices == 16 && info.mesh_max_primitives == 18);
+      /* 4 POS + 7 varyings = 11 comps -> planes=12 -> widened V32/P42 (G=128,
+       * strides [256, 128]) and Tier 2 K=16 (recognizing hoisted narrow-VBO
+       * pack_* passthroughs!). */
+      CHECK(info.mesh_max_vertices == 32 && info.mesh_max_primitives == 42);
       CHECK(info.multipatch_tier == 2 && info.patches_per_group == 16);
       /* Exclusive R16G16_UNORM slot VAR3 was also compacted in TCS (2 floats -> 1 u32). */
       ralloc_free(obj);
@@ -1879,8 +1882,9 @@ fused_tess_interval_bounds_suite(void)
       CHECK(!info.constant_tess_levels);
       if (safe_nan) {
          CHECK(info.max_prims_per_patch == 181u);
-         /* Multi-ring triangle chunker (V=24/P=20 -> p_chunk=20): ceil(181/20) = 10 WGs. */
-         CHECK(info.max_child_wgs_per_patch == 10u);
+         /* Multi-ring triangle chunker (20 comps -> V=24/P=42 -> p_chunk=21):
+          * ceil(181/21) = 9 WGs. */
+         CHECK(info.max_child_wgs_per_patch == 9u);
       } else {
          CHECK(info.max_prims_per_patch == 5953u);
       }
@@ -2955,8 +2959,8 @@ fused_tess_astra_regression_suite(void)
       struct hk_tess_fused_info info = {0};
       const char *r = NULL;
       CHECK(hk_nir_tess_fused_lower(vs, tcs, tes, &pid_opts, &obj, &mesh, &info, &r));
-      /* 4 (pos) + 1 (PrimitiveId) = 5 components -> planes = 8 -> V24/P20. */
-      CHECK(info.mesh_max_vertices == 24 && info.mesh_max_primitives == 20);
+      /* 4 (pos) + 1 (PrimitiveId) = 5 components -> planes = 8 -> V32/P42. */
+      CHECK(info.mesh_max_vertices == 32 && info.mesh_max_primitives == 42);
       CHECK(mesh->info.outputs_written & VARYING_BIT_PRIMITIVE_ID);
       hk_apple9_lower_prerast_sysvals(mesh, MESA_SHADER_COMPUTE);
       struct hk_apple9_graphics_key mkey = {
@@ -4083,20 +4087,24 @@ fused_tess_multipatch_suite(void)
    base_opts.vertex.format[0] = PIPE_FORMAT_R32G32B32A32_FLOAT;
 
    /* 1. Tier 2 Passthrough-TCS K=16 across all 4 meshlet shapes:
-    *    planes <= 4 -> V32/P42, 8..32 -> V24/P20, 36..68 -> V16/P18,
-    *    72..128 -> V8/P6, plus full OBJECT + MESH AGX backend compilation. */
+    *    planes 4/8/12/24/28 -> V32/P42, 16/20/32/36 -> V24/P42,
+    *    40..68 -> V16/P18, 72..128 -> V8/P6, plus full OBJECT + MESH AGX
+    *    backend compilation. */
    {
       const struct {
          unsigned vec4_vars;
          unsigned exp_v, exp_p;
       } shape_cases[] = {
-         {0, 32, 42},  /* 4 planes */
-         {1, 24, 20},  /* 8 planes -> V24/P20 (24/76 > 16/52) */
-         {2, 16, 18},  /* 12 planes -> V16/P18 (16/64 = 0.25 > 24/100 = 0.24) */
-         {3, 24, 20},  /* 16 planes -> V24/P20 (24/148 > 16/100) */
-         {4, 24, 20},  /* 20 planes -> golden V24/P20 */
-         {7, 24, 20},  /* 32 planes -> golden V24/P20 */
-         {8, 16, 18},  /* 36 planes -> V16/P18 */
+         {0, 32, 42},  /* 4 planes -> V32/P42 (G=64) */
+         {1, 32, 42},  /* 8 planes -> V32/P42 (padded 12, G=128) */
+         {2, 32, 42},  /* 12 planes -> V32/P42 (G=128) */
+         {3, 24, 42},  /* 16 planes -> V24/P42 (padded 20, G=128) */
+         {4, 24, 42},  /* 20 planes -> V24/P42 (G=128) */
+         {5, 32, 42},  /* 24 planes -> V32/P42 (padded 28, G=256) */
+         {6, 32, 42},  /* 28 planes -> V32/P42 (G=256) */
+         {7, 24, 42},  /* 32 planes -> V24/P42 (padded 36, G=256) */
+         {8, 24, 42},  /* 36 planes -> V24/P42 (G=256) */
+         {9, 16, 18},  /* 40 planes -> V16/P18 */
          {16, 16, 18}, /* 68 planes -> V16/P18 */
          {17, 8, 6},   /* 72 planes -> V8/P6 */
       };
@@ -4207,7 +4215,7 @@ fused_tess_multipatch_suite(void)
          struct hk_tess_fused_info info = {0};
          compile_fused_tess_pair(vs, cb.shader, tes, &base_opts, &info);
          CHECK(info.multipatch_tier == 1);
-         CHECK(info.patches_per_group >= 4 && info.patches_per_group <= 8);
+         CHECK(info.patches_per_group >= 4 && info.patches_per_group <= 10);
          CHECK(info.payload_B <= 1024);
          ralloc_free(vs);
          ralloc_free(cb.shader);
@@ -4539,7 +4547,7 @@ fused_tess_multipatch_suite(void)
                struct hk_tess_fused_info info = {0};
                compile_fused_tess_pair(vs, tcs, tes, &opts, &info);
                CHECK(info.multipatch_tier == 2 && info.patches_per_group == 16);
-               CHECK(info.mesh_max_vertices == 24 && info.mesh_max_primitives == 20);
+               CHECK(info.mesh_max_vertices == 24 && info.mesh_max_primitives == 42);
                ralloc_free(vs);
                ralloc_free(tcs);
                ralloc_free(tes);
@@ -5484,26 +5492,30 @@ fused_tess_hightess_chunker_suite(void)
    base_opts.vertex.stride[0] = 16;
 
    /* 1. Exact child WG dispatch counts for tess = 4, 6, 8, 16, 32, 64
-    *    (Triangles & Quads) across V=24/P=20 (extra_vars=3) and V=16/P=18
-    *    (extra_vars=10). */
+    *    (Triangles & Quads) across V=32/P=42 (extra_vars=5), V=24/P=42
+    *    (extra_vars=3), and V=16/P=18 (extra_vars=10). */
    {
       struct wg_expect {
          float tess;
-         uint32_t tri_v24, tri_v16, quad_v24, quad_v16;
+         uint32_t tri_wgs[3];
+         uint32_t quad_wgs[3];
       };
       static const struct wg_expect expects[] = {
-         {4.0f,  2,   2,   3,   3},
-         {6.0f,  3,   5,   4,   6},
-         {8.0f,  5,   8,   7,   10},
-         {16.0f, 20,  30,  26,  42},
-         {32.0f, 77,  119, 103, 168},
-         {64.0f, 308, 473, 411, 677},
+         {4.0f,  {1,   1,   2},   {1,   3,   3}},
+         {6.0f,  {2,   3,   5},   {4,   4,   6}},
+         {8.0f,  {4,   5,   8},   {5,   7,   10}},
+         {16.0f, {14,  19,  30},  {18,  26,  42}},
+         {32.0f, {53,  74,  119}, {74,  103, 168}},
+         {64.0f, {212, 293, 473}, {292, 411, 677}},
       };
+      const unsigned evs[3] = {5, 3, 10};
+      const unsigned exp_vs[3] = {32, 24, 16};
+      const unsigned exp_ps[3] = {42, 42, 18};
       for (unsigned i = 0; i < ARRAY_SIZE(expects); ++i) {
-         for (unsigned shape_i = 0; shape_i < 2; ++shape_i) {
-            unsigned ev = shape_i == 0 ? 3 : 10;
-            unsigned exp_v = shape_i == 0 ? 24 : 16;
-            unsigned exp_p = shape_i == 0 ? 20 : 18;
+         for (unsigned shape_i = 0; shape_i < 3; ++shape_i) {
+            unsigned ev = evs[shape_i];
+            unsigned exp_v = exp_vs[shape_i];
+            unsigned exp_p = exp_ps[shape_i];
             for (unsigned d = 0; d < 2; ++d) {
                enum tess_primitive_mode dom =
                   d == 0 ? TESS_PRIMITIVE_TRIANGLES : TESS_PRIMITIVE_QUADS;
@@ -5522,8 +5534,8 @@ fused_tess_hightess_chunker_suite(void)
                CHECK(info.mesh_max_vertices == exp_v &&
                      info.mesh_max_primitives == exp_p);
                uint32_t want_wgs =
-                  d == 0 ? (shape_i == 0 ? expects[i].tri_v24 : expects[i].tri_v16)
-                         : (shape_i == 0 ? expects[i].quad_v24 : expects[i].quad_v16);
+                  d == 0 ? expects[i].tri_wgs[shape_i]
+                         : expects[i].quad_wgs[shape_i];
                CHECK(info.max_child_wgs_per_patch == want_wgs);
                /* Also verify real OBJECT NIR launch_grid[0] matches! */
                uint8_t pay[1024] = {0};
