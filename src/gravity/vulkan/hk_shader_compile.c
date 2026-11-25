@@ -1979,6 +1979,7 @@ hk_apple9_native_tess_fused_check(struct hk_device *dev,
       .vertex = key->vertex,
       .max_payload_bytes = AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES,
       .fs_reads_clip_distance = key->fs_reads_clip_distance,
+      .fs_reads_primitive_id = key->fs_reads_primitive_id || !has_fs_mask,
       .has_fs_inputs_mask = has_fs_mask,
    };
    struct hk_apple9_graphics_key stage_key = *key;
@@ -2889,6 +2890,10 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
          key.vertex.outputs_linear = infos[i].nir->info.linear_varyings;
          key.fs_reads_clip_distance = infos[i].nir->info.inputs_read &
             (VARYING_BIT_CLIP_DIST0 | VARYING_BIT_CLIP_DIST1);
+         key.fs_reads_primitive_id =
+            !!((infos[i].nir->info.inputs_read & VARYING_BIT_PRIMITIVE_ID) ||
+               BITSET_TEST(infos[i].nir->info.system_values_read,
+                           SYSTEM_VALUE_PRIMITIVE_ID));
       }
    }
 
@@ -3182,6 +3187,8 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                      .vertex = key.vertex,
                      .max_payload_bytes = AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES,
                      .fs_reads_clip_distance = key.fs_reads_clip_distance,
+                     .fs_reads_primitive_id =
+                        key.fs_reads_primitive_id || !has_fs_var_read_mask,
                      .has_fs_inputs_mask = has_fs_var_read_mask,
                   };
                   if (has_fs_var_read_mask)
@@ -3781,6 +3788,10 @@ hk_apple9_compile_graphics_mode(struct hk_device *dev, uint32_t count,
          key.vertex.outputs_linear = infos[i].nir->info.linear_varyings;
          key.fs_reads_clip_distance = !!(infos[i].nir->info.inputs_read &
             (VARYING_BIT_CLIP_DIST0 | VARYING_BIT_CLIP_DIST1));
+         key.fs_reads_primitive_id =
+            !!((infos[i].nir->info.inputs_read & VARYING_BIT_PRIMITIVE_ID) ||
+               BITSET_TEST(infos[i].nir->info.system_values_read,
+                           SYSTEM_VALUE_PRIMITIVE_ID));
       }
       if (infos[i].stage != MESA_SHADER_FRAGMENT)
          continue;

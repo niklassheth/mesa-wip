@@ -258,10 +258,9 @@ clamp_factor(float factor, enum poly_tess_partitioning partitioning, float maxf)
                     ? POLY_TESS_MAX_ODD_TESSELLATION_FACTOR
                     : POLY_TESS_MAX_EVEN_TESSELLATION_FACTOR;
 
-   // If any TessFactor will end up > 1 after floatToFixed conversion later,
+   // If any TessFactor is strictly > 1 (before 16.16 quantization),
    // then force the inside TessFactors to be > 1 so there is a picture frame.
-   if (partitioning == POLY_TESS_PARTITIONING_FRACTIONAL_ODD &&
-       maxf > MIN_ODD_TESSFACTOR_PLUS_HALF_EPSILON) {
+   if (partitioning == POLY_TESS_PARTITIONING_FRACTIONAL_ODD && maxf > 1.0f) {
 
       lower = POLY_TESS_MIN_ODD_TESSELLATION_FACTOR + EPSILON;
    }
@@ -364,16 +363,18 @@ RemoveMSB(uint32_t val)
 }
 
 static inline int
-NumPointsForTessFactor(bool odd, FXP fxpTessFactor)
+NumSegmentsForTessFactorFloat(enum poly_tess_partitioning partitioning,
+                              float clamped)
 {
-   // Add epsilon for rounding and add 1 for odd
-   FXP f = fxpTessFactor + (odd ? (FXP_ONE + 1) : 1);
-   int r = fxpCeil(f / 2) >> (FXP_FRACTION_BITS - 1);
-   return odd ? r : r + 1;
+   if (partitioning == POLY_TESS_PARTITIONING_INTEGER)
+      return (int)clamped;
+   if (partitioning == POLY_TESS_PARTITIONING_FRACTIONAL_ODD)
+      return 2 * (int)ceil((clamped - 1.0f) * 0.5f) + 1;
+   return 2 * (int)ceil(clamped * 0.5f);
 }
 
 static inline void
-ComputeTessFactorCtx(bool odd, FXP fxpTessFactor,
+ComputeTessFactorCtx(bool odd, FXP fxpTessFactor, int numSegments,
                      private TESS_FACTOR_CONTEXT *TessFactorCtx)
 {
    // fxpHalfTessFactor == 1/2 if TessFactor is 1,
@@ -382,9 +383,16 @@ ComputeTessFactorCtx(bool odd, FXP fxpTessFactor,
    if (odd || (fxpHalfTessFactor == FXP_ONE_HALF)) {
       fxpHalfTessFactor += FXP_ONE_HALF;
    }
-   FXP fxpFloorHalfTessFactor = fxpFloor(fxpHalfTessFactor);
-   FXP fxpCeilHalfTessFactor = fxpCeil(fxpHalfTessFactor);
-   TessFactorCtx->fxpHalfTessFactorFraction = fxpHalfTessFactor - fxpFloorHalfTessFactor;
+   int ceilInt = max(1, (numSegments + (odd ? 1 : 0)) >> 1);
+   FXP fxpCeilHalfTessFactor = (FXP)ceilInt << FXP_FRACTION_BITS;
+   FXP fxpFloorHalfTessFactor =
+      fxpHalfTessFactor < fxpCeilHalfTessFactor
+         ? ((FXP)(ceilInt - 1) << FXP_FRACTION_BITS)
+         : fxpCeilHalfTessFactor;
+   TessFactorCtx->fxpHalfTessFactorFraction =
+      fxpHalfTessFactor < fxpCeilHalfTessFactor
+         ? (fxpHalfTessFactor - fxpFloorHalfTessFactor)
+         : 0;
    TessFactorCtx->numHalfTessFactorPoints =
       (fxpCeilHalfTessFactor >> FXP_FRACTION_BITS); // for EVEN, we don't include the point always
                                                     // fixed at the midpoint of the TessFactor
@@ -789,21 +797,19 @@ poly_tess_isoline_process(constant struct poly_tess_params *p, uint32_t patch,
    }
 
    FXP fxpTessFactor_U_LineDetail = floatToFixed(TessFactor_U_LineDetail);
+   int numSegmentsPerLine =
+      NumSegmentsForTessFactorFloat(partitioning, TessFactor_U_LineDetail);
 
    ComputeTessFactorCtx(lineDetailOdd, fxpTessFactor_U_LineDetail,
-                        &lineDetailTessFactorCtx);
-   int numPointsPerLine =
-      NumPointsForTessFactor(lineDetailOdd, fxpTessFactor_U_LineDetail);
+                        numSegmentsPerLine, &lineDetailTessFactorCtx);
+   int numPointsPerLine = numSegmentsPerLine + 1;
 
    TessFactor_V_LineDensity = ceil(TessFactor_V_LineDensity);
    lineDensityOdd = isOdd(TessFactor_V_LineDensity);
    FXP fxpTessFactor_V_LineDensity = floatToFixed(TessFactor_V_LineDensity);
-   ComputeTessFactorCtx(lineDensityOdd, fxpTessFactor_V_LineDensity,
+   int numLines = (int)TessFactor_V_LineDensity;
+   ComputeTessFactorCtx(lineDensityOdd, fxpTessFactor_V_LineDensity, numLines,
                         &lineDensityTessFactorCtx);
-
-   // don't draw last line at V == 1.
-   int numLines =
-      NumPointsForTessFactor(lineDensityOdd, fxpTessFactor_V_LineDensity) - 1;
 
    /* Points */
    uint num_points = numPointsPerLine * numLines;
@@ -924,11 +930,12 @@ poly_tess_tri_process(constant struct poly_tess_params *p, uint32_t patch,
    insideTessFactor = floatToFixed(insideTessFactor_f);
 
    if (partitioning != POLY_TESS_PARTITIONING_FRACTIONAL_EVEN) {
-      // Special case if all TessFactors are 1
-      if ((FXP_ONE == insideTessFactor) &&
-          (FXP_ONE == outsideTessFactor[Ueq0]) &&
-          (FXP_ONE == outsideTessFactor[Veq0]) &&
-          (FXP_ONE == outsideTessFactor[Weq0])) {
+      // Special case if all TessFactors are 1 (checked on clamped floats before
+      // 16.16 quantization so sub-1/65536 factors still subdivide).
+      if ((1.0f == insideTessFactor_f) &&
+          (1.0f == outsideTessFactor_f[Ueq0]) &&
+          (1.0f == outsideTessFactor_f[Veq0]) &&
+          (1.0f == outsideTessFactor_f[Weq0])) {
 
          /* Just do minimum tess factor */
          if (mode == POLY_TESS_MODE_COUNT) {
@@ -958,33 +965,29 @@ poly_tess_tri_process(constant struct poly_tess_params *p, uint32_t patch,
       }
    }
 
-   // Compute per-TessFactor metadata
-   for (int edge = 0; edge < TRI_EDGES; edge++) {
-      ComputeTessFactorCtx(outsideTessFactorOdd[edge], outsideTessFactor[edge],
-                           &outsideTessFactorCtx[edge]);
-   }
-   ComputeTessFactorCtx(insideTessFactorOdd, insideTessFactor,
-                        &insideTessFactorCtx);
-
-   // Compute some initial data.
+   // Compute per-TessFactor metadata using parity-rounded segment counts from
+   // the clamped floating-point factors before 16.16 quantization.
    int NumPoints = 0;
 
    // outside edge offsets and storage
    for (int edge = 0; edge < TRI_EDGES; edge++) {
-      numPointsForOutsideEdge[edge] = NumPointsForTessFactor(
-         outsideTessFactorOdd[edge], outsideTessFactor[edge]);
+      int segs = NumSegmentsForTessFactorFloat(partitioning,
+                                               outsideTessFactor_f[edge]);
+      ComputeTessFactorCtx(outsideTessFactorOdd[edge], outsideTessFactor[edge],
+                           segs, &outsideTessFactorCtx[edge]);
+      numPointsForOutsideEdge[edge] = segs + 1;
       NumPoints += numPointsForOutsideEdge[edge];
    }
    NumPoints -= 3;
 
    // inside edge offsets
-   numPointsForInsideTessFactor =
-      NumPointsForTessFactor(insideTessFactorOdd, insideTessFactor);
    {
+      int segs = NumSegmentsForTessFactorFloat(partitioning, insideTessFactor_f);
+      ComputeTessFactorCtx(insideTessFactorOdd, insideTessFactor, segs,
+                           &insideTessFactorCtx);
       int pointCountMin = insideTessFactorOdd ? 4 : 3;
       // max() allows degenerate transition regions when inside TessFactor == 1
-      numPointsForInsideTessFactor =
-         max(pointCountMin, numPointsForInsideTessFactor);
+      numPointsForInsideTessFactor = max(pointCountMin, segs + 1);
    }
 
    insideEdgePointBaseOffset = NumPoints;
@@ -1263,13 +1266,14 @@ poly_tess_quad_process(constant struct poly_tess_params *p, uint32_t patch,
    }
 
    if (partitioning != POLY_TESS_PARTITIONING_FRACTIONAL_EVEN) {
-      // Special case if all TessFactors are 1
-      if ((FXP_ONE == insideTessFactor[U]) &&
-          (FXP_ONE == insideTessFactor[V]) &&
-          (FXP_ONE == outsideTessFactor[Ueq0]) &&
-          (FXP_ONE == outsideTessFactor[Veq0]) &&
-          (FXP_ONE == outsideTessFactor[Ueq1]) &&
-          (FXP_ONE == outsideTessFactor[Veq1])) {
+      // Special case if all TessFactors are 1 (checked on clamped floats before
+      // 16.16 quantization so sub-1/65536 factors still subdivide).
+      if ((1.0f == insideTessFactor_f[U]) &&
+          (1.0f == insideTessFactor_f[V]) &&
+          (1.0f == outsideTessFactor_f[Ueq0]) &&
+          (1.0f == outsideTessFactor_f[Veq0]) &&
+          (1.0f == outsideTessFactor_f[Ueq1]) &&
+          (1.0f == outsideTessFactor_f[Veq1])) {
 
          /* Just do minimum tess factor */
          if (!p->points_mode) {
@@ -1296,35 +1300,30 @@ poly_tess_quad_process(constant struct poly_tess_params *p, uint32_t patch,
       }
    }
 
-   // Compute TessFactor-specific metadata
-   for (int edge = 0; edge < QUAD_EDGES; edge++) {
-      ComputeTessFactorCtx(outsideTessFactorOdd[edge], outsideTessFactor[edge],
-                           &outsideTessFactorCtx[edge]);
-   }
-
-   for (int axis = 0; axis < QUAD_AXES; axis++) {
-      ComputeTessFactorCtx(insideTessFactorOdd[axis], insideTessFactor[axis],
-                           &insideTessFactorCtx[axis]);
-   }
-
+   // Compute TessFactor-specific metadata using parity-rounded segment counts
+   // from the clamped floating-point factors before 16.16 quantization.
    int NumPoints = 0;
 
    // outside edge offsets and storage
    for (int edge = 0; edge < QUAD_EDGES; edge++) {
-      numPointsForOutsideEdge[edge] = NumPointsForTessFactor(
-         outsideTessFactorOdd[edge], outsideTessFactor[edge]);
+      int segs = NumSegmentsForTessFactorFloat(partitioning,
+                                               outsideTessFactor_f[edge]);
+      ComputeTessFactorCtx(outsideTessFactorOdd[edge], outsideTessFactor[edge],
+                           segs, &outsideTessFactorCtx[edge]);
+      numPointsForOutsideEdge[edge] = segs + 1;
       NumPoints += numPointsForOutsideEdge[edge];
    }
    NumPoints -= 4;
 
    // inside edge offsets
    for (int axis = 0; axis < QUAD_AXES; axis++) {
-      numPointsForInsideTessFactor[axis] = NumPointsForTessFactor(
-         insideTessFactorOdd[axis], insideTessFactor[axis]);
+      int segs = NumSegmentsForTessFactorFloat(partitioning,
+                                               insideTessFactor_f[axis]);
+      ComputeTessFactorCtx(insideTessFactorOdd[axis], insideTessFactor[axis],
+                           segs, &insideTessFactorCtx[axis]);
       int pointCountMin = insideTessFactorOdd[axis] ? 4 : 3;
       // max() allows degenerate transition regions when inside TessFactor == 1
-      numPointsForInsideTessFactor[axis] =
-         max(pointCountMin, numPointsForInsideTessFactor[axis]);
+      numPointsForInsideTessFactor[axis] = max(pointCountMin, segs + 1);
    }
 
    insideEdgePointBaseOffset = NumPoints;

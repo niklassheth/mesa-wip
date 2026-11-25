@@ -45,7 +45,6 @@
 
 /* Minimum positive 16.16 fixed-point epsilon matching poly_tessellator.h. */
 #define HK_TESS_ODD_MIN_PLUS_EPS  (1.0f + 1.0f / 65536.0f)
-#define HK_TESS_ODD_HALF_EPS      (1.0f + 0.5f / 65536.0f)
 
 struct tess_meshlet_shape {
    unsigned max_v;
@@ -61,8 +60,7 @@ choose_meshlet_shape(unsigned vertex_components)
 {
    unsigned planes = ALIGN_POT(vertex_components, 4);
    if (planes <= 4) {
-      /* wg_rows = 8 * 4 + 8 = 40 <= 40 (unbounded); fits tess4 tri (V19/P24)
-       * and tess4 quad (V25/P32) in a single child MESH workgroup. */
+      /* Fits tess4 tri (V19/P24) and tess4 quad (V25/P32) in one child MESH WG. */
       return (struct tess_meshlet_shape){
          .max_v = 32,
          .max_p = 42,
@@ -72,8 +70,9 @@ choose_meshlet_shape(unsigned vertex_components)
          .allow_whole_patch = true,
       };
    }
-   if (planes <= 8) {
-      /* wg_rows = 4 * 8 + 8 = 40 <= 40 (unbounded). */
+   if (planes <= 68) {
+      /* Safe-stride U0_B unlocks wg_rows == 32 and wg_rows > 40 across all
+       * planes <= 68 (3.78x faster on T8132 silicon at comps=32 vs V4/P2). */
       return (struct tess_meshlet_shape){
          .max_v = 16,
          .max_p = 18,
@@ -83,31 +82,15 @@ choose_meshlet_shape(unsigned vertex_components)
          .allow_whole_patch = true,
       };
    }
-   if (planes == 16) {
-      /* wg_rows = 2 * 16 + 8 = 40 <= 40 (unbounded).
-       * Note: planes == 12 with V=8 would hit wg_rows = 2 * 12 + 8 = 32
-       * (TVB-grow exact-wrap divisor), so planes == 12 uses V=4 below
-       * (wg_rows = 1 * 12 + 8 = 20, unbounded and safe). */
-      return (struct tess_meshlet_shape){
-         .max_v = 8,
-         .max_p = 6,
-         .tile_w = 3,
-         .tile_h = 1,
-         .p_strip = 6,
-         .allow_whole_patch = true,
-      };
-   }
-   /* planes = 12, 20, 28, 32 -> wg_rows in {20, 28, 36, 40} (unbounded);
-    * planes = 24 -> padded to 28 (wg_rows = 36, unbounded) by native mesh
-    * lowering so it never hits the wg_rows == 32 TVB-grow exact-wrap guard;
-    * planes = 36..64 -> wg_rows = 44..72 (draw-time ring-bounded). */
+   /* Very wide varying payloads (planes 72..128): V8/P6 keeps safe-stride
+    * ring occupancy compact while still 2.6x+ wider than V4/P2. */
    return (struct tess_meshlet_shape){
-      .max_v = 4,
-      .max_p = 2,
-      .tile_w = 1,
+      .max_v = 8,
+      .max_p = 6,
+      .tile_w = 3,
       .tile_h = 1,
-      .p_strip = 2,
-      .allow_whole_patch = false,
+      .p_strip = 6,
+      .allow_whole_patch = true,
    };
 }
 
@@ -494,13 +477,13 @@ cpu_seg_count(float clamped, enum gl_tess_spacing spacing)
 {
    if (spacing == TESS_SPACING_EQUAL)
       return (unsigned)clamped;
-   /* Match NumPointsForTessFactor(odd, floatToFixed(clamped)) - 1 bit-for-bit. */
-   const bool odd = spacing == TESS_SPACING_FRACTIONAL_ODD;
-   uint32_t fxp = (uint32_t)(clamped * 65536.0f + 0.5f);
-   uint32_t half = (fxp + (odd ? 65537u : 1u)) >> 1;
-   uint32_t ceil_half = (half + 0xffffu) & ~0xffffu;
-   uint32_t r = ceil_half >> 15;
-   return odd ? r - 1u : r;
+   /* Parity-round on the clamped binary32 float before 16.16 quantization so
+    * factors immediately above a parity boundary (e.g. 0x40000001 for even or
+    * 0x3f800001 for odd) retain their required segment count. Both (clamped - 1)
+    * in [0, 62] and * 0.5f are exact in IEEE-754 binary32. */
+   if (spacing == TESS_SPACING_FRACTIONAL_ODD)
+      return 2u * (unsigned)ceilf((clamped - 1.0f) * 0.5f) + 1u;
+   return 2u * (unsigned)ceilf(clamped * 0.5f);
 }
 
 static void
@@ -532,8 +515,7 @@ cpu_patch_counts(enum tess_primitive_mode domain, enum gl_tess_spacing spacing,
       if (raw_i > maxf)
          maxf = raw_i;
    }
-   float in_lo = (spacing == TESS_SPACING_FRACTIONAL_ODD &&
-                  maxf > HK_TESS_ODD_HALF_EPS)
+   float in_lo = (spacing == TESS_SPACING_FRACTIONAL_ODD && maxf > 1.0f)
                     ? HK_TESS_ODD_MIN_PLUS_EPS
                     : 0.0f;
    for (unsigned a = 0; a < n_inner; ++a)
@@ -1333,6 +1315,36 @@ finterval_div(struct tess_finterval a, struct tess_finterval b)
    return r;
 }
 
+/* IEEE-754 binary32 round-to-nearest-even implemented purely on bit patterns
+ * so interval analysis never depends on the calling thread's fegetround() mode. */
+static float
+finterval_round_even(float x)
+{
+   uint32_t bits;
+   memcpy(&bits, &x, sizeof(bits));
+   uint32_t sign = bits & 0x80000000u;
+   int exp = (int)((bits >> 23) & 0xffu) - 127;
+   if (exp >= 23)
+      return x;
+   if (exp < 0) {
+      uint32_t abs_bits = bits & 0x7fffffffu;
+      uint32_t res = abs_bits > 0x3f000000u ? (sign | 0x3f800000u) : sign;
+      float out;
+      memcpy(&out, &res, sizeof(out));
+      return out;
+   }
+   uint32_t frac_bits = 23u - (uint32_t)exp;
+   uint32_t frac_mask = (1u << frac_bits) - 1u;
+   uint32_t half = 1u << (frac_bits - 1u);
+   uint32_t frac = bits & frac_mask;
+   uint32_t trunc_bits = bits & ~frac_mask;
+   if (frac > half || (frac == half && ((trunc_bits >> frac_bits) & 1u)))
+      trunc_bits += (1u << frac_bits);
+   float out;
+   memcpy(&out, &trunc_bits, sizeof(out));
+   return out;
+}
+
 struct tess_interval_ctx {
    struct tess_finterval *memo;
    uint8_t *state; /* 0 = unvisited, 1 = visiting, 2 = done */
@@ -1574,8 +1586,8 @@ eval_finterval(struct tess_interval_ctx *ctx, nir_def *def, unsigned comp,
             lo = ceilf(lo);
             hi = ceilf(hi);
          } else {
-            lo = nearbyintf(lo);
-            hi = nearbyintf(hi);
+            lo = finterval_round_even(lo);
+            hi = finterval_round_even(hi);
          }
          res = (struct tess_finterval){
             .lo = lo,
@@ -1818,7 +1830,12 @@ analyze_tess_level_bounds(nir_shader *vs, nir_shader *tcs,
             unsigned wmask = nir_intrinsic_write_mask(intr);
             u_foreach_bit(i, wmask) {
                unsigned dst = comp + i;
-               if ((is_outer && dst >= n_edges) || (!is_outer && dst >= n_inner))
+               /* Track all 6 addressable TCS tess-level slots (Outer[0..3],
+                * Inner[0..1]) across both passes so cross-invocation reads of
+                * domain-inactive slots (e.g. Outer[3] on triangles) never
+                * spuriously evaluate to 0.0f. Domain projection happens below
+                * when deriving final generator bounds. */
+               if ((is_outer && dst >= 4u) || (!is_outer && dst >= 2u))
                   continue;
                unsigned slot = is_outer ? dst : 4u + dst;
                struct tess_finterval iv =
@@ -1992,12 +2009,16 @@ nir_eval_1d_fxp(nir_builder *b, enum gl_tess_spacing spacing, nir_def *n,
             b, nir_ieq_imm(b, fxp_half, HK_TESS_FXP_ONE_HALF),
             nir_imm_int(b, HK_TESS_FXP_ONE), fxp_half);
       }
-      nir_def *fxp_floor = nir_iand_imm(b, fxp_half, ~0xffffu);
-      nir_def *fxp_ceil =
-         nir_iand_imm(b, nir_iadd_imm(b, fxp_half, 0xffffu), ~0xffffu);
-      nir_def *frac = nir_isub(b, fxp_half, fxp_floor);
-      nir_def *floor_int = nir_ushr_imm(b, fxp_floor, 16);
-      nir_def *ceil_int = nir_ushr_imm(b, fxp_ceil, 16);
+      nir_def *ceil_int = nir_umax(
+         b, nir_ushr_imm(b, nir_iadd_imm(b, n, odd ? 1 : 0), 1),
+         nir_imm_int(b, 1));
+      nir_def *fxp_ceil = nir_ishl_imm(b, ceil_int, 16);
+      nir_def *below_ceil = nir_ult(b, fxp_half, fxp_ceil);
+      nir_def *floor_int = nir_bcsel(
+         b, below_ceil, nir_iadd_imm(b, ceil_int, -1), ceil_int);
+      nir_def *fxp_floor = nir_ishl_imm(b, floor_int, 16);
+      nir_def *frac = nir_bcsel(
+         b, below_ceil, nir_isub(b, fxp_half, fxp_floor), nir_imm_int(b, 0));
 
       nir_def *split_raw;
       if (odd) {
@@ -2048,20 +2069,84 @@ nir_eval_1d(nir_builder *b, enum gl_tess_spacing spacing, nir_def *n,
    return nir_fxp_to_f32(b, nir_eval_1d_fxp(b, spacing, n, f, k));
 }
 
-/* Closed-form symmetric monotone strip stitcher: maps step t in [0..n_o+n_is]
- * to inner vertex index i(t) in [0..n_is] with i(t+1)-i(t) in {0, 1}. */
+/* Exact bitmask of positions in finalPointPositionTable(2..32) with bound < H
+ * (H in [0..32]). Matches tessellator.h::StitchTransition bit-for-bit. */
+static nir_def *
+nir_stitch_mask(nir_builder *b, nir_def *h)
+{
+   nir_def *k = nir_usub_sat(b, h, nir_imm_int(b, 1)); /* 0..31 */
+   nir_def *b_msb = nir_ufind_msb(b, k);               /* 0..4 for k >= 1 */
+   nir_def *r = nir_isub(b, k, nir_ishl(b, nir_imm_int(b, 1), b_msb));
+   nir_def *is_b0 = nir_ieq_imm(b, b_msb, 0);
+   nir_def *is_b1 = nir_ieq_imm(b, b_msb, 1);
+   nir_def *is_b2 = nir_ieq_imm(b, b_msb, 2);
+   nir_def *is_b3 = nir_ieq_imm(b, b_msb, 3);
+   nir_def *base = nir_bcsel(
+      b, is_b0, nir_imm_int(b, 0x00000000u),
+      nir_bcsel(b, is_b1, nir_imm_int(b, 0x00008000u),
+                nir_bcsel(b, is_b2, nir_imm_int(b, 0x00808080u),
+                          nir_bcsel(b, is_b3, nir_imm_int(b, 0x08888888u),
+                                    nir_imm_int(b, 0x2aaaaaaau)))));
+   nir_def *lvl = nir_bcsel(
+      b, is_b0, nir_imm_int(b, 0x00008000u),
+      nir_bcsel(b, is_b1, nir_imm_int(b, 0x00800080u),
+                nir_bcsel(b, is_b2, nir_imm_int(b, 0x08080808u),
+                          nir_bcsel(b, is_b3, nir_imm_int(b, 0x22222222u),
+                                    nir_imm_int(b, 0x55555555u)))));
+   nir_def *stride = nir_ushr(b, nir_imm_int(b, 32), b_msb);
+   nir_def *bits = nir_imul(b, nir_iadd_imm(b, r, 1), stride);
+   nir_def *cut = nir_bcsel(
+      b, nir_uge_imm(b, bits, 32), nir_imm_int(b, 0xffffffffu),
+      nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), bits), -1));
+   return nir_bcsel(b, nir_ieq_imm(b, k, 0), nir_imm_int(b, 0),
+                    nir_ior(b, base, nir_iand(b, lvl, cut)));
+}
+
+static nir_def *
+nir_stitch_i_half(nir_builder *b, nir_def *h_o, nir_def *h_i, nir_def *t)
+{
+   nir_def *m_o = nir_stitch_mask(b, h_o);
+   nir_def *m_i = nir_stitch_mask(b, h_i);
+   nir_def *o_init = nir_b2i32(b, nir_ine_imm(b, h_o, 0));
+   nir_def *rem = nir_usub_sat(b, t, o_init);
+   nir_def *pos = nir_imm_int(b, 0);
+   const unsigned steps[5] = {16, 8, 4, 2, 1};
+   for (unsigned s = 0; s < 5; ++s) {
+      nir_def *cand = nir_iadd_imm(b, pos, steps[s]);
+      nir_def *lo = nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), cand), -1);
+      nir_def *c = nir_iadd(b, nir_bit_count(b, nir_iand(b, m_i, lo)),
+                            nir_bit_count(b, nir_iand(b, m_o, lo)));
+      pos = nir_bcsel(b, nir_uge(b, rem, c), cand, pos);
+   }
+   nir_def *lo = nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), pos), -1);
+   nir_def *ci = nir_bit_count(b, nir_iand(b, m_i, lo));
+   nir_def *co = nir_bit_count(b, nir_iand(b, m_o, lo));
+   nir_def *extra = nir_bcsel(
+      b, nir_ult(b, nir_iadd(b, ci, co), rem),
+      nir_iand_imm(b, nir_ushr(b, m_i, pos), 1), nir_imm_int(b, 0));
+   return nir_bcsel(b, nir_uge(b, o_init, t), nir_imm_int(b, 0),
+                    nir_iadd(b, ci, extra));
+}
+
+/* Exact strip stitcher matching tessellator.h::StitchTransition (and
+ * StitchRegular DIAGONALS_MIRRORED when n_out == n_in_seg + 2) bit-for-bit
+ * across all (n_out, n_in_seg) in [1..64] x [0..62]: maps step t to inner
+ * vertex index i(t) in [0..n_in_seg] with i(t+1)-i(t) in {0, 1}. */
 static nir_def *
 nir_stitch_i(nir_builder *b, nir_def *n_out, nir_def *n_in_seg, nir_def *t)
 {
    nir_def *total = nir_iadd(b, n_out, n_in_seg);
+   nir_def *h_o = nir_ushr_imm(b, n_out, 1);
    nir_def *k = nir_ushr_imm(b, n_in_seg, 1);
-   nir_def *half_t = nir_iadd(b, nir_ushr_imm(b, n_out, 1), k);
-   nir_def *denom = nir_umax(b, half_t, nir_imm_int(b, 1));
-   nir_def *left = nir_udiv(b, nir_imul(b, t, k), denom);
+   nir_def *h_i = nir_iadd_imm(b, k, 1);
+   nir_def *half_t = nir_iadd(b, h_o, k);
+   nir_def *in_first = nir_uge(b, half_t, t);
    nir_def *rt = nir_usub_sat(b, total, t);
-   nir_def *right = nir_isub(b, n_in_seg, nir_udiv(b, nir_imul(b, rt, k), denom));
-   return nir_bcsel(b, nir_uge(b, half_t, t), left,
-                    nir_bcsel(b, nir_uge(b, half_t, rt), right,
+   nir_def *in_second = nir_uge(b, half_t, rt);
+   nir_def *t_query = nir_bcsel(b, in_first, t, rt);
+   nir_def *q = nir_stitch_i_half(b, h_o, h_i, t_query);
+   return nir_bcsel(b, in_first, q,
+                    nir_bcsel(b, in_second, nir_isub(b, n_in_seg, q),
                               nir_iadd_imm(b, k, 1)));
 }
 
@@ -2089,15 +2174,16 @@ nir_seg_count_from_factor(nir_builder *b, nir_def *clamped,
 {
    if (spacing == TESS_SPACING_EQUAL)
       return nir_f2u32(b, clamped);
-   /* Match NumPointsForTessFactor(odd, floatToFixed(clamped)) - 1 bit-for-bit
-    * so segment counts and PlacePointIn1D agree across sub-1/65536 boundaries. */
-   const bool odd = spacing == TESS_SPACING_FRACTIONAL_ODD;
-   nir_def *fxp = nir_float_to_fxp(b, clamped);
-   nir_def *half = nir_ushr_imm(b, nir_iadd_imm(b, fxp, odd ? 65537u : 1u), 1);
-   nir_def *ceil_half =
-      nir_iand_imm(b, nir_iadd_imm(b, half, 0xffffu), ~0xffffu);
-   nir_def *r = nir_ushr_imm(b, ceil_half, 15);
-   return odd ? nir_iadd_imm(b, r, -1) : r;
+   /* Parity-round on the clamped binary32 float before 16.16 quantization so
+    * factors immediately above a parity boundary retain their required segment
+    * count, matching tessellator.h::NumSegmentsForTessFactorFloat bit-for-bit. */
+   if (spacing == TESS_SPACING_FRACTIONAL_ODD) {
+      nir_def *half = nir_fmul_imm(b, nir_fadd_imm(b, clamped, -1.0f), 0.5f);
+      return nir_iadd_imm(b, nir_ishl_imm(b, nir_f2u32(b, nir_fceil(b, half)), 1),
+                          1);
+   }
+   nir_def *half = nir_fmul_imm(b, clamped, 0.5f);
+   return nir_ishl_imm(b, nir_f2u32(b, nir_fceil(b, half)), 1);
 }
 
 static nir_def *
@@ -2307,17 +2393,21 @@ lower_tcs_intr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return true;
    }
    case nir_intrinsic_barrier: {
-      /* Replace TCS output barrier with a workgroup barrier while preserving
-       * nir_var_mem_task_payload on our synthesized payload zero-init barrier. */
-      if (nir_intrinsic_execution_scope(intr) != SCOPE_NONE) {
-         nir_variable_mode keep =
-            nir_intrinsic_memory_modes(intr) & nir_var_mem_task_payload;
-         nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
-                     .memory_scope = SCOPE_WORKGROUP,
-                     .memory_semantics = NIR_MEMORY_ACQ_REL,
-                     .memory_modes = nir_var_mem_shared | keep);
+      /* Translate TCS output memory class to every backing storage class used
+       * by lowered TCS outputs (shared tess_levels + task payload backed by
+       * global memory). Preserve memory-only barriers and original semantics
+       * and scope rather than dropping them. */
+      nir_variable_mode modes = nir_intrinsic_memory_modes(intr);
+      if (modes & nir_var_shader_out) {
+         modes = (modes & ~nir_var_shader_out) | nir_var_mem_shared |
+                 nir_var_mem_task_payload;
+         nir_intrinsic_set_memory_modes(intr, modes);
       }
-      nir_instr_remove(&intr->instr);
+      if (nir_intrinsic_execution_scope(intr) != SCOPE_NONE) {
+         nir_intrinsic_set_execution_scope(intr, SCOPE_WORKGROUP);
+         if (modes && nir_intrinsic_memory_scope(intr) < SCOPE_WORKGROUP)
+            nir_intrinsic_set_memory_scope(intr, SCOPE_WORKGROUP);
+      }
       return true;
    }
    default:
@@ -2325,13 +2415,30 @@ lower_tcs_intr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 }
 
+struct tcs_split_barrier {
+   mesa_scope memory_scope;
+   nir_memory_semantics memory_semantics;
+   nir_variable_mode memory_modes;
+};
+
 static void
-emit_workgroup_shm_barrier(nir_builder *b)
+emit_tcs_split_barrier(nir_builder *b, const struct tcs_split_barrier *sb)
 {
+   nir_variable_mode modes = sb->memory_modes;
+   if (modes & nir_var_shader_out) {
+      modes = (modes & ~nir_var_shader_out) | nir_var_mem_shared |
+              nir_var_mem_task_payload;
+   }
+   mesa_scope mem_scope = sb->memory_scope;
+   if (modes && mem_scope < SCOPE_WORKGROUP)
+      mem_scope = SCOPE_WORKGROUP;
+   nir_memory_semantics sem = sb->memory_semantics;
+   if (modes && !sem)
+      sem = NIR_MEMORY_ACQ_REL;
    nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
-               .memory_scope = SCOPE_WORKGROUP,
-               .memory_semantics = NIR_MEMORY_ACQ_REL,
-               .memory_modes = nir_var_mem_shared);
+               .memory_scope = mem_scope,
+               .memory_semantics = sem,
+               .memory_modes = modes);
 }
 
 static nir_shader *
@@ -2421,18 +2528,30 @@ build_object_shader(nir_shader *vs, nir_shader *tcs,
    }
 
    /* Extract TCS segments split at top-level control barriers so barriers stay
-    * at uniform top-level CF across all 32 physical lanes. */
-   unsigned num_segs = util_dynarray_num_elements(&barriers, nir_instr *) + 1;
+    * at uniform top-level CF across all 32 physical lanes, preserving each
+    * original barrier's memory modes, semantics, and scope. */
+   unsigned num_bars = util_dynarray_num_elements(&barriers, nir_instr *);
+   unsigned num_segs = num_bars + 1;
    nir_cf_list *tcs_segs = calloc(num_segs, sizeof(*tcs_segs));
-   if (!tcs_segs) {
+   struct tcs_split_barrier *bar_info =
+      num_bars ? calloc(num_bars, sizeof(*bar_info)) : NULL;
+   if (!tcs_segs || (num_bars && !bar_info)) {
+      free(tcs_segs);
+      free(bar_info);
       util_dynarray_fini(&barriers);
       if (reason)
          *reason = "out of memory splitting TCS segments";
       return NULL;
    }
    nir_cursor cur = nir_before_impl(impl);
-   for (unsigned s = 0; s < num_segs - 1; ++s) {
+   for (unsigned s = 0; s < num_bars; ++s) {
       nir_instr *bar = *util_dynarray_element(&barriers, nir_instr *, s);
+      nir_intrinsic_instr *bi = nir_instr_as_intrinsic(bar);
+      bar_info[s] = (struct tcs_split_barrier){
+         .memory_scope = nir_intrinsic_memory_scope(bi),
+         .memory_semantics = nir_intrinsic_memory_semantics(bi),
+         .memory_modes = nir_intrinsic_memory_modes(bi),
+      };
       nir_cf_extract(&tcs_segs[s], cur, nir_before_instr(bar));
       cur = nir_after_instr(bar);
    }
@@ -2591,9 +2710,10 @@ build_object_shader(nir_shader *vs, nir_shader *tcs,
       b.cursor = nir_cf_reinsert(&tcs_segs[s], b.cursor);
       nir_pop_if(&b, tcs_if);
       if (s + 1 < num_segs)
-         emit_workgroup_shm_barrier(&b);
+         emit_tcs_split_barrier(&b, &bar_info[s]);
    }
    free(tcs_segs);
+   free(bar_info);
    /* Hoist load_const and undef out of guarded TCS segments into the entry
     * block so nir_repair_ssa_impl never wraps constant IO slot offsets in
     * phi(const, undef) across top-level barrier splits. */
@@ -2627,9 +2747,13 @@ build_object_shader(nir_shader *vs, nir_shader *tcs,
    NIR_PASS(_, obj, nir_shader_intrinsics_pass, lower_tcs_intr,
             nir_metadata_none, &tcs_state);
 
-   /* Final barrier: TCS tess-level stores visible to lane 0. */
+   /* Final barrier: TCS tess-level and payload stores visible before lane 0
+    * computes counts, writes the 40 B header, and launches child mesh WGs. */
    b.cursor = nir_after_impl(impl);
-   emit_workgroup_shm_barrier(&b);
+   nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_shared | nir_var_mem_task_payload);
 
    /* Phase 3: Lane 0 culls/clamps tess factors, writes 40 B header (+ optional
     * raw levels) to GET_SR 0xe0/0xe1 task payload, and launches exact child
@@ -2678,7 +2802,7 @@ build_object_shader(nir_shader *vs, nir_shader *tcs,
          nir_def *in_lo = NULL;
          if (spacing == TESS_SPACING_FRACTIONAL_ODD) {
             in_lo = nir_bcsel(
-               &b, nir_flt(&b, nir_imm_float(&b, HK_TESS_ODD_HALF_EPS), maxf),
+               &b, nir_flt(&b, nir_imm_float(&b, 1.0f), maxf),
                nir_imm_float(&b, HK_TESS_ODD_MIN_PLUS_EPS),
                nir_imm_float(&b, 1.0f));
          }
@@ -3021,37 +3145,33 @@ nir_tri_ring_uv(nir_builder *b, enum gl_tess_spacing spacing, nir_def *r,
          nir_iadd_imm(b, nir_imul_imm(b, perp_raw, HK_TESS_FXP_TWO_THIRDS),
                       HK_TESS_FXP_ONE_HALF),
          16);
-      nir_def *one_m_2p_fxp = nir_usub_sat(
-         b, nir_imm_int(b, HK_TESS_FXP_ONE), nir_ishl_imm(b, perp_fxp, 1));
+      /* Canonicalize ring endpoints (k == s_r) to the next edge's start
+       * ((e + 1) % 3, k = 0) and evaluate the exact fallback tessellator.h
+       * formula fxpParam - (fxpPerpParam + 1) / 2 so every interior vertex
+       * and corner matches the SW fallback bit-for-bit. */
+      nir_def *at_end = nir_ieq(b, k, s_r);
+      nir_def *e_c = nir_bcsel(
+         b, at_end,
+         nir_bcsel(b, nir_ieq_imm(b, e, 2), nir_imm_int(b, 0),
+                   nir_iadd_imm(b, e, 1)),
+         e);
+      nir_def *k_c = nir_bcsel(b, at_end, nir_imm_int(b, 0), k);
       nir_def *q = nir_bcsel(
-         b, nir_ieq_imm(b, e, 1), nir_iadd(b, r, k),
-         nir_usub_sat(b, nir_usub_sat(b, n_in, r), k));
+         b, nir_ieq_imm(b, e_c, 1), nir_iadd(b, r, k_c),
+         nir_usub_sat(b, nir_usub_sat(b, n_in, r), k_c));
       nir_def *param_fxp = nir_eval_1d_fxp(b, spacing, n_in, f_in, q);
       nir_def *half_perp = nir_ushr_imm(b, nir_iadd_imm(b, perp_fxp, 1), 1);
       nir_def *tmp_fxp = nir_usub_sat(b, param_fxp, half_perp);
-      nir_def *u_gen = nir_bcsel(b, nir_ieq_imm(b, e, 0), perp_fxp, tmp_fxp);
+      nir_def *u_gen = nir_bcsel(b, nir_ieq_imm(b, e_c, 0), perp_fxp, tmp_fxp);
       nir_def *v_gen = nir_bcsel(
-         b, nir_ieq_imm(b, e, 0), tmp_fxp,
-         nir_bcsel(b, nir_ieq_imm(b, e, 1), perp_fxp,
+         b, nir_ieq_imm(b, e_c, 0), tmp_fxp,
+         nir_bcsel(b, nir_ieq_imm(b, e_c, 1), perp_fxp,
                    nir_usub_sat(b, nir_imm_int(b, HK_TESS_FXP_ONE),
                                 nir_iadd(b, tmp_fxp, perp_fxp))));
-
-      /* Exact corner coordinates so k == s_r matches (e+1)%3, k == 0 bit-for-bit. */
-      nir_def *at_start = nir_ieq_imm(b, k, 0);
-      nir_def *at_end = nir_ieq(b, k, s_r);
-      nir_def *c_id = nir_bcsel(
-         b, at_start, e,
-         nir_bcsel(b, nir_ieq_imm(b, e, 2), nir_imm_int(b, 0),
-                   nir_iadd_imm(b, e, 1)));
-      nir_def *u_c =
-         nir_bcsel(b, nir_ieq_imm(b, c_id, 2), one_m_2p_fxp, perp_fxp);
-      nir_def *v_c =
-         nir_bcsel(b, nir_ieq_imm(b, c_id, 0), one_m_2p_fxp, perp_fxp);
-      nir_def *at_corner = nir_ior(b, at_start, at_end);
-      nir_def *u_fxp = nir_bcsel(b, is_center, nir_imm_int(b, HK_TESS_FXP_ONE_THIRD),
-                                 nir_bcsel(b, at_corner, u_c, u_gen));
-      nir_def *v_fxp = nir_bcsel(b, is_center, nir_imm_int(b, HK_TESS_FXP_ONE_THIRD),
-                                 nir_bcsel(b, at_corner, v_c, v_gen));
+      nir_def *u_fxp =
+         nir_bcsel(b, is_center, nir_imm_int(b, HK_TESS_FXP_ONE_THIRD), u_gen);
+      nir_def *v_fxp =
+         nir_bcsel(b, is_center, nir_imm_int(b, HK_TESS_FXP_ONE_THIRD), v_gen);
       uv_inner = nir_vec2(b, nir_fxp_to_f32(b, u_fxp), nir_fxp_to_f32(b, v_fxp));
    }
    nir_pop_if(b, NULL);
@@ -3085,8 +3205,10 @@ emit_quad_cell_tri(nir_builder *b, nir_def *prim_idx, nir_def *v00, nir_def *v10
    nir_def *gx2p1 = nir_iadd_imm(b, nir_ishl_imm(b, gx, 1), 1);
    nir_def *gy2p1 = nir_iadd_imm(b, nir_ishl_imm(b, gy, 1), 1);
    nir_def *diag_00_11 = nir_ior(
-      b, nir_iand(b, nir_ult(b, gx2p1, qu), nir_ult(b, gy2p1, qv)),
-      nir_iand(b, nir_ult(b, qu, gx2p1), nir_ult(b, qv, gy2p1)));
+      b,
+      nir_ior(b, nir_iand(b, nir_ult(b, gx2p1, qu), nir_ult(b, gy2p1, qv)),
+              nir_iand(b, nir_ult(b, qu, gx2p1), nir_ult(b, qv, gy2p1))),
+      nir_iand(b, nir_ieq(b, gx2p1, qu), nir_ine(b, gy2p1, qv)));
    nir_def *t0_c = nir_bcsel(b, diag_00_11, v11, v01);
    nir_def *t1_a = nir_bcsel(b, diag_00_11, v00, v10);
    emit_triangle_prim(b, prim_idx, nir_bcsel(b, is_t1, t1_a, v00),
@@ -3210,7 +3332,7 @@ build_mesh_shader(nir_shader *tes, enum tess_primitive_mode domain,
                   enum gl_tess_spacing spacing,
                   const struct tess_payload_layout *pl,
                   const struct tess_meshlet_shape *shape, unsigned clip_size,
-                  unsigned cull_size)
+                  unsigned cull_size, bool export_primitive_id)
 {
    NIR_PASS(_, tes, nir_lower_returns);
    NIR_PASS(_, tes, nir_lower_tess_coord_z, domain == TESS_PRIMITIVE_TRIANGLES);
@@ -3746,18 +3868,7 @@ build_mesh_shader(nir_shader *tes, enum tess_primitive_mode domain,
    nir_def *uv_val = nir_load_var(&b, uv_var);
 
    nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
-   nir_def *v_pub = v_live;
-   /* Avoid publishing a runtime vertex count whose quad-aligned footprint hits
-    * wg_rows == 32 (4096 / 32 = 128 exact wrap: V=21..24 at planes=4, V=9..12
-    * at planes=8). Extra slots stay <= shape->max_v and unreferenced. */
-   if (shape->max_v == 32) {
-      nir_def *bad = nir_ult_imm(&b, nir_iadd_imm(&b, v_pub, -21), 4);
-      v_pub = nir_bcsel(&b, bad, nir_imm_int(&b, 25), v_pub);
-   } else if (shape->max_v == 16) {
-      nir_def *bad = nir_ult_imm(&b, nir_iadd_imm(&b, v_pub, -9), 4);
-      v_pub = nir_bcsel(&b, bad, nir_imm_int(&b, 13), v_pub);
-   }
-   nir_set_vertex_and_primitive_count(&b, v_pub, p_live, nir_imm_int(&b, 0));
+   nir_set_vertex_and_primitive_count(&b, v_live, p_live, nir_imm_int(&b, 0));
    nir_pop_if(&b, NULL);
 
    nir_def *mode = nir_load_var(&b, mode_var);
@@ -4097,6 +4208,16 @@ build_mesh_shader(nir_shader *tes, enum tess_primitive_mode domain,
             &b, nir_imm_float(&b, 0.0f), lane, nir_imm_int(&b, 0),
             .component = d % 4, .write_mask = 1, .src_type = nir_type_float32,
             .io_semantics = {.location = VARYING_SLOT_CLIP_DIST0 + d / 4,
+                             .num_slots = 1});
+      }
+      if (export_primitive_id) {
+         /* Export the original patch ID (including first_patch chunk offset) as
+          * a flat linked mesh varying so FS gl_PrimitiveID observes the input
+          * patch ID rather than the rasterizer's generated triangle ID (0x60). */
+         nir_store_per_vertex_output(
+            &b, patch_id, lane, nir_imm_int(&b, 0),
+            .write_mask = 1, .src_type = nir_type_uint32,
+            .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_ID,
                              .num_slots = 1});
       }
       b.cursor = nir_cf_reinsert(&tes_body, b.cursor);
@@ -4519,6 +4640,11 @@ hk_nir_tess_fused_lower(const nir_shader *vs_source,
          out_masks[loc] |= wmask << comp;
       }
    }
+   const bool export_primitive_id =
+      options && options->fs_reads_primitive_id;
+   if (export_primitive_id)
+      out_masks[VARYING_SLOT_PRIMITIVE_ID] |= 1;
+
    unsigned vertex_components = 4; /* VARYING_SLOT_POS */
    for (unsigned loc = VARYING_SLOT_VAR0; loc < VARYING_SLOT_VAR0 + 32; ++loc)
       vertex_components += util_bitcount(out_masks[loc]);
@@ -4641,7 +4767,8 @@ hk_nir_tess_fused_lower(const nir_shader *vs_source,
    }
 
    nir_shader *mesh =
-      build_mesh_shader(tes, domain, spacing, &pl, &shape, clip_size, cull_size);
+      build_mesh_shader(tes, domain, spacing, &pl, &shape, clip_size, cull_size,
+                        export_primitive_id);
    if (!mesh) {
       ralloc_free(obj);
       ralloc_free(tes);

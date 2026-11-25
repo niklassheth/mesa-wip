@@ -75,6 +75,7 @@ struct hk_tess_fused_options {
    struct agx_apple9_vertex_layout vertex;
    uint32_t max_payload_bytes;
    bool fs_reads_clip_distance;
+   bool fs_reads_primitive_id;
    bool has_fs_inputs_mask;
    /* Per-VAR0..31 4-bit component mask read by the linked FS (all 0 for depth-only). */
    uint8_t fs_var_read_mask[32];
@@ -895,6 +896,10 @@ struct hk_apple9_graphics_key {
    /* The linked fragment shader reads gl_ClipDistance: a native mesh also
     * links its clip distances as varyings (hk_apple9_native_mesh_options). */
    bool fs_reads_clip_distance;
+   /* The linked fragment shader reads gl_PrimitiveID: fused tessellation must
+    * export the patch ID via a flat linked mesh varying rather than letting FS
+    * bind the rasterizer's generated triangle ID (0x60). */
+   bool fs_reads_primitive_id;
    /* Per-device policy; actual use still requires an exact qualified mesh. */
    bool native_index;
    /* Immutable task records feed native mesh children. API task stays compute. */
