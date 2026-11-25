@@ -1060,7 +1060,6 @@ agx_nir_lower_apple9_native_mesh(
       (nir->info.outputs_written & VARYING_BIT_LAYER);
    key.physical_threads = physical_threads;
    key.hw_payload = native_object_hw_payload;
-   key.pad_wg_rows_32 = options && options->attributes;
    if (!agx_nir_lower_apple9_mesh(nir, &key, info, reason))
       return false;
    if (native_object_payload) {
@@ -1279,10 +1278,22 @@ agx_nir_lower_apple9_native_mesh(
    /* Publish the completed output memory before issuing mesh allocation.
     * U0 consumes the counts but does not write these global output planes.
     * Keeping this fence before U0 lets the first channel submit consume U0's
-    * separate completion dependency through its measured input-wait field. */
+    * separate completion dependency through its measured input-wait field.
+    *
+    * When a wrap-safe U0_B stride exists for this layout, pass that constant
+    * U0_B for every non-empty workgroup so all dynamic SetMeshOutputsEXT(v, p)
+    * counts share one wrap-safe stride across the 4,096-row ring while
+    * MESH_SUBMIT_CHANNEL / MESH_SUBMIT_SCALAR still publish the exact runtime
+    * vertex count. */
    device_fence(&b);
+   nir_def *u0_b = vertices;
+   uint32_t safe_u0_b = 0;
+   if (agx_apple9_mesh_safe_u0_b(layout, &safe_u0_b, NULL) && safe_u0_b > 4u) {
+      u0_b = nir_bcsel(&b, nir_ine_imm(&b, vertices, 0),
+                       nir_imm_int(&b, safe_u0_b), nir_imm_int(&b, 0));
+   }
    nir_mesh_control_apple9_agx(&b, nir_u2u16(&b, primitives),
-                               nir_u2u16(&b, vertices), .base = 1);
+                               nir_u2u16(&b, u0_b), .base = 1);
 
    /* Each channel/index collective publishes at most one round of entries.
     * Its lanes form a contiguous prefix supplying one common source byte

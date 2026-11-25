@@ -114,6 +114,9 @@ def check_program(rows, channels=None):
                 assert (word >> 42) & 127 == int(r["src"][0][1:])
                 assert (word >> 50) & 31 == 0 and (word >> 84) & 63 == 16
                 return ("low16", value(r["src"][0], i))
+            if r["op"] == "SELECT":
+                assert len(r["src"]) == 1
+                return ("safe_u0_b", value(r["src"][0], i))
             raise AssertionError(("unmodelled input definition", r))
         raise AssertionError(("undefined allocated input", reg, before))
 
@@ -124,7 +127,10 @@ def check_program(rows, channels=None):
         assert not killed.intersection(r["src"]), ("post-U0 read", killed, r)
         killed.discard(r["dst"])
 
-    expected = [[("low16", ("local", 6, 16)), ("local", 6, 20)],
+    planes = ((len(channels) + 3) & ~3)
+    needs_safe_u0_b = (4096 % (planes + 4)) not in range(0, 1) and (4096 % (planes + 4)) < planes
+    u0_b = ("safe_u0_b", ("local", 6, 20)) if needs_safe_u0_b else ("local", 6, 20)
+    expected = [[("low16", ("local", 6, 16)), u0_b],
                 *channels, [("local", 6, 20), 0]]
     for i, want in zip(units, expected):
         got = [value(s, i) for s in decoded(i)]

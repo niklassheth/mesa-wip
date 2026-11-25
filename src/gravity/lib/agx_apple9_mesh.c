@@ -56,40 +56,32 @@ agx_apple9_mesh_state_build(uint32_t out[AGX_APPLE9_MESH_STATE_WORDS],
    return true;
 }
 
-/* T8132's mesh output ring holds 4,096 16-byte rows (64 KiB). Each workgroup
- * occupies ceil(V / 4) * ALIGN_POT(n, 4) + 8 rows (4-vertex quads times
- * 4-plane-aligned vertex components plus an 8-row per-workgroup header).
- * When a draw's total ring usage exceeds 4,096 rows, hardware can admit extra
- * workgroups before draining earlier ones, wrapping onto live workgroup data
- * (reproduced on T8132 with T32 V24 P30 K=1 at 56 rows/WG). Footprints <= 40
- * rows stay safe concurrently, except wg_rows == 32 (exact power-of-two ring
- * divisor 4096 / 32 = 128), which reproduced 3/3 corruption on T8132 silicon
- * during mid-render TVB growth (V=4 planes=24 and V=8 planes=12; wg_rows =
- * 16, 20, 24, 28, 36, 40 all passed 0/3). Larger footprints and wg_rows == 32
- * are admitted only when the entire draw fits in 4,096 rows. Generated GS/TES
- * mesh shaders also pad runtime SetMeshOutputsEXT counts out of the wg_rows ==
- * 32 quad band so runtime counts cannot hit it under an unbounded layout. */
+/* T8132's per-pipe mesh output ring holds 4,096 16-byte rows (64 KiB).
+ * When agx_apple9_mesh_safe_u0_b() finds a wrap-safe U0_B stride
+ * (4096 % stride == 0 || 4096 % stride >= actual_vtx_rows), common native
+ * mesh completion passes that constant U0_B to MESH_CONTROL for every
+ * non-empty workgroup, making all grid sizes concurrent-safe regardless of
+ * runtime vertex counts (including wg_rows == 32 and wg_rows > 40).
+ * Layouts too large for a wrap-safe stride <= 2048 fall back to bounded
+ * admission where cumulative ring occupancy stays within 4,096 rows. */
 static bool
 agx_apple9_mesh_wg_rows(const struct agx_apple9_mesh_layout *layout,
                         uint64_t *wg_rows)
 {
    if (!layout || !wg_rows)
       return false;
-   uint64_t quads = ((uint64_t)layout->max_vertices + 3) / 4;
-   uint64_t planes = ((uint64_t)layout->vertex_components + 3) & ~UINT64_C(3);
-   if (quads &&
-       planes > (AGX_APPLE9_MESH_RING_ROWS - AGX_APPLE9_MESH_RING_HEADER_ROWS) /
-                   quads)
+   uint64_t n =
+      (uint64_t)layout->vertex_components + (layout->primitive_components != 0);
+   uint64_t quads = ((uint64_t)layout->max_vertices + 3u) / 4u;
+   uint64_t planes = (n + 3u) & ~UINT64_C(3);
+   uint64_t header = MAX2(agx_apple9_mesh_idx_rows(layout),
+                          (uint64_t)AGX_APPLE9_MESH_RING_HEADER_ROWS);
+   if (header > AGX_APPLE9_MESH_RING_ROWS)
       return false;
-   *wg_rows = quads * planes + AGX_APPLE9_MESH_RING_HEADER_ROWS;
+   if (quads && planes > (AGX_APPLE9_MESH_RING_ROWS - header) / quads)
+      return false;
+   *wg_rows = quads * planes + header;
    return true;
-}
-
-static bool
-agx_apple9_mesh_wg_rows_concurrent_safe(uint64_t wg_rows)
-{
-   return wg_rows <= AGX_APPLE9_MESH_RING_CONCURRENT_SAFE_ROWS &&
-          wg_rows != AGX_APPLE9_MESH_RING_EXACT_WRAP_ROWS;
 }
 
 bool
@@ -99,9 +91,12 @@ agx_apple9_mesh_ring_max_groups(const struct agx_apple9_mesh_layout *layout,
    uint64_t wg_rows;
    if (!max_groups || !agx_apple9_mesh_wg_rows(layout, &wg_rows))
       return false;
-   *max_groups = agx_apple9_mesh_wg_rows_concurrent_safe(wg_rows)
-                    ? UINT64_MAX
-                    : AGX_APPLE9_MESH_RING_ROWS / wg_rows;
+   uint32_t safe_u0 = 0, safe_stride = 0;
+   if (agx_apple9_mesh_safe_u0_b(layout, &safe_u0, &safe_stride)) {
+      *max_groups = UINT64_MAX;
+      return true;
+   }
+   *max_groups = AGX_APPLE9_MESH_RING_ROWS / wg_rows;
    return true;
 }
 
@@ -112,7 +107,14 @@ agx_apple9_mesh_ring_usage(const struct agx_apple9_mesh_layout *layout,
    uint64_t wg_rows;
    if (!rows || !limited || !agx_apple9_mesh_wg_rows(layout, &wg_rows))
       return false;
-   *limited = !agx_apple9_mesh_wg_rows_concurrent_safe(wg_rows);
+   uint32_t safe_u0 = 0, safe_stride = 0;
+   if (agx_apple9_mesh_safe_u0_b(layout, &safe_u0, &safe_stride)) {
+      *limited = false;
+      uint64_t stride = safe_stride ? safe_stride : wg_rows;
+      *rows = groups > UINT64_MAX / stride ? UINT64_MAX : groups * stride;
+      return true;
+   }
+   *limited = true;
    *rows = groups > UINT64_MAX / wg_rows ? UINT64_MAX : groups * wg_rows;
    return true;
 }

@@ -316,58 +316,86 @@ check_mesh_ring_fits(void)
    CHECK(!agx_apple9_mesh_ring_fits(NULL, 1));
    CHECK(!agx_apple9_mesh_ring_max_groups(NULL, &max_groups));
 
-   /* Qualified native-index classes and small footprints (<= 40 rows) stay
-    * within the 64 KiB ring at any grid size without concurrent wrap. */
-   const struct agx_apple9_mesh_layout small_cases[] = {
+   /* Safe-stride U0_B unlocks wg_rows == 32 and wg_rows > 40 across all layouts
+    * with a wrap-safe stride <= 2048 (4096 % stride == 0 || >= vtx_rows). */
+   const struct agx_apple9_mesh_layout safe_cases[] = {
       {.max_vertices = 0, .vertex_components = 0},
-      {.max_vertices = 3, .vertex_components = 4},   /* 12 rows */
-      {.max_vertices = 32, .vertex_components = 4},  /* 40 rows (T32V32P42, exact safe cap) */
-      {.max_vertices = 16, .vertex_components = 8},  /* 40 rows (V16 K=1) */
-      {.max_vertices = 4, .vertex_components = 32},  /* 40 rows */
+      {.max_vertices = 3, .max_primitives = 1, .indices_per_primitive = 3, .vertex_components = 4},
+      {.max_vertices = 32, .max_primitives = 42, .indices_per_primitive = 3, .vertex_components = 4},
+      {.max_vertices = 16, .max_primitives = 1, .indices_per_primitive = 3, .vertex_components = 8},
+      {.max_vertices = 32, .max_primitives = 32, .indices_per_primitive = 3, .vertex_components = 4},
+      {.max_vertices = 4, .max_primitives = 2, .indices_per_primitive = 3, .vertex_components = 24},
+      {.max_vertices = 8, .max_primitives = 6, .indices_per_primitive = 3, .vertex_components = 12},
+      {.max_vertices = 4, .max_primitives = 2, .indices_per_primitive = 3, .vertex_components = 32},
+      {.max_vertices = 4, .max_primitives = 2, .indices_per_primitive = 3, .vertex_components = 56},
+      {.max_vertices = 16, .max_primitives = 18, .indices_per_primitive = 3, .vertex_components = 32},
+      {.max_vertices = 16, .max_primitives = 18, .indices_per_primitive = 3, .vertex_components = 64},
+      {.max_vertices = 32, .max_primitives = 42, .indices_per_primitive = 3, .vertex_components = 32},
+      {.max_vertices = 8, .max_primitives = 6, .indices_per_primitive = 3, .vertex_components = 128},
+      {.max_vertices = 24, .max_primitives = 30, .indices_per_primitive = 3, .vertex_components = 8},
+      {.max_vertices = 128, .max_primitives = 64, .indices_per_primitive = 3, .vertex_components = 8},
    };
-   for (unsigned i = 0; i < ARRAY_SIZE(small_cases); ++i) {
-      CHECK(agx_apple9_mesh_ring_max_groups(&small_cases[i], &max_groups));
+   for (unsigned i = 0; i < ARRAY_SIZE(safe_cases); ++i) {
+      uint32_t u0_b = 0, stride = 0;
+      CHECK(agx_apple9_mesh_safe_u0_b(&safe_cases[i], &u0_b, &stride));
+      if (safe_cases[i].max_vertices) {
+         uint64_t vtx_rows =
+            (uint64_t)DIV_ROUND_UP(safe_cases[i].max_vertices, 4u) *
+            ALIGN_POT(safe_cases[i].vertex_components, 4u);
+         uint64_t rem = AGX_APPLE9_MESH_RING_ROWS % stride;
+         CHECK(u0_b >= safe_cases[i].max_vertices &&
+               (u0_b == safe_cases[i].max_vertices || (u0_b % 4u) == 0));
+         CHECK(stride <= AGX_APPLE9_MESH_SAFE_STRIDE_MAX);
+         CHECK(rem == 0 || rem >= vtx_rows);
+      }
+      CHECK(agx_apple9_mesh_ring_max_groups(&safe_cases[i], &max_groups));
       CHECK(max_groups == UINT64_MAX);
-      CHECK(agx_apple9_mesh_ring_fits(&small_cases[i], 0));
-      CHECK(agx_apple9_mesh_ring_fits(&small_cases[i], 65535));
-      CHECK(agx_apple9_mesh_ring_fits(&small_cases[i],
+      CHECK(agx_apple9_mesh_ring_fits(&safe_cases[i], 0));
+      CHECK(agx_apple9_mesh_ring_fits(&safe_cases[i], 65535));
+      CHECK(agx_apple9_mesh_ring_fits(&safe_cases[i],
                                       HK_APPLE9_NATIVE_MAX_GROUP_TOTAL));
    }
 
-   /* Footprints > 40 rows (including T32 V24 P30 K=1 at 56 rows, which
-    * reproduced concurrent ring overwrite corruption on T8132 silicon) AND
-    * wg_rows == 32 (4096 / 32 = 128 exact power-of-two ring divisor, which
-    * reproduced 3/3 TVB-grow corruption on T8132 silicon) are admitted only
-    * when groups * wg_rows <= 4096. Planes align up to multiples of 4. */
+   /* Silicon-verified exact safe U0_B points from T8132 sweeps. */
+   {
+      uint32_t u0 = 0, st = 0;
+      struct agx_apple9_mesh_layout v16c32 = {
+         .max_vertices = 16, .max_primitives = 18, .indices_per_primitive = 3, .vertex_components = 32,
+      };
+      CHECK(agx_apple9_mesh_safe_u0_b(&v16c32, &u0, &st) && u0 == 20 && st == 164);
+      struct agx_apple9_mesh_layout v32c32 = {
+         .max_vertices = 32, .max_primitives = 42, .indices_per_primitive = 3, .vertex_components = 32,
+      };
+      CHECK(agx_apple9_mesh_safe_u0_b(&v32c32, &u0, &st) && u0 == 52 && st == 424);
+      struct agx_apple9_mesh_layout v4c24 = {
+         .max_vertices = 4, .max_primitives = 2, .indices_per_primitive = 3, .vertex_components = 24,
+      };
+      CHECK(agx_apple9_mesh_safe_u0_b(&v4c24, &u0, &st) && u0 == 8 && st == 52);
+      struct agx_apple9_mesh_layout v4c56 = {
+         .max_vertices = 4, .max_primitives = 2, .indices_per_primitive = 3, .vertex_components = 56,
+      };
+      CHECK(agx_apple9_mesh_safe_u0_b(&v4c56, &u0, &st) && u0 == 12 && st == 172);
+   }
+
+   /* Huge footprints exceeding the 2048-row safe-stride ceiling remain bounded
+    * to 4096 / wg_rows so cumulative ring occupancy never wraps. */
    const struct {
-      unsigned max_vertices, vertex_components;
+      unsigned max_vertices, max_primitives, vertex_components;
       uint64_t max_safe_groups;
    } ring_cases[] = {
-      { 4, 24, 128}, /* wg_rows = 1*24 + 8 = 32 (TVB-grow exact-wrap guard); 4096 / 32 = 128 */
-      { 8, 12, 128}, /* wg_rows = 2*12 + 8 = 32; 4096 / 32 = 128 */
-      {12,  8, 128}, /* wg_rows = 3*8  + 8 = 32; 4096 / 32 = 128 */
-      {24,  4, 128}, /* wg_rows = 6*4  + 8 = 32; 4096 / 32 = 128 */
-      {24,  8, 73},  /* T32 V24 P30 K=1 regression: 6*8 + 8 = 56; 4096 / 56 = 73 */
-      {48,  4, 73},  /* V48 pos-only: 12*4 + 8 = 56; 4096 / 56 = 73 */
-      {28,  8, 64},  /* 7*8 + 8 = 64; 4096 / 64 = 64 */
-      { 4, 56, 64},  /* 1*56 + 8 = 64; 4096 / 64 = 64 */
-      {32,  8, 56},  /* wg_rows = 8*8 + 8 = 72; 4096 / 72 = 56 */
-      {128, 8, 15},  /* draw_count_{32,64}: 32*8 + 8 = 264; 4096 / 264 = 15 */
-      {124, 8, 16},  /* 31*8 + 8 = 256; 4096 / 256 = 16 */
-      {256, 8, 7},   /* 64*8 + 8 = 520; 4096 / 520 = 7 */
-      {96, 10, 13},  /* ALIGN_POT(10,4)=12: 24*12 + 8 = 296; 4096 / 296 = 13 */
-      {100, 10, 13}, /* 25*12 + 8 = 308; 4096 / 308 = 13 */
-      {96, 12, 13},  /* 24*12 + 8 = 296; 4096 / 296 = 13 */
-      {48, 20, 16},  /* 12*20 + 8 = 248; 4096 / 248 = 16 */
-      {52, 20, 15},  /* 13*20 + 8 = 268; 4096 / 268 = 15 */
-      {6, 128, 15},  /* in_out.with_i16 max varyings: 2*128 + 8 = 264 */
-      {256, 60, 1},  /* 64*60 + 8 = 3848 <= 4096: single WG fits */
+      {256, 1, 32, 1},   /* 64*32 + 8 = 2056 > 2048: 4096 / 2056 = 1 */
+      {256, 1, 60, 1},   /* 64*60 + 8 = 3848 <= 4096: single WG fits */
+      {128, 1, 64, 1},   /* 32*64 + 8 = 2056 > 2048: 4096 / 2056 = 1 */
+      {128, 1, 124, 1},  /* 32*124 + 8 = 3976 <= 4096: single WG fits */
    };
    for (unsigned i = 0; i < ARRAY_SIZE(ring_cases); ++i) {
       struct agx_apple9_mesh_layout l = {
          .max_vertices = ring_cases[i].max_vertices,
+         .max_primitives = ring_cases[i].max_primitives,
+         .indices_per_primitive = 3,
          .vertex_components = ring_cases[i].vertex_components,
       };
+      CHECK(!agx_apple9_mesh_safe_u0_b(&l, NULL, NULL));
       CHECK(agx_apple9_mesh_ring_max_groups(&l, &max_groups));
       CHECK(max_groups == ring_cases[i].max_safe_groups);
       CHECK(agx_apple9_mesh_ring_fits(&l, 0));
@@ -468,13 +496,16 @@ check_batch_ring_budget(void)
       .primitives = 32,
    };
 
-   /* Two T32 V24 P30 K=1 draws of 73 groups (4088 rows each) individually fit
-    * 4096 rows, but combined (8176 > 4096) must split into separate renders. */
-   struct agx_apple9_mesh_layout v24k1 = {.max_vertices = 24, .vertex_components = 8};
+   /* Two ring-limited huge draws (2056 rows each) individually fit 4096 rows,
+    * but combined (4112 > 4096) must split into separate renders. */
+   struct agx_apple9_mesh_layout huge_lim = {
+      .max_vertices = 256, .max_primitives = 1, .indices_per_primitive = 3,
+      .vertex_components = 32,
+   };
    uint64_t rows = 0;
    bool limited = false;
-   CHECK(agx_apple9_mesh_ring_usage(&v24k1, 73, &rows, &limited));
-   CHECK(limited && rows == 73 * 56);
+   CHECK(agx_apple9_mesh_ring_usage(&huge_lim, 1, &rows, &limited));
+   CHECK(limited && rows == 2056);
    struct hk_apple9_stream_summary s = base_stream;
    struct hk_apple9_draw_summary d = base_draw;
    s.ring_rows = rows;
@@ -483,27 +514,15 @@ check_batch_ring_budget(void)
    d.ring_limited = limited;
    CHECK(!hk_apple9_native_stream_admits(&s, &d, &profile));
 
-   /* 24 single-WG V32 P32 K=4 draws (168 rows each) fit 4032 <= 4096 rows;
-    * the 25th (4200 > 4096) splits cleanly. */
-   struct agx_apple9_mesh_layout v32k4 = {.max_vertices = 32, .vertex_components = 20};
-   CHECK(agx_apple9_mesh_ring_usage(&v32k4, 1, &rows, &limited));
-   CHECK(limited && rows == 168);
-   s = base_stream;
-   d = base_draw;
-   s.ring_rows = 23 * rows;
-   s.ring_limited = true;
-   d.ring_rows = rows;
-   d.ring_limited = true;
-   CHECK(hk_apple9_native_stream_admits(&s, &d, &profile));
-   s.ring_rows = 24 * rows;
-   CHECK(!hk_apple9_native_stream_admits(&s, &d, &profile));
-
-   /* Concurrent-safe shapes (wg_rows <= 40) batch freely with one another,
-    * split against ring-limited draws when combined rows exceed 4096, and
-    * ordinary VS draws remain admissible in mixed renders. */
-   struct agx_apple9_mesh_layout v32k0 = {.max_vertices = 32, .vertex_components = 4};
-   CHECK(agx_apple9_mesh_ring_usage(&v32k0, 1000, &rows, &limited));
-   CHECK(!limited && rows == 40000);
+   /* Safe-stride layouts (e.g. V=16/P=18/comps=32, V=32/P=32/comps=20) report
+    * limited=false and batch freely with one another, split against ring-limited
+    * draws when combined rows exceed 4096, and ordinary VS draws stay admissible. */
+   struct agx_apple9_mesh_layout v16c32 = {
+      .max_vertices = 16, .max_primitives = 18, .indices_per_primitive = 3,
+      .vertex_components = 32,
+   };
+   CHECK(agx_apple9_mesh_ring_usage(&v16c32, 1000, &rows, &limited));
+   CHECK(!limited && rows == 1000 * 164);
    s = base_stream;
    d = base_draw;
    s.ring_rows = rows;
@@ -511,10 +530,10 @@ check_batch_ring_budget(void)
    d.ring_rows = rows;
    d.ring_limited = false;
    CHECK(hk_apple9_native_stream_admits(&s, &d, &profile));
-   d.ring_rows = 168;
+   d.ring_rows = 2056;
    d.ring_limited = true;
    CHECK(!hk_apple9_native_stream_admits(&s, &d, &profile));
-   s.ring_rows = 168;
+   s.ring_rows = 2056;
    s.ring_limited = true;
    d = (struct hk_apple9_draw_summary){.native = false, .primitives = 32};
    CHECK(hk_apple9_native_stream_admits(&s, &d, &profile));

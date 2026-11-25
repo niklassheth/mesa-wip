@@ -33,11 +33,6 @@ struct agx_apple9_mesh_key {
    /* Load the per-parent hardware payload VA from GET_SR 0xe0/0xe1 instead of
     * the draw-wide AGX_APPLE9_MESH_PAYLOAD_UNIFORM pointer. */
    bool hw_payload;
-   /* Pad vertex component layouts whose mesh ring footprint hits the T8132
-    * exact power-of-two wrap divisor wg_rows == 32 (planes == 24 at quads == 1
-    * -> planes == 28 / wg_rows == 36; planes == 12 at quads == 2 -> planes ==
-    * 16 / wg_rows == 40) so they stay concurrent-safe and unbounded. */
-   bool pad_wg_rows_32;
 };
 
 #define AGX_APPLE9_MESH_KEY                                                    \
@@ -124,6 +119,82 @@ agx_apple9_mesh_plane_offset(const struct agx_apple9_mesh_layout *layout,
    unsigned idx = layout->vertex_component[slot][component];
    assert(idx != AGX_APPLE9_MESH_UNUSED);
    return layout->position_B + layout->vertex_pitch_B * idx;
+}
+
+/* Apple9 (T8132) per-pipe mesh vertex output ring capacity in 16-byte rows
+ * (64 KiB). Each non-empty workgroup allocates a physical ring stride of:
+ *   stride = ceil(U0_B / 4) * ALIGN_POT(n, 4) + idx_rows
+ * where U0_B is the 16-bit auxiliary vertex count passed to MESH_CONTROL,
+ * n = vertex_components + (primitive_components != 0), and
+ * idx_rows = 4 * DIV_ROUND_UP(max_primitives * indices_per_primitive, 64).
+ *
+ * When a draw wraps the 4,096-row ring, the last workgroup before row 4,096
+ * starts at row (4096 - rem) where rem = 4096 % stride. If rem == 0 or
+ * rem >= ceil(max_vertices / 4) * ALIGN_POT(n, 4), its actual vertex writes
+ * stay strictly below row 4,096 and never overwrite live WG #0 at row 0,
+ * after which the ring pointer resets to 0 for the next workgroup. Passing
+ * this constant safe U0_B to MESH_CONTROL for every non-empty workgroup keeps
+ * the ring stride invariant across all dynamic SetMeshOutputsEXT(v, p) vertex
+ * counts v in [1..max_vertices] and unlocks wg_rows == 32 and wg_rows > 40. */
+#define AGX_APPLE9_MESH_RING_ROWS        4096u
+#define AGX_APPLE9_MESH_RING_HEADER_ROWS 8u
+#define AGX_APPLE9_MESH_SAFE_U0_B_MAX    256u
+#define AGX_APPLE9_MESH_SAFE_STRIDE_MAX  2048u
+
+static inline uint64_t
+agx_apple9_mesh_idx_rows(const struct agx_apple9_mesh_layout *layout)
+{
+   if (!layout)
+      return 4u;
+   uint64_t idx_bytes =
+      (uint64_t)layout->max_primitives * layout->indices_per_primitive;
+   if (!idx_bytes)
+      return 4u;
+   return DIV_ROUND_UP(idx_bytes, 64u) * 4u;
+}
+
+static inline bool
+agx_apple9_mesh_safe_u0_b(const struct agx_apple9_mesh_layout *layout,
+                          uint32_t *out_u0_b, uint32_t *out_stride)
+{
+   if (!layout)
+      return false;
+   if (!layout->max_vertices) {
+      if (out_u0_b)
+         *out_u0_b = 0;
+      if (out_stride)
+         *out_stride = 0;
+      return true;
+   }
+   uint64_t n =
+      layout->vertex_components
+         ? (uint64_t)layout->vertex_components + (layout->primitive_components != 0)
+         : 4u;
+   if (n > 256 || layout->max_vertices > AGX_APPLE9_MESH_SAFE_U0_B_MAX)
+      return false;
+   uint64_t quads = ((uint64_t)layout->max_vertices + 3u) / 4u;
+   uint64_t planes = (n + 3u) & ~UINT64_C(3);
+   uint64_t idx_rows = agx_apple9_mesh_idx_rows(layout);
+   if (idx_rows >= AGX_APPLE9_MESH_RING_ROWS)
+      return false;
+   uint64_t vtx_rows = quads * planes;
+   if (vtx_rows + idx_rows > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
+      return false;
+
+   for (uint64_t q = quads; q <= AGX_APPLE9_MESH_SAFE_U0_B_MAX / 4u; ++q) {
+      uint64_t stride = q * planes + idx_rows;
+      if (stride > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
+         break;
+      uint64_t rem = AGX_APPLE9_MESH_RING_ROWS % stride;
+      if (rem == 0 || rem >= vtx_rows) {
+         if (out_u0_b)
+            *out_u0_b = q == quads ? layout->max_vertices : (uint32_t)(q * 4u);
+         if (out_stride)
+            *out_stride = (uint32_t)stride;
+         return true;
+      }
+   }
+   return false;
 }
 
 struct agx_apple9_mesh_body_info {

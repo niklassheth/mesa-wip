@@ -3536,16 +3536,14 @@ TEST(Apple9MeshNativeExpand, PerVertexLayerAndViewportPreserveLayerBits)
    }
 }
 
-TEST(Apple9MeshNativeExpand, PadWgRows32ToUnbounded)
+TEST(Apple9MeshNativeExpand, SafeU0BUnlocksWgRows32AndGt40)
 {
-   /* Verify quads == 1 (V <= 4) with planes == 24 (21..24 comps) pads to
-    * vertex_components == 25 (planes == 28, wg_rows == 36), and quads == 2
-    * (V in 5..8) with planes == 12 (9..12 comps) pads to 13 (planes == 16,
-    * wg_rows == 40), and that no V <= 4 component count in 4..40 emits
-    * wg_rows == 32. */
+   /* Verify V=4 across 4..40 components (covering wg_rows == 32 at planes == 24
+    * and wg_rows > 40 at planes >= 36) keeps exact unpadded vertex_components
+    * and resolves a wrap-safe U0_B stride, keeping the ring unbounded. */
    for (unsigned user_comps = 0; user_comps <= 36; ++user_comps) {
       nir_builder b = nir_builder_init_simple_shader(
-         MESA_SHADER_MESH, &agx_nir_options, "pad_wg32_v4");
+         MESA_SHADER_MESH, &agx_nir_options, "safe_u0b_v4");
       b.shader->info.io_lowered = true;
       b.shader->info.workgroup_size[0] = 32;
       b.shader->info.workgroup_size[1] = 1;
@@ -3600,16 +3598,17 @@ TEST(Apple9MeshNativeExpand, PadWgRows32ToUnbounded)
                                                  &info, &reason))
          << "user_comps=" << user_comps << ": " << (reason ?: "");
       unsigned raw_vc = 4u + user_comps;
-      unsigned expected_vc =
-         ALIGN_POT(raw_vc, 4u) == 24u ? 25u : raw_vc;
-      EXPECT_EQ(info.layout.vertex_components, expected_vc);
-      EXPECT_EQ(code.info.apple9_varyings.count, expected_vc - 4u);
-      unsigned planes = ALIGN_POT(info.layout.vertex_components, 4u);
-      unsigned wg_rows = DIV_ROUND_UP(info.layout.max_vertices, 4u) * planes + 8u;
-      EXPECT_NE(wg_rows, 32u);
+      EXPECT_EQ(info.layout.vertex_components, raw_vc);
+      EXPECT_EQ(code.info.apple9_varyings.count, user_comps);
+      uint32_t safe_u0_b = 0, stride = 0;
+      ASSERT_TRUE(agx_apple9_mesh_safe_u0_b(&info.layout, &safe_u0_b, &stride));
+      unsigned planes = ALIGN_POT(raw_vc, 4u);
+      unsigned rem = AGX_APPLE9_MESH_RING_ROWS % stride;
+      EXPECT_TRUE(rem == 0u || rem >= planes);
       if (raw_vc >= 21u && raw_vc <= 24u) {
-         EXPECT_EQ(planes, 28u);
-         EXPECT_EQ(wg_rows, 36u);
+         /* v4_p24: planes=24, idx=4 -> U0_B=8, stride=52, rem=40 >= 24. */
+         EXPECT_EQ(safe_u0_b, 8u);
+         EXPECT_EQ(stride, 52u);
       }
       EXPECT_EQ(info.layout.local_size_B,
                 info.layout.position_B +
@@ -3618,30 +3617,31 @@ TEST(Apple9MeshNativeExpand, PadWgRows32ToUnbounded)
       ralloc_free(b.shader);
    }
 
-   /* Also verify quads == 2 (V=8) with planes == 12 (9..12 comps) pads to 13
-    * (planes == 16, wg_rows == 40). */
-   for (unsigned user_comps = 5; user_comps <= 8; ++user_comps) {
+   /* Verify widened V=16/P=18 with 32 components (v16_p32: planes=32, idx=4 ->
+    * U0_B=20, stride=164, rem=160 >= 128) compiles cleanly with exact unpadded
+    * vertex_components and safe U0_B == 20. */
+   {
       nir_builder b = nir_builder_init_simple_shader(
-         MESA_SHADER_MESH, &agx_nir_options, "pad_wg32_v8");
+         MESA_SHADER_MESH, &agx_nir_options, "safe_u0b_v16_p32");
       b.shader->info.io_lowered = true;
       b.shader->info.workgroup_size[0] = 32;
       b.shader->info.workgroup_size[1] = 1;
       b.shader->info.workgroup_size[2] = 1;
-      b.shader->info.mesh.max_vertices_out = 8;
-      b.shader->info.mesh.max_primitives_out = 4;
+      b.shader->info.mesh.max_vertices_out = 16;
+      b.shader->info.mesh.max_primitives_out = 18;
       b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
 
       nir_def *lane = nir_load_local_invocation_index(&b);
       nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
-      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 8),
-                                         nir_imm_int(&b, 4),
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 16),
+                                         nir_imm_int(&b, 18),
                                          nir_imm_int(&b, 0));
-      for (unsigned v = 0; v < 8; ++v) {
+      for (unsigned v = 0; v < 16; ++v) {
          nir_store_per_vertex_output(
             &b, nir_imm_vec4(&b, float(v), 0.0f, 0.5f, 1.0f), nir_imm_int(&b, v),
             nir_imm_int(&b, 0), .write_mask = 0xf, .src_type = nir_type_float32,
             .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
-         for (unsigned u = 0; u < user_comps; ++u) {
+         for (unsigned u = 0; u < 28; ++u) {
             nir_store_per_vertex_output(
                &b, nir_imm_float(&b, float(u + 1)), nir_imm_int(&b, v),
                nir_imm_int(&b, 0), .write_mask = 0x1, .component = u % 4,
@@ -3650,7 +3650,7 @@ TEST(Apple9MeshNativeExpand, PadWgRows32ToUnbounded)
                                 .num_slots = 1});
          }
       }
-      for (unsigned p = 0; p < 4; ++p) {
+      for (unsigned p = 0; p < 18; ++p) {
          nir_store_per_primitive_output(
             &b, nir_imm_ivec3(&b, 0, 1, 2), nir_imm_int(&b, p),
             nir_imm_int(&b, 0), .write_mask = 0x7, .src_type = nir_type_uint32,
@@ -3671,13 +3671,13 @@ TEST(Apple9MeshNativeExpand, PadWgRows32ToUnbounded)
       const char *reason = nullptr;
       ASSERT_TRUE(agx_compile_apple9_native_mesh(b.shader, true, &opts, &code,
                                                  &info, &reason))
-         << "v8 user_comps=" << user_comps << ": " << (reason ?: "");
-      EXPECT_EQ(info.layout.vertex_components, 13u);
-      EXPECT_EQ(code.info.apple9_varyings.count, 9u);
-      unsigned planes = ALIGN_POT(info.layout.vertex_components, 4u);
-      unsigned wg_rows = DIV_ROUND_UP(info.layout.max_vertices, 4u) * planes + 8u;
-      EXPECT_EQ(planes, 16u);
-      EXPECT_EQ(wg_rows, 40u);
+         << (reason ?: "");
+      EXPECT_EQ(info.layout.vertex_components, 32u);
+      EXPECT_EQ(code.info.apple9_varyings.count, 28u);
+      uint32_t safe_u0_b = 0, stride = 0;
+      ASSERT_TRUE(agx_apple9_mesh_safe_u0_b(&info.layout, &safe_u0_b, &stride));
+      EXPECT_EQ(safe_u0_b, 20u);
+      EXPECT_EQ(stride, 164u);
       free(code.binary);
       ralloc_free(b.shader);
    }

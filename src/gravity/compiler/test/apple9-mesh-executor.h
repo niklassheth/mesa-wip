@@ -38,7 +38,7 @@ struct machine {
    unsigned check_zero_header;
    unsigned count_lanes, actual_vertices, actual_primitives;
    bool variable_counts;
-   unsigned expected_vertices, expected_primitives;
+   unsigned expected_vertices, expected_primitives, expected_control_vertices;
    bool (*handle_intrinsic)(struct machine *, nir_intrinsic_instr *, unsigned);
 };
 
@@ -180,8 +180,16 @@ instruction(struct machine *m, nir_instr *i, unsigned lane)
          CHECK(nir_intrinsic_base(n) == 1);
          CHECK(src(m, n->src[0], lane)[0].u16 ==
                (m->variable_counts ? m->expected_primitives : 1));
-         CHECK(src(m, n->src[1], lane)[0].u16 ==
-               (m->variable_counts ? m->expected_vertices : 3));
+         {
+            unsigned exp_v = m->variable_counts ? m->expected_vertices : 3;
+            unsigned got_v = src(m, n->src[1], lane)[0].u16;
+            if (exp_v == 0)
+               CHECK(got_v == 0);
+            else if (m->expected_control_vertices)
+               CHECK(got_v == m->expected_control_vertices);
+            else
+               CHECK(got_v >= exp_v && got_v <= AGX_APPLE9_MESH_SAFE_U0_B_MAX);
+         }
          CHECK(!(m->controls & (1u << lane)));
          m->controls |= 1u << lane;
          break;
