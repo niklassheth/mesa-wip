@@ -1338,6 +1338,7 @@ apple9_materialize_unsupported_loads(struct agx_apple9_vir_program *program,
          for (unsigned c = 0; c < components; ++c)
             program->fixed_phys[producer->dest + c] = AGX_APPLE9_PHYS_INVALID;
          agx_apple9_vir_remove(program, producer);
+         agx_apple9_vir_ensure_indexed(program);
          --i;
          continue;
       }
@@ -1383,7 +1384,7 @@ apple9_collect_memory_source_tuples(struct agx_apple9_vir_program *program,
             struct agx_apple9_vir_instr *collect =
                program->instructions[old_count];
             agx_apple9_vir_move_before(program, collect, store);
-            agx_apple9_invalidate_uses(program);
+            agx_apple9_vir_ensure_indexed(program);
             store = program->instructions[i + 1];
             store->src[off[k]] = tuple;
             store->src[off[k] + 1] = tuple + 1;
@@ -1433,8 +1434,7 @@ apple9_collect_memory_source_tuples(struct agx_apple9_vir_program *program,
          struct agx_apple9_vir_instr *collect =
             program->instructions[old_count];
          agx_apple9_vir_move_before(program, collect, store);
-
-         agx_apple9_invalidate_uses(program);
+         agx_apple9_vir_ensure_indexed(program);
          store = program->instructions[i + 1];
          for (unsigned c = 0; c < components; ++c)
             store->src[first + c] = tuple + c;
@@ -1613,11 +1613,12 @@ bool
 agx_apple9_assign_vir_scoreboard_slots(struct agx_apple9_vir_program *program,
                                        const char **reason)
 {
-   agx_apple9_invalidate_uses(program);
    if (reason != NULL)
       *reason = NULL;
    if (program == NULL)
       return false;
+   agx_apple9_vir_ensure_indexed(program);
+   agx_apple9_invalidate_uses(program);
 
    for (unsigned i = 0; i < program->instruction_count; ++i) {
       struct agx_apple9_vir_instr *ins = program->instructions[i];

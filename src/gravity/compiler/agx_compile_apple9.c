@@ -9426,6 +9426,7 @@ apple9_compile_dag_once(nir_shader *nir, struct agx_shader_part *out,
       }
    }
    vir_offsets[lower.program.instruction_count] = emitter.bytes.size;
+   agx_apple9_vir_ensure_indexed(&lower.program);
    for (struct agx_apple9_block *block = lower.program.blocks; block; block = block->next)
       block->offset = vir_offsets[block->start_index];
 

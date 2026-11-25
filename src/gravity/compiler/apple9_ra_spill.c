@@ -383,8 +383,7 @@ vir_emit_mov_at(struct agx_apple9_vir_program *program,
    if (!ok)
       return NULL;
 
-   struct agx_apple9_vir_instr *mov =
-      program->instructions[program->instruction_count - 1];
+   struct agx_apple9_vir_instr *mov = agx_apple9_block_last_instr(block);
    mov->dest = dst;
    mov->dest_components = width;
    vir_insert_at(program, block, before, mov);
@@ -1049,8 +1048,7 @@ remat_to_at(struct spill_ctx *ctx, struct agx_apple9_block *block,
       return NULL;
    }
 
-   struct agx_apple9_vir_instr *copy =
-      ctx->program->instructions[ctx->program->instruction_count - 1];
+   struct agx_apple9_vir_instr *copy = agx_apple9_block_last_instr(block);
    *copy = *orig;
    copy->dest = dst;
    copy->dest_components = 1;
@@ -2439,6 +2437,7 @@ apple9_ra_spill(struct agx_apple9_vir_program *program,
    if (program->num_cfg_blocks == 0 && !agx_apple9_vir_build_logical_cfg(program))
       return false;
 
+   agx_apple9_vir_ensure_indexed(program);
    bool has_phi_src = false;
    for (unsigned i = 0; i < program->instruction_count; ++i) {
       if (program->instructions[i]->op == AGX_APPLE9_VIR_PHI_SRC) {
@@ -2697,6 +2696,7 @@ apple9_ra_spill(struct agx_apple9_vir_program *program,
 
    /* Step 6: Prune dead pure ALU / constants left behind by remat. */
    vir_post_spill_dce(program, state);
+   agx_apple9_vir_ensure_indexed(program);
 
    return true;
 }

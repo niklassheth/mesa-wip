@@ -257,15 +257,15 @@ static bool
 a9_ensure_program_pub_array(struct agx_apple9_vir_program *program,
                             const char **error)
 {
-   bool has_pub = false;
-   for (unsigned i = 0; i < program->instruction_count; ++i) {
-      if (apple9_ra_is_publication_instr(program->instructions[i])) {
-         has_pub = true;
-         break;
-      }
-   }
-
    if (!program->publication) {
+      agx_apple9_vir_ensure_indexed(program);
+      bool has_pub = false;
+      for (unsigned i = 0; i < program->instruction_count; ++i) {
+         if (apple9_ra_is_publication_instr(program->instructions[i])) {
+            has_pub = true;
+            break;
+         }
+      }
       if (has_pub) {
          if (!agx_apple9_allocate_publications(program, error))
             return false;
@@ -296,6 +296,7 @@ a9_ensure_program_pub_array(struct agx_apple9_vir_program *program,
 static void
 a9_strip_atomic_results(struct agx_apple9_vir_program *program)
 {
+   agx_apple9_vir_ensure_indexed(program);
    struct util_dynarray to_remove;
    util_dynarray_init(&to_remove, NULL);
 
@@ -340,6 +341,7 @@ a9_is_identity_ior(const struct agx_apple9_vir_program *program,
 static bool
 a9_eliminate_identity_copies(struct agx_apple9_vir_program *program)
 {
+   agx_apple9_vir_ensure_indexed(program);
    unsigned vcount = program->value_count;
    if (!vcount || !program->instruction_count)
       return true;
@@ -425,7 +427,7 @@ a9_prepare_tuples_and_clobbers(struct agx_apple9_vir_program *program,
                                struct apple9_ra_spill_state *spill,
                                bool do_clobbers, const char **error)
 {
-   agx_apple9_vir_reindex(program);
+   agx_apple9_vir_ensure_indexed(program);
    unsigned n_orig = program->instruction_count;
    if (n_orig == 0)
       return true;
@@ -518,8 +520,7 @@ a9_prepare_tuples_and_clobbers(struct agx_apple9_vir_program *program,
                   ok = false;
                   break;
                }
-               struct agx_apple9_vir_instr *mov =
-                  program->instructions[program->instruction_count - 1];
+               struct agx_apple9_vir_instr *mov = agx_apple9_block_last_instr(blk);
                mov->dest = copy_v;
                mov->dest_components = 1;
                agx_apple9_vir_move_before(program, mov, ins);
@@ -635,8 +636,7 @@ a9_prepare_tuples_and_clobbers(struct agx_apple9_vir_program *program,
                ok = false;
                break;
             }
-            struct agx_apple9_vir_instr *collect =
-               program->instructions[program->instruction_count - 1];
+            struct agx_apple9_vir_instr *collect = agx_apple9_block_last_instr(blk);
             collect->dest = base;
             collect->dest_components = (uint8_t)width;
             agx_apple9_vir_move_before(program, collect, ins);
@@ -672,7 +672,7 @@ a9_prepare_tuples_and_clobbers(struct agx_apple9_vir_program *program,
    free(snap);
    free(defs);
    if (ok) {
-      agx_apple9_vir_reindex(program);
+      agx_apple9_vir_ensure_indexed(program);
       ok = a9_ensure_program_pub_array(program, error);
    }
    return ok;
@@ -1781,8 +1781,7 @@ a9_evict_register(struct a9_ra_ctx *rctx, unsigned r_victim,
       return false;
    }
 
-   struct agx_apple9_vir_instr *mov =
-      rctx->program->instructions[rctx->program->instruction_count - 1];
+   struct agx_apple9_vir_instr *mov = agx_apple9_block_last_instr(rctx->cur_block);
    mov->dest = u_new;
    mov->dest_components = 1;
    if (before)
@@ -2012,20 +2011,17 @@ a9_assign_constrained_sources(struct a9_ra_ctx *rctx,
                   rctx->program, AGX_APPLE9_VIR_MOV, AGX_APPLE9_ENC_PSEUDO, s1,
                   1, 0);
                struct agx_apple9_vir_instr *m1 =
-                  e1 ? rctx->program->instructions[rctx->program->instruction_count - 1]
-                     : NULL;
+                  e1 ? agx_apple9_block_last_instr(rctx->cur_block) : NULL;
                bool e2 = e1 && agx_apple9_vir_emit_side_effect(
                   rctx->program, AGX_APPLE9_VIR_MOV, AGX_APPLE9_ENC_PSEUDO, s2,
                   1, 0);
                struct agx_apple9_vir_instr *m2 =
-                  e2 ? rctx->program->instructions[rctx->program->instruction_count - 1]
-                     : NULL;
+                  e2 ? agx_apple9_block_last_instr(rctx->cur_block) : NULL;
                bool e3 = e2 && agx_apple9_vir_emit_side_effect(
                   rctx->program, AGX_APPLE9_VIR_MOV, AGX_APPLE9_ENC_PSEUDO, s3,
                   1, 0);
                struct agx_apple9_vir_instr *m3 =
-                  e3 ? rctx->program->instructions[rctx->program->instruction_count - 1]
-                     : NULL;
+                  e3 ? agx_apple9_block_last_instr(rctx->cur_block) : NULL;
                rctx->program->current_block = saved;
                if (!e3) {
                   rctx->error = "out of memory emitting COPY_REG swap bridge";
@@ -2089,7 +2085,7 @@ a9_assign_constrained_sources(struct a9_ra_ctx *rctx,
             return false;
          }
          struct agx_apple9_vir_instr *mov =
-            rctx->program->instructions[rctx->program->instruction_count - 1];
+            agx_apple9_block_last_instr(rctx->cur_block);
          mov->dest = reloc_v;
          mov->dest_components = 1;
          agx_apple9_vir_move_before(rctx->program, mov, ins);
@@ -2194,7 +2190,7 @@ a9_assign_constrained_sources(struct a9_ra_ctx *rctx,
          return false;
       }
       struct agx_apple9_vir_instr *collect =
-         rctx->program->instructions[rctx->program->instruction_count - 1];
+         agx_apple9_block_last_instr(rctx->cur_block);
       collect->dest = tbase;
       collect->dest_components = (uint8_t)w;
       agx_apple9_vir_move_before(rctx->program, collect, ins);
@@ -2454,7 +2450,7 @@ a9_splice_loop_header_phi(struct a9_ra_ctx *rctx,
       return false;
 
    struct agx_apple9_vir_instr *phi =
-      rctx->program->instructions[rctx->program->instruction_count - 1];
+      agx_apple9_block_last_instr(rctx->program->current_block);
    /* Place phi at logical block entry (right after any ENTRY_REG / ELSE). */
    struct agx_apple9_vir_instr *first_non_prefix = NULL;
    for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(header);
@@ -2673,7 +2669,7 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                      return false;
 
                   struct agx_apple9_vir_instr *phi =
-                     rctx->program->instructions[rctx->program->instruction_count - 1];
+                     agx_apple9_block_last_instr(rctx->program->current_block);
                   struct agx_apple9_vir_instr *anchor = NULL;
                   for (struct agx_apple9_vir_instr *I =
                           agx_apple9_block_first_instr(block);
@@ -3503,6 +3499,7 @@ a9_emit_phys_parallel_copies(struct agx_apple9_vir_program *out,
 static bool
 a9_remove_empty_else(struct agx_apple9_vir_program *p)
 {
+   agx_apple9_vir_ensure_indexed(p);
    struct agx_apple9_vir_instr **remove = NULL;
    unsigned count = 0;
    for (unsigned i = 0; i + 1 < p->instruction_count; ++i) {
@@ -3513,8 +3510,10 @@ a9_remove_empty_else(struct agx_apple9_vir_program *p)
          return false;
       remove[count++] = p->instructions[i];
    }
-   if (count)
+   if (count) {
       agx_apple9_vir_remove_many(p, remove, count);
+      agx_apple9_vir_ensure_indexed(p);
+   }
    free(remove);
    return true;
 }
@@ -4116,7 +4115,7 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
                                      : AGX_APPLE9_GPR_COUNT;
    unsigned reserved = opts.reserved_gprs;
 
-   agx_apple9_vir_reindex(program);
+   agx_apple9_vir_ensure_indexed(program);
    if (!agx_apple9_validate_mesh_control(program, &res->error))
       return false;
 
@@ -4168,6 +4167,7 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
       res->error = "out of memory eliminating identity copies";
       return false;
    }
+   agx_apple9_vir_ensure_indexed(program);
 
    struct apple9_ra_spill_state spill_state;
    apple9_ra_spill_state_init(&spill_state);
@@ -4918,7 +4918,7 @@ apple9_ra_allocate_native(struct agx_apple9_vir_program *program,
    }
 
    /* Reindex & refresh liveness/kill_mask if any live-range split occurred. */
-   agx_apple9_vir_reindex(program);
+   agx_apple9_vir_ensure_indexed(program);
    if (rctx.any_split) {
       apple9_ra_liveness_finish(&liveness);
       if (!apple9_ra_liveness(program, &liveness)) {

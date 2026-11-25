@@ -32,6 +32,9 @@ struct incomplete_phi {
 struct repair_block {
    bool sealed;
 
+   /* Cached first non-entry-prefix instruction in this block for O(1) PHI placement. */
+   struct agx_apple9_vir_instr *first_non_prefix;
+
    /* Sparse map: original variable ID -> current SSA uint32_t value (+1). */
    struct hash_table_u64 *defs;
 
@@ -119,8 +122,7 @@ emit_repair_phi(struct repair_ctx *ctx, struct agx_apple9_block *block,
       return NULL;
    }
 
-   struct agx_apple9_vir_instr *phi =
-      ctx->program->instructions[ctx->program->instruction_count - 1];
+   struct agx_apple9_vir_instr *phi = agx_apple9_block_last_instr(block);
 
    if (width > 1) {
       if (!apple9_ra_vir_grow_values(ctx->program, ctx->state, width - 1, NULL)) {
@@ -147,16 +149,8 @@ emit_repair_phi(struct repair_ctx *ctx, struct agx_apple9_block *block,
    if (!is_mem && orig_var < ctx->n && ctx->program->max_phys)
       ctx->program->max_phys[val] = ctx->program->max_phys[orig_var];
 
-   struct agx_apple9_vir_instr *first_non_prefix = NULL;
-   for (struct agx_apple9_vir_instr *I = agx_apple9_block_first_instr(block);
-        I; I = agx_apple9_instr_next(I)) {
-      if (I == phi)
-         continue;
-      if (!agx_apple9_is_block_entry_prefix(I)) {
-         first_non_prefix = I;
-         break;
-      }
-   }
+   struct agx_apple9_vir_instr *first_non_prefix =
+      repair_block(ctx, block)->first_non_prefix;
    if (first_non_prefix)
       agx_apple9_vir_move_before(ctx->program, phi, first_non_prefix);
    else
@@ -426,7 +420,7 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
 {
    unsigned old_count = program->value_count;
    if (!old_count) {
-      agx_apple9_vir_reindex(program);
+      agx_apple9_vir_ensure_indexed(program);
       return true;
    }
 
@@ -654,7 +648,7 @@ apple9_reindex_ssa(struct agx_apple9_vir_program *program,
    free(remap);
    free(has_def);
    free(referenced);
-   agx_apple9_vir_reindex(program);
+   agx_apple9_vir_ensure_indexed(program);
    return true;
 }
 
@@ -670,7 +664,7 @@ apple9_ra_repair_ssa(struct agx_apple9_vir_program *program,
    if (!program)
       return false;
    if (!program->blocks || program->value_count == 0) {
-      agx_apple9_vir_reindex(program);
+      agx_apple9_vir_ensure_indexed(program);
       return true;
    }
 
@@ -679,7 +673,7 @@ apple9_ra_repair_ssa(struct agx_apple9_vir_program *program,
 
    unsigned num_blocks = program->num_cfg_blocks;
    if (num_blocks == 0) {
-      agx_apple9_vir_reindex(program);
+      agx_apple9_vir_ensure_indexed(program);
       return true;
    }
 
@@ -708,6 +702,14 @@ apple9_ra_repair_ssa(struct agx_apple9_vir_program *program,
          return false;
       }
       util_dynarray_init(&blocks[bi].incomplete_phis, memctx);
+      for (struct agx_apple9_vir_instr *I =
+              agx_apple9_block_first_instr(cfg_blocks[bi]);
+           I; I = agx_apple9_instr_next(I)) {
+         if (!agx_apple9_is_block_entry_prefix(I)) {
+            blocks[bi].first_non_prefix = I;
+            break;
+         }
+      }
    }
 
    struct hash_table_u64 *homes =

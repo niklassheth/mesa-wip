@@ -18230,9 +18230,12 @@ TEST(Apple9Vir, PrePhysicalPseudoOpsKillMaskAndBlockNavigation)
    EXPECT_EQ(agx_apple9_block_last_instr(b1), mov_ins);
 
    agx_apple9_vir_move_after(&program, split_ins, swap_ins);
+   EXPECT_TRUE(program.index_dirty);
    EXPECT_EQ(agx_apple9_instr_block(split_ins), b1);
    EXPECT_EQ(agx_apple9_instr_next(swap_ins), split_ins);
    EXPECT_EQ(agx_apple9_instr_next(split_ins), mov_ins);
+   agx_apple9_vir_ensure_indexed(&program);
+   EXPECT_FALSE(program.index_dirty);
    EXPECT_EQ(agx_apple9_instr_position(swap_ins), 1u);
    EXPECT_EQ(agx_apple9_instr_position(split_ins), 2u);
    EXPECT_EQ(agx_apple9_instr_position(mov_ins), 3u);

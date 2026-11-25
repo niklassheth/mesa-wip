@@ -175,7 +175,9 @@ agx_apple9_instr_block(const struct agx_apple9_vir_instr *instr)
 unsigned
 agx_apple9_instr_position(const struct agx_apple9_vir_instr *instr)
 {
-   return apple9_node(instr)->position;
+   struct apple9_instruction_node *node = apple9_node(instr);
+   assert(!node->block->program->index_dirty);
+   return node->position;
 }
 
 struct agx_apple9_block *
@@ -199,6 +201,10 @@ agx_apple9_block_begin(struct agx_apple9_vir_program *program,
    assert(block && block->program == program && !block->placed);
    block->placed = true;
    block->prev = program->last_block;
+   if (!program->index_dirty) {
+      block->index = program->last_block ? program->last_block->index + 1 : 0;
+      block->start_index = program->instruction_count;
+   }
    if (program->last_block)
       program->last_block->next = block;
    else
@@ -417,6 +423,7 @@ apple9_vir_refresh_index(struct agx_apple9_vir_program *program)
       }
    }
    assert(count == program->instruction_count);
+   program->index_dirty = false;
 }
 
 void
@@ -437,7 +444,8 @@ agx_apple9_vir_move_before(struct agx_apple9_vir_program *program,
    list_addtail(&node->link, &next->link);
    assert(next->block->program == program && node->block->program == program);
    node->block = next->block;
-   agx_apple9_vir_reindex(program);
+   agx_apple9_invalidate_uses(program);
+   program->index_dirty = true;
 }
 
 void
@@ -451,7 +459,8 @@ agx_apple9_vir_move_after(struct agx_apple9_vir_program *program,
    list_add(&node->link, &previous->link);
    assert(previous->block->program == program && node->block->program == program);
    node->block = previous->block;
-   agx_apple9_vir_reindex(program);
+   agx_apple9_invalidate_uses(program);
+   program->index_dirty = true;
 }
 
 void
@@ -464,7 +473,8 @@ agx_apple9_vir_move_to_block_start(struct agx_apple9_vir_program *program,
    list_del(&node->link);
    list_add(&node->link, &block->instructions);
    node->block = block;
-   agx_apple9_vir_reindex(program);
+   agx_apple9_invalidate_uses(program);
+   program->index_dirty = true;
 }
 
 void
@@ -477,7 +487,8 @@ agx_apple9_vir_move_to_block_end(struct agx_apple9_vir_program *program,
    list_del(&node->link);
    list_addtail(&node->link, &block->instructions);
    node->block = block;
-   agx_apple9_vir_reindex(program);
+   agx_apple9_invalidate_uses(program);
+   program->index_dirty = true;
 }
 
 void
@@ -487,12 +498,14 @@ agx_apple9_vir_remove(struct agx_apple9_vir_program *program,
    agx_apple9_vir_remove_many(program, &instr, 1);
 }
 
-/* Remove several instructions with a single reindex. */
+/* Remove several instructions in O(count), deferring flat-index rebuild. */
 void
 agx_apple9_vir_remove_many(struct agx_apple9_vir_program *program,
                            struct agx_apple9_vir_instr *const *instrs,
                            unsigned count)
 {
+   if (!count)
+      return;
    for (unsigned i = 0; i < count; ++i) {
       struct apple9_instruction_node *node = apple9_node(instrs[i]);
       list_del(&node->link);
@@ -500,7 +513,8 @@ agx_apple9_vir_remove_many(struct agx_apple9_vir_program *program,
       free(node);
    }
    program->instruction_count -= count;
-   agx_apple9_vir_reindex(program);
+   agx_apple9_invalidate_uses(program);
+   program->index_dirty = true;
 }
 
 void
@@ -669,8 +683,6 @@ agx_apple9_vir_clone(struct agx_apple9_vir_program *dst,
       goto done;
    }
    dst->instruction_capacity = MAX2(src->instruction_count, 1);
-   for (unsigned i = 0; i < src->instruction_count; ++i)
-      dst->instructions[i] = MAP(src->instructions[i]);
    for (unsigned i = 0; i < nr_blocks; ++i) {
       list_for_each_entry(struct apple9_instruction_node, node,
                           &((struct agx_apple9_block *)MAP(order[i]))->instructions, link) {
@@ -681,8 +693,8 @@ agx_apple9_vir_clone(struct agx_apple9_vir_program *dst,
          I->completion_consumer = MAP(I->completion_consumer);
       }
    }
-   for (unsigned i = 0; ok && i < src->instruction_count; ++i)
-      ok &= dst->instructions[i] != NULL;
+   if (ok)
+      apple9_vir_refresh_index(dst);
 #undef MAP
 
 done:
@@ -783,6 +795,11 @@ apple9_vir_append_instruction(struct agx_apple9_vir_program *program)
       return NULL;
    node->block = program->current_block;
    list_addtail(&node->link, &node->block->instructions);
+   if (node->block != program->last_block || program->index_dirty) {
+      program->index_dirty = true;
+   } else {
+      node->position = program->instruction_count;
+   }
    program->instructions[program->instruction_count++] = &node->instruction;
    return &node->instruction;
 }
@@ -892,6 +909,7 @@ bool
 agx_apple9_layout_object_calls(struct agx_apple9_vir_program *p,
                               const char **reason)
 {
+   agx_apple9_vir_ensure_indexed(p);
    /* Validate before moving anything. Each closed callee is a single logical
     * block: its mask operations cannot escape the call. Real task functions,
     * nested calls and spill frames require further ABI work. */
@@ -2470,7 +2488,7 @@ agx_apple9_vir_emit_phi_canonical(struct agx_apple9_vir_program *program,
    if (value == AGX_APPLE9_VREG_INVALID)
       return AGX_APPLE9_VREG_INVALID;
    struct agx_apple9_vir_instr *phi =
-      program->instructions[program->instruction_count - 1];
+      agx_apple9_block_last_instr(program->current_block);
    if (!agx_apple9_vir_phi_alloc_srcs(phi, num_preds)) {
       agx_apple9_vir_remove(program, phi);
       return AGX_APPLE9_VREG_INVALID;
@@ -2488,6 +2506,7 @@ agx_apple9_vir_canonicalize_phis(struct agx_apple9_vir_program *program)
       return false;
 
    agx_apple9_place_phis(program);
+   agx_apple9_vir_ensure_indexed(program);
 
    struct agx_apple9_vir_instr **phi_by_value =
       calloc(MAX2(program->value_count, 1), sizeof(*phi_by_value));
@@ -2554,8 +2573,10 @@ agx_apple9_vir_canonicalize_phis(struct agx_apple9_vir_program *program)
       *agx_apple9_vir_src_ptr(phi, pred_idx) = ins->src[0];
    }
 
-   if (remove_count)
+   if (remove_count) {
       agx_apple9_vir_remove_many(program, to_remove, remove_count);
+      agx_apple9_vir_ensure_indexed(program);
+   }
    agx_apple9_invalidate_uses(program);
 
 done:
@@ -2621,6 +2642,7 @@ agx_apple9_vir_emit_phi_edge(struct agx_apple9_vir_program *program,
 void
 agx_apple9_place_phis(struct agx_apple9_vir_program *program)
 {
+   agx_apple9_vir_ensure_indexed(program);
    /* Selection may encounter an incoming edge before the successor. The
     * declaration is created early for SSA lookup, then attached to its block
     * once structured selection has placed every block in layout order. */
@@ -3164,9 +3186,12 @@ agx_apple9_vir_dest_components(const struct agx_apple9_vir_instr *instruction)
 bool
 agx_apple9_analyze_uses(struct agx_apple9_vir_program *program)
 {
-   if (program->use_analysis && program->use_analysis->valid)
+   if (program->use_analysis && program->use_analysis->valid) {
+      assert(!program->index_dirty);
       return true;
-   apple9_vir_refresh_index(program);
+   }
+   if (program->index_dirty)
+      apple9_vir_refresh_index(program);
    struct agx_apple9_use_analysis *a = calloc(1, sizeof(*a));
    if (!a)
       return false;
@@ -3954,14 +3979,15 @@ agx_apple9_materialize_spill_completion(struct agx_apple9_vir_program *program,
                                       AGX_APPLE9_ENC_MOV_IMM32, NULL, 0, 0);
    if (zero == AGX_APPLE9_VREG_INVALID)
       return false;
-   struct agx_apple9_vir_instr *constant = program->instructions[program->instruction_count - 1];
+   struct agx_apple9_vir_instr *constant = agx_apple9_block_last_instr(program->current_block);
    uint32_t sources[] = {zero, zero};
    if (agx_apple9_vir_emit(program, AGX_APPLE9_VIR_IOR,
                            AGX_APPLE9_ENC_LOGIC_EXTENDED, sources, 2, 0) == AGX_APPLE9_VREG_INVALID)
       return false;
-   struct agx_apple9_vir_instr *wait = program->instructions[program->instruction_count - 1];
+   struct agx_apple9_vir_instr *wait = agx_apple9_block_last_instr(program->current_block);
    agx_apple9_vir_move_after(program, constant, store);
    agx_apple9_vir_move_after(program, wait, constant);
+   agx_apple9_vir_ensure_indexed(program);
    store->completion_consumer = wait;
    return true;
 }
@@ -3971,6 +3997,7 @@ agx_apple9_materialize_pending_result_at(struct agx_apple9_vir_program *program,
                                      unsigned producer_index,
                                      unsigned insertion, const char **reason)
 {
+   agx_apple9_vir_ensure_indexed(program);
    const unsigned old_count = program->instruction_count;
    const struct agx_apple9_vir_instr *producer =
       program->instructions[producer_index];
@@ -4065,6 +4092,7 @@ agx_apple9_materialize_pending_result_at(struct agx_apple9_vir_program *program,
       struct agx_apple9_vir_instr *before = program->instructions[insertion];
       for (unsigned c = 0; c < components; ++c)
          agx_apple9_vir_move_before(program, materialize_instructions[c], before);
+      agx_apple9_vir_ensure_indexed(program);
    }
 
    agx_apple9_invalidate_uses(program);

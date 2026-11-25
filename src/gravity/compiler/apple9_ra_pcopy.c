@@ -742,7 +742,7 @@ emit_pcopy_op_to_vir(void *vctx, const struct apple9_ra_pcopy_op *op)
          ok = agx_apple9_vir_emit_side_effect(
             p, AGX_APPLE9_VIR_MOV, AGX_APPLE9_ENC_PSEUDO, srcs, 1, 0);
          if (ok) {
-            ins = p->instructions[p->instruction_count - 1];
+            ins = agx_apple9_block_last_instr(ctx->block);
             ins->dest = op->dst.value;
             ins->dest_components = 1;
             ins->target = APPLE9_RA_PHYS_OP_TAG;
@@ -753,7 +753,7 @@ emit_pcopy_op_to_vir(void *vctx, const struct apple9_ra_pcopy_op *op)
             p, AGX_APPLE9_VIR_SPILL_LOAD, AGX_APPLE9_ENC_SPILL_LOAD, NULL, 0,
             op->src.value);
          if (ok) {
-            ins = p->instructions[p->instruction_count - 1];
+            ins = agx_apple9_block_last_instr(ctx->block);
             ins->dest = op->dst.value;
             ins->dest_components = 1;
             ins->target = APPLE9_RA_PHYS_OP_TAG;
@@ -765,7 +765,7 @@ emit_pcopy_op_to_vir(void *vctx, const struct apple9_ra_pcopy_op *op)
             p, AGX_APPLE9_VIR_SPILL_STORE, AGX_APPLE9_ENC_SPILL_STORE, srcs, 1,
             op->dst.value);
          if (ok) {
-            ins = p->instructions[p->instruction_count - 1];
+            ins = agx_apple9_block_last_instr(ctx->block);
             ins->target = APPLE9_RA_PHYS_OP_TAG;
          }
       }
@@ -781,7 +781,7 @@ emit_pcopy_op_to_vir(void *vctx, const struct apple9_ra_pcopy_op *op)
       ok = agx_apple9_vir_emit_side_effect(p, AGX_APPLE9_VIR_IMM, enc, NULL, 0,
                                            op->src.value);
       if (ok) {
-         ins = p->instructions[p->instruction_count - 1];
+         ins = agx_apple9_block_last_instr(ctx->block);
          ins->dest = op->dst.value;
          ins->dest_components = 1;
          ins->target = APPLE9_RA_PHYS_OP_TAG;
@@ -796,7 +796,7 @@ emit_pcopy_op_to_vir(void *vctx, const struct apple9_ra_pcopy_op *op)
       ok = agx_apple9_vir_emit_side_effect(
          p, AGX_APPLE9_VIR_SWAP, AGX_APPLE9_ENC_PSEUDO, srcs, 2, 0);
       if (ok) {
-         ins = p->instructions[p->instruction_count - 1];
+         ins = agx_apple9_block_last_instr(ctx->block);
          ins->target = APPLE9_RA_PHYS_OP_TAG;
       }
       break;
@@ -834,8 +834,8 @@ apple9_ra_emit_parallel_copies_vir(struct agx_apple9_vir_program *program,
    bool ok = apple9_ra_lower_parallel_copies(copies, num_copies, opts,
                                              emit_pcopy_op_to_vir, &ctx);
    if (ok)
-      agx_apple9_vir_reindex(program);
-   return ok;
+      return true;
+   return false;
 }
 
 static bool
@@ -1060,8 +1060,11 @@ apple9_ra_lower_phi_edge(struct agx_apple9_vir_program *program,
                          const struct apple9_ra_assignment *assign,
                          const struct apple9_ra_pcopy_opts *opts)
 {
-   return apple9_ra_lower_phi_edge_internal(program, pred, succ, assign, opts,
-                                            NULL, NULL, 0);
+   bool ok = apple9_ra_lower_phi_edge_internal(program, pred, succ, assign, opts,
+                                               NULL, NULL, 0);
+   if (ok && program)
+      agx_apple9_vir_ensure_indexed(program);
+   return ok;
 }
 
 bool
@@ -1072,6 +1075,8 @@ apple9_ra_lower_all_phi_edges(struct agx_apple9_vir_program *program,
 {
    if (!program)
       return false;
+
+   agx_apple9_vir_ensure_indexed(program);
 
    /* Snapshot scalar VIR_IMM SSA definitions once before emitting any physical
     * edge copies (which tag physical GPRs with APPLE9_RA_PHYS_OP_TAG). */
@@ -1110,10 +1115,12 @@ apple9_ra_lower_all_phi_edges(struct agx_apple9_vir_program *program,
       struct util_dynarray to_remove;
       util_dynarray_init(&to_remove, NULL);
 
-      for (unsigned i = 0; i < program->instruction_count; ++i) {
-         struct agx_apple9_vir_instr *ins = program->instructions[i];
-         if (ins->op == AGX_APPLE9_VIR_PHI)
-            util_dynarray_append(&to_remove, ins);
+      for (struct agx_apple9_block *b = program->blocks; b; b = b->next) {
+         for (struct agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(b);
+              ins; ins = agx_apple9_instr_next(ins)) {
+            if (ins->op == AGX_APPLE9_VIR_PHI)
+               util_dynarray_append(&to_remove, ins);
+         }
       }
 
       unsigned nr = util_dynarray_num_elements(
@@ -1125,5 +1132,6 @@ apple9_ra_lower_all_phi_edges(struct agx_apple9_vir_program *program,
       util_dynarray_fini(&to_remove);
    }
 
+   agx_apple9_vir_ensure_indexed(program);
    return true;
 }

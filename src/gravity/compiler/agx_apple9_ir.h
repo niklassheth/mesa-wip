@@ -805,6 +805,10 @@ struct agx_apple9_vir_program {
    struct agx_apple9_block *allocated_blocks;
    struct agx_apple9_use_analysis *use_analysis;
    bool dependencies_finalized;
+   /* Set when block instruction lists have been mutated (move/remove/non-tail
+    * emit) so program->instructions[], node->position, and block->start_index
+    * must be refreshed via agx_apple9_vir_ensure_indexed() before indexed use. */
+   bool index_dirty;
    unsigned instruction_count;
    unsigned instruction_capacity;
    unsigned num_cfg_blocks;
@@ -944,6 +948,12 @@ void agx_apple9_vir_remove_many(struct agx_apple9_vir_program *program,
                                 struct agx_apple9_vir_instr *const *instrs,
                                 unsigned count);
 void agx_apple9_vir_reindex(struct agx_apple9_vir_program *program);
+static inline void
+agx_apple9_vir_ensure_indexed(struct agx_apple9_vir_program *program)
+{
+   if (unlikely(program->index_dirty))
+      agx_apple9_vir_reindex(program);
+}
 bool agx_apple9_instr_is_pure_alu(const struct agx_apple9_vir_instr *instruction);
 bool agx_apple9_supports_special_uniform(enum agx_apple9_vir_opcode op);
 

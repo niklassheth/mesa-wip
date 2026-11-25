@@ -188,6 +188,7 @@ apple9_ra_dce(struct agx_apple9_vir_program *p)
    for (unsigned v = 0; v < valloc; ++v)
       def_idx[v] = UINT32_MAX;
 
+   agx_apple9_vir_ensure_indexed(p);
    bool has_phi_src = false;
    for (unsigned i = 0; i < n; ++i) {
       const struct agx_apple9_vir_instr *ins = p->instructions[i];
@@ -324,8 +325,10 @@ apple9_ra_dce(struct agx_apple9_vir_program *p)
       }
    }
 
-   if (remove_count > 0)
+   if (remove_count > 0) {
       agx_apple9_vir_remove_many(p, to_remove, remove_count);
+      agx_apple9_vir_ensure_indexed(p);
+   }
 
 cleanup:
    free(to_remove);
@@ -449,6 +452,7 @@ build_defs_and_pub_mask(const struct agx_apple9_vir_program *p, void *mem_ctx,
                         struct agx_apple9_vir_instr ***defs_out,
                         BITSET_WORD **pub_defs_out)
 {
+   assert(!p->index_dirty);
    const unsigned valloc = MAX2(p->value_count, 1u);
    struct agx_apple9_vir_instr **defs =
       rzalloc_array(mem_ctx, struct agx_apple9_vir_instr *, valloc);
@@ -497,6 +501,7 @@ apple9_ra_liveness(struct agx_apple9_vir_program *p,
       return true;
    }
 
+   agx_apple9_vir_ensure_indexed(p);
    const unsigned num_blocks = p->num_cfg_blocks;
    const unsigned vcount = p->value_count;
    void *mem_ctx = ralloc_context(NULL);
@@ -2257,54 +2262,19 @@ apply_vir_schedule(struct agx_apple9_vir_program *p,
    if (!changed)
       return false;
 
-   /* Bulk-reorder the body's list_head nodes in blk->instructions in O(count)
-    * while preserving instruction pointer identity, deferring the single
-    * agx_apple9_vir_reindex() to the end of scheduling instead of reindexing
-    * the entire program on every moved instruction. */
-   struct list_head **body_links =
-      ralloc_array(blk_ctx, struct list_head *, count);
-   if (body_links) {
-      struct list_head *cur_link = blk->instructions.next;
-      struct agx_apple9_vir_instr *cur_ins = agx_apple9_block_first_instr(blk);
-      while (cur_ins && cur_ins != first_body) {
-         cur_link = cur_link->next;
-         cur_ins = agx_apple9_instr_next(cur_ins);
+   /* Reorder the body's list_head nodes in blk->instructions in O(count);
+    * move helpers defer reindexing until after all blocks are scheduled. */
+   struct agx_apple9_vir_instr *anchor = last_pinned_entry;
+   for (unsigned k = count; k-- > 0;) {
+      struct agx_apple9_vir_instr *ins = bottom_up_order[k];
+      if (!anchor) {
+         if (agx_apple9_block_first_instr(blk) != ins)
+            agx_apple9_vir_move_to_block_start(p, ins, blk);
+      } else {
+         if (agx_apple9_instr_next(anchor) != ins)
+            agx_apple9_vir_move_after(p, ins, anchor);
       }
-      assert(cur_ins == first_body && cur_link != &blk->instructions);
-      struct list_head *anchor_link = cur_link->prev;
-      const unsigned base_pos = agx_apple9_instr_position(first_body);
-      for (unsigned i = 0; i < count; ++i) {
-         assert(cur_ins && agx_apple9_instr_position(cur_ins) == base_pos + i);
-         body_links[i] = cur_link;
-         cur_link = cur_link->next;
-         cur_ins = agx_apple9_instr_next(cur_ins);
-      }
-
-      struct list_head *prev = anchor_link;
-      for (unsigned k = count; k-- > 0;) {
-         struct agx_apple9_vir_instr *ins = bottom_up_order[k];
-         unsigned orig_off = agx_apple9_instr_position(ins) - base_pos;
-         assert(orig_off < count);
-         struct list_head *lnk = body_links[orig_off];
-         if (prev->next != lnk) {
-            list_del(lnk);
-            list_add(lnk, prev);
-         }
-         prev = lnk;
-      }
-   } else {
-      struct agx_apple9_vir_instr *anchor = last_pinned_entry;
-      for (unsigned k = count; k-- > 0;) {
-         struct agx_apple9_vir_instr *ins = bottom_up_order[k];
-         if (!anchor) {
-            if (agx_apple9_block_first_instr(blk) != ins)
-               agx_apple9_vir_move_to_block_start(p, ins, blk);
-         } else {
-            if (agx_apple9_instr_next(anchor) != ins)
-               agx_apple9_vir_move_after(p, ins, anchor);
-         }
-         anchor = ins;
-      }
+      anchor = ins;
    }
 
    /* Intra-block reordering preserves live_in/live_out; refresh this block's
@@ -2641,8 +2611,7 @@ apple9_ra_remat_long_spans(struct agx_apple9_vir_program *p,
                   break;
                }
 
-               struct agx_apple9_vir_instr *copy =
-                  p->instructions[p->instruction_count - 1];
+               struct agx_apple9_vir_instr *copy = agx_apple9_block_last_instr(blk);
                *copy = *orig;
                copy->dest = new_v;
                copy->dest_components = 1;
@@ -2951,8 +2920,7 @@ apple9_ra_remat_cross_block(struct agx_apple9_vir_program *p,
                   failed = true;
                   break;
                }
-               struct agx_apple9_vir_instr *imm_copy =
-                  p->instructions[p->instruction_count - 1];
+               struct agx_apple9_vir_instr *imm_copy = agx_apple9_block_last_instr(ub);
                *imm_copy = *s0_imm;
                imm_copy->dest = new_imm_v;
                imm_copy->dest_components = 1;
@@ -2989,8 +2957,7 @@ apple9_ra_remat_cross_block(struct agx_apple9_vir_program *p,
                failed = true;
                break;
             }
-            struct agx_apple9_vir_instr *copy =
-               p->instructions[p->instruction_count - 1];
+            struct agx_apple9_vir_instr *copy = agx_apple9_block_last_instr(ub);
             *copy = *orig;
             copy->dest = new_v;
             copy->dest_components = 1;
@@ -3096,6 +3063,8 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
       return false;
    }
 
+   agx_apple9_vir_ensure_indexed(p);
+
    struct agx_apple9_vir_instr **defs = NULL;
    BITSET_WORD *pub_defs = NULL;
    uint8_t *val_max_gpr = compute_value_max_gprs(p, mem_ctx);
@@ -3107,11 +3076,6 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
       apple9_ra_liveness_finish(&liveness);
       return false;
    }
-
-   /* Ensure instruction positions are contiguous within each block so
-    * apply_vir_schedule can bulk-reorder nodes in O(count) without calling
-    * agx_apple9_vir_reindex per moved instruction. */
-   agx_apple9_vir_reindex(p);
 
    bool any_reordered = false;
 
@@ -3460,7 +3424,7 @@ apple9_ra_pressure_schedule_opts(struct agx_apple9_vir_program *p,
    ralloc_free(mem_ctx);
 
    if (any_reordered) {
-      agx_apple9_vir_reindex(p);
+      agx_apple9_vir_ensure_indexed(p);
       unsigned global_peak = 0;
       for (unsigned b = 0; b < liveness.num_cfg_blocks; ++b)
          global_peak = MAX2(global_peak, liveness.block_peak_gprs[b]);

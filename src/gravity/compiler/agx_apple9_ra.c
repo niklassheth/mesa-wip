@@ -946,6 +946,7 @@ bool
 agx_apple9_schedule_physical(struct agx_apple9_vir_program *program,
                              const char **reason)
 {
+   agx_apple9_vir_ensure_indexed(program);
    if (!program->blocks || !program->last_block ||
        program->instruction_count == 0) {
       program->physical = true;

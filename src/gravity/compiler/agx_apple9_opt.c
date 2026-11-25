@@ -1101,8 +1101,10 @@ fold_uniform_stores(struct agx_apple9_vir_program *p)
          ++i;
       }
    }
-   if (nr_remove)
+   if (nr_remove) {
       agx_apple9_vir_remove_many(p, remove, nr_remove);
+      agx_apple9_vir_ensure_indexed(p);
+   }
    free(remove);
    agx_apple9_invalidate_uses(p);
    return true;
@@ -1554,6 +1556,7 @@ agx_apple9_optimize_vir_with_constants(
    const struct agx_apple9_uniform_constants *constants)
 {
    assert(!p->physical && !p->dependencies_finalized);
+   agx_apple9_vir_ensure_indexed(p);
    if (!p->value_count)
       return true;
 
