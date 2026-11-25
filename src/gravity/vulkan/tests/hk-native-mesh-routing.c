@@ -799,6 +799,39 @@ tess_fused_routes(struct hk_cmd_buffer *cmd)
          100, 1, AGX_NATIVE_OBJECT_MAX_GROUPS, 1, 8192, 4096, prim_cap, &plan));
       CHECK(plan.inst_chunk_cap == 1 && plan.patch_chunk_cap == 100);
 
+      /* Multi-patch K=16 chunk planning: 2,000,000 patches pack into
+       * 125,000 OBJECT WGs <= AGX_NATIVE_OBJECT_MAX_GROUPS -> 1 SINGLE chunk! */
+      CHECK(hk_apple9_native_tess_fused_chunk_plan_ex(
+         2000000, 1, 16, AGX_NATIVE_OBJECT_MAX_GROUPS, 4096, 8192, UINT64_MAX,
+         prim_cap, &plan));
+      CHECK(plan.inst_chunk_cap == 1 && plan.patch_chunk_cap == 2000000);
+      /* Partial tail patch counts (1, 3, 17, 31) with K=4 and K=16 plan in 1 chunk. */
+      const uint32_t tail_pc[] = {1, 3, 17, 31};
+      for (unsigned ti = 0; ti < ARRAY_SIZE(tail_pc); ++ti) {
+         CHECK(hk_apple9_native_tess_fused_chunk_plan_ex(
+            tail_pc[ti], 1, 4, AGX_NATIVE_OBJECT_MAX_GROUPS, 64, 64, UINT64_MAX,
+            prim_cap, &plan));
+         CHECK(plan.patch_chunk_cap == tail_pc[ti]);
+         CHECK(hk_apple9_native_tess_fused_chunk_plan_ex(
+            tail_pc[ti], 1, 16, AGX_NATIVE_OBJECT_MAX_GROUPS, 64, 64, UINT64_MAX,
+            prim_cap, &plan));
+         CHECK(plan.patch_chunk_cap == tail_pc[ti]);
+      }
+
+      /* Dynamic patchControlPoints guard: reject draws whose pcp > apple9_tess_max_input_pcp. */
+      main->info.apple9_tess_patches_per_group = 16;
+      main->info.apple9_tess_max_input_pcp = 4;
+      dyn->ts.patch_control_points = 4;
+      draw.b.count[0] = 4 * 31;
+      draw.b.count[1] = 1;
+      CHECK(hk_apple9_use_native_tess(cmd, draw));
+      dyn->ts.patch_control_points = 5;
+      draw.b.count[0] = 5 * 31;
+      CHECK(!hk_apple9_use_native_tess(cmd, draw));
+      dyn->ts.patch_control_points = 4;
+      main->info.apple9_tess_max_input_pcp = 0;
+      main->info.apple9_tess_patches_per_group = 1;
+
       /* Single-chunk unbounded draw stays admitted. */
       main->info.apple9_tess_max_patch_prims = 32;
       draw.b.count[0] = 4 * (uint32_t)(prim_cap / 32);
