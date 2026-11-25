@@ -3604,7 +3604,7 @@ TEST(Apple9MeshNativeExpand, SafeU0BUnlocksWgRows32AndGt40)
       ASSERT_TRUE(agx_apple9_mesh_safe_u0_b(&info.layout, &safe_u0_b, &stride));
       unsigned planes = ALIGN_POT(raw_vc, 4u);
       unsigned rem = AGX_APPLE9_MESH_RING_ROWS % stride;
-      EXPECT_TRUE(rem == 0u || rem >= planes);
+      EXPECT_TRUE(rem == 0u || rem >= planes + 4u);
       if (raw_vc >= 21u && raw_vc <= 24u) {
          /* v4_p24: planes=24, idx=4 -> U0_B=8, stride=52, rem=40 >= 24. */
          EXPECT_EQ(safe_u0_b, 8u);
@@ -3747,12 +3747,12 @@ TEST(Apple9MeshNativeExpand, SafeU0BUnlocksWgRows32AndGt40)
          EXPECT_EQ(info.layout.fixed_idx_rows, 0u);
          EXPECT_FALSE(agx_apple9_mesh_safe_u0_b(&info.layout, &safe_u0_b, &stride));
       } else if (mode == 1) {
-         /* Constant P=42 -> single 8-row bucket, exact stride 72. */
+         /* Constant P=42 -> single 8-row bucket, rem == 0 exact divisor 128. */
          EXPECT_FALSE(info.layout.variable_idx_rows);
          EXPECT_EQ(info.layout.fixed_idx_rows, 8u);
          ASSERT_TRUE(agx_apple9_mesh_safe_u0_b(&info.layout, &safe_u0_b, &stride));
-         EXPECT_EQ(safe_u0_b, 32u);
-         EXPECT_EQ(stride, 72u);
+         EXPECT_EQ(safe_u0_b, 60u);
+         EXPECT_EQ(stride, 128u);
       } else {
          /* Dynamic P under max_primitives=18 -> single 4-row bucket. */
          EXPECT_FALSE(info.layout.variable_idx_rows);

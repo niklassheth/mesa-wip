@@ -981,7 +981,7 @@ fused_tess_suite(void)
                                              HK_APPLE9_NATIVE_MESH));
          uint32_t safe_u0 = 0, safe_stride = 0;
          CHECK(agx_apple9_mesh_safe_u0_b(&body.layout, &safe_u0, &safe_stride));
-         CHECK(safe_u0 == 16u && safe_stride == 100u);
+         CHECK(safe_u0 == 24u && safe_stride == 148u);
          uint64_t ring_max = 0;
          CHECK(agx_apple9_mesh_ring_max_groups(&body.layout, &ring_max));
          CHECK(ring_max == UINT64_MAX);

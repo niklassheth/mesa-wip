@@ -136,13 +136,13 @@ agx_apple9_mesh_plane_offset(const struct agx_apple9_mesh_layout *layout,
  * idx_rows = 4 * DIV_ROUND_UP(max_primitives * indices_per_primitive, 64).
  *
  * When a draw wraps the 4,096-row ring, the last workgroup before row 4,096
- * starts at row (4096 - rem) where rem = 4096 % stride. If rem == 0 or
- * rem >= ceil(max_vertices / 4) * ALIGN_POT(n, 4), its actual vertex writes
- * stay strictly below row 4,096 and never overwrite live WG #0 at row 0,
- * after which the ring pointer resets to 0 for the next workgroup. Passing
- * this constant safe U0_B to MESH_CONTROL for every non-empty workgroup keeps
- * the ring stride invariant across all dynamic SetMeshOutputsEXT(v, p) vertex
- * counts v in [1..max_vertices] and unlocks wg_rows == 32 and wg_rows > 40. */
+ * starts at row (4096 - rem) where rem = 4096 % stride. Its actual live
+ * payload occupies vtx_rows + idx_rows rows (ceil(max_vertices / 4) *
+ * ALIGN_POT(n, 4) + idx_rows). If rem == 0 or rem >= vtx_rows + idx_rows,
+ * all actual vertex and index writes stay strictly below row 4,096 and never
+ * wrap mid-workgroup (verified on T8132 silicon: rem == vtx_rows fails at
+ * the wrap workgroup on both V16/P18 comps=48 and V128/P32 comps=8, whereas
+ * rem >= vtx_rows + idx_rows passes bit-exact across 16,384 workgroups). */
 #define AGX_APPLE9_MESH_RING_ROWS        4096u
 #define AGX_APPLE9_MESH_RING_HEADER_ROWS 8u
 #define AGX_APPLE9_MESH_SAFE_U0_B_MAX    256u
@@ -198,7 +198,8 @@ agx_apple9_mesh_safe_u0_b(const struct agx_apple9_mesh_layout *layout,
    if (!idx_rows || (idx_rows & 3u) || idx_rows >= AGX_APPLE9_MESH_RING_ROWS)
       return false;
    uint64_t vtx_rows = quads * planes;
-   if (vtx_rows + idx_rows > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
+   uint64_t live_rows = vtx_rows + idx_rows;
+   if (live_rows > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
       return false;
 
    for (uint64_t q = quads; q <= AGX_APPLE9_MESH_SAFE_U0_B_MAX / 4u; ++q) {
@@ -209,7 +210,7 @@ agx_apple9_mesh_safe_u0_b(const struct agx_apple9_mesh_layout *layout,
       if (stride > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
          break;
       uint64_t rem = AGX_APPLE9_MESH_RING_ROWS % stride;
-      if (rem == 0 || rem >= vtx_rows) {
+      if (rem == 0 || rem >= live_rows) {
          if (out_u0_b)
             *out_u0_b = q == quads ? layout->max_vertices : (uint32_t)(q * 4u);
          if (out_stride)

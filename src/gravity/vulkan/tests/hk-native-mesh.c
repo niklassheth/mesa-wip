@@ -389,12 +389,25 @@ check_mesh_ring_fits(void)
       CHECK(agx_apple9_mesh_ring_fits(&var_idx, var_max));
       CHECK(!agx_apple9_mesh_ring_fits(&var_idx, var_max + 1));
 
-      /* Constant P=42 (fixed_idx_rows=8) stays unbounded with exact stride. */
+      /* Constant P=42 (fixed_idx_rows=8) stays unbounded with rem >= live_rows. */
       struct agx_apple9_mesh_layout fixed_idx = {
          .max_vertices = 32, .max_primitives = 42, .indices_per_primitive = 3,
          .vertex_components = 8, .fixed_idx_rows = 8,
       };
-      CHECK(agx_apple9_mesh_safe_u0_b(&fixed_idx, &u0, &st) && u0 == 32 && st == 72);
+      CHECK(agx_apple9_mesh_safe_u0_b(&fixed_idx, &u0, &st) && u0 == 60 && st == 128);
+
+      /* Silicon boundary regression cases: rem == vtx_rows (without idx_rows)
+       * fails at the wrap workgroup; require rem == 0 || rem >= vtx_rows + idx_rows. */
+      struct agx_apple9_mesh_layout v16c48 = {
+         .max_vertices = 16, .max_primitives = 18, .indices_per_primitive = 3,
+         .vertex_components = 48,
+      };
+      CHECK(agx_apple9_mesh_safe_u0_b(&v16c48, &u0, &st) && u0 == 32 && st == 388);
+      struct agx_apple9_mesh_layout v128c8 = {
+         .max_vertices = 128, .max_primitives = 32, .indices_per_primitive = 3,
+         .vertex_components = 8, .fixed_idx_rows = 8,
+      };
+      CHECK(agx_apple9_mesh_safe_u0_b(&v128c8, &u0, &st) && u0 == 168 && st == 344);
 
       /* Position-only (planes == 4) with variable_idx_rows stays unbounded via
        * runtime U0_B compensation to a single constant stride. */
