@@ -116,8 +116,26 @@ def check_program(rows, channels=None):
                 return ("low16", value(r["src"][0], i))
             if r["op"] == "SELECT":
                 assert len(r["src"]) == 1 and len(r["code"]) == 10
-                word = int.from_bytes(r["code"], "little")
-                assert (r["imm"] & 0xff) == 7  # EQ
+                code = r["code"]
+                word = int.from_bytes(code, "little")
+                assert (r["imm"] & 0xff) == 7 and code[6] == 7  # EQ
+                assert (code[4] & 0x04) == 0x04  # AGX_APPLE9_SELECT_EQUALITY
+                dst = (((word >> 4) & 0xf) | (((word >> 22) & 3) << 4) |
+                       (((word >> 60) & 1) << 6))
+                assert dst == int(reg[1:]), (dst, reg, r)
+                cmp_a = ((word >> 9) & 0x3f) | (((word >> 56) & 1) << 6)
+                assert ((word >> 55) & 1) == 0 and cmp_a == int(r["src"][0][1:])
+                # cmp_b must be an integer compare literal equal to 0.
+                assert ((word >> 31) & 1) == 1 and ((word >> 57) & 1) == 1
+                assert ((word >> 58) & 1) == 0
+                cmp_b = (((word >> 52) & 1) | (((code[3] >> 1) & 0x3f) << 1) |
+                         (((word >> 20) & 1) << 7))
+                assert cmp_b == 0, (cmp_b, r)
+                # if_true and if_false must be integer immediates (0 / safe_u0_b).
+                assert ((word >> 37) & 1) == 1 and ((word >> 38) & 1) == 0
+                assert ((word >> 47) & 1) == 1
+                assert ((word >> 69) & 1) == 1 and ((word >> 70) & 1) == 0
+                assert ((word >> 79) & 1) == 1
                 if_true = ((word >> 40) & 0x7f) | (((word >> 39) & 1) << 7)
                 if_false = ((word >> 72) & 0x7f) | (((word >> 71) & 1) << 7)
                 assert if_true == 0, (if_true, r)

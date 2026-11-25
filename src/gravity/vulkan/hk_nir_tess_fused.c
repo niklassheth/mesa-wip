@@ -1984,81 +1984,85 @@ nir_remove_msb(nir_builder *b, nir_def *val)
 
 /* Exact 16.16 fixed-point 1D point placement matching ComputeTessFactorCtx +
  * PlacePointIn1D in src/poly/cl/tessellator.h bit-for-bit for all 3 spacings.
- * k in [0 .. n]. Returns integer q in [0 .. 65536]. */
+ * Mirrors around numHalfTessFactorPoints derived from f (not promoted n) and
+ * omits clamping q_half so all fractional boundary evaluations match upstream. */
 static nir_def *
 nir_eval_1d_fxp(nir_builder *b, enum gl_tess_spacing spacing, nir_def *n,
                 nir_def *f, nir_def *k)
 {
-   nir_def *k2 = nir_ishl_imm(b, k, 1);
-   nir_def *flip = nir_ult(b, n, k2);
-   nir_def *j = nir_bcsel(b, flip, nir_isub(b, n, k), k);
-   nir_def *j_is_0 = nir_ieq_imm(b, j, 0);
-   nir_def *j_is_mid = nir_ieq(b, nir_ishl_imm(b, j, 1), n);
-
-   nir_def *q_mid;
    if (spacing == TESS_SPACING_EQUAL) {
+      nir_def *odd = nir_i2b(b, nir_iand_imm(b, n, 1));
+      nir_def *num_half = nir_ushr_imm(b, nir_iadd_imm(b, n, 1), 1);
+      nir_def *flip = nir_uge(b, k, num_half);
+      nir_def *j = nir_bcsel(b, flip, nir_isub(b, n, k), k);
+      nir_def *is_mid = nir_iand(b, nir_inot(b, odd), nir_ieq(b, j, num_half));
       nir_def *inv_n = nir_float_to_fxp(
          b, nir_fdiv(b, nir_imm_float(b, 1.0f), nir_u2f32(b, n)));
-      q_mid = nir_imul(b, j, inv_n);
-   } else {
-      const bool odd = spacing == TESS_SPACING_FRACTIONAL_ODD;
-      nir_def *fxp_tess = nir_float_to_fxp(b, f);
-      nir_def *fxp_half = nir_ushr_imm(b, nir_iadd_imm(b, fxp_tess, 1), 1);
-      if (odd) {
-         fxp_half = nir_iadd_imm(b, fxp_half, HK_TESS_FXP_ONE_HALF);
-      } else {
-         fxp_half = nir_bcsel(
-            b, nir_ieq_imm(b, fxp_half, HK_TESS_FXP_ONE_HALF),
-            nir_imm_int(b, HK_TESS_FXP_ONE), fxp_half);
-      }
-      nir_def *floor_int = nir_ushr_imm(b, fxp_half, 16);
-      nir_def *ceil_int =
-         nir_ushr_imm(b, nir_iadd_imm(b, fxp_half, HK_TESS_FXP_ONE - 1), 16);
-      nir_def *fxp_floor = nir_ishl_imm(b, floor_int, 16);
-      nir_def *fxp_ceil = nir_ishl_imm(b, ceil_int, 16);
-      nir_def *frac = nir_isub(b, fxp_half, fxp_floor);
-
-      nir_def *split_raw;
-      if (odd) {
-         nir_def *rm = nir_remove_msb(b, nir_usub_sat(b, floor_int, nir_imm_int(b, 1)));
-         split_raw = nir_bcsel(b, nir_ieq_imm(b, floor_int, 1),
-                               nir_imm_int(b, 0),
-                               nir_iadd_imm(b, nir_ishl_imm(b, rm, 1), 1));
-      } else {
-         nir_def *rm = nir_remove_msb(b, floor_int);
-         split_raw = nir_iadd_imm(b, nir_ishl_imm(b, rm, 1), 1);
-      }
-      nir_def *split = nir_bcsel(b, nir_ieq(b, fxp_ceil, fxp_floor),
-                                 nir_iadd_imm(b, ceil_int, 1), split_raw);
-
-      nir_def *floor_segs = nir_umax(
-         b, nir_usub_sat(b, nir_ishl_imm(b, floor_int, 1), nir_imm_int(b, odd ? 1 : 0)),
-         nir_imm_int(b, 1));
-      nir_def *ceil_segs = nir_umax(
-         b, nir_usub_sat(b, nir_ishl_imm(b, ceil_int, 1), nir_imm_int(b, odd ? 1 : 0)),
-         nir_imm_int(b, 1));
-      nir_def *inv_floor = nir_float_to_fxp(
-         b, nir_fdiv(b, nir_imm_float(b, 1.0f), nir_u2f32(b, floor_segs)));
-      nir_def *inv_ceil = nir_float_to_fxp(
-         b, nir_fdiv(b, nir_imm_float(b, 1.0f), nir_u2f32(b, ceil_segs)));
-
-      nir_def *idx_floor = nir_bcsel(b, nir_ult(b, split, j),
-                                     nir_iadd_imm(b, j, -1), j);
-      nir_def *loc_floor = nir_imul(b, idx_floor, inv_floor);
-      nir_def *loc_ceil = nir_imul(b, j, inv_ceil);
-      nir_def *inv_frac = nir_isub(b, nir_imm_int(b, HK_TESS_FXP_ONE), frac);
-      nir_def *lerp = nir_iadd(b, nir_imul(b, loc_floor, inv_frac),
-                               nir_imul(b, loc_ceil, frac));
-      q_mid = nir_ushr_imm(b, nir_iadd_imm(b, lerp, HK_TESS_FXP_ONE_HALF), 16);
+      nir_def *q = nir_imul(b, j, inv_n);
+      nir_def *res = nir_bcsel(
+         b, flip, nir_isub(b, nir_imm_int(b, HK_TESS_FXP_ONE), q), q);
+      return nir_bcsel(b, is_mid, nir_imm_int(b, HK_TESS_FXP_ONE_HALF), res);
    }
 
-   nir_def *q_half = nir_bcsel(
-      b, j_is_0, nir_imm_int(b, 0),
-      nir_bcsel(b, j_is_mid, nir_imm_int(b, HK_TESS_FXP_ONE_HALF),
-                nir_umin(b, q_mid, nir_imm_int(b, HK_TESS_FXP_ONE_HALF))));
-   return nir_bcsel(b, flip,
-                    nir_isub(b, nir_imm_int(b, HK_TESS_FXP_ONE), q_half),
-                    q_half);
+   const bool odd = spacing == TESS_SPACING_FRACTIONAL_ODD;
+   nir_def *fxp_tess = nir_float_to_fxp(b, f);
+   nir_def *fxp_half = nir_ushr_imm(b, nir_iadd_imm(b, fxp_tess, 1), 1);
+   if (odd) {
+      fxp_half = nir_iadd_imm(b, fxp_half, HK_TESS_FXP_ONE_HALF);
+   } else {
+      fxp_half = nir_bcsel(
+         b, nir_ieq_imm(b, fxp_half, HK_TESS_FXP_ONE_HALF),
+         nir_imm_int(b, HK_TESS_FXP_ONE), fxp_half);
+   }
+   nir_def *floor_int = nir_ushr_imm(b, fxp_half, 16);
+   nir_def *ceil_int =
+      nir_ushr_imm(b, nir_iadd_imm(b, fxp_half, HK_TESS_FXP_ONE - 1), 16);
+   nir_def *fxp_floor = nir_ishl_imm(b, floor_int, 16);
+   nir_def *fxp_ceil = nir_ishl_imm(b, ceil_int, 16);
+   nir_def *frac = nir_isub(b, fxp_half, fxp_floor);
+
+   nir_def *split_raw;
+   if (odd) {
+      nir_def *rm = nir_remove_msb(b, nir_usub_sat(b, floor_int, nir_imm_int(b, 1)));
+      split_raw = nir_bcsel(b, nir_ieq_imm(b, floor_int, 1),
+                            nir_imm_int(b, 0),
+                            nir_iadd_imm(b, nir_ishl_imm(b, rm, 1), 1));
+   } else {
+      nir_def *rm = nir_remove_msb(b, floor_int);
+      split_raw = nir_iadd_imm(b, nir_ishl_imm(b, rm, 1), 1);
+   }
+   nir_def *split = nir_bcsel(b, nir_ieq(b, fxp_ceil, fxp_floor),
+                              nir_iadd_imm(b, ceil_int, 1), split_raw);
+
+   nir_def *floor_segs = nir_umax(
+      b, nir_usub_sat(b, nir_ishl_imm(b, floor_int, 1), nir_imm_int(b, odd ? 1 : 0)),
+      nir_imm_int(b, 1));
+   nir_def *ceil_segs = nir_umax(
+      b, nir_usub_sat(b, nir_ishl_imm(b, ceil_int, 1), nir_imm_int(b, odd ? 1 : 0)),
+      nir_imm_int(b, 1));
+   nir_def *inv_floor = nir_float_to_fxp(
+      b, nir_fdiv(b, nir_imm_float(b, 1.0f), nir_u2f32(b, floor_segs)));
+   nir_def *inv_ceil = nir_float_to_fxp(
+      b, nir_fdiv(b, nir_imm_float(b, 1.0f), nir_u2f32(b, ceil_segs)));
+
+   nir_def *flip = nir_uge(b, k, ceil_int);
+   nir_def *mirrored = nir_isub(b, nir_ishl_imm(b, ceil_int, 1), k);
+   if (odd)
+      mirrored = nir_iadd_imm(b, mirrored, -1);
+   nir_def *j = nir_bcsel(b, flip, mirrored, k);
+   nir_def *is_mid = nir_ieq(b, j, ceil_int);
+
+   nir_def *idx_floor = nir_bcsel(b, nir_ult(b, split, j),
+                                  nir_iadd_imm(b, j, -1), j);
+   nir_def *loc_floor = nir_imul(b, idx_floor, inv_floor);
+   nir_def *loc_ceil = nir_imul(b, j, inv_ceil);
+   nir_def *inv_frac = nir_isub(b, nir_imm_int(b, HK_TESS_FXP_ONE), frac);
+   nir_def *lerp = nir_iadd(b, nir_imul(b, loc_floor, inv_frac),
+                            nir_imul(b, loc_ceil, frac));
+   nir_def *q = nir_ushr_imm(b, nir_iadd_imm(b, lerp, HK_TESS_FXP_ONE_HALF), 16);
+   nir_def *res = nir_bcsel(
+      b, flip, nir_isub(b, nir_imm_int(b, HK_TESS_FXP_ONE), q), q);
+   return nir_bcsel(b, is_mid, nir_imm_int(b, HK_TESS_FXP_ONE_HALF), res);
 }
 
 static nir_def *

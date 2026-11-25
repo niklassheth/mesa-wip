@@ -366,9 +366,14 @@ main(int argc, char **argv)
             struct blob_reader reader; blob_reader_init(&reader, data, size);
             struct vk_shader *copy = NULL;
             VkResult result = hk_deserialize_api_shader(&dev->vk, &reader, 0, NULL, &copy);
-            bool accept_cache = hk_apple9_native_mesh_available_device(dev) && (policy & bit);
-            CHECK(result == (accept_cache ? VK_SUCCESS : VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT));
-            if (copy) hk_api_shader_destroy(&dev->vk, copy, NULL);
+            bool compat_uuid = hk_apple9_native_mesh_available(pdev) && (policy & bit);
+            CHECK(result == (compat_uuid ? VK_SUCCESS : VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT));
+            if (copy) {
+               struct hk_api_shader *api = container_of(copy, struct hk_api_shader, vk);
+               CHECK(!!hk_api_shader_native(api) ==
+                     hk_apple9_native_mesh_available_device(dev));
+               hk_api_shader_destroy(&dev->vk, copy, NULL);
+            }
             free(data);
          }
       }

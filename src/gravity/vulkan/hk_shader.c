@@ -686,7 +686,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
 
 static VkResult
 hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
-                      struct hk_shader *shader)
+                      struct hk_shader *shader, bool upload)
 {
    struct hk_shader_info info;
    blob_copy_bytes(blob, &info, sizeof(info));
@@ -709,6 +709,16 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
    shader->code_size = code_size;
    shader->data_size = data_size;
    shader->b.info.binary_size = code_size;
+
+   if (!upload) {
+      blob_skip_bytes(blob, code_size);
+      blob_skip_bytes(blob, data_size);
+      if (blob->overrun)
+         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      shader->code_size = 0;
+      shader->data_size = 0;
+      return VK_SUCCESS;
+   }
 
    shader->code_ptr = malloc(MAX2(code_size, 1));
    if (shader->code_ptr == NULL)
@@ -774,6 +784,20 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
    }
    blob_copy_bytes(blob, obj->apple9_native_pair_id,
                    sizeof(obj->apple9_native_pair_id));
+   struct hk_physical_device *pdev = hk_device_physical(dev);
+   /* Logical-off open under a physical-on device shares the physical
+    * shaderBinaryUUID: structurally validate optional child native leaves from
+    * public VK_EXT_shader_object binaries and drop them, keeping the usable
+    * emulated parent intact. */
+   const bool drop_native_leaf =
+      hk_apple9_native_mesh_available(pdev) &&
+      !hk_apple9_native_mesh_available_device(dev);
+   const bool leaf_mesh_ok = drop_native_leaf && !allow_native
+                                ? hk_apple9_native_mesh_available(pdev)
+                                : hk_apple9_native_mesh_available_device(dev);
+   const bool leaf_object_ok = drop_native_leaf && !allow_native
+                                  ? hk_apple9_native_object_available(pdev)
+                                  : hk_apple9_native_object_available_device(dev);
    bool gs_leaf = (hk_apple9_native_gs_enabled() ||
                    (obj->apple9_native_stage_mask == HK_APPLE9_NATIVE_GS_BIT)) &&
                   (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_GEOMETRY);
@@ -783,12 +807,11 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
       (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_TESS_CTRL ||
        stage == MESA_SHADER_TESS_EVAL);
    bool task_leaf =
-      (hk_apple9_native_task_bridge_enabled() ||
-       hk_apple9_native_object_available_device(dev)) &&
+      (hk_apple9_native_task_bridge_enabled() || leaf_object_ok) &&
       stage == MESA_SHADER_TASK;
    if (blob->overrun ||
        (obj->apple9_native_leaf &&
-        (!hk_apple9_native_mesh_available_device(dev) ||
+        (!leaf_mesh_ok ||
          (stage != MESA_SHADER_MESH && stage != MESA_SHADER_FRAGMENT &&
           !gs_leaf && !tess_leaf && !task_leaf)))) {
       hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
@@ -796,7 +819,8 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
    }
 
    hk_foreach_variant(obj, shader) {
-      VkResult result = hk_deserialize_shader(dev, blob, shader);
+      VkResult result = hk_deserialize_shader(
+         dev, blob, shader, !(drop_native_leaf && !allow_native));
 
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
@@ -812,7 +836,7 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
          uint32_t payload_alloc_B =
             t->info.apple9_native.task_payload_stride_B +
             (t->info.apple9_native.writes_child_grid ? 16 : 0);
-         if (!hk_apple9_native_object_available_device(dev) ||
+         if (!leaf_object_ok ||
              t->info.apple9_native.key.physical_threads >
                 AGX_NATIVE_OBJECT_MAX_THREADS ||
              t->info.apple9_native.task_payload_size_B >
@@ -835,7 +859,7 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
          m->info.apple9_native.task_payload_stride_B +
          (m->info.apple9_native.reads_child_grid ? 16 : 0);
       if ((mi->native_object &&
-           (!hk_apple9_native_object_available_device(dev) ||
+           (!leaf_object_ok ||
             (m->info.apple9_native.key.hw_payload &&
              mesh_payload_alloc_B > AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES))) ||
           (mi->native_task_bridge && !hk_apple9_native_task_bridge_enabled())) {
@@ -912,6 +936,20 @@ hk_deserialize_api_shader_inner(struct vk_device *vk_dev, struct blob_reader *bl
          hk_api_shader_destroy(vk_dev, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       }
+   }
+
+   if (drop_native_leaf && allow_native) {
+      if (obj->apple9_task_bridge) {
+         hk_api_shader_destroy(vk_dev, &obj->apple9_task_bridge->vk,
+                               pAllocator);
+         obj->apple9_task_bridge = NULL;
+      }
+      if (obj->apple9_native) {
+         hk_api_shader_destroy(vk_dev, &obj->apple9_native->vk, pAllocator);
+         obj->apple9_native = NULL;
+      }
+      obj->apple9_native_stage_mask = 0;
+      p_atomic_set(&obj->apple9_native_candidate, false);
    }
 
    bool has_gs_pp = blob_read_uint8(blob);

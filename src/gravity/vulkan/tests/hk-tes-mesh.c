@@ -2330,45 +2330,46 @@ ref_remove_msb(uint32_t val)
 static uint32_t
 ref_eval_1d_fxp(enum gl_tess_spacing spacing, uint32_t n, float f, uint32_t k)
 {
-   bool flip = 2u * k > n;
-   uint32_t j = flip ? n - k : k;
-   uint32_t q_half;
-   if (j == 0) {
-      q_half = 0;
-   } else if (2u * j == n) {
-      q_half = 32768u;
-   } else if (spacing == TESS_SPACING_EQUAL) {
-      q_half = j * ref_float_to_fxp(1.0f / (float)n);
-   } else {
-      bool odd = spacing == TESS_SPACING_FRACTIONAL_ODD;
-      uint32_t fxp_tess = ref_float_to_fxp(f);
-      uint32_t fxp_half = (fxp_tess + 1u) >> 1;
-      if (odd || fxp_half == 32768u)
-         fxp_half += 32768u;
-      uint32_t floor_int = fxp_half >> 16;
-      uint32_t ceil_int = (fxp_half + 65535u) >> 16;
-      uint32_t fxp_floor = floor_int << 16;
-      uint32_t fxp_ceil = ceil_int << 16;
-      uint32_t frac = fxp_half - fxp_floor;
-      uint32_t split;
-      if (fxp_ceil == fxp_floor)
-         split = ceil_int + 1u;
-      else if (odd)
-         split = floor_int == 1u ? 0u : (ref_remove_msb(floor_int - 1u) << 1) + 1u;
-      else
-         split = (ref_remove_msb(floor_int) << 1) + 1u;
-      uint32_t floor_segs = MAX2((floor_int << 1) - (odd ? 1u : 0u), 1u);
-      uint32_t ceil_segs = MAX2((ceil_int << 1) - (odd ? 1u : 0u), 1u);
-      uint32_t inv_floor = ref_float_to_fxp(1.0f / (float)floor_segs);
-      uint32_t inv_ceil = ref_float_to_fxp(1.0f / (float)ceil_segs);
-      uint32_t idx_floor = j > split ? j - 1u : j;
-      uint32_t loc_floor = idx_floor * inv_floor;
-      uint32_t loc_ceil = j * inv_ceil;
-      q_half = (loc_floor * (65536u - frac) + loc_ceil * frac + 32768u) >> 16;
+   if (spacing == TESS_SPACING_EQUAL) {
+      bool odd = (n & 1u) != 0;
+      uint32_t num_half = (n + 1u) >> 1;
+      bool flip = k >= num_half;
+      uint32_t j = flip ? n - k : k;
+      if (!odd && j == num_half)
+         return 32768u;
+      uint32_t q = j * ref_float_to_fxp(1.0f / (float)n);
+      return flip ? 65536u - q : q;
    }
-   if (q_half > 32768u)
-      q_half = 32768u;
-   return flip ? 65536u - q_half : q_half;
+   bool odd = spacing == TESS_SPACING_FRACTIONAL_ODD;
+   uint32_t fxp_tess = ref_float_to_fxp(f);
+   uint32_t fxp_half = (fxp_tess + 1u) >> 1;
+   if (odd || fxp_half == 32768u)
+      fxp_half += 32768u;
+   uint32_t floor_int = fxp_half >> 16;
+   uint32_t ceil_int = (fxp_half + 65535u) >> 16;
+   uint32_t fxp_floor = floor_int << 16;
+   uint32_t fxp_ceil = ceil_int << 16;
+   uint32_t frac = fxp_half - fxp_floor;
+   uint32_t split;
+   if (fxp_ceil == fxp_floor)
+      split = ceil_int + 1u;
+   else if (odd)
+      split = floor_int == 1u ? 0u : (ref_remove_msb(floor_int - 1u) << 1) + 1u;
+   else
+      split = (ref_remove_msb(floor_int) << 1) + 1u;
+   uint32_t floor_segs = MAX2((floor_int << 1) - (odd ? 1u : 0u), 1u);
+   uint32_t ceil_segs = MAX2((ceil_int << 1) - (odd ? 1u : 0u), 1u);
+   uint32_t inv_floor = ref_float_to_fxp(1.0f / (float)floor_segs);
+   uint32_t inv_ceil = ref_float_to_fxp(1.0f / (float)ceil_segs);
+   bool flip = k >= ceil_int;
+   uint32_t j = flip ? ((ceil_int << 1) - k - (odd ? 1u : 0u)) : k;
+   if (j == ceil_int)
+      return 32768u;
+   uint32_t idx_floor = j > split ? j - 1u : j;
+   uint32_t loc_floor = idx_floor * inv_floor;
+   uint32_t loc_ceil = j * inv_ceil;
+   uint32_t q = (loc_floor * (65536u - frac) + loc_ceil * frac + 32768u) >> 16;
+   return flip ? 65536u - q : q;
 }
 
 static float
@@ -2465,6 +2466,13 @@ fused_tess_topology_suite(void)
    CHECK(ref_eval_1d_fxp(TESS_SPACING_EQUAL, 7, 7.0f, 2) == 18724u);
    CHECK(ref_eval_1d_fxp(TESS_SPACING_FRACTIONAL_EVEN, 4, 2.5f, 1) == 28672u);
    CHECK(ref_eval_1d_fxp(TESS_SPACING_FRACTIONAL_EVEN, 4, 2.5f, 3) == 65536u - 28672u);
+   /* Exact upstream PlacePointIn1D checks: promoted odd inner (n=3, f=1.0,
+    * k=1 -> 65536) and unclamped fractional-even midpoint neighbor (6 + 2^-16,
+    * n=8, k=3 -> 32769). */
+   CHECK(ref_eval_1d_fxp(TESS_SPACING_FRACTIONAL_ODD, 3, 1.0f, 1) == 65536u);
+   CHECK(ref_eval_1d_fxp(TESS_SPACING_FRACTIONAL_ODD, 3, 1.0f, 2) == 65536u);
+   CHECK(ref_eval_1d_fxp(TESS_SPACING_FRACTIONAL_EVEN, 8,
+                         6.0f + 1.0f / 65536.0f, 3) == 32769u);
    /* Sub-1/65536 nextafter boundaries quantize to 16.16 before parity rounding,
     * matching upstream tessellator.h with zero collapsed frac==0 folds. */
    CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_ODD, nextafterf(3.0f, INFINITY)) == 3u);

@@ -94,8 +94,9 @@ def walk_vdm_stream(directory, index, start_address):
                 raise ValueError(
                     f'{directory}: unexpected VDM state packet {hdr:#x} at {addr:#x}')
         elif block_type == 3:
-            if (hdr & 0xf0000000) == 0x70000000:
-                # Native mesh dispatch tail: header + 3 global + 3 local words.
+            if (hdr & 0xfffff0ff) == 0x70000000:
+                # Native mesh dispatch tail: 0x70000000 | (primitive << 8),
+                # followed by 3 global + 3 local words.
                 has_native_pkt = True
                 addr += 7 * 4
             elif (hdr & 0xffff00ff) == 0x61c40000:

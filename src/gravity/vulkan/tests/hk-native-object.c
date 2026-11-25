@@ -1093,7 +1093,7 @@ main(int argc, char **argv)
          CHECK(cs_vk->ops->serialize(&dev->vk, cs_vk, &cblob));
          hk_api_shader_destroy(&dev->vk, cs_vk, NULL);
 
-         dev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
+          dev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
          CHECK(hk_apple9_native_mesh_available_device(dev));
          struct blob_reader cr;
          struct vk_shader *cs_imp = NULL;
@@ -1103,6 +1103,56 @@ main(int argc, char **argv)
          CHECK(cs_imp && cs_imp->stage == MESA_SHADER_COMPUTE);
          hk_api_shader_destroy(&dev->vk, cs_imp, NULL);
          blob_finish(&cblob);
+
+         /* Reverse direction (logical-on -> logical-off sharing the same
+          * physical shaderBinaryUUID): export a Task + Mesh + FS set carrying
+          * optional native + task-bridge leaves on logical-on, then import on
+          * logical-off. Import MUST succeed with native leaves stripped and
+          * zero BO leaks, while physical-off still fails closed. */
+         unsigned base_bos = live_bos;
+         compile_pair(dev, 32, 2048, 0, 4, false, false, &t, &m, &f);
+         CHECK(hk_api_shader_native(t) && hk_api_shader_task_bridge(t));
+         CHECK(hk_api_shader_native(m) && hk_api_shader_task_bridge(m));
+         CHECK(hk_api_shader_native(f) && hk_api_shader_task_bridge(f));
+         struct blob blobs[3];
+         struct hk_api_shader *srcs[3] = {t, m, f};
+         for (unsigned si = 0; si < 3; ++si) {
+            blob_init(&blobs[si]);
+            CHECK(srcs[si]->vk.ops->serialize(&dev->vk, &srcs[si]->vk,
+                                              &blobs[si]));
+         }
+         destroy_pair(dev, t, m, f);
+
+         dev->dev.params.features = 0;
+         CHECK(hk_apple9_native_mesh_available(pdev) &&
+               !hk_apple9_native_mesh_available_device(dev));
+         for (unsigned si = 0; si < 3; ++si) {
+            struct blob_reader r;
+            struct vk_shader *imp = NULL;
+            blob_reader_init(&r, blobs[si].data, blobs[si].size);
+            CHECK(hk_device_shader_ops.deserialize(&dev->vk, &r, 0, NULL,
+                                                   &imp) == VK_SUCCESS);
+            CHECK(imp && r.current == r.end && !r.overrun);
+            struct hk_api_shader *api = container_of(imp, struct hk_api_shader, vk);
+            CHECK(!hk_api_shader_native(api) && !hk_api_shader_task_bridge(api));
+            hk_api_shader_destroy(&dev->vk, imp, NULL);
+         }
+         CHECK(live_bos == base_bos);
+
+         /* Physical-off (different shaderBinaryUUID) still rejects native leaves. */
+         pdev->dev.params.features = 0;
+         for (unsigned si = 0; si < 3; ++si) {
+            struct blob_reader r;
+            struct vk_shader *imp = NULL;
+            blob_reader_init(&r, blobs[si].data, blobs[si].size);
+            CHECK(hk_device_shader_ops.deserialize(&dev->vk, &r, 0, NULL,
+                                                   &imp) ==
+                  VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+            CHECK(!imp);
+            blob_finish(&blobs[si]);
+         }
+         pdev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
+         dev->dev.params.features = DRM_ASAHI_FEATURE_NATIVE_MESH;
       }
    }
 
