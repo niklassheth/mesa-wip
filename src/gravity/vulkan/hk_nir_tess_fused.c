@@ -304,6 +304,19 @@ validate_stages(const nir_shader *vs, const nir_shader *tcs,
    if (!hk_nir_fused_validate_vs(vs, opts ? &opts->vertex : NULL, reason))
       return false;
 
+   /* Volatile VS loads have observable side effects even when TCS reads no VS
+    * outputs and cannot be skipped or re-evaluated; fall back to SW tess. */
+   nir_foreach_block(block, nir_shader_get_entrypoint((nir_shader *)vs)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (nir_intrinsic_has_access(intr) &&
+             (nir_intrinsic_access(intr) & ACCESS_VOLATILE))
+            REJECT("fused tess falls back on volatile VS loads");
+      }
+   }
+
    /* Validate TCS instructions. */
    unsigned tcs_impls = 0;
    nir_foreach_function_impl(impl, tcs) {
@@ -2764,7 +2777,9 @@ analyze_tcs_passthrough(const nir_shader *vs_source, const nir_shader *vs,
    if (!cull)
       return false;
    bool uses_inv_id = false;
-   bool single_ok = true;
+   bool has_ext_exec_bar = false;
+   bool has_ext_effect = false;
+   bool guarded_ok = true;
    bool have_id = false;
    unsigned inv_id = 0;
    nir_foreach_block(block, nir_shader_get_entrypoint(cull)) {
@@ -2776,34 +2791,40 @@ analyze_tcs_passthrough(const nir_shader *vs_source, const nir_shader *vs,
             ralloc_free(cull);
             return false;
          }
-         if (intr->intrinsic == nir_intrinsic_barrier &&
-             tcs_barrier_is_external(intr) &&
-             nir_intrinsic_execution_scope(intr) != SCOPE_NONE) {
-            single_ok = false;
-         }
+         bool is_ext_bar =
+            intr->intrinsic == nir_intrinsic_barrier &&
+            tcs_barrier_is_external(intr);
+         bool is_vol_or_atomic =
+            nir_intrinsic_has_access(intr) &&
+            (nir_intrinsic_access(intr) & (ACCESS_VOLATILE | ACCESS_ATOMIC));
+         if (is_ext_bar && nir_intrinsic_execution_scope(intr) != SCOPE_NONE)
+            has_ext_exec_bar = true;
+         if (is_ext_bar || is_vol_or_atomic)
+            has_ext_effect = true;
          if (intr->intrinsic == nir_intrinsic_load_invocation_id)
             uses_inv_id = true;
          if (intr->intrinsic == nir_intrinsic_store_output ||
-             intr->intrinsic == nir_intrinsic_load_output) {
+             intr->intrinsic == nir_intrinsic_load_output ||
+             is_ext_bar || is_vol_or_atomic) {
             unsigned c = 0;
             if (!block_enclosing_inv_const(block, pl->out_v, &c) ||
                 c >= pl->out_v) {
-               single_ok = false;
+               guarded_ok = false;
             } else if (!have_id) {
                have_id = true;
                inv_id = c;
             } else if (inv_id != c) {
-               single_ok = false;
+               guarded_ok = false;
             }
          }
       }
    }
    ralloc_free(cull);
 
-   if (single_ok && !uses_inv_id) {
+   if (!has_ext_exec_bar && !uses_inv_id && !has_ext_effect) {
       out->single_inv_patch_main = true;
       out->single_inv_id = 0;
-   } else if (single_ok) {
+   } else if (!has_ext_exec_bar && guarded_ok) {
       out->single_inv_patch_main = true;
       out->single_inv_id = have_id ? inv_id : 0;
    } else {

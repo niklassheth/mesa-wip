@@ -3303,6 +3303,16 @@ fused_tess_astra_regression_suite(void)
    printf("fused tessellation Astra regression suite: F1..F8 + M3 safe-U0_B checks passed\n");
 }
 
+static float
+ref_clamp_tess(enum gl_tess_spacing spacing, float v)
+{
+   if (spacing == TESS_SPACING_FRACTIONAL_ODD)
+      return fminf(fmaxf(v, 1.0f), 63.0f);
+   if (spacing == TESS_SPACING_FRACTIONAL_EVEN)
+      return fminf(fmaxf(v, 2.0f), 64.0f);
+   return ceilf(fminf(fmaxf(v, 1.0f), 64.0f));
+}
+
 /* Simulate the unified order-preserving seg_desc + seg_wg_end multi-patch
  * protocol emitted by build_object_shader_mp() + build_mesh_shader_mp() for an
  * arbitrary K-patch OBJECT WG containing mixed culled (tess=0), small-packed
@@ -3315,7 +3325,8 @@ sim_multipatch_object_wg(enum tess_primitive_mode domain,
                          uint32_t tile_h, uint32_t p_strip, uint32_t K,
                          uint32_t first_patch, uint32_t patch_count,
                          uint32_t wg_idx, const float *levels_outer,
-                         const float *levels_inner)
+                         const float *levels_inner,
+                         uint32_t *out_total_v, uint32_t *out_total_p)
 {
    uint32_t surv_mask = 0, small_mask = 0;
    uint32_t pv[16] = {0}, pp[16] = {0}, pwgs[16] = {0}, pid[16] = {0};
@@ -3342,12 +3353,12 @@ sim_multipatch_object_wg(enum tess_primitive_mode domain,
       if (domain == TESS_PRIMITIVE_QUADS) {
          uint32_t no[4];
          for (unsigned e = 0; e < 4; ++e) {
-            float c = fminf(fmaxf(levels_outer[i * 4 + e], 1.0f), 64.0f);
+            float c = ref_clamp_tess(spacing, levels_outer[i * 4 + e]);
             no[e] = ref_seg_count(spacing, c);
          }
          uint32_t ni[2];
          for (unsigned e = 0; e < 2; ++e) {
-            float c = fminf(fmaxf(levels_inner[i * 2 + e], 1.0f), 64.0f);
+            float c = ref_clamp_tess(spacing, levels_inner[i * 2 + e]);
             ni[e] = ref_seg_count(spacing, c);
             if (spacing == TESS_SPACING_FRACTIONAL_ODD && ni[e] == 1 &&
                 (no[0] > 1 || no[1] > 1 || no[2] > 1 || no[3] > 1))
@@ -3385,10 +3396,10 @@ sim_multipatch_object_wg(enum tess_primitive_mode domain,
       } else {
          uint32_t no[3];
          for (unsigned e = 0; e < 3; ++e) {
-            float c = fminf(fmaxf(levels_outer[i * 4 + e], 1.0f), 64.0f);
+            float c = ref_clamp_tess(spacing, levels_outer[i * 4 + e]);
             no[e] = ref_seg_count(spacing, c);
          }
-         float ci = fminf(fmaxf(i0, 1.0f), 64.0f);
+         float ci = ref_clamp_tess(spacing, i0);
          uint32_t ni = ref_seg_count(spacing, ci);
          if (spacing == TESS_SPACING_FRACTIONAL_ODD && ni == 1 &&
              (no[0] > 1 || no[1] > 1 || no[2] > 1))
@@ -3574,6 +3585,485 @@ sim_multipatch_object_wg(enum tess_primitive_mode domain,
    CHECK(obs_surviving == expected_surviving);
    CHECK(obs_v == expected_total_v);
    CHECK(obs_p == expected_total_p);
+   if (out_total_v)
+      *out_total_v = obs_v;
+   if (out_total_p)
+      *out_total_p = obs_p;
+}
+
+/* Lightweight lock-step 32-lane structured-NIR interpreter for executing real
+ * generated OBJECT(VS+TCS) and MESH(TES) shaders on the host and comparing
+ * multi-patch vs K=1 PrimitiveID order, vertex positions, counts, and culled
+ * 0xe0/0xe1 store counts. */
+struct nir_wg_val {
+   uint64_t u[4];
+};
+
+struct nir_wg_exec {
+   const nir_shader *nir;
+   struct nir_wg_val *ssa[32]; /* [lane][ssa_index] */
+   uint32_t pred_block[32];
+   uint8_t shm[32768];
+   uint8_t *payload;
+   uint32_t payload_size;
+   uint32_t payload_store_count;
+   const struct hk_apple9_fused_tess_params *params;
+   const uint32_t *ubo0;
+   uint32_t ubo0_words;
+   uint32_t wg_id[3];
+   uint32_t launch_grid[3];
+   uint32_t out_v_cnt, out_p_cnt;
+   uint32_t out_indices[48][3];
+   float out_pos[48][4];
+   uint32_t out_pid[48];
+   uint32_t break_mask;
+   uint32_t cont_mask;
+};
+
+static inline float
+u32_to_f32(uint32_t u)
+{
+   float f;
+   memcpy(&f, &u, sizeof(f));
+   return f;
+}
+
+static inline uint32_t
+f32_to_u32(float f)
+{
+   uint32_t u;
+   memcpy(&u, &f, sizeof(u));
+   return u;
+}
+
+static inline uint64_t
+wg_src_u(const struct nir_wg_exec *ex, unsigned lane, nir_src src, unsigned c)
+{
+   return ex->ssa[lane][src.ssa->index].u[c];
+}
+
+static inline uint64_t
+wg_alu_src_u(const struct nir_wg_exec *ex, unsigned lane,
+             const nir_alu_src *as, unsigned c)
+{
+   return ex->ssa[lane][as->src.ssa->index].u[as->swizzle[c]];
+}
+
+static uint64_t
+wg_eval_alu_scalar(nir_op op, unsigned bs, uint64_t a, uint64_t b, uint64_t c)
+{
+   uint32_t ua = (uint32_t)a, ub = (uint32_t)b, uc = (uint32_t)c;
+   int32_t ia = (int32_t)ua, ib = (int32_t)ub;
+   float fa = u32_to_f32(ua), fb = u32_to_f32(ub), fc = u32_to_f32(uc);
+   switch (op) {
+   case nir_op_mov: return a;
+   case nir_op_iadd: return bs == 64 ? a + b : (uint64_t)(uint32_t)(ua + ub);
+   case nir_op_isub: return bs == 64 ? a - b : (uint64_t)(uint32_t)(ua - ub);
+   case nir_op_uadd_sat: return (uint64_t)(ua > UINT32_MAX - ub ? UINT32_MAX : ua + ub);
+   case nir_op_usub_sat: return (uint64_t)(ua > ub ? ua - ub : 0u);
+   case nir_op_imul: return bs == 64 ? a * b : (uint64_t)(uint32_t)(ua * ub);
+   case nir_op_umul_2x32_64: return (uint64_t)ua * (uint64_t)ub;
+   case nir_op_umul_high: return (uint64_t)(((uint64_t)ua * (uint64_t)ub) >> 32);
+   case nir_op_udiv: return ub ? (uint64_t)(ua / ub) : 0u;
+   case nir_op_umod: return ub ? (uint64_t)(ua % ub) : 0u;
+   case nir_op_ineg: return (uint64_t)(uint32_t)(-ia);
+   case nir_op_iand: return bs == 64 ? (a & b) : (uint64_t)(ua & ub);
+   case nir_op_ior: return bs == 64 ? (a | b) : (uint64_t)(ua | ub);
+   case nir_op_ixor: return bs == 64 ? (a ^ b) : (uint64_t)(ua ^ ub);
+   case nir_op_inot: return bs == 1 ? (!ua) : (uint64_t)(~ua);
+   case nir_op_ishl: return (uint64_t)(ua << (ub & 31));
+   case nir_op_ushr: return (uint64_t)(ua >> (ub & 31));
+   case nir_op_ishr: return (uint64_t)(uint32_t)(ia >> (ub & 31));
+   case nir_op_umin: return ua < ub ? ua : ub;
+   case nir_op_umax: return ua > ub ? ua : ub;
+   case nir_op_imin: return ia < ib ? ua : ub;
+   case nir_op_imax: return ia > ib ? ua : ub;
+   case nir_op_ieq: return a == b ? 1 : 0;
+   case nir_op_ine: return a != b ? 1 : 0;
+   case nir_op_ult: return ua < ub ? 1 : 0;
+   case nir_op_uge: return ua >= ub ? 1 : 0;
+   case nir_op_ilt: return ia < ib ? 1 : 0;
+   case nir_op_ige: return ia >= ib ? 1 : 0;
+   case nir_op_feq: return fa == fb ? 1 : 0;
+   case nir_op_fneu: return !(fa == fb) ? 1 : 0;
+   case nir_op_flt: return fa < fb ? 1 : 0;
+   case nir_op_fge: return fa >= fb ? 1 : 0;
+   case nir_op_fadd: return f32_to_u32(fa + fb);
+   case nir_op_fsub: return f32_to_u32(fa - fb);
+   case nir_op_fmul: return f32_to_u32(fa * fb);
+   case nir_op_ffma: return f32_to_u32(fmaf(fa, fb, fc));
+   case nir_op_fdiv: return f32_to_u32(fa / fb);
+   case nir_op_fneg: return f32_to_u32(-fa);
+   case nir_op_fabs: return f32_to_u32(fabsf(fa));
+   case nir_op_fmin: return f32_to_u32(isnan(fa) ? fb : (isnan(fb) ? fa : fminf(fa, fb)));
+   case nir_op_fmax: return f32_to_u32(isnan(fa) ? fb : (isnan(fb) ? fa : fmaxf(fa, fb)));
+   case nir_op_fceil: return f32_to_u32(ceilf(fa));
+   case nir_op_ffloor: return f32_to_u32(floorf(fa));
+   case nir_op_ftrunc: return f32_to_u32(truncf(fa));
+   case nir_op_fround_even: return f32_to_u32(nearbyintf(fa));
+   case nir_op_fsat: return f32_to_u32(fminf(fmaxf(fa, 0.0f), 1.0f));
+   case nir_op_frcp: return f32_to_u32(1.0f / fa);
+   case nir_op_fsqrt: return f32_to_u32(sqrtf(fa));
+   case nir_op_f2u32: return (uint32_t)fa;
+   case nir_op_f2i32: return (uint32_t)(int32_t)fa;
+   case nir_op_u2f32: return f32_to_u32((float)ua);
+   case nir_op_i2f32: return f32_to_u32((float)ia);
+   case nir_op_b2i32: return ua ? 1u : 0u;
+   case nir_op_u2u64: return (uint64_t)ua;
+   case nir_op_u2u32: return (uint64_t)ua;
+   case nir_op_u2u16: return (uint64_t)(ua & 0xffffu);
+   case nir_op_bcsel: return (a & 1) ? b : c;
+   case nir_op_bit_count: return (uint64_t)util_bitcount(ua);
+   case nir_op_ufind_msb: return ua ? (uint64_t)(31 - __builtin_clz(ua)) : UINT32_MAX;
+   case nir_op_find_lsb: return ua ? (uint64_t)__builtin_ctz(ua) : UINT32_MAX;
+   case nir_op_ubitfield_extract: {
+      unsigned off = ub & 31, bits = uc & 31;
+      return bits ? ((ua >> off) & ((1u << bits) - 1u)) : 0u;
+   }
+   default:
+      fprintf(stderr, "unsupported NIR ALU op in host tess eval: %s\n",
+              nir_op_infos[op].name);
+      CHECK(false);
+      return 0;
+   }
+}
+
+static void wg_exec_cf_list(struct nir_wg_exec *ex, struct exec_list *list,
+                            uint32_t active);
+
+static void
+wg_exec_block(struct nir_wg_exec *ex, nir_block *blk, uint32_t active)
+{
+   if (!active)
+      return;
+   nir_foreach_instr(instr, blk) {
+      if (!active)
+         break;
+      switch (instr->type) {
+      case nir_instr_type_phi: {
+         nir_phi_instr *phi = nir_instr_as_phi(instr);
+         unsigned dst = phi->def.index;
+         for (unsigned l = 0; l < 32; ++l) {
+            if (!(active & (1u << l)))
+               continue;
+            bool matched = false;
+            nir_foreach_phi_src(ps, phi) {
+               if (ps->pred->index == ex->pred_block[l]) {
+                  ex->ssa[l][dst] = ex->ssa[l][ps->src.ssa->index];
+                  matched = true;
+                  break;
+               }
+            }
+            CHECK(matched);
+         }
+         break;
+      }
+      case nir_instr_type_load_const: {
+         nir_load_const_instr *lc = nir_instr_as_load_const(instr);
+         unsigned dst = lc->def.index;
+         for (unsigned l = 0; l < 32; ++l) {
+            if (!(active & (1u << l)))
+               continue;
+            for (unsigned c = 0; c < lc->def.num_components; ++c) {
+               ex->ssa[l][dst].u[c] =
+                  lc->def.bit_size == 64 ? lc->value[c].u64
+                  : lc->def.bit_size == 1 ? (lc->value[c].b ? 1u : 0u)
+                                          : lc->value[c].u32;
+            }
+         }
+         break;
+      }
+      case nir_instr_type_undef: {
+         nir_undef_instr *un = nir_instr_as_undef(instr);
+         for (unsigned l = 0; l < 32; ++l)
+            if (active & (1u << l))
+               memset(&ex->ssa[l][un->def.index], 0, sizeof(struct nir_wg_val));
+         break;
+      }
+      case nir_instr_type_alu: {
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         unsigned dst = alu->def.index;
+         unsigned nc = alu->def.num_components;
+         unsigned bs = alu->def.bit_size;
+         unsigned nsrc = nir_op_infos[alu->op].num_inputs;
+         for (unsigned l = 0; l < 32; ++l) {
+            if (!(active & (1u << l)))
+               continue;
+            if (nir_op_is_vec(alu->op)) {
+               for (unsigned c = 0; c < nc; ++c)
+                  ex->ssa[l][dst].u[c] = wg_alu_src_u(ex, l, &alu->src[c], 0);
+            } else {
+               for (unsigned c = 0; c < nc; ++c) {
+                  uint64_t a = nsrc > 0 ? wg_alu_src_u(ex, l, &alu->src[0], c) : 0;
+                  uint64_t b = nsrc > 1 ? wg_alu_src_u(ex, l, &alu->src[1], c) : 0;
+                  uint64_t cv = nsrc > 2 ? wg_alu_src_u(ex, l, &alu->src[2], c) : 0;
+                  ex->ssa[l][dst].u[c] = wg_eval_alu_scalar(alu->op, bs, a, b, cv);
+               }
+            }
+         }
+         break;
+      }
+      case nir_instr_type_jump: {
+         nir_jump_instr *j = nir_instr_as_jump(instr);
+         if (j->type == nir_jump_break)
+            ex->break_mask |= active;
+         else if (j->type == nir_jump_continue)
+            ex->cont_mask |= active;
+         for (unsigned l = 0; l < 32; ++l)
+            if (active & (1u << l))
+               ex->pred_block[l] = blk->index;
+         return;
+      }
+      case nir_instr_type_intrinsic: {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         switch (intr->intrinsic) {
+         case nir_intrinsic_load_local_invocation_index:
+            for (unsigned l = 0; l < 32; ++l)
+               if (active & (1u << l))
+                  ex->ssa[l][intr->def.index].u[0] = l;
+            break;
+         case nir_intrinsic_load_workgroup_id:
+            for (unsigned l = 0; l < 32; ++l)
+               if (active & (1u << l))
+                  for (unsigned c = 0; c < 3; ++c)
+                     ex->ssa[l][intr->def.index].u[c] = ex->wg_id[c];
+            break;
+         case nir_intrinsic_load_tess_param_buffer_poly:
+            for (unsigned l = 0; l < 32; ++l)
+               if (active & (1u << l))
+                  ex->ssa[l][intr->def.index].u[0] = (uintptr_t)ex->params;
+            break;
+         case nir_intrinsic_load_global:
+         case nir_intrinsic_load_global_constant:
+            for (unsigned l = 0; l < 32; ++l) {
+               if (!(active & (1u << l)))
+                  continue;
+               uint64_t addr = wg_src_u(ex, l, intr->src[0], 0);
+               for (unsigned c = 0; c < intr->def.num_components; ++c) {
+                  if (intr->def.bit_size == 64) {
+                     uint64_t v = 0;
+                     memcpy(&v, (const uint8_t *)(uintptr_t)(addr + c * 8), 8);
+                     ex->ssa[l][intr->def.index].u[c] = v;
+                  } else {
+                     uint32_t v = 0;
+                     memcpy(&v, (const uint8_t *)(uintptr_t)(addr + c * 4), 4);
+                     ex->ssa[l][intr->def.index].u[c] = v;
+                  }
+               }
+            }
+            break;
+         case nir_intrinsic_load_ubo:
+            for (unsigned l = 0; l < 32; ++l) {
+               if (!(active & (1u << l)))
+                  continue;
+               uint32_t off = (uint32_t)wg_src_u(ex, l, intr->src[1], 0);
+               for (unsigned c = 0; c < intr->def.num_components; ++c) {
+                  uint32_t w = (off / 4u) + c;
+                  ex->ssa[l][intr->def.index].u[c] =
+                     (ex->ubo0 && w < ex->ubo0_words) ? ex->ubo0[w] : 0u;
+               }
+            }
+            break;
+         case nir_intrinsic_load_shared:
+            for (unsigned l = 0; l < 32; ++l) {
+               if (!(active & (1u << l)))
+                  continue;
+               uint32_t off =
+                  (uint32_t)wg_src_u(ex, l, intr->src[0], 0) + nir_intrinsic_base(intr);
+               CHECK(off + intr->def.num_components * 4u <= sizeof(ex->shm));
+               for (unsigned c = 0; c < intr->def.num_components; ++c) {
+                  uint32_t v = 0;
+                  memcpy(&v, ex->shm + off + c * 4u, 4);
+                  ex->ssa[l][intr->def.index].u[c] = v;
+               }
+            }
+            break;
+         case nir_intrinsic_store_shared: {
+            unsigned wm = nir_intrinsic_write_mask(intr);
+            for (unsigned l = 0; l < 32; ++l) {
+               if (!(active & (1u << l)))
+                  continue;
+               uint32_t off =
+                  (uint32_t)wg_src_u(ex, l, intr->src[1], 0) + nir_intrinsic_base(intr);
+               u_foreach_bit(c, wm) {
+                  CHECK(off + (c + 1u) * 4u <= sizeof(ex->shm));
+                  uint32_t v = (uint32_t)wg_src_u(ex, l, intr->src[0], c);
+                  memcpy(ex->shm + off + c * 4u, &v, 4);
+               }
+            }
+            break;
+         }
+         case nir_intrinsic_load_task_payload:
+            for (unsigned l = 0; l < 32; ++l) {
+               if (!(active & (1u << l)))
+                  continue;
+               uint32_t off =
+                  (uint32_t)wg_src_u(ex, l, intr->src[0], 0) + nir_intrinsic_base(intr);
+               CHECK(off + intr->def.num_components * 4u <= ex->payload_size);
+               for (unsigned c = 0; c < intr->def.num_components; ++c) {
+                  uint32_t v = 0;
+                  memcpy(&v, ex->payload + off + c * 4u, 4);
+                  ex->ssa[l][intr->def.index].u[c] = v;
+               }
+            }
+            break;
+         case nir_intrinsic_store_task_payload: {
+            unsigned wm = nir_intrinsic_write_mask(intr);
+            for (unsigned l = 0; l < 32; ++l) {
+               if (!(active & (1u << l)))
+                  continue;
+               uint32_t off =
+                  (uint32_t)wg_src_u(ex, l, intr->src[1], 0) + nir_intrinsic_base(intr);
+               u_foreach_bit(c, wm) {
+                  CHECK(off + (c + 1u) * 4u <= ex->payload_size);
+                  uint32_t v = (uint32_t)wg_src_u(ex, l, intr->src[0], c);
+                  memcpy(ex->payload + off + c * 4u, &v, 4);
+                  ex->payload_store_count++;
+               }
+            }
+            break;
+         }
+         case nir_intrinsic_ballot: {
+            uint32_t mask = 0;
+            for (unsigned l = 0; l < 32; ++l)
+               if ((active & (1u << l)) && (wg_src_u(ex, l, intr->src[0], 0) & 1))
+                  mask |= (1u << l);
+            for (unsigned l = 0; l < 32; ++l)
+               if (active & (1u << l))
+                  ex->ssa[l][intr->def.index].u[0] = mask;
+            break;
+         }
+         case nir_intrinsic_barrier:
+            break;
+         case nir_intrinsic_launch_mesh_workgroups:
+            if (active & 1u) {
+               for (unsigned c = 0; c < 3; ++c)
+                  ex->launch_grid[c] = (uint32_t)wg_src_u(ex, 0, intr->src[0], c);
+            }
+            break;
+         case nir_intrinsic_set_vertex_and_primitive_count:
+            if (active & 1u) {
+               ex->out_v_cnt = (uint32_t)wg_src_u(ex, 0, intr->src[0], 0);
+               ex->out_p_cnt = (uint32_t)wg_src_u(ex, 0, intr->src[1], 0);
+            }
+            break;
+         case nir_intrinsic_store_per_primitive_output: {
+            unsigned loc = nir_intrinsic_io_semantics(intr).location;
+            if (loc == VARYING_SLOT_PRIMITIVE_INDICES) {
+               for (unsigned l = 0; l < 32; ++l) {
+                  if (!(active & (1u << l)))
+                     continue;
+                  uint32_t pidx = (uint32_t)wg_src_u(ex, l, intr->src[1], 0);
+                  CHECK(pidx < 48);
+                  for (unsigned c = 0; c < 3; ++c)
+                     ex->out_indices[pidx][c] = (uint32_t)wg_src_u(ex, l, intr->src[0], c);
+               }
+            }
+            break;
+         }
+         case nir_intrinsic_store_per_vertex_output: {
+            unsigned loc = nir_intrinsic_io_semantics(intr).location;
+            unsigned comp = nir_intrinsic_component(intr);
+            unsigned wm = nir_intrinsic_write_mask(intr);
+            for (unsigned l = 0; l < 32; ++l) {
+               if (!(active & (1u << l)))
+                  continue;
+               uint32_t vidx = (uint32_t)wg_src_u(ex, l, intr->src[1], 0);
+               CHECK(vidx < 48);
+               if (loc == VARYING_SLOT_POS) {
+                  u_foreach_bit(c, wm)
+                     ex->out_pos[vidx][comp + c] =
+                        u32_to_f32((uint32_t)wg_src_u(ex, l, intr->src[0], c));
+               } else if (loc == VARYING_SLOT_PRIMITIVE_ID) {
+                  ex->out_pid[vidx] = (uint32_t)wg_src_u(ex, l, intr->src[0], 0);
+               }
+            }
+            break;
+         }
+         default:
+            fprintf(stderr, "unsupported NIR intr in host tess eval: %s\n",
+                    nir_intrinsic_infos[intr->intrinsic].name);
+            CHECK(false);
+         }
+         break;
+      }
+      default:
+         break;
+      }
+   }
+   for (unsigned l = 0; l < 32; ++l)
+      if (active & (1u << l))
+         ex->pred_block[l] = blk->index;
+}
+
+static void
+wg_exec_cf_list(struct nir_wg_exec *ex, struct exec_list *list, uint32_t active)
+{
+   if (!active)
+      return;
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      uint32_t live = active & ~(ex->break_mask | ex->cont_mask);
+      if (!live)
+         break;
+      switch (node->type) {
+      case nir_cf_node_block:
+         wg_exec_block(ex, nir_cf_node_as_block(node), live);
+         break;
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         uint32_t tmask = 0, emask = 0;
+         for (unsigned l = 0; l < 32; ++l) {
+            if (!(live & (1u << l)))
+               continue;
+            if (wg_src_u(ex, l, nif->condition, 0) & 1)
+               tmask |= (1u << l);
+            else
+               emask |= (1u << l);
+         }
+         wg_exec_cf_list(ex, &nif->then_list, tmask);
+         wg_exec_cf_list(ex, &nif->else_list, emask);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         uint32_t saved_brk = ex->break_mask;
+         uint32_t saved_cnt = ex->cont_mask;
+         ex->break_mask = 0;
+         ex->cont_mask = 0;
+         uint32_t lmask = live;
+         unsigned guard = 0;
+         while (lmask) {
+            CHECK(++guard < 256);
+            ex->cont_mask = 0;
+            wg_exec_cf_list(ex, &loop->body, lmask);
+            lmask &= ~ex->break_mask;
+         }
+         ex->break_mask = saved_brk;
+         ex->cont_mask = saved_cnt;
+         break;
+      }
+      default:
+         CHECK(false);
+      }
+   }
+}
+
+static void
+run_nir_wg(nir_shader *nir, struct nir_wg_exec *ex)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_index_ssa_defs(impl);
+   nir_index_blocks(impl);
+   for (unsigned l = 0; l < 32; ++l) {
+      ex->ssa[l] = calloc(impl->ssa_alloc + 1, sizeof(struct nir_wg_val));
+      ex->pred_block[l] = 0;
+   }
+   ex->nir = nir;
+   ex->break_mask = 0;
+   ex->cont_mask = 0;
+   wg_exec_cf_list(ex, &impl->body, UINT32_MAX);
+   for (unsigned l = 0; l < 32; ++l)
+      free(ex->ssa[l]);
 }
 
 static void
@@ -4000,12 +4490,12 @@ fused_tess_multipatch_suite(void)
             for (unsigned ki = 0; ki < ARRAY_SIZE(ks); ++ki) {
                /* Full mixed WG on V=24, P=20 and V=16, P=18 */
                sim_multipatch_object_wg(doms[d], sps[s], 24, 20, 3, 3, 20,
-                                        ks[ki], 5, 64, 0, lo, li);
+                                        ks[ki], 5, 64, 0, lo, li, NULL, NULL);
                sim_multipatch_object_wg(doms[d], sps[s], 16, 18, 3, 3, 14,
-                                        ks[ki], 5, 64, 0, lo, li);
+                                        ks[ki], 5, 64, 0, lo, li, NULL, NULL);
                /* All-culled WG */
                sim_multipatch_object_wg(doms[d], sps[s], 24, 20, 3, 3, 20,
-                                        ks[ki], 0, 64, 0, zero_o, zero_i);
+                                        ks[ki], 0, 64, 0, zero_o, zero_i, NULL, NULL);
                /* Partial tail WGs + first_patch != 0 */
                for (unsigned ti = 0; ti < ARRAY_SIZE(tail_counts); ++ti) {
                   uint32_t pc = tail_counts[ti];
@@ -4013,7 +4503,7 @@ fused_tess_multipatch_suite(void)
                   for (unsigned fp = 0; fp < ARRAY_SIZE(first_patches); ++fp) {
                      sim_multipatch_object_wg(doms[d], sps[s], 24, 20, 3, 3, 20,
                                               ks[ki], first_patches[fp], pc,
-                                              nwg - 1, lo, li);
+                                              nwg - 1, lo, li, NULL, NULL);
                   }
                }
             }
@@ -4022,7 +4512,7 @@ fused_tess_multipatch_suite(void)
    }
 
    /* 5. PrimitiveID export, CW/CCW, all 3 spacings, Quads/Triangles, indexed
-    *    (1/2/4 B IBO) + disable_multipatch=true deferred payload verification. */
+    *    (1/2/4 B IBO) + runtime-executed all-culled zero-payload-write proof. */
    {
       const enum gl_tess_spacing sps[3] = {
          TESS_SPACING_EQUAL, TESS_SPACING_FRACTIONAL_ODD,
@@ -4052,16 +4542,24 @@ fused_tess_multipatch_suite(void)
          }
       }
 
-      /* Verify OBJECT defers all 0xe0/0xe1 store_task_payload writes STRICTLY
-       * AFTER the post-TCS tess-level barrier (zero pre-cull payload writes!),
-       * covering normal (tcs_copy_B > 0), header-only (tcs_copy_B == 0), and
-       * raw-levels-only (tcs_copy_B == 0, has_raw_levels) in K=1 and K=16. */
+      /* Execute an all-culled (tess=0.0f) fixture through the REAL generated
+       * OBJECT NIR for normal (tcs_copy_B > 0), header-only (tcs_copy_B == 0),
+       * raw-levels-only (tcs_copy_B == 0, has_raw_levels) in K=1 and K=16, and
+       * assert ZERO 0xe0/0xe1 store_task_payload executions and launch_x == 0! */
       for (unsigned kind = 0; kind < 4; ++kind) {
          bool mp = (kind == 3);
          bool header_only = (kind == 1 || kind == 2);
          bool raw_lvls = (kind == 2);
-         nir_shader *vs = make_fused_vs(2, false);
-         nir_shader *tcs = make_fused_tcs(3, 2, 2.0f, 2.0f, false, false, false,
+         /* Pure header/level TCS reading no VS inputs so host eval needs no VBO. */
+         nir_builder vb = nir_builder_init_simple_shader(
+            MESA_SHADER_VERTEX, &agx_nir_options, "cull_zero_vs");
+         vb.shader->info.io_lowered = true;
+         nir_store_output(&vb, nir_imm_vec4(&vb, 0, 0, 0, 1), nir_imm_int(&vb, 0),
+                          .write_mask = 0xf, .src_type = nir_type_float32,
+                          .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         nir_shader_gather_info(vb.shader, nir_shader_get_entrypoint(vb.shader));
+
+         nir_shader *tcs = make_fused_tcs(3, 0, 0.0f, 0.0f, false, false, false,
                                           TESS_SPACING_EQUAL, false, false);
          nir_shader *tes;
          if (header_only) {
@@ -4087,94 +4585,266 @@ fused_tess_multipatch_suite(void)
             tes = eb.shader;
          } else {
             tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES, TESS_SPACING_EQUAL,
-                                 false, false, 3, 2, 0, 0, false, false);
+                                 false, false, 3, 0, 0, 0, false, false);
          }
          struct hk_tess_fused_options opts = base_opts;
          opts.disable_multipatch = !mp;
          nir_shader *obj = NULL, *mesh = NULL;
          struct hk_tess_fused_info info = {0};
-         CHECK(hk_nir_tess_fused_lower(vs, tcs, tes, &opts, &obj, &mesh, &info, NULL));
+         CHECK(hk_nir_tess_fused_lower(vb.shader, tcs, tes, &opts, &obj, &mesh,
+                                       &info, NULL));
          if (!mp) {
             CHECK(info.multipatch_tier == 0 && info.patches_per_group == 1);
          } else {
             CHECK(info.multipatch_tier == 2 && info.patches_per_group == 16);
          }
-         /* Every store_task_payload MUST occur strictly AFTER the first
-          * workgroup barrier (post-VS/TCS, inside the survival branch) and
-          * NEVER at top level. */
-         nir_function_impl *oimpl = nir_shader_get_entrypoint(obj);
-         bool seen_wg_barrier = false;
-         unsigned pre_cull_stores = 0, top_pay_stores = 0, post_cull_stores = 0;
-         nir_foreach_block(blk, oimpl) {
-            bool top = blk->cf_node.parent == &oimpl->cf_node;
-            nir_foreach_instr(instr, blk) {
-               if (instr->type != nir_instr_type_intrinsic)
-                  continue;
-               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-               if (intr->intrinsic == nir_intrinsic_barrier &&
-                   nir_intrinsic_execution_scope(intr) == SCOPE_WORKGROUP) {
-                  seen_wg_barrier = true;
-               } else if (intr->intrinsic == nir_intrinsic_store_task_payload) {
-                  if (!seen_wg_barrier)
-                     pre_cull_stores++;
-                  if (top)
-                     top_pay_stores++;
-                  else if (seen_wg_barrier)
-                     post_cull_stores++;
-               }
-            }
-         }
-         CHECK(pre_cull_stores == 0 && top_pay_stores == 0 && post_cull_stores > 0);
+         uint8_t pay[1024] = {0};
+         struct hk_apple9_fused_tess_params params = {
+            .input_patch_size = 3,
+            .patches_per_instance = 16,
+            .groups_x = 1,
+         };
+         struct nir_wg_exec ex = {
+            .payload = pay,
+            .payload_size = sizeof(pay),
+            .params = &params,
+         };
+         run_nir_wg(obj, &ex);
+         CHECK(ex.launch_grid[0] == 0 && ex.launch_grid[1] == 0);
+         CHECK(ex.payload_store_count == 0);
          ralloc_free(obj);
          ralloc_free(mesh);
-         ralloc_free(vs);
+         ralloc_free(vb.shader);
          ralloc_free(tcs);
          ralloc_free(tes);
       }
    }
 
-   /* 6. Astra P0/P1/P2 multi-patch regression guards:
-    *    - P0: Exact order-preserving large-before-small (patch 0=tess 8,
-    *      patch 1=tess 1, patch 2=tess 1, patch 3=tess 8) + exact 4V/2P quad
-    *      and 7V/6P tri counts.
-    *    - P1 #2: Atomic/volatile VS load rejected from Tier 2 -> Tier 1.
-    *    - P1 #3: Device-scope acquire memory barrier preserved in Tier 2 OBJECT
-    *      and external execution barrier disables single-inv specialization.
-    *    - P1 #4: Wide 16-CP passthrough (K=1 payload 1072 B > 1024 B) admitted
-    *      as Tier 2 K=16 (720 B <= 1024 B), rejected only when MP disabled.
-    *    - P2 #6: Vector invocation guard equal(uvec2(id,id), uvec2(0,1)).y
-    *      specializes to invocation 1 (not 0). */
+   /* 6. Astra P0/P1/P2 multi-patch regression guards (including end-to-end
+    *    host execution of generated OBJECT + MESH NIR vs K=1!). */
    {
-      /* 6a: Exact 4V/2P quad, 7V/6P tri, and large-before-small primitive order */
+      /* 6a: Exact simulator counts (4V/2P quad, 7V/6P equal-1.5 & equal-2 tri,
+       *     63-seg odd-64 clamp) + end-to-end host NIR execution of REAL
+       *     generated OBJECT + MESH comparing K=16 vs K=1 on large/small/small/
+       *     large (odd n_segs=3) and literal 4V/2P & 7V/6P outputs! */
       {
+         uint32_t tv = 0, tp = 0;
          float o1[4] = {1, 1, 1, 1}, i1[2] = {1, 1};
          sim_multipatch_object_wg(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
-                                  24, 20, 3, 3, 20, 4, 0, 1, 0, o1, i1);
+                                  24, 20, 3, 3, 20, 4, 0, 1, 0, o1, i1, &tv, &tp);
+         CHECK(tv == 4 && tp == 2);
+         float o15[4] = {1.5f, 1.5f, 1.5f, 1.5f}, i15[2] = {1.5f, 1.5f};
+         sim_multipatch_object_wg(TESS_PRIMITIVE_TRIANGLES, TESS_SPACING_EQUAL,
+                                  24, 20, 3, 3, 20, 4, 0, 1, 0, o15, i15, &tv, &tp);
+         CHECK(tv == 7 && tp == 6);
          float o2[4] = {2, 2, 2, 2}, i2[2] = {2, 2};
          sim_multipatch_object_wg(TESS_PRIMITIVE_TRIANGLES, TESS_SPACING_EQUAL,
-                                  24, 20, 3, 3, 20, 4, 0, 1, 0, o2, i2);
-         /* Adversarial Vulkan primitive order: patch 0 large, patches 1..2 small, patch 3 large */
-         float lo[16 * 4] = {0}, li[16 * 2] = {0};
-         const float seq[4] = {8.0f, 1.0f, 1.0f, 8.0f};
-         for (unsigned p = 0; p < 4; ++p) {
-            for (unsigned c = 0; c < 4; ++c) lo[p * 4 + c] = seq[p];
-            for (unsigned c = 0; c < 2; ++c) li[p * 2 + c] = seq[p];
+                                  24, 20, 3, 3, 20, 4, 0, 1, 0, o2, i2, &tv, &tp);
+         CHECK(tv == 7 && tp == 6);
+         CHECK(ref_seg_count(TESS_SPACING_FRACTIONAL_ODD,
+                             ref_clamp_tess(TESS_SPACING_FRACTIONAL_ODD, 64.0f)) == 63u);
+
+         /* Real OBJECT + MESH NIR execution: patch 0=8 (large), patch 1=1 (small),
+          * patch 2=1 (small), patch 3=8 (large) -> odd n_segs=3! Compare K=16
+          * emitted PrimitiveID sequence & bit-exact vertex positions against K=1! */
+         nir_builder vb = nir_builder_init_simple_shader(
+            MESA_SHADER_VERTEX, &agx_nir_options, "e2e_vs");
+         vb.shader->info.io_lowered = true;
+         nir_store_output(&vb, nir_imm_vec4(&vb, 0, 0, 0, 1), nir_imm_int(&vb, 0),
+                          .write_mask = 0xf, .src_type = nir_type_float32,
+                          .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         nir_shader_gather_info(vb.shader, nir_shader_get_entrypoint(vb.shader));
+
+         nir_builder cb = nir_builder_init_simple_shader(
+            MESA_SHADER_TESS_CTRL, &agx_nir_options, "e2e_mixed_tcs");
+         cb.shader->info.io_lowered = true;
+         cb.shader->info.tess.tcs_vertices_out = 3;
+         nir_def *inv = nir_load_invocation_id(&cb);
+         nir_def *p = nir_load_per_vertex_input(
+            &cb, 4, 32, inv, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         nir_store_per_vertex_output(
+            &cb, p, inv, nir_imm_int(&cb, 0), .write_mask = 0xf,
+            .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         nir_push_if(&cb, nir_ieq_imm(&cb, inv, 0));
+         nir_def *pid = nir_load_primitive_id(&cb);
+         nir_def *lvl = nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0),
+                                     nir_ishl_imm(&cb, pid, 2), .align_mul = 4, .range = 64);
+         nir_store_output(&cb, nir_vec4(&cb, lvl, lvl, lvl, lvl), nir_imm_int(&cb, 0),
+                          .write_mask = 0xf, .src_type = nir_type_float32,
+                          .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+         nir_store_output(&cb, nir_vec2(&cb, lvl, lvl), nir_imm_int(&cb, 0),
+                          .write_mask = 0x3, .src_type = nir_type_float32,
+                          .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+         nir_pop_if(&cb, NULL);
+         nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+
+         nir_shader *tes_tri = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                              TESS_SPACING_EQUAL, false, false, 3,
+                                              0, 0, 0, false, false);
+         struct hk_tess_fused_options e2e_opts = base_opts;
+         e2e_opts.fs_reads_primitive_id = true;
+
+         nir_shader *obj_mp = NULL, *mesh_mp = NULL, *obj_k1 = NULL, *mesh_k1 = NULL;
+         struct hk_tess_fused_info info_mp = {0}, info_k1 = {0};
+         CHECK(hk_nir_tess_fused_lower(vb.shader, cb.shader, tes_tri, &e2e_opts,
+                                       &obj_mp, &mesh_mp, &info_mp, NULL));
+         CHECK(info_mp.multipatch_tier == 2 && info_mp.patches_per_group == 16);
+         e2e_opts.disable_multipatch = true;
+         CHECK(hk_nir_tess_fused_lower(vb.shader, cb.shader, tes_tri, &e2e_opts,
+                                       &obj_k1, &mesh_k1, &info_k1, NULL));
+         CHECK(info_k1.multipatch_tier == 0 && info_k1.patches_per_group == 1);
+
+         /* Run K=16 on [8.0, 1.0, 1.0, 8.0] (odd n_segs=3!) and compare vs K=1! */
+         uint32_t ubo_lvls[4] = {
+            f32_to_u32(8.0f), f32_to_u32(1.0f), f32_to_u32(1.0f), f32_to_u32(8.0f),
+         };
+         struct hk_apple9_fused_tess_params params = {
+            .input_patch_size = 3,
+            .patches_per_instance = 4,
+            .first_patch = 0,
+            .groups_x = 4,
+         };
+         uint32_t mp_pids[512], k1_pids[512];
+         float mp_vpos[512][3][2], k1_vpos[512][3][2];
+         uint32_t mp_prims = 0, k1_prims = 0;
+
+         /* Execute MP OBJECT -> MESH */
+         uint8_t pay_mp[1024] = {0};
+         struct nir_wg_exec oex_mp = {
+            .payload = pay_mp, .payload_size = sizeof(pay_mp),
+            .params = &params, .ubo0 = ubo_lvls, .ubo0_words = 4,
+         };
+         run_nir_wg(obj_mp, &oex_mp);
+         CHECK((pay_mp[0] & 0xffu) == 3u); /* odd n_segs == 3! */
+         CHECK(oex_mp.launch_grid[0] >= 3u);
+         for (uint32_t cwg = 0; cwg < oex_mp.launch_grid[0]; ++cwg) {
+            struct nir_wg_exec mex = {
+               .payload = pay_mp, .payload_size = sizeof(pay_mp),
+               .params = &params, .ubo0 = ubo_lvls, .ubo0_words = 4,
+               .wg_id = {cwg, 0, 0},
+            };
+            run_nir_wg(mesh_mp, &mex);
+            for (uint32_t pr = 0; pr < mex.out_p_cnt; ++pr) {
+               CHECK(mp_prims < 512);
+               uint32_t i0 = mex.out_indices[pr][0];
+               uint32_t i1 = mex.out_indices[pr][1];
+               uint32_t i2 = mex.out_indices[pr][2];
+               CHECK(mex.out_pid[i0] == mex.out_pid[i1] &&
+                     mex.out_pid[i0] == mex.out_pid[i2]);
+               mp_pids[mp_prims] = mex.out_pid[i0];
+               mp_vpos[mp_prims][0][0] = mex.out_pos[i0][0];
+               mp_vpos[mp_prims][0][1] = mex.out_pos[i0][1];
+               mp_vpos[mp_prims][1][0] = mex.out_pos[i1][0];
+               mp_vpos[mp_prims][1][1] = mex.out_pos[i1][1];
+               mp_vpos[mp_prims][2][0] = mex.out_pos[i2][0];
+               mp_vpos[mp_prims][2][1] = mex.out_pos[i2][1];
+               mp_prims++;
+            }
          }
-         sim_multipatch_object_wg(TESS_PRIMITIVE_TRIANGLES, TESS_SPACING_EQUAL,
-                                  24, 20, 3, 3, 20, 16, 0, 4, 0, lo, li);
-         sim_multipatch_object_wg(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
-                                  24, 20, 3, 3, 20, 16, 0, 4, 0, lo, li);
+
+         /* Execute K=1 OBJECT -> MESH across patches 0..3 */
+         for (uint32_t p_i = 0; p_i < 4; ++p_i) {
+            uint8_t pay_k1[1024] = {0};
+            struct nir_wg_exec oex_k1 = {
+               .payload = pay_k1, .payload_size = sizeof(pay_k1),
+               .params = &params, .ubo0 = ubo_lvls, .ubo0_words = 4,
+               .wg_id = {p_i, 0, 0},
+            };
+            run_nir_wg(obj_k1, &oex_k1);
+            for (uint32_t cwg = 0; cwg < oex_k1.launch_grid[0]; ++cwg) {
+               struct nir_wg_exec mex = {
+                  .payload = pay_k1, .payload_size = sizeof(pay_k1),
+                  .params = &params, .ubo0 = ubo_lvls, .ubo0_words = 4,
+                  .wg_id = {cwg, 0, 0},
+               };
+               run_nir_wg(mesh_k1, &mex);
+               for (uint32_t pr = 0; pr < mex.out_p_cnt; ++pr) {
+                  CHECK(k1_prims < 512);
+                  uint32_t i0 = mex.out_indices[pr][0];
+                  uint32_t i1 = mex.out_indices[pr][1];
+                  uint32_t i2 = mex.out_indices[pr][2];
+                  k1_pids[k1_prims] = mex.out_pid[i0];
+                  k1_vpos[k1_prims][0][0] = mex.out_pos[i0][0];
+                  k1_vpos[k1_prims][0][1] = mex.out_pos[i0][1];
+                  k1_vpos[k1_prims][1][0] = mex.out_pos[i1][0];
+                  k1_vpos[k1_prims][1][1] = mex.out_pos[i1][1];
+                  k1_vpos[k1_prims][2][0] = mex.out_pos[i2][0];
+                  k1_vpos[k1_prims][2][1] = mex.out_pos[i2][1];
+                  k1_prims++;
+               }
+            }
+         }
+         /* Exact PrimitiveID order & bit-exact vertex positions! */
+         CHECK(mp_prims == k1_prims && mp_prims > 100);
+         for (uint32_t pr = 0; pr < mp_prims; ++pr) {
+            CHECK(mp_pids[pr] == k1_pids[pr]);
+            CHECK(memcmp(mp_vpos[pr], k1_vpos[pr], sizeof(mp_vpos[pr])) == 0);
+         }
+
+         /* Also verify literal 7V/6P on equal-1.5 tri through generated MP NIR! */
+         uint32_t ubo_15[1] = {f32_to_u32(1.5f)};
+         struct hk_apple9_fused_tess_params p1 = {
+            .input_patch_size = 3, .patches_per_instance = 1, .groups_x = 1,
+         };
+         uint8_t pay_15[1024] = {0};
+         struct nir_wg_exec oex_15 = {
+            .payload = pay_15, .payload_size = sizeof(pay_15),
+            .params = &p1, .ubo0 = ubo_15, .ubo0_words = 1,
+         };
+         run_nir_wg(obj_mp, &oex_15);
+         CHECK(oex_15.launch_grid[0] == 1u);
+         struct nir_wg_exec mex_15 = {
+            .payload = pay_15, .payload_size = sizeof(pay_15),
+            .params = &p1, .ubo0 = ubo_15, .ubo0_words = 1,
+         };
+         run_nir_wg(mesh_mp, &mex_15);
+         CHECK(mex_15.out_v_cnt == 7u && mex_15.out_p_cnt == 6u);
+
+         /* Also verify literal 4V/2P on equal-1.0 quad through generated MP NIR! */
+         nir_shader *tes_q = make_fused_tes(TESS_PRIMITIVE_QUADS,
+                                            TESS_SPACING_EQUAL, false, false, 3,
+                                            0, 0, 0, false, false);
+         nir_shader *obj_q = NULL, *mesh_q = NULL;
+         CHECK(hk_nir_tess_fused_lower(vb.shader, cb.shader, tes_q, &base_opts,
+                                       &obj_q, &mesh_q, NULL, NULL));
+         uint32_t ubo_1[1] = {f32_to_u32(1.0f)};
+         uint8_t pay_q[1024] = {0};
+         struct nir_wg_exec oex_q = {
+            .payload = pay_q, .payload_size = sizeof(pay_q),
+            .params = &p1, .ubo0 = ubo_1, .ubo0_words = 1,
+         };
+         run_nir_wg(obj_q, &oex_q);
+         CHECK(oex_q.launch_grid[0] == 1u);
+         struct nir_wg_exec mex_q = {
+            .payload = pay_q, .payload_size = sizeof(pay_q),
+            .params = &p1, .ubo0 = ubo_1, .ubo0_words = 1,
+         };
+         run_nir_wg(mesh_q, &mex_q);
+         CHECK(mex_q.out_v_cnt == 4u && mex_q.out_p_cnt == 2u);
+
+         ralloc_free(obj_q);
+         ralloc_free(mesh_q);
+         ralloc_free(tes_q);
+         ralloc_free(obj_mp);
+         ralloc_free(mesh_mp);
+         ralloc_free(obj_k1);
+         ralloc_free(mesh_k1);
+         ralloc_free(tes_tri);
+         ralloc_free(cb.shader);
+         ralloc_free(vb.shader);
       }
 
-      /* 6b (P1 #2): Atomic / volatile VS load must reject Tier 2 -> Tier 1 */
-      for (unsigned acc_i = 0; acc_i < 2; ++acc_i) {
+      /* 6b (P1 #2): Atomic VS load rejects Tier 2 -> Tier 1; volatile VS load
+       * rejects fused tessellation cleanly even when TCS reads no VS inputs. */
+      {
          nir_builder vb = nir_builder_init_simple_shader(
             MESA_SHADER_VERTEX, &agx_nir_options, "t1_atomic_vs");
          vb.shader->info.io_lowered = true;
-         nir_def *addr = nir_imm_int64(&vb, 0x100000);
          nir_def *g = nir_load_global(
-            &vb, 4, 32, addr, .align_mul = 4,
-            .access = acc_i == 0 ? ACCESS_ATOMIC : ACCESS_VOLATILE);
+            &vb, 4, 32, nir_imm_int64(&vb, 0x100000), .align_mul = 4,
+            .access = ACCESS_ATOMIC);
          nir_store_output(&vb, g, nir_imm_int(&vb, 0), .write_mask = 0xf,
                           .src_type = nir_type_float32,
                           .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
@@ -4191,10 +4861,50 @@ fused_tess_multipatch_suite(void)
          ralloc_free(tcs);
          ralloc_free(tes);
       }
+      {
+         nir_builder vb = nir_builder_init_simple_shader(
+            MESA_SHADER_VERTEX, &agx_nir_options, "volatile_vs");
+         vb.shader->info.io_lowered = true;
+         nir_def *g = nir_load_global(
+            &vb, 4, 32, nir_imm_int64(&vb, 0x100000), .align_mul = 4,
+            .access = ACCESS_VOLATILE);
+         nir_store_output(&vb, g, nir_imm_int(&vb, 0), .write_mask = 0xf,
+                          .src_type = nir_type_float32,
+                          .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         nir_shader_gather_info(vb.shader, nir_shader_get_entrypoint(vb.shader));
+         /* TCS writes constant output without reading ANY VS inputs. */
+         nir_builder cb = nir_builder_init_simple_shader(
+            MESA_SHADER_TESS_CTRL, &agx_nir_options, "no_vs_read_tcs");
+         cb.shader->info.io_lowered = true;
+         cb.shader->info.tess.tcs_vertices_out = 3;
+         nir_def *inv = nir_load_invocation_id(&cb);
+         nir_store_per_vertex_output(
+            &cb, nir_imm_vec4(&cb, 0, 0, 0, 1), inv, nir_imm_int(&cb, 0),
+            .write_mask = 0xf, .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+         nir_store_output(&cb, nir_imm_vec4(&cb, 2, 2, 2, 2), nir_imm_int(&cb, 0),
+                          .write_mask = 0xf, .src_type = nir_type_float32,
+                          .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+         nir_store_output(&cb, nir_imm_vec2(&cb, 2, 2), nir_imm_int(&cb, 0),
+                          .write_mask = 0x3, .src_type = nir_type_float32,
+                          .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+         nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+         nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                          TESS_SPACING_EQUAL, false, false, 3,
+                                          0, 0, 0, false, false);
+         const char *r = NULL;
+         CHECK(!hk_nir_tess_fused_lower(vb.shader, cb.shader, tes, &base_opts,
+                                        NULL, NULL, NULL, &r));
+         ralloc_free(vb.shader);
+         ralloc_free(cb.shader);
+         ralloc_free(tes);
+      }
 
-      /* 6c (P1 #3): Device-scope acquire barrier in single-inv TCS is retained,
-       * and external execution barrier disables single-inv K=16 specialization. */
-      for (unsigned ext_exec = 0; ext_exec < 2; ++ext_exec) {
+      /* 6c (P1 #1 & Round 1 #3): Device-scope acquire barrier in inv 0 is
+       * retained in K=16; external execution barrier OR external fence/volatile
+       * load in a DIFFERENT invocation (inv 1) disables single-inv K=16 and
+       * preserves BOTH the device barrier AND the volatile load in OBJECT! */
+      for (unsigned mode = 0; mode < 3; ++mode) {
          nir_shader *vs = make_fused_vs(1, false);
          nir_builder cb = nir_builder_init_simple_shader(
             MESA_SHADER_TESS_CTRL, &agx_nir_options, "t2_dev_bar_tcs");
@@ -4211,14 +4921,14 @@ fused_tess_multipatch_suite(void)
                .src_type = nir_type_float32,
                .io_semantics = {.location = loc, .num_slots = 1});
          }
-         if (ext_exec) {
+         if (mode == 1) {
             nir_barrier(&cb, .execution_scope = SCOPE_WORKGROUP,
                         .memory_scope = SCOPE_DEVICE,
                         .memory_semantics = NIR_MEMORY_ACQ_REL,
                         .memory_modes = nir_var_mem_ssbo | nir_var_shader_out);
          }
          nir_push_if(&cb, nir_ieq_imm(&cb, inv, 0));
-         if (!ext_exec) {
+         if (mode == 0) {
             nir_barrier(&cb, .execution_scope = SCOPE_NONE,
                         .memory_scope = SCOPE_DEVICE,
                         .memory_semantics = NIR_MEMORY_ACQUIRE,
@@ -4233,6 +4943,17 @@ fused_tess_multipatch_suite(void)
                           .write_mask = 0x3, .src_type = nir_type_float32,
                           .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
          nir_pop_if(&cb, NULL);
+         if (mode == 2) {
+            /* Invocation 1 performs a device fence + volatile load! */
+            nir_push_if(&cb, nir_ieq_imm(&cb, inv, 1));
+            nir_barrier(&cb, .execution_scope = SCOPE_NONE,
+                        .memory_scope = SCOPE_DEVICE,
+                        .memory_semantics = NIR_MEMORY_ACQUIRE,
+                        .memory_modes = nir_var_mem_ssbo);
+            (void)nir_load_global(&cb, 1, 32, nir_imm_int64(&cb, 0x200004),
+                                  .align_mul = 4, .access = ACCESS_VOLATILE);
+            nir_pop_if(&cb, NULL);
+         }
          nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
          nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
                                           TESS_SPACING_EQUAL, false, false, 3,
@@ -4242,13 +4963,14 @@ fused_tess_multipatch_suite(void)
          CHECK(hk_nir_tess_fused_lower(vs, cb.shader, tes, &base_opts, &obj,
                                        &mesh, &info, NULL));
          CHECK(info.multipatch_tier == 2);
-         if (!ext_exec) {
+         if (mode == 0) {
             CHECK(info.patches_per_group == 16);
          } else {
-            /* External execution barrier disables single-inv -> K <= 32 / 3 = 10. */
+            /* External execution barrier or other-invocation fence/volatile
+             * disables single-inv specialization -> K = 32 / 3 = 10. */
             CHECK(info.patches_per_group == 10);
          }
-         bool has_dev_bar = false;
+         bool has_dev_bar = false, has_vol_ld = false;
          nir_foreach_block(blk, nir_shader_get_entrypoint(obj)) {
             nir_foreach_instr(instr, blk) {
                if (instr->type != nir_instr_type_intrinsic)
@@ -4258,14 +4980,61 @@ fused_tess_multipatch_suite(void)
                    nir_intrinsic_memory_scope(intr) == SCOPE_DEVICE &&
                    (nir_intrinsic_memory_modes(intr) & nir_var_mem_ssbo))
                   has_dev_bar = true;
+               if (intr->intrinsic == nir_intrinsic_load_global &&
+                   (nir_intrinsic_access(intr) & ACCESS_VOLATILE))
+                  has_vol_ld = true;
             }
          }
          CHECK(has_dev_bar);
+         if (mode == 2)
+            CHECK(has_vol_ld);
          ralloc_free(obj);
          ralloc_free(mesh);
          ralloc_free(vs);
          ralloc_free(cb.shader);
          ralloc_free(tes);
+      }
+
+      /* 6f (P2 #3): Barrier-free passthrough TCS with unguarded identical
+       * constant tess levels specializes cleanly to Tier 2 K=16 for both
+       * out_v = 3 AND out_v = 32! */
+      {
+         const unsigned ovs[2] = {3, 32};
+         for (unsigned oi = 0; oi < 2; ++oi) {
+            nir_shader *vs = make_fused_vs(1, false);
+            nir_builder cb = nir_builder_init_simple_shader(
+               MESA_SHADER_TESS_CTRL, &agx_nir_options, "unguarded_const_tcs");
+            cb.shader->info.io_lowered = true;
+            cb.shader->info.tess.tcs_vertices_out = ovs[oi];
+            nir_def *inv = nir_load_invocation_id(&cb);
+            for (unsigned s = 0; s < 2; ++s) {
+               unsigned loc = s == 0 ? VARYING_SLOT_POS : VARYING_SLOT_VAR0;
+               nir_def *v = nir_load_per_vertex_input(
+                  &cb, 4, 32, inv, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+                  .io_semantics = {.location = loc, .num_slots = 1});
+               nir_store_per_vertex_output(
+                  &cb, v, inv, nir_imm_int(&cb, 0), .write_mask = 0xf,
+                  .src_type = nir_type_float32,
+                  .io_semantics = {.location = loc, .num_slots = 1});
+            }
+            /* Unguarded identical constant tess levels (no if (inv == 0)). */
+            nir_store_output(&cb, nir_imm_vec4(&cb, 2, 2, 2, 2), nir_imm_int(&cb, 0),
+                             .write_mask = 0xf, .src_type = nir_type_float32,
+                             .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+            nir_store_output(&cb, nir_imm_vec2(&cb, 2, 2), nir_imm_int(&cb, 0),
+                             .write_mask = 0x3, .src_type = nir_type_float32,
+                             .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+            nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+            nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                             TESS_SPACING_EQUAL, false, false,
+                                             ovs[oi], 1, 0, 0, false, false);
+            struct hk_tess_fused_info info = {0};
+            compile_fused_tess_pair(vs, cb.shader, tes, &base_opts, &info);
+            CHECK(info.multipatch_tier == 2 && info.patches_per_group == 16);
+            ralloc_free(vs);
+            ralloc_free(cb.shader);
+            ralloc_free(tes);
+         }
       }
 
       /* 6d (P1 #4): Wide 16-CP passthrough (16 CPs * 16 comps = 1024 B CP body,
