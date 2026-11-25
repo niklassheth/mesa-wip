@@ -1728,15 +1728,17 @@ hk_apple9_native_tess_state_eligible(struct hk_cmd_buffer *cmd,
 }
 
 bool
-hk_apple9_native_tess_fused_chunk_plan(
-   uint32_t patches_per_inst, uint32_t instances, uint32_t max_groups,
-   uint32_t max_child_wgs_per_patch, uint32_t max_prims_per_patch,
-   uint64_t ring_max, uint64_t render_prim_cap,
+hk_apple9_native_tess_fused_chunk_plan_ex(
+   uint32_t patches_per_inst, uint32_t instances, uint32_t patches_per_group,
+   uint32_t max_groups, uint32_t max_child_wgs_per_patch,
+   uint32_t max_prims_per_patch, uint64_t ring_max, uint64_t render_prim_cap,
    struct hk_apple9_fused_tess_chunk_plan *out)
 {
    if (!patches_per_inst || !instances || !max_groups ||
        instances > HK_APPLE9_NATIVE_MAX_GROUP_COUNT)
       return false;
+   const uint32_t K = MAX2(patches_per_group, 1u);
+   const uint32_t parent_wgs_per_inst = DIV_ROUND_UP(patches_per_inst, K);
    const uint32_t group_cap =
       MIN2(max_groups, HK_APPLE9_NATIVE_MAX_GROUP_TOTAL);
 
@@ -1747,7 +1749,7 @@ hk_apple9_native_tess_fused_chunk_plan(
       const uint64_t tvb_patch_cap =
          render_prim_cap ? render_prim_cap / patch_prims : UINT64_MAX;
       uint32_t grid[3];
-      if (!hk_apple9_native_gs_fused_grid(patches_per_inst, instances, grid))
+      if (!hk_apple9_native_gs_fused_grid(parent_wgs_per_inst, instances, grid))
          return false;
       uint64_t total_parents = (uint64_t)grid[0] * grid[1] * grid[2];
       if (total_parents > group_cap)
@@ -1765,13 +1767,13 @@ hk_apple9_native_tess_fused_chunk_plan(
       return true;
    }
 
-   /* Unbounded (wg_rows <= 40, != 32) multi-parent fused OBJECT -> MESH
+   /* Unbounded (safe-stride U0_B) multi-parent fused OBJECT -> MESH
     * tessellation draws do not apply the conservative 1M TVB primitive cap:
     * only hardware object-grid limits (group_cap <= 1,048,575) and the
     * max-chunk bound (HK_APPLE9_NATIVE_TESS_MAX_CHUNKS = 4) apply. */
    uint32_t single_grid[3];
-   if (patches_per_inst <= group_cap &&
-       hk_apple9_native_gs_fused_grid(patches_per_inst, 1, single_grid)) {
+   if (parent_wgs_per_inst <= group_cap &&
+       hk_apple9_native_gs_fused_grid(parent_wgs_per_inst, 1, single_grid)) {
       uint64_t grid_xy = (uint64_t)single_grid[0] * single_grid[1];
       if (grid_xy <= group_cap) {
          uint64_t by_grid = group_cap / grid_xy;
@@ -1780,7 +1782,7 @@ hk_apple9_native_tess_fused_chunk_plan(
             (uint64_t)HK_APPLE9_NATIVE_MAX_GROUP_COUNT);
          uint32_t check_grid[3];
          if (inst_cap &&
-             hk_apple9_native_gs_fused_grid(patches_per_inst, inst_cap,
+             hk_apple9_native_gs_fused_grid(parent_wgs_per_inst, inst_cap,
                                             check_grid) &&
              (uint64_t)check_grid[0] * check_grid[1] * check_grid[2] <=
                 group_cap &&
@@ -1797,12 +1799,15 @@ hk_apple9_native_tess_fused_chunk_plan(
 
    const uint64_t safe_group_cap =
       group_cap > 16 ? (uint64_t)group_cap - 16 : (uint64_t)group_cap;
+   const uint64_t max_chunk_patches =
+      safe_group_cap > UINT32_MAX / K ? UINT32_MAX : safe_group_cap * K;
    const uint32_t patch_cap =
-      (uint32_t)MIN2((uint64_t)patches_per_inst, safe_group_cap);
+      (uint32_t)MIN2((uint64_t)patches_per_inst, max_chunk_patches);
    if (!patch_cap)
       return false;
+   const uint32_t chunk_parents = DIV_ROUND_UP(patch_cap, K);
    uint32_t check_grid[3];
-   if (!hk_apple9_native_gs_fused_grid(patch_cap, 1, check_grid) ||
+   if (!hk_apple9_native_gs_fused_grid(chunk_parents, 1, check_grid) ||
        (uint64_t)check_grid[0] * check_grid[1] > group_cap)
       return false;
    uint64_t patch_chunks = DIV_ROUND_UP((uint64_t)patches_per_inst, patch_cap);
@@ -1814,6 +1819,18 @@ hk_apple9_native_tess_fused_chunk_plan(
       .patch_chunk_cap = patch_cap,
    };
    return true;
+}
+
+bool
+hk_apple9_native_tess_fused_chunk_plan(
+   uint32_t patches_per_inst, uint32_t instances, uint32_t max_groups,
+   uint32_t max_child_wgs_per_patch, uint32_t max_prims_per_patch,
+   uint64_t ring_max, uint64_t render_prim_cap,
+   struct hk_apple9_fused_tess_chunk_plan *out)
+{
+   return hk_apple9_native_tess_fused_chunk_plan_ex(
+      patches_per_inst, instances, 1u, max_groups, max_child_wgs_per_patch,
+      max_prims_per_patch, ring_max, render_prim_cap, out);
 }
 
 bool
@@ -1872,14 +1889,20 @@ hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw)
       if (!agx_apple9_mesh_ring_max_groups(&body->layout, &ring_max))
          return false;
       const uint32_t pcp = cmd->vk.dynamic_graphics_state.ts.patch_control_points;
+      const uint32_t max_pcp = main->info.apple9_tess_max_input_pcp
+                                  ? main->info.apple9_tess_max_input_pcp
+                                  : 32u;
+      if (pcp > max_pcp)
+         return false;
       const uint32_t patches = draw.b.count[0] / pcp;
+      const uint32_t K = MAX2(main->info.apple9_tess_patches_per_group, 1u);
       uint32_t max_child_wgs = 0, max_patch_prims = 0;
       hk_nir_tess_fused_eval_counts(&main->info,
                                     cmd->state.gfx.descriptors.root.push,
                                     &max_child_wgs, &max_patch_prims);
       struct hk_apple9_fused_tess_chunk_plan plan;
-      return hk_apple9_native_tess_fused_chunk_plan(
-         patches, draw.b.count[1], AGX_NATIVE_OBJECT_MAX_GROUPS,
+      return hk_apple9_native_tess_fused_chunk_plan_ex(
+         patches, draw.b.count[1], K, AGX_NATIVE_OBJECT_MAX_GROUPS,
          max_child_wgs, max_patch_prims, ring_max,
          hk_apple9_native_render_primitives(), &plan);
    }
@@ -1952,6 +1975,7 @@ hk_apple9_launch_native_tess_fused(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    const uint32_t pcp = dyn->ts.patch_control_points;
    const uint32_t patches = draw.b.count[0] / pcp;
    const uint32_t instances = draw.b.count[1];
+   const uint32_t K = MAX2(main->info.apple9_tess_patches_per_group, 1u);
    uint64_t ring_max = 0;
    bool ring_ok = agx_apple9_mesh_ring_max_groups(layout, &ring_max);
    assert(ring_ok);
@@ -1960,8 +1984,8 @@ hk_apple9_launch_native_tess_fused(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    hk_nir_tess_fused_eval_counts(&main->info, desc->root.push, &max_child_wgs,
                                  &max_patch_prims);
    struct hk_apple9_fused_tess_chunk_plan plan = {0};
-   bool plan_ok = hk_apple9_native_tess_fused_chunk_plan(
-      patches, instances, AGX_NATIVE_OBJECT_MAX_GROUPS, max_child_wgs,
+   bool plan_ok = hk_apple9_native_tess_fused_chunk_plan_ex(
+      patches, instances, K, AGX_NATIVE_OBJECT_MAX_GROUPS, max_child_wgs,
       max_patch_prims, ring_max, hk_apple9_native_render_primitives(), &plan);
    assert(plan_ok);
    if (!plan_ok)
@@ -1993,9 +2017,10 @@ hk_apple9_launch_native_tess_fused(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       for (uint64_t first_patch = 0; first_patch < patches;) {
          const uint32_t chunk_patches = (uint32_t)MIN2(
             (uint64_t)plan.patch_chunk_cap, patches - first_patch);
+         const uint32_t parent_wgs_per_inst = DIV_ROUND_UP(chunk_patches, K);
          uint32_t obj_groups[3];
-         bool ok = hk_apple9_native_gs_fused_grid(chunk_patches, chunk_insts,
-                                                  obj_groups);
+         bool ok = hk_apple9_native_gs_fused_grid(parent_wgs_per_inst,
+                                                  chunk_insts, obj_groups);
          assert(ok);
          (void)ok;
 

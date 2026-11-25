@@ -22,6 +22,7 @@ uint64_t hk_apple9_native_index_shapes(void);
 /* Separate default-off GS route; also requires native mesh and exact classes. */
 bool hk_apple9_native_gs_enabled(void);
 bool hk_apple9_native_tess_enabled(void);
+bool hk_apple9_tess_multipatch_enabled(void);
 bool hk_apple9_native_task_bridge_enabled(void);
 bool hk_apple9_native_object_enabled(void);
 bool hk_apple9_native_object_available(const struct hk_physical_device *pdev);

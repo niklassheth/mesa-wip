@@ -110,6 +110,7 @@ static const char *const hk_codegen_env[] = {
    "HK_APPLE9_GS_NATIVE",
    "HK_APPLE9_TESS_MESH_PROBE",
    "HK_APPLE9_TESS_NATIVE",
+   "HK_APPLE9_TESS_MULTIPATCH",
 };
 
 /* These controls change diagnostics, memory backing, when a variant is
@@ -195,7 +196,8 @@ hk_hash_apple9_native_mesh_abi(struct mesa_blake3 *ctx)
       1, /* Guarded empty-grid taskless object/mesh for indirect & cond render. */
       1, /* Multiview native mesh layer lowering from root.draw.view_index. */
       1, /* Native-only indirect output-slot lowering without fallback bloat. */
-      3, /* Safe-stride U0_B (rem >= vtx_rows + idx_rows), variable idx_rows guard, & widened fused tess meshlets. */
+      4, /* Safe-stride U0_B (rem >= vtx_rows + idx_rows), variable idx_rows guard, & two-tier multi-patch packed fused tess (V24/P20). */
+      hk_apple9_tess_multipatch_enabled(),
    };
    _mesa_blake3_update(ctx, abi, sizeof(abi));
 }

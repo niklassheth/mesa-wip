@@ -14,6 +14,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(native_index, "HK_APPLE9_NATIVE_INDEX", false)
 DEBUG_GET_ONCE_OPTION(native_stages, "HK_APPLE9_NATIVE_STAGES", NULL)
 DEBUG_GET_ONCE_BOOL_OPTION(native_gs, "HK_APPLE9_GS_NATIVE", false)
 DEBUG_GET_ONCE_BOOL_OPTION(native_tess, "HK_APPLE9_TESS_NATIVE", false)
+DEBUG_GET_ONCE_BOOL_OPTION(tess_multipatch, "HK_APPLE9_TESS_MULTIPATCH", true)
 DEBUG_GET_ONCE_BOOL_OPTION(native_gs_pack, "HK_APPLE9_NATIVE_GS_PACK", false)
 DEBUG_GET_ONCE_BOOL_OPTION(native_tes_pack, "HK_APPLE9_NATIVE_TES_PACK", false)
 
@@ -57,6 +58,12 @@ bool
 hk_apple9_native_tess_enabled(void)
 {
    return hk_apple9_native_mesh_enabled() && debug_get_option_native_tess();
+}
+
+bool
+hk_apple9_tess_multipatch_enabled(void)
+{
+   return debug_get_option_tess_multipatch();
 }
 
 bool

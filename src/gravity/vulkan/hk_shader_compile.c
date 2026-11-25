@@ -2054,9 +2054,11 @@ hk_apple9_native_tess_fused_check(struct hk_device *dev,
    VkResult result =
       hk_apple9_native_mesh_check(mesh_nir, &stage_key, supported, reason);
    if (debug_get_option_tess_native_log())
-      fprintf(stderr, "HK_TESS_FUSED_CAP accepted=%u payload=%u V=%u P=%u reason=%s\n",
+      fprintf(stderr,
+              "HK_TESS_FUSED_CAP accepted=%u payload=%u V=%u P=%u tier=%u K=%u reason=%s\n",
               *supported, fused_info.payload_B, fused_info.mesh_max_vertices,
-              fused_info.mesh_max_primitives, *reason ?: "supported");
+              fused_info.mesh_max_primitives, fused_info.multipatch_tier,
+              fused_info.patches_per_group, *reason ?: "supported");
    ralloc_free(mesh_nir);
    return result;
 }
@@ -3253,6 +3255,10 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                   main->info.apple9_tess_fused = true;
                   main->info.apple9_tess_const_levels =
                      fused_info.constant_tess_levels;
+                  main->info.apple9_tess_patches_per_group =
+                     fused_info.patches_per_group;
+                  main->info.apple9_tess_max_input_pcp =
+                     fused_info.max_input_pcp;
                   main->info.apple9_tess_payload_B = fused_info.payload_B;
                   main->info.apple9_tess_max_child_wgs =
                      fused_info.max_child_wgs_per_patch;

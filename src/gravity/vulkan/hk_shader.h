@@ -77,6 +77,7 @@ struct hk_tess_fused_options {
    bool fs_reads_clip_distance;
    bool fs_reads_primitive_id;
    bool has_fs_inputs_mask;
+   bool disable_multipatch;
    /* Per-VAR0..31 4-bit component mask read by the linked FS (all 0 for depth-only). */
    uint8_t fs_var_read_mask[32];
 };
@@ -115,6 +116,9 @@ struct hk_tess_fused_info {
    uint8_t spacing;
    bool ccw;
    uint8_t tcs_vertices_out;
+   uint8_t patches_per_group;
+   uint8_t multipatch_tier;
+   uint8_t max_input_pcp;
    uint16_t payload_B;
    uint16_t max_child_wgs_per_patch;
    uint16_t max_prims_per_patch;
@@ -345,6 +349,8 @@ struct hk_shader_info {
    /* Zero-PREGFX fused OBJECT(VS+TCS) -> MESH(TES) metadata. */
    bool apple9_tess_fused;
    bool apple9_tess_const_levels;
+   uint8_t apple9_tess_patches_per_group;
+   uint8_t apple9_tess_max_input_pcp;
    uint16_t apple9_tess_payload_B;
    uint16_t apple9_tess_max_child_wgs;
    uint16_t apple9_tess_max_patch_prims;

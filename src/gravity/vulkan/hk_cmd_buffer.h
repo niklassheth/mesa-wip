@@ -1691,6 +1691,11 @@ struct hk_apple9_fused_tess_chunk_plan {
    uint32_t inst_chunk_cap;
    uint32_t patch_chunk_cap;
 };
+bool hk_apple9_native_tess_fused_chunk_plan_ex(
+   uint32_t patches_per_inst, uint32_t instances, uint32_t patches_per_group,
+   uint32_t max_groups, uint32_t max_child_wgs_per_patch,
+   uint32_t max_prims_per_patch, uint64_t ring_max, uint64_t render_prim_cap,
+   struct hk_apple9_fused_tess_chunk_plan *out);
 bool hk_apple9_native_tess_fused_chunk_plan(
    uint32_t patches_per_inst, uint32_t instances, uint32_t max_groups,
    uint32_t max_child_wgs_per_patch, uint32_t max_prims_per_patch,
