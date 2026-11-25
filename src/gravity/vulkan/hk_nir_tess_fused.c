@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <float.h>
 #include <math.h>
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_control_flow.h"
@@ -825,6 +826,1045 @@ detect_tess_level_sources(const nir_shader *tcs,
    return true;
 }
 
+/* =========================================================================
+ * Conservative Fused VS + TCS NIR Float Interval Upper-Bound Analysis
+ *
+ * Computes sound IEEE-754 float intervals [lo, hi] (tracking NaN possibility
+ * and optional push-constant upper bounds) across VS outputs and TCS
+ * tessellation-level stores to tighten static max_child_wgs_per_patch and
+ * max_prims_per_patch whenever TCS tess levels are clamped or bounded.
+ * ========================================================================= */
+
+struct tess_finterval {
+   float lo;
+   float hi;
+   bool may_nan;
+   /* When true: whenever push[push_offset] (f32) is non-NaN at draw time, the
+    * runtime value is guaranteed non-NaN and <= max(push[push_offset], 0),
+    * with push <= 0 implying val <= 0 (so culled outer / min inner). */
+   bool has_push_cap;
+   uint16_t push_offset;
+};
+
+static inline struct tess_finterval
+finterval_top(void)
+{
+   return (struct tess_finterval){
+      .lo = -INFINITY,
+      .hi = INFINITY,
+      .may_nan = true,
+   };
+}
+
+static inline float
+finterval_ftz_lo(float f)
+{
+   return (f > 0.0f && f < FLT_MIN) ? 0.0f : f;
+}
+
+static inline float
+finterval_ftz_hi(float f)
+{
+   return (f < 0.0f && f > -FLT_MIN) ? 0.0f : f;
+}
+
+static inline float
+finterval_d_to_f_down(double d)
+{
+   if (isnan(d))
+      return -INFINITY;
+   if (d < -(double)FLT_MAX)
+      return -INFINITY;
+   if (d > (double)FLT_MAX)
+      return FLT_MAX;
+   float f = (float)d;
+   if ((double)f > d)
+      f = nextafterf(f, -INFINITY);
+   return finterval_ftz_lo(f);
+}
+
+static inline float
+finterval_d_to_f_up(double d)
+{
+   if (isnan(d))
+      return INFINITY;
+   if (d > (double)FLT_MAX)
+      return INFINITY;
+   if (d < -(double)FLT_MAX)
+      return -FLT_MAX;
+   float f = (float)d;
+   if ((double)f < d)
+      f = nextafterf(f, INFINITY);
+   return finterval_ftz_hi(f);
+}
+
+static inline struct tess_finterval
+finterval_const(float c)
+{
+   if (isnan(c))
+      return finterval_top();
+   return (struct tess_finterval){
+      .lo = finterval_ftz_lo(c),
+      .hi = finterval_ftz_hi(c),
+      .may_nan = false,
+   };
+}
+
+static inline bool
+finterval_is_finite_const(struct tess_finterval a, float *out)
+{
+   if (!a.may_nan && isfinite(a.lo) && a.lo == a.hi) {
+      *out = a.lo;
+      return true;
+   }
+   return false;
+}
+
+static inline struct tess_finterval
+finterval_union(struct tess_finterval a, struct tess_finterval b)
+{
+   struct tess_finterval r = {
+      .lo = fminf(a.lo, b.lo),
+      .hi = fmaxf(a.hi, b.hi),
+      .may_nan = a.may_nan || b.may_nan,
+   };
+   if (a.has_push_cap && b.has_push_cap && a.push_offset == b.push_offset) {
+      r.has_push_cap = true;
+      r.push_offset = a.push_offset;
+   } else if (a.has_push_cap && !b.may_nan && b.hi <= 0.0f) {
+      r.has_push_cap = true;
+      r.push_offset = a.push_offset;
+   } else if (b.has_push_cap && !a.may_nan && a.hi <= 0.0f) {
+      r.has_push_cap = true;
+      r.push_offset = b.push_offset;
+   }
+   return r;
+}
+
+static inline struct tess_finterval
+finterval_neg(struct tess_finterval a)
+{
+   return (struct tess_finterval){
+      .lo = finterval_ftz_lo(-a.hi),
+      .hi = finterval_ftz_hi(-a.lo),
+      .may_nan = a.may_nan,
+   };
+}
+
+static inline struct tess_finterval
+finterval_abs(struct tess_finterval a)
+{
+   if (a.lo >= 0.0f)
+      return (struct tess_finterval){
+         .lo = finterval_ftz_lo(a.lo),
+         .hi = finterval_ftz_hi(a.hi),
+         .may_nan = a.may_nan,
+      };
+   if (a.hi <= 0.0f)
+      return (struct tess_finterval){
+         .lo = finterval_ftz_lo(-a.hi),
+         .hi = finterval_ftz_hi(-a.lo),
+         .may_nan = a.may_nan,
+      };
+   return (struct tess_finterval){
+      .lo = 0.0f,
+      .hi = finterval_ftz_hi(fmaxf(-a.lo, a.hi)),
+      .may_nan = a.may_nan,
+   };
+}
+
+static inline struct tess_finterval
+finterval_max(struct tess_finterval a, struct tess_finterval b)
+{
+   /* NIR nir_op_fmax is IEEE maxNum: fmax(NaN, y) = y, fmax(x, NaN) = x. */
+   struct tess_finterval r;
+   if (!a.may_nan && !b.may_nan) {
+      r = (struct tess_finterval){
+         .lo = finterval_ftz_lo(fmaxf(a.lo, b.lo)),
+         .hi = finterval_ftz_hi(fmaxf(a.hi, b.hi)),
+         .may_nan = false,
+      };
+   } else if (a.may_nan && !b.may_nan) {
+      r = (struct tess_finterval){
+         .lo = finterval_ftz_lo(b.lo),
+         .hi = finterval_ftz_hi(fmaxf(a.hi, b.hi)),
+         .may_nan = false,
+      };
+   } else if (!a.may_nan && b.may_nan) {
+      r = (struct tess_finterval){
+         .lo = finterval_ftz_lo(a.lo),
+         .hi = finterval_ftz_hi(fmaxf(a.hi, b.hi)),
+         .may_nan = false,
+      };
+   } else {
+      r = (struct tess_finterval){
+         .lo = finterval_ftz_lo(fminf(a.lo, b.lo)),
+         .hi = finterval_ftz_hi(fmaxf(a.hi, b.hi)),
+         .may_nan = true,
+      };
+   }
+   if (a.has_push_cap && b.has_push_cap && a.push_offset == b.push_offset) {
+      r.has_push_cap = true;
+      r.push_offset = a.push_offset;
+   } else if (a.has_push_cap && !b.may_nan && b.hi <= 0.0f) {
+      r.has_push_cap = true;
+      r.push_offset = a.push_offset;
+   } else if (b.has_push_cap && !a.may_nan && a.hi <= 0.0f) {
+      r.has_push_cap = true;
+      r.push_offset = b.push_offset;
+   }
+   return r;
+}
+
+static inline struct tess_finterval
+finterval_min(struct tess_finterval a, struct tess_finterval b)
+{
+   /* NIR nir_op_fmin is IEEE minNum: fmin(NaN, y) = y, fmin(x, NaN) = x. */
+   struct tess_finterval r;
+   if (!a.may_nan && !b.may_nan) {
+      r = (struct tess_finterval){
+         .lo = finterval_ftz_lo(fminf(a.lo, b.lo)),
+         .hi = finterval_ftz_hi(fminf(a.hi, b.hi)),
+         .may_nan = false,
+      };
+   } else if (a.may_nan && !b.may_nan) {
+      r = (struct tess_finterval){
+         .lo = finterval_ftz_lo(fminf(a.lo, b.lo)),
+         .hi = finterval_ftz_hi(b.hi),
+         .may_nan = false,
+      };
+   } else if (!a.may_nan && b.may_nan) {
+      r = (struct tess_finterval){
+         .lo = finterval_ftz_lo(fminf(a.lo, b.lo)),
+         .hi = finterval_ftz_hi(a.hi),
+         .may_nan = false,
+      };
+   } else {
+      r = (struct tess_finterval){
+         .lo = finterval_ftz_lo(fminf(a.lo, b.lo)),
+         .hi = finterval_ftz_hi(fmaxf(a.hi, b.hi)),
+         .may_nan = true,
+      };
+   }
+   /* If a's push cap holds whenever push[off] is non-NaN, a is non-NaN in that
+    * state, so fmin(a, anything) is non-NaN and <= a. */
+   if (a.has_push_cap) {
+      r.has_push_cap = true;
+      r.push_offset = a.push_offset;
+   } else if (b.has_push_cap) {
+      r.has_push_cap = true;
+      r.push_offset = b.push_offset;
+   }
+   return r;
+}
+
+static inline struct tess_finterval
+finterval_add(struct tess_finterval a, struct tess_finterval b)
+{
+   bool may_nan = a.may_nan || b.may_nan ||
+                  (a.lo == -INFINITY && b.hi == INFINITY) ||
+                  (a.hi == INFINITY && b.lo == -INFINITY);
+   float lo;
+   if ((a.lo == -INFINITY && b.lo == INFINITY) ||
+       (a.lo == INFINITY && b.lo == -INFINITY))
+      lo = -INFINITY;
+   else if (a.lo == -INFINITY || b.lo == -INFINITY)
+      lo = -INFINITY;
+   else if (a.lo == INFINITY || b.lo == INFINITY)
+      lo = INFINITY;
+   else
+      lo = finterval_d_to_f_down((double)a.lo + (double)b.lo);
+
+   float hi;
+   if ((a.hi == -INFINITY && b.hi == INFINITY) ||
+       (a.hi == INFINITY && b.hi == -INFINITY))
+      hi = INFINITY;
+   else if (a.hi == INFINITY || b.hi == INFINITY)
+      hi = INFINITY;
+   else if (a.hi == -INFINITY || b.hi == -INFINITY)
+      hi = -INFINITY;
+   else
+      hi = finterval_d_to_f_up((double)a.hi + (double)b.hi);
+
+   struct tess_finterval r = {
+      .lo = lo,
+      .hi = hi,
+      .may_nan = may_nan,
+   };
+   float c = 0.0f;
+   if (a.has_push_cap && finterval_is_finite_const(b, &c) && c <= 0.0f) {
+      r.has_push_cap = true;
+      r.push_offset = a.push_offset;
+   } else if (b.has_push_cap && finterval_is_finite_const(a, &c) && c <= 0.0f) {
+      r.has_push_cap = true;
+      r.push_offset = b.push_offset;
+   }
+   return r;
+}
+
+static inline struct tess_finterval
+finterval_square(struct tess_finterval a)
+{
+   float lo, hi;
+   if (a.lo >= 0.0f) {
+      lo = isinf(a.lo) ? INFINITY : finterval_d_to_f_down((double)a.lo * (double)a.lo);
+      hi = isinf(a.hi) ? INFINITY : finterval_d_to_f_up((double)a.hi * (double)a.hi);
+   } else if (a.hi <= 0.0f) {
+      lo = isinf(a.hi) ? INFINITY : finterval_d_to_f_down((double)a.hi * (double)a.hi);
+      hi = isinf(a.lo) ? INFINITY : finterval_d_to_f_up((double)a.lo * (double)a.lo);
+   } else {
+      float m = fmaxf(-a.lo, a.hi);
+      lo = 0.0f;
+      hi = isinf(m) ? INFINITY : finterval_d_to_f_up((double)m * (double)m);
+   }
+   return (struct tess_finterval){
+      .lo = lo,
+      .hi = hi,
+      .may_nan = a.may_nan,
+   };
+}
+
+static inline struct tess_finterval
+finterval_mul(struct tess_finterval a, struct tess_finterval b)
+{
+   float c = 0.0f;
+   if (finterval_is_finite_const(b, &c)) {
+      struct tess_finterval tmp = a;
+      a = b;
+      b = tmp;
+   }
+   if (finterval_is_finite_const(a, &c)) {
+      if (c == 0.0f) {
+         return (struct tess_finterval){
+            .lo = 0.0f,
+            .hi = 0.0f,
+            .may_nan = b.may_nan || isinf(b.lo) || isinf(b.hi),
+         };
+      }
+      struct tess_finterval r;
+      if (c > 0.0f) {
+         r = (struct tess_finterval){
+            .lo = isinf(b.lo) ? b.lo : finterval_d_to_f_down((double)c * (double)b.lo),
+            .hi = isinf(b.hi) ? b.hi : finterval_d_to_f_up((double)c * (double)b.hi),
+            .may_nan = b.may_nan,
+         };
+         if (b.has_push_cap && c <= 1.0f) {
+            r.has_push_cap = true;
+            r.push_offset = b.push_offset;
+         }
+      } else {
+         r = (struct tess_finterval){
+            .lo = isinf(b.hi) ? -b.hi : finterval_d_to_f_down((double)c * (double)b.hi),
+            .hi = isinf(b.lo) ? -b.lo : finterval_d_to_f_up((double)c * (double)b.lo),
+            .may_nan = b.may_nan,
+         };
+      }
+      return r;
+   }
+
+   if (isfinite(a.lo) && isfinite(a.hi) && isfinite(b.lo) && isfinite(b.hi)) {
+      double p0 = (double)a.lo * (double)b.lo;
+      double p1 = (double)a.lo * (double)b.hi;
+      double p2 = (double)a.hi * (double)b.lo;
+      double p3 = (double)a.hi * (double)b.hi;
+      double mn = fmin(fmin(p0, p1), fmin(p2, p3));
+      double mx = fmax(fmax(p0, p1), fmax(p2, p3));
+      return (struct tess_finterval){
+         .lo = finterval_d_to_f_down(mn),
+         .hi = finterval_d_to_f_up(mx),
+         .may_nan = a.may_nan || b.may_nan,
+      };
+   }
+
+   bool a_inf = isinf(a.lo) || isinf(a.hi);
+   bool b_inf = isinf(b.lo) || isinf(b.hi);
+   bool may_nan = a.may_nan || b.may_nan ||
+                  (a_inf && b.lo <= 0.0f && b.hi >= 0.0f) ||
+                  (b_inf && a.lo <= 0.0f && a.hi >= 0.0f);
+   if (a.lo >= 0.0f && b.lo >= 0.0f)
+      return (struct tess_finterval){.lo = 0.0f, .hi = INFINITY, .may_nan = may_nan};
+   if (a.hi <= 0.0f && b.hi <= 0.0f)
+      return (struct tess_finterval){.lo = 0.0f, .hi = INFINITY, .may_nan = may_nan};
+   if ((a.lo >= 0.0f && b.hi <= 0.0f) || (a.hi <= 0.0f && b.lo >= 0.0f))
+      return (struct tess_finterval){.lo = -INFINITY, .hi = 0.0f, .may_nan = may_nan};
+   return (struct tess_finterval){.lo = -INFINITY, .hi = INFINITY, .may_nan = may_nan};
+}
+
+/* Float32 ULP at real value |r| per Vulkan SPIR-V precision rules
+ * (2^(floor(log2(|r|)) - 23), clamped below at subnormal 2^-149). */
+static inline double
+finterval_f32_ulp(double r)
+{
+   double a = fabs(r);
+   if (a == 0.0 || !isfinite(a))
+      return 0.0;
+   int exp = 0;
+   frexp(a, &exp); /* 2^(exp-1) <= a < 2^exp */
+   int ulp_exp = exp - 24;
+   if (ulp_exp < -149)
+      ulp_exp = -149;
+   return ldexp(1.0, ulp_exp);
+}
+
+static inline struct tess_finterval
+finterval_sqrt(struct tess_finterval a)
+{
+   if (a.hi < 0.0f)
+      return finterval_top();
+   bool may_nan = a.may_nan || a.lo < 0.0f;
+   /* Apple9 lowers fsqrt(x) as x * factor(x) where factor approximates
+    * 1/sqrt(x) within 2 ULP (Vulkan InverseSqrt). Propagating 2 * x * ulp(1/sqrt(x))
+    * <= 2^-22 * sqrt(x) < 4 * ulp(sqrt(x)) plus 0.5 ULP multiply rounding yields
+    * < 4.5 ULP; 5.0 * ulp(d) in double before directed rounding encloses all
+    * float32 inputs including power-of-two boundaries and Vulkan's 3-ULP Sqrt. */
+   float lo;
+   if (a.lo <= 0.0f) {
+      lo = 0.0f;
+   } else if (isinf(a.lo)) {
+      lo = INFINITY;
+   } else {
+      double d = sqrt((double)a.lo);
+      double err = 5.0 * finterval_f32_ulp(d);
+      lo = fmaxf(0.0f, finterval_d_to_f_down(d - err));
+   }
+   float hi;
+   if (a.hi == 0.0f) {
+      hi = 0.0f;
+   } else if (isinf(a.hi)) {
+      hi = INFINITY;
+   } else {
+      double d = sqrt((double)a.hi);
+      double err = 5.0 * finterval_f32_ulp(d);
+      hi = finterval_d_to_f_up(d + err);
+   }
+   return (struct tess_finterval){.lo = lo, .hi = hi, .may_nan = may_nan};
+}
+
+static inline struct tess_finterval
+finterval_rsq(struct tess_finterval a)
+{
+   /* IEEE 1/sqrt(-0.0) = -Inf and 1/sqrt(+0.0) = +Inf; whenever a.lo <= 0.0f,
+    * -0.0f is representable in the interval so the lower bound can reach -Inf. */
+   if (a.lo <= 0.0f)
+      return (struct tess_finterval){
+         .lo = -INFINITY,
+         .hi = INFINITY,
+         .may_nan = a.may_nan || a.lo < 0.0f,
+      };
+   /* Vulkan InverseSqrt permits 2 ULP defined at the infinitely precise result;
+    * compute absolute error in double before directed float32 rounding so
+    * power-of-two boundary crossings are enclosed soundly. */
+   float lo;
+   if (isinf(a.hi)) {
+      lo = 0.0f;
+   } else {
+      double d = 1.0 / sqrt((double)a.hi);
+      double err = 2.001 * finterval_f32_ulp(d);
+      lo = fmaxf(0.0f, finterval_d_to_f_down(d - err));
+   }
+   float hi;
+   if (isinf(a.lo)) {
+      hi = 0.0f;
+   } else {
+      double d = 1.0 / sqrt((double)a.lo);
+      double err = 2.001 * finterval_f32_ulp(d);
+      hi = finterval_d_to_f_up(d + err);
+   }
+   return (struct tess_finterval){.lo = lo, .hi = hi, .may_nan = a.may_nan};
+}
+
+static inline struct tess_finterval
+finterval_rcp(struct tess_finterval a)
+{
+   /* Strictly exclude +/-0.0f so 1/a stays finite and sign-preserving.
+    * Widen in double by 2.501 * ulp(exact) to cover Vulkan's 2.5-ULP 1/x
+    * precision rule across power-of-two boundaries. */
+   if (a.lo > 0.0f) {
+      float lo;
+      if (isinf(a.hi)) {
+         lo = 0.0f;
+      } else {
+         double d = 1.0 / (double)a.hi;
+         lo = fmaxf(0.0f, finterval_d_to_f_down(d - 2.501 * finterval_f32_ulp(d)));
+      }
+      float hi;
+      if (isinf(a.lo)) {
+         hi = 0.0f;
+      } else {
+         double d = 1.0 / (double)a.lo;
+         hi = finterval_d_to_f_up(d + 2.501 * finterval_f32_ulp(d));
+      }
+      return (struct tess_finterval){.lo = lo, .hi = hi, .may_nan = a.may_nan};
+   }
+   if (a.hi < 0.0f) {
+      float lo;
+      if (isinf(a.hi)) {
+         lo = 0.0f;
+      } else {
+         double d = 1.0 / (double)a.hi;
+         lo = finterval_d_to_f_down(d - 2.501 * finterval_f32_ulp(d));
+      }
+      float hi;
+      if (isinf(a.lo)) {
+         hi = 0.0f;
+      } else {
+         double d = 1.0 / (double)a.lo;
+         hi = fminf(0.0f, finterval_d_to_f_up(d + 2.501 * finterval_f32_ulp(d)));
+      }
+      return (struct tess_finterval){.lo = lo, .hi = hi, .may_nan = a.may_nan};
+   }
+   return finterval_top();
+}
+
+static inline struct tess_finterval
+finterval_div(struct tess_finterval a, struct tess_finterval b)
+{
+   /* AGX enables lower_fdiv (a / b -> a * frcp(b)), so bound via a * rcp(b)
+    * with outward-widened rcp(b), which conservatively encloses both exact
+    * IEEE division and reciprocal-multiply lowering. */
+   struct tess_finterval rcp = finterval_rcp(b);
+   if (rcp.lo == -INFINITY && rcp.hi == INFINITY)
+      return finterval_top();
+   struct tess_finterval r = finterval_mul(a, rcp);
+   if (a.has_push_cap && !rcp.may_nan && rcp.lo > 0.0f && rcp.hi <= 1.0f) {
+      r.has_push_cap = true;
+      r.push_offset = a.push_offset;
+   }
+   return r;
+}
+
+struct tess_interval_ctx {
+   struct tess_finterval *memo;
+   uint8_t *state; /* 0 = unvisited, 1 = visiting, 2 = done */
+   unsigned num_defs;
+   const struct tess_finterval (*vs_outs)[4]; /* NULL when evaluating VS */
+   const struct tess_finterval *tcs_levels;   /* Optional pass-1 TCS levels[6] */
+};
+
+static struct tess_finterval
+eval_finterval(struct tess_interval_ctx *ctx, nir_def *def, unsigned comp,
+               unsigned depth)
+{
+   nir_scalar s = nir_scalar_resolved(def, comp);
+   if (nir_scalar_is_const(s))
+      return s.def->bit_size == 32 ? finterval_const(nir_scalar_as_float(s))
+                                   : finterval_top();
+   if (s.def->bit_size != 32 || s.comp >= 4 || s.def->index >= ctx->num_defs ||
+       depth > 64)
+      return finterval_top();
+
+   unsigned idx = s.def->index * 4u + s.comp;
+   if (ctx->state[idx] == 2)
+      return ctx->memo[idx];
+   if (ctx->state[idx] == 1)
+      return finterval_top(); /* Cycle / loop-carried value. */
+
+   ctx->state[idx] = 1;
+   struct tess_finterval res = finterval_top();
+   nir_instr *instr = nir_def_instr(s.def);
+
+   if (instr->type == nir_instr_type_phi) {
+      nir_phi_instr *phi = nir_instr_as_phi(instr);
+      bool in_loop = false;
+      for (nir_cf_node *n = instr->block->cf_node.parent; n; n = n->parent) {
+         if (n->type == nir_cf_node_loop) {
+            in_loop = true;
+            break;
+         }
+      }
+      if (!in_loop && !exec_list_is_empty(&phi->srcs)) {
+         bool first = true;
+         nir_foreach_phi_src(psrc, phi) {
+            struct tess_finterval iv =
+               eval_finterval(ctx, psrc->src.ssa, s.comp, depth + 1);
+            res = first ? iv : finterval_union(res, iv);
+            first = false;
+         }
+      }
+   } else if (instr->type == nir_instr_type_intrinsic) {
+      struct hk_apple9_tess_level_src psrc = {0};
+      if (resolve_tess_level_scalar(s.def, s.comp, &psrc) &&
+          psrc.kind == HK_APPLE9_TESS_LEVEL_PUSH) {
+         res = (struct tess_finterval){
+            .lo = -INFINITY,
+            .hi = INFINITY,
+            .may_nan = true,
+            .has_push_cap = true,
+            .push_offset = psrc.push_offset,
+         };
+      } else {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_per_vertex_input &&
+             ctx->vs_outs && nir_src_is_const(intr->src[1])) {
+            uint64_t loc = (uint64_t)nir_intrinsic_io_semantics(intr).location +
+                           nir_src_as_uint(intr->src[1]);
+            unsigned c = nir_intrinsic_component(intr) + s.comp;
+            if (loc < VARYING_SLOT_MAX && c < 4)
+               res = ctx->vs_outs[loc][c];
+         } else if (intr->intrinsic == nir_intrinsic_load_output &&
+                    ctx->tcs_levels && nir_src_is_const(intr->src[0])) {
+            uint64_t loc = (uint64_t)nir_intrinsic_io_semantics(intr).location +
+                           nir_src_as_uint(intr->src[0]);
+            unsigned c = nir_intrinsic_component(intr) + s.comp;
+            if (loc == VARYING_SLOT_TESS_LEVEL_OUTER && c < 4)
+               res = ctx->tcs_levels[c];
+            else if (loc == VARYING_SLOT_TESS_LEVEL_INNER && c < 2)
+               res = ctx->tcs_levels[4u + c];
+         }
+      }
+   } else if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      switch (alu->op) {
+      case nir_op_mov:
+         res = eval_finterval(ctx, alu->src[0].src.ssa,
+                              alu->src[0].swizzle[s.comp], depth + 1);
+         break;
+      case nir_op_fneg:
+         res = finterval_neg(eval_finterval(ctx, alu->src[0].src.ssa,
+                                            alu->src[0].swizzle[s.comp],
+                                            depth + 1));
+         break;
+      case nir_op_fabs:
+         res = finterval_abs(eval_finterval(ctx, alu->src[0].src.ssa,
+                                            alu->src[0].swizzle[s.comp],
+                                            depth + 1));
+         break;
+      case nir_op_fsat: {
+         struct tess_finterval a =
+            eval_finterval(ctx, alu->src[0].src.ssa,
+                           alu->src[0].swizzle[s.comp], depth + 1);
+         res = (struct tess_finterval){
+            .lo = a.may_nan ? 0.0f : finterval_ftz_lo(fminf(fmaxf(a.lo, 0.0f), 1.0f)),
+            .hi = finterval_ftz_hi(fminf(fmaxf(a.hi, 0.0f), 1.0f)),
+            .may_nan = a.may_nan,
+         };
+         break;
+      }
+      case nir_op_fmin: {
+         struct tess_finterval a =
+            eval_finterval(ctx, alu->src[0].src.ssa,
+                           alu->src[0].swizzle[s.comp], depth + 1);
+         struct tess_finterval b =
+            eval_finterval(ctx, alu->src[1].src.ssa,
+                           alu->src[1].swizzle[s.comp], depth + 1);
+         res = finterval_min(a, b);
+         break;
+      }
+      case nir_op_fmax: {
+         struct tess_finterval a =
+            eval_finterval(ctx, alu->src[0].src.ssa,
+                           alu->src[0].swizzle[s.comp], depth + 1);
+         struct tess_finterval b =
+            eval_finterval(ctx, alu->src[1].src.ssa,
+                           alu->src[1].swizzle[s.comp], depth + 1);
+         res = finterval_max(a, b);
+         break;
+      }
+      case nir_op_fadd: {
+         struct tess_finterval a =
+            eval_finterval(ctx, alu->src[0].src.ssa,
+                           alu->src[0].swizzle[s.comp], depth + 1);
+         struct tess_finterval b =
+            eval_finterval(ctx, alu->src[1].src.ssa,
+                           alu->src[1].swizzle[s.comp], depth + 1);
+         res = finterval_add(a, b);
+         break;
+      }
+      case nir_op_fsub: {
+         struct tess_finterval a =
+            eval_finterval(ctx, alu->src[0].src.ssa,
+                           alu->src[0].swizzle[s.comp], depth + 1);
+         struct tess_finterval b =
+            eval_finterval(ctx, alu->src[1].src.ssa,
+                           alu->src[1].swizzle[s.comp], depth + 1);
+         res = finterval_add(a, finterval_neg(b));
+         break;
+      }
+      case nir_op_fmul: {
+         nir_scalar sa = nir_scalar_resolved(alu->src[0].src.ssa,
+                                             alu->src[0].swizzle[s.comp]);
+         nir_scalar sb = nir_scalar_resolved(alu->src[1].src.ssa,
+                                             alu->src[1].swizzle[s.comp]);
+         struct tess_finterval a = eval_finterval(ctx, sa.def, sa.comp, depth + 1);
+         if (nir_scalar_equal(sa, sb))
+            res = finterval_square(a);
+         else
+            res = finterval_mul(a, eval_finterval(ctx, sb.def, sb.comp, depth + 1));
+         break;
+      }
+      case nir_op_ffma: {
+         nir_scalar sa = nir_scalar_resolved(alu->src[0].src.ssa,
+                                             alu->src[0].swizzle[s.comp]);
+         nir_scalar sb = nir_scalar_resolved(alu->src[1].src.ssa,
+                                             alu->src[1].swizzle[s.comp]);
+         struct tess_finterval a = eval_finterval(ctx, sa.def, sa.comp, depth + 1);
+         struct tess_finterval prod =
+            nir_scalar_equal(sa, sb)
+               ? finterval_square(a)
+               : finterval_mul(a, eval_finterval(ctx, sb.def, sb.comp, depth + 1));
+         struct tess_finterval c =
+            eval_finterval(ctx, alu->src[2].src.ssa,
+                           alu->src[2].swizzle[s.comp], depth + 1);
+         res = finterval_add(prod, c);
+         break;
+      }
+      case nir_op_fdot2:
+      case nir_op_fdot3:
+      case nir_op_fdot4: {
+         unsigned n = alu->op == nir_op_fdot2 ? 2u
+                      : (alu->op == nir_op_fdot3 ? 3u : 4u);
+         struct tess_finterval acc = finterval_const(0.0f);
+         for (unsigned i = 0; i < n; ++i) {
+            nir_scalar sa =
+               nir_scalar_resolved(alu->src[0].src.ssa, alu->src[0].swizzle[i]);
+            nir_scalar sb =
+               nir_scalar_resolved(alu->src[1].src.ssa, alu->src[1].swizzle[i]);
+            struct tess_finterval a = eval_finterval(ctx, sa.def, sa.comp, depth + 1);
+            struct tess_finterval prod =
+               nir_scalar_equal(sa, sb)
+                  ? finterval_square(a)
+                  : finterval_mul(a, eval_finterval(ctx, sb.def, sb.comp, depth + 1));
+            acc = i == 0 ? prod : finterval_add(acc, prod);
+         }
+         res = acc;
+         break;
+      }
+      case nir_op_fsqrt:
+         res = finterval_sqrt(eval_finterval(ctx, alu->src[0].src.ssa,
+                                             alu->src[0].swizzle[s.comp],
+                                             depth + 1));
+         break;
+      case nir_op_frsq:
+         res = finterval_rsq(eval_finterval(ctx, alu->src[0].src.ssa,
+                                            alu->src[0].swizzle[s.comp],
+                                            depth + 1));
+         break;
+      case nir_op_fdiv: {
+         struct tess_finterval a =
+            eval_finterval(ctx, alu->src[0].src.ssa,
+                           alu->src[0].swizzle[s.comp], depth + 1);
+         struct tess_finterval b =
+            eval_finterval(ctx, alu->src[1].src.ssa,
+                           alu->src[1].swizzle[s.comp], depth + 1);
+         res = finterval_div(a, b);
+         break;
+      }
+      case nir_op_frcp: {
+         struct tess_finterval a =
+            eval_finterval(ctx, alu->src[0].src.ssa,
+                           alu->src[0].swizzle[s.comp], depth + 1);
+         res = finterval_rcp(a);
+         break;
+      }
+      case nir_op_ftrunc:
+      case nir_op_ffloor:
+      case nir_op_fceil:
+      case nir_op_fround_even: {
+         struct tess_finterval a =
+            eval_finterval(ctx, alu->src[0].src.ssa,
+                           alu->src[0].swizzle[s.comp], depth + 1);
+         float lo = a.lo, hi = a.hi;
+         if (alu->op == nir_op_ftrunc) {
+            lo = truncf(lo);
+            hi = truncf(hi);
+         } else if (alu->op == nir_op_ffloor) {
+            lo = floorf(lo);
+            hi = floorf(hi);
+         } else if (alu->op == nir_op_fceil) {
+            lo = ceilf(lo);
+            hi = ceilf(hi);
+         } else {
+            lo = nearbyintf(lo);
+            hi = nearbyintf(hi);
+         }
+         res = (struct tess_finterval){
+            .lo = lo,
+            .hi = hi,
+            .may_nan = a.may_nan,
+         };
+         if (a.has_push_cap &&
+             (alu->op == nir_op_ftrunc || alu->op == nir_op_ffloor)) {
+            res.has_push_cap = true;
+            res.push_offset = a.push_offset;
+         }
+         break;
+      }
+      case nir_op_bcsel: {
+         nir_scalar cond = nir_scalar_resolved(alu->src[0].src.ssa,
+                                               alu->src[0].swizzle[s.comp]);
+         if (nir_scalar_is_const(cond)) {
+            unsigned take = nir_scalar_as_bool(cond) ? 1u : 2u;
+            res = eval_finterval(ctx, alu->src[take].src.ssa,
+                                 alu->src[take].swizzle[s.comp], depth + 1);
+         } else {
+            struct tess_finterval t =
+               eval_finterval(ctx, alu->src[1].src.ssa,
+                              alu->src[1].swizzle[s.comp], depth + 1);
+            struct tess_finterval f =
+               eval_finterval(ctx, alu->src[2].src.ssa,
+                              alu->src[2].swizzle[s.comp], depth + 1);
+            res = finterval_union(t, f);
+         }
+         break;
+      }
+      case nir_op_b2f32:
+         res = (struct tess_finterval){.lo = 0.0f, .hi = 1.0f, .may_nan = false};
+         break;
+      case nir_op_u2f32: {
+         unsigned bits = alu->src[0].src.ssa->bit_size;
+         float hi = bits == 1 ? 1.0f
+                    : (bits == 8 ? 255.0f
+                       : (bits == 16 ? 65535.0f
+                          : (bits == 32 ? 4294967296.0f : INFINITY)));
+         res = (struct tess_finterval){.lo = 0.0f, .hi = hi, .may_nan = false};
+         break;
+      }
+      case nir_op_i2f32: {
+         unsigned bits = alu->src[0].src.ssa->bit_size;
+         float lo = bits == 1 ? -1.0f
+                    : (bits == 8 ? -128.0f
+                       : (bits == 16 ? -32768.0f
+                          : (bits == 32 ? -2147483648.0f : -INFINITY)));
+         float hi = bits == 1 ? 0.0f
+                    : (bits == 8 ? 127.0f
+                       : (bits == 16 ? 32767.0f
+                          : (bits == 32 ? 2147483648.0f : INFINITY)));
+         res = (struct tess_finterval){.lo = lo, .hi = hi, .may_nan = false};
+         break;
+      }
+      default:
+         break;
+      }
+   }
+
+   ctx->memo[idx] = res;
+   ctx->state[idx] = 2;
+   return res;
+}
+
+static void
+compute_vs_output_intervals(nir_shader *vs,
+                            struct tess_finterval out[VARYING_SLOT_MAX][4])
+{
+   for (unsigned loc = 0; loc < VARYING_SLOT_MAX; ++loc)
+      for (unsigned c = 0; c < 4; ++c)
+         out[loc][c] = finterval_top();
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(vs);
+   nir_index_ssa_defs(impl);
+   unsigned n_defs = impl->ssa_alloc;
+   if (!n_defs)
+      return;
+
+   struct tess_finterval *memo = calloc((size_t)n_defs * 4u, sizeof(*memo));
+   uint8_t *state = calloc((size_t)n_defs * 4u, sizeof(*state));
+   if (!memo || !state) {
+      free(memo);
+      free(state);
+      return;
+   }
+
+   struct tess_interval_ctx ctx = {
+      .memo = memo,
+      .state = state,
+      .num_defs = n_defs,
+   };
+
+   struct tess_finterval acc[VARYING_SLOT_MAX][4];
+   uint8_t seen[VARYING_SLOT_MAX] = {0};
+   uint8_t uncond[VARYING_SLOT_MAX] = {0};
+   bool indirect_store = false;
+
+   nir_foreach_block(block, impl) {
+      bool is_top_level = block->cf_node.parent->type == nir_cf_node_function;
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_output)
+            continue;
+         if (!nir_src_is_const(intr->src[1])) {
+            indirect_store = true;
+            break;
+         }
+         uint64_t loc = (uint64_t)nir_intrinsic_io_semantics(intr).location +
+                        nir_src_as_uint(intr->src[1]);
+         if (loc >= VARYING_SLOT_MAX)
+            continue;
+         unsigned comp = nir_intrinsic_component(intr);
+         unsigned wmask = nir_intrinsic_write_mask(intr);
+         u_foreach_bit(i, wmask) {
+            unsigned c = comp + i;
+            if (c >= 4)
+               continue;
+            struct tess_finterval iv =
+               eval_finterval(&ctx, intr->src[0].ssa, i, 0);
+            if (!(seen[loc] & BITFIELD_BIT(c))) {
+               acc[loc][c] = iv;
+               seen[loc] |= BITFIELD_BIT(c);
+            } else {
+               acc[loc][c] = finterval_union(acc[loc][c], iv);
+            }
+            if (is_top_level)
+               uncond[loc] |= BITFIELD_BIT(c);
+         }
+      }
+      if (indirect_store)
+         break;
+   }
+
+   if (!indirect_store) {
+      for (unsigned loc = 0; loc < VARYING_SLOT_MAX; ++loc) {
+         for (unsigned c = 0; c < 4; ++c) {
+            if (uncond[loc] & BITFIELD_BIT(c))
+               out[loc][c] = acc[loc][c];
+         }
+      }
+   }
+
+   free(memo);
+   free(state);
+}
+
+/* Analyze fused VS + TCS NIR to compute sound per-component upper bounds on
+ * gl_TessLevelOuter[0..3] and gl_TessLevelInner[0..1], plus optional
+ * draw-time push-constant caps. */
+static void
+analyze_tess_level_bounds(nir_shader *vs, nir_shader *tcs,
+                          enum tess_primitive_mode domain,
+                          enum gl_tess_spacing spacing,
+                          struct hk_apple9_tess_level_src out_bounds[6],
+                          bool *out_has_push)
+{
+   const float max_f = spacing == TESS_SPACING_FRACTIONAL_ODD ? 63.0f : 64.0f;
+   const unsigned n_edges = domain == TESS_PRIMITIVE_QUADS ? 4u : 3u;
+   const unsigned n_inner = domain == TESS_PRIMITIVE_QUADS ? 2u : 1u;
+   *out_has_push = false;
+   for (unsigned s = 0; s < 6; ++s) {
+      out_bounds[s] = (struct hk_apple9_tess_level_src){
+         .kind = HK_APPLE9_TESS_LEVEL_DYNAMIC,
+         .const_value = max_f,
+      };
+   }
+
+   struct tess_finterval (*vs_outs)[4] =
+      calloc(VARYING_SLOT_MAX, sizeof(*vs_outs));
+   if (!vs_outs)
+      return;
+   compute_vs_output_intervals(vs, vs_outs);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(tcs);
+   nir_index_ssa_defs(impl);
+   unsigned n_defs = impl->ssa_alloc;
+   if (!n_defs) {
+      free(vs_outs);
+      return;
+   }
+
+   struct tess_finterval *memo = calloc((size_t)n_defs * 4u, sizeof(*memo));
+   uint8_t *state = calloc((size_t)n_defs * 4u, sizeof(*state));
+   if (!memo || !state) {
+      free(memo);
+      free(state);
+      free(vs_outs);
+      return;
+   }
+
+   struct tess_finterval slot_iv[6];
+   struct tess_finterval prev_iv[6];
+   bool has_level_load = false;
+   bool indirect_store = false;
+
+   for (unsigned pass = 0; pass < 2; ++pass) {
+      memset(state, 0, (size_t)n_defs * 4u * sizeof(*state));
+      struct tess_interval_ctx ctx = {
+         .memo = memo,
+         .state = state,
+         .num_defs = n_defs,
+         .vs_outs = vs_outs,
+         .tcs_levels = pass == 0 ? NULL : prev_iv,
+      };
+      /* build_object_shader zero-initializes shared tess_levels[0..5]. */
+      for (unsigned s = 0; s < 6; ++s)
+         slot_iv[s] = finterval_const(0.0f);
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_output &&
+                nir_src_is_const(intr->src[0])) {
+               uint64_t loc = (uint64_t)nir_intrinsic_io_semantics(intr).location +
+                              nir_src_as_uint(intr->src[0]);
+               if (loc == VARYING_SLOT_TESS_LEVEL_OUTER ||
+                   loc == VARYING_SLOT_TESS_LEVEL_INNER)
+                  has_level_load = true;
+               continue;
+            }
+            if (intr->intrinsic != nir_intrinsic_store_output)
+               continue;
+            if (!nir_src_is_const(intr->src[1])) {
+               indirect_store = true;
+               break;
+            }
+            uint64_t loc = (uint64_t)nir_intrinsic_io_semantics(intr).location +
+                           nir_src_as_uint(intr->src[1]);
+            if (loc != VARYING_SLOT_TESS_LEVEL_OUTER &&
+                loc != VARYING_SLOT_TESS_LEVEL_INNER)
+               continue;
+            bool is_outer = loc == VARYING_SLOT_TESS_LEVEL_OUTER;
+            unsigned comp = nir_intrinsic_component(intr);
+            unsigned wmask = nir_intrinsic_write_mask(intr);
+            u_foreach_bit(i, wmask) {
+               unsigned dst = comp + i;
+               if ((is_outer && dst >= n_edges) || (!is_outer && dst >= n_inner))
+                  continue;
+               unsigned slot = is_outer ? dst : 4u + dst;
+               struct tess_finterval iv =
+                  eval_finterval(&ctx, intr->src[0].ssa, i, 0);
+               slot_iv[slot] = finterval_union(slot_iv[slot], iv);
+            }
+         }
+         if (indirect_store)
+            break;
+      }
+      if (indirect_store || !has_level_load)
+         break;
+      memcpy(prev_iv, slot_iv, sizeof(prev_iv));
+   }
+
+   if (!indirect_store) {
+      for (unsigned s = 0; s < 6; ++s) {
+         bool active = s < 4 ? (s < n_edges) : (s - 4u < n_inner);
+         if (!active)
+            continue;
+         float hi = slot_iv[s].hi;
+         if (isnan(hi) || hi > max_f)
+            hi = max_f;
+         else if (hi < 0.0f)
+            hi = 0.0f;
+         if (slot_iv[s].has_push_cap) {
+            out_bounds[s] = (struct hk_apple9_tess_level_src){
+               .kind = HK_APPLE9_TESS_LEVEL_PUSH_BOUND,
+               .push_offset = slot_iv[s].push_offset,
+               .const_value = hi,
+            };
+            *out_has_push = true;
+         } else {
+            out_bounds[s] = (struct hk_apple9_tess_level_src){
+               .kind = HK_APPLE9_TESS_LEVEL_DYNAMIC,
+               .const_value = hi,
+            };
+         }
+      }
+   }
+
+   free(memo);
+   free(state);
+   free(vs_outs);
+}
+
 void
 hk_nir_tess_fused_eval_counts(const struct hk_shader_info *info,
                               const uint8_t *push_data,
@@ -848,15 +1888,20 @@ hk_nir_tess_fused_eval_counts(const struct hk_shader_info *info,
    float raw_inner[2] = {0.0f, 0.0f};
    for (unsigned i = 0; i < 6; ++i) {
       float v = 0.0f;
-      if (pl->levels[i].kind == HK_APPLE9_TESS_LEVEL_CONST) {
+      if (pl->levels[i].kind == HK_APPLE9_TESS_LEVEL_CONST ||
+          pl->levels[i].kind == HK_APPLE9_TESS_LEVEL_DYNAMIC) {
          v = pl->levels[i].const_value;
-      } else if (pl->levels[i].kind == HK_APPLE9_TESS_LEVEL_PUSH) {
+      } else if (pl->levels[i].kind == HK_APPLE9_TESS_LEVEL_PUSH ||
+                 pl->levels[i].kind == HK_APPLE9_TESS_LEVEL_PUSH_BOUND) {
          if (pl->levels[i].push_offset > HK_MAX_PUSH_SIZE - sizeof(float)) {
             *out_max_child_wgs = info->apple9_tess_max_child_wgs;
             *out_max_patch_prims = info->apple9_tess_max_patch_prims;
             return;
          }
          memcpy(&v, push_data + pl->levels[i].push_offset, sizeof(float));
+         if (pl->levels[i].kind == HK_APPLE9_TESS_LEVEL_PUSH_BOUND)
+            v = isnan(v) ? pl->levels[i].const_value
+                         : fminf(v, pl->levels[i].const_value);
       }
       if (i < 4)
          raw_outer[i] = v;
@@ -876,8 +1921,12 @@ hk_nir_tess_fused_eval_counts(const struct hk_shader_info *info,
    cpu_patch_counts((enum tess_primitive_mode)pl->domain,
                     (enum gl_tess_spacing)pl->spacing, raw_outer, raw_inner,
                     &shape, &wgs, &prims);
-   *out_max_child_wgs = wgs;
-   *out_max_patch_prims = prims;
+   *out_max_child_wgs =
+      info->apple9_tess_max_child_wgs ? MIN2(wgs, info->apple9_tess_max_child_wgs)
+                                      : wgs;
+   *out_max_patch_prims =
+      info->apple9_tess_max_patch_prims ? MIN2(prims, info->apple9_tess_max_patch_prims)
+                                        : prims;
 }
 
 /* =========================================================================
@@ -3509,8 +4558,8 @@ hk_nir_tess_fused_lower(const nir_shader *vs_source,
 
    struct tess_meshlet_shape shape = choose_meshlet_shape(vertex_components);
 
-   /* Compute static or worst-case child WGs and primitives per patch, plus
-    * push-constant level metadata for exact draw-time TVB/ring bounds. */
+   /* Compute exact static bounds, conservative VS+TCS interval upper bounds,
+    * and push-constant level/cap metadata for draw-time TVB/ring bounds. */
    struct hk_apple9_tess_level_src level_srcs[6];
    bool const_levels = false;
    bool have_level_srcs =
@@ -3527,13 +4576,46 @@ hk_nir_tess_fused_lower(const nir_shader *vs_source,
       };
       cpu_patch_counts(domain, spacing, const_outer, const_inner, &shape,
                        &max_child_wgs, &max_patch_prims);
-   } else {
+   } else if (have_level_srcs) {
       const float max_f = spacing == TESS_SPACING_FRACTIONAL_ODD ? 63.0f : 64.0f;
-      const float max_o[4] = {max_f, max_f, max_f, max_f};
-      const float max_i[2] = {max_f, max_f};
-      cpu_patch_counts(domain, spacing, max_o, max_i, &shape, &max_child_wgs,
+      float hi_o[4], hi_i[2];
+      for (unsigned e = 0; e < 4; ++e)
+         hi_o[e] = level_srcs[e].kind == HK_APPLE9_TESS_LEVEL_CONST
+                      ? level_srcs[e].const_value
+                      : max_f;
+      for (unsigned a = 0; a < 2; ++a)
+         hi_i[a] = level_srcs[4u + a].kind == HK_APPLE9_TESS_LEVEL_CONST
+                      ? level_srcs[4u + a].const_value
+                      : max_f;
+      cpu_patch_counts(domain, spacing, hi_o, hi_i, &shape, &max_child_wgs,
                        &max_patch_prims);
-      if (have_level_srcs) {
+      push_levels = (struct hk_apple9_tess_push_levels){
+         .valid = true,
+         .domain = domain,
+         .spacing = spacing,
+         .shape_max_v = shape.max_v,
+         .shape_max_p = shape.max_p,
+         .shape_p_strip = shape.p_strip,
+         .shape_tile_w = shape.tile_w,
+         .shape_tile_h = shape.tile_h,
+         .shape_allow_whole = shape.allow_whole_patch,
+      };
+      memcpy(push_levels.levels, level_srcs, sizeof(push_levels.levels));
+   } else {
+      struct hk_apple9_tess_level_src bound_srcs[6];
+      bool has_push_bound = false;
+      analyze_tess_level_bounds(vs, tcs, domain, spacing, bound_srcs,
+                                &has_push_bound);
+      float hi_o[4] = {
+         bound_srcs[0].const_value, bound_srcs[1].const_value,
+         bound_srcs[2].const_value, bound_srcs[3].const_value,
+      };
+      float hi_i[2] = {
+         bound_srcs[4].const_value, bound_srcs[5].const_value,
+      };
+      cpu_patch_counts(domain, spacing, hi_o, hi_i, &shape, &max_child_wgs,
+                       &max_patch_prims);
+      if (has_push_bound) {
          push_levels = (struct hk_apple9_tess_push_levels){
             .valid = true,
             .domain = domain,
@@ -3545,7 +4627,7 @@ hk_nir_tess_fused_lower(const nir_shader *vs_source,
             .shape_tile_h = shape.tile_h,
             .shape_allow_whole = shape.allow_whole_patch,
          };
-         memcpy(push_levels.levels, level_srcs, sizeof(push_levels.levels));
+         memcpy(push_levels.levels, bound_srcs, sizeof(push_levels.levels));
       }
    }
 

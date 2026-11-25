@@ -84,6 +84,9 @@ enum hk_apple9_tess_level_kind {
    HK_APPLE9_TESS_LEVEL_DYNAMIC = 0,
    HK_APPLE9_TESS_LEVEL_CONST = 1,
    HK_APPLE9_TESS_LEVEL_PUSH = 2,
+   /* Upper bound min(const_value, push_float) when push_float is non-NaN;
+    * falls back to const_value if push_float is NaN. */
+   HK_APPLE9_TESS_LEVEL_PUSH_BOUND = 3,
 };
 
 struct hk_apple9_tess_level_src {

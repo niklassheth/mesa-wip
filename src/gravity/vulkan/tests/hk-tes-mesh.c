@@ -1716,6 +1716,538 @@ fused_tess_vbo_pack_suite(void)
    printf("fused tessellation VBO pack suite: 0-ULP exhaustive + 4 norm formats + payload compaction + rejections passed\n");
 }
 
+static void
+fused_tess_interval_bounds_suite(void)
+{
+   struct hk_tess_fused_options opts = {
+      .vertex = {
+         .buffer_descriptor_ubo = HK_APPLE9_VERTEX_BUFFERS_BINDING,
+         .draw_params_ubo = HK_APPLE9_DRAW_PARAMS_BINDING,
+         .dynamic_stride = true,
+      },
+      .max_payload_bytes = 1024,
+   };
+
+   /* 1. Fused VS + TCS distance formula:
+    *    VS:  v = cond ? (8.0 - (sqrt(dx^2 + dy^2 + dz^2) - 3.0) * 0.363636374) : 0.0
+    *    TCS: e = cull ? 0.0 : fmin(fmax(0.5*(v[i]+v[j]), 1.0), 64.0)
+    *         inner = (e0 + e1 + e2) * 0.333
+    *    Provable hi <= 9.0909 -> FractionalOdd seg=11 -> 181 tris/patch (33x tighter). */
+   for (unsigned safe_nan = 0; safe_nan < 2; ++safe_nan) {
+      nir_builder vb = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "interval_dist_vs");
+      vb.shader->info.io_lowered = true;
+      nir_def *u = nir_load_ubo(&vb, 4, 32, nir_imm_int(&vb, 0),
+                                nir_imm_int(&vb, 0), .align_mul = 4, .range = 16);
+      nir_def *dx = nir_channel(&vb, u, 0);
+      nir_def *dy = nir_channel(&vb, u, 1);
+      nir_def *dz = nir_channel(&vb, u, 2);
+      nir_def *dist2 =
+         nir_fadd(&vb, nir_fadd(&vb, nir_fmul(&vb, dx, dx), nir_fmul(&vb, dy, dy)),
+                  nir_fmul(&vb, dz, dz));
+      nir_def *dist = nir_fsqrt(&vb, dist2);
+      nir_def *lvl = nir_fadd(
+         &vb, nir_imm_float(&vb, 8.0f),
+         nir_fneg(&vb, nir_fmul_imm(&vb, nir_fadd_imm(&vb, dist, -3.0f),
+                                    0.363636374f)));
+      nir_def *en = nir_ine_imm(&vb, nir_channel(&vb, u, 3), 0);
+      nir_def *v = nir_bcsel(&vb, en, lvl, nir_imm_float(&vb, 0.0f));
+      nir_store_output(&vb, nir_vec4(&vb, dx, dy, dz, v), nir_imm_int(&vb, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_shader_gather_info(vb.shader, nir_shader_get_entrypoint(vb.shader));
+
+      nir_builder cb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "interval_dist_tcs");
+      cb.shader->info.io_lowered = true;
+      cb.shader->info.tess.tcs_vertices_out = 3;
+      nir_def *inv = nir_load_invocation_id(&cb);
+      nir_def *pin = nir_load_per_vertex_input(
+         &cb, 4, 32, inv, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &cb, pin, inv, nir_imm_int(&cb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_push_if(&cb, nir_ieq_imm(&cb, inv, 0));
+      nir_def *v0 = nir_channel(
+         &cb,
+         nir_load_per_vertex_input(
+            &cb, 4, 32, nir_imm_int(&cb, 0), nir_imm_int(&cb, 0),
+            .dest_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1}),
+         3);
+      nir_def *v1 = nir_channel(
+         &cb,
+         nir_load_per_vertex_input(
+            &cb, 4, 32, nir_imm_int(&cb, 1), nir_imm_int(&cb, 0),
+            .dest_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1}),
+         3);
+      nir_def *v2 = nir_channel(
+         &cb,
+         nir_load_per_vertex_input(
+            &cb, 4, 32, nir_imm_int(&cb, 2), nir_imm_int(&cb, 0),
+            .dest_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1}),
+         3);
+      nir_def *cull = nir_ine_imm(
+         &cb,
+         nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0), nir_imm_int(&cb, 0),
+                      .align_mul = 4, .range = 16),
+         0);
+      nir_def *edges[3] = {
+         nir_fmul_imm(&cb, nir_fadd(&cb, v1, v2), 0.5f),
+         nir_fmul_imm(&cb, nir_fadd(&cb, v2, v0), 0.5f),
+         nir_fmul_imm(&cb, nir_fadd(&cb, v0, v1), 0.5f),
+      };
+      for (unsigned e = 0; e < 3; ++e) {
+         nir_def *x = edges[e];
+         /* With safe_nan=1, fmax(x, 1.0) eliminates NaN before fmin(..., 64.0).
+          * With safe_nan=0, IEEE fmin(NaN, 64.0) == 64.0, so analysis MUST stay
+          * conservative at worst-case 5953! */
+         if (safe_nan)
+            x = nir_fmax(&cb, x, nir_imm_float(&cb, 1.0f));
+         x = nir_fmin(&cb, x, nir_imm_float(&cb, 64.0f));
+         edges[e] = nir_bcsel(&cb, cull, x, nir_imm_float(&cb, 0.0f));
+      }
+      nir_store_output(
+         &cb, nir_vec3(&cb, edges[0], edges[1], edges[2]), nir_imm_int(&cb, 0),
+         .write_mask = 0x7, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+      nir_def *inner = nir_fmul_imm(
+         &cb, nir_fadd(&cb, nir_fadd(&cb, edges[0], edges[1]), edges[2]), 0.333f);
+      nir_store_output(
+         &cb, inner, nir_imm_int(&cb, 0), .write_mask = 0x1,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+      nir_pop_if(&cb, NULL);
+      nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                       TESS_SPACING_FRACTIONAL_ODD, false, false,
+                                       3, 4, 0, 0, false, false);
+      struct hk_tess_fused_info info = {0};
+      const char *reason = NULL;
+      CHECK(hk_nir_tess_fused_lower(vb.shader, cb.shader, tes, &opts, NULL,
+                                    NULL, &info, &reason));
+      CHECK(!info.constant_tess_levels);
+      if (safe_nan) {
+         CHECK(info.max_prims_per_patch == 181u);
+         CHECK(info.max_child_wgs_per_patch == 91u);
+      } else {
+         CHECK(info.max_prims_per_patch == 5953u);
+      }
+      ralloc_free(vb.shader);
+      ralloc_free(cb.shader);
+      ralloc_free(tes);
+   }
+
+   /* 2. Dynamic TCS clamped by both a static constant (8.0) and a push-constant
+    *    cap (fmin(fmin(ubo, push[8]), 8.0)), plus load_output(OUTER) -> INNER. */
+   {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_builder cb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "interval_push_cap_tcs");
+      cb.shader->info.io_lowered = true;
+      cb.shader->info.tess.tcs_vertices_out = 1;
+      nir_def *inv = nir_load_invocation_id(&cb);
+      nir_def *pos = nir_load_per_vertex_input(
+         &cb, 4, 32, inv, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &cb, pos, inv, nir_imm_int(&cb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_push_if(&cb, nir_ieq_imm(&cb, inv, 0));
+      nir_def *dyn = nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0),
+                                  nir_imm_int(&cb, 0), .align_mul = 4, .range = 16);
+      nir_def *pcap = nir_load_push_constant(
+         &cb, 1, 32, nir_imm_int(&cb, 8), .base = 0, .range = 16);
+      nir_def *bounded = nir_fmin(&cb, nir_fmin(&cb, dyn, pcap),
+                                  nir_imm_float(&cb, 8.0f));
+      nir_store_output(
+         &cb, nir_vec4(&cb, bounded, bounded, bounded, bounded),
+         nir_imm_int(&cb, 0), .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+      nir_def *o0 = nir_load_output(
+         &cb, 1, 32, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+      nir_store_output(
+         &cb, nir_vec2(&cb, o0, o0), nir_imm_int(&cb, 0), .write_mask = 0x3,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+      nir_pop_if(&cb, NULL);
+      nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
+                                       false, false, 1, 4, 0, 0, false, false);
+      struct hk_tess_fused_info info = {0};
+      CHECK(hk_nir_tess_fused_lower(vs, cb.shader, tes, &opts, NULL, NULL,
+                                    &info, NULL));
+      CHECK(!info.constant_tess_levels);
+      /* Static clamp <= 8.0 on Quads Equal: 2 * 8 * 8 = 128 tris/patch (vs 8192). */
+      CHECK(info.max_prims_per_patch == 128u);
+      CHECK(info.push_levels.valid);
+      CHECK(info.push_levels.levels[0].kind == HK_APPLE9_TESS_LEVEL_PUSH_BOUND);
+      CHECK(info.push_levels.levels[4].kind == HK_APPLE9_TESS_LEVEL_PUSH_BOUND);
+
+      struct hk_shader_info sinfo = {
+         .apple9_tess_fused = true,
+         .apple9_tess_max_child_wgs = info.max_child_wgs_per_patch,
+         .apple9_tess_max_patch_prims = info.max_prims_per_patch,
+         .apple9_tess_push_levels = info.push_levels,
+      };
+      const struct {
+         float push_cap;
+         uint32_t expected_prims;
+      } cases[] = {
+         {0.0f, 0u},      /* push cap <= 0 -> guaranteed culled */
+         {-2.0f, 0u},
+         {2.0f, 8u},      /* 2 * 2 * 2 */
+         {4.0f, 32u},     /* 2 * 4 * 4 */
+         {16.0f, 128u},   /* capped by static fmin(..., 8.0) */
+         {NAN, 128u},     /* NaN push cap MUST fall back to static 8.0, never cull! */
+      };
+      for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+         uint8_t push[HK_MAX_PUSH_SIZE] = {0};
+         memcpy(push + 8, &cases[i].push_cap, sizeof(float));
+         uint32_t wgs = 999, prims = 999;
+         hk_nir_tess_fused_eval_counts(&sinfo, push, &wgs, &prims);
+         CHECK(prims == cases[i].expected_prims);
+      }
+      ralloc_free(vs);
+      ralloc_free(cb.shader);
+      ralloc_free(tes);
+   }
+
+   /* 3. Conservative fallback on conditional-only VS write and TCS loop-carried phi. */
+   {
+      nir_builder vb = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "interval_cond_vs");
+      vb.shader->info.io_lowered = true;
+      nir_def *u = nir_load_ubo(&vb, 1, 32, nir_imm_int(&vb, 0),
+                                nir_imm_int(&vb, 0), .align_mul = 4, .range = 16);
+      nir_store_output(&vb, nir_imm_vec4(&vb, 0, 0, 0, 1), nir_imm_int(&vb, 0),
+                       .write_mask = 0x7, .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_push_if(&vb, nir_ine_imm(&vb, u, 0));
+      nir_store_output(&vb, nir_imm_float(&vb, 2.0f), nir_imm_int(&vb, 0),
+                       .component = 3, .write_mask = 0x1, .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_pop_if(&vb, NULL);
+      nir_shader_gather_info(vb.shader, nir_shader_get_entrypoint(vb.shader));
+
+      nir_builder cb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "interval_cond_tcs");
+      cb.shader->info.io_lowered = true;
+      cb.shader->info.tess.tcs_vertices_out = 1;
+      nir_def *inv = nir_load_invocation_id(&cb);
+      nir_def *pin = nir_load_per_vertex_input(
+         &cb, 4, 32, inv, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &cb, pin, inv, nir_imm_int(&cb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_def *w = nir_channel(&cb, pin, 3);
+      nir_store_output(
+         &cb, nir_vec4(&cb, w, w, w, w), nir_imm_int(&cb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+      nir_store_output(
+         &cb, nir_vec2(&cb, w, w), nir_imm_int(&cb, 0), .write_mask = 0x3,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+      nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
+                                       false, false, 1, 0, 0, 0, false, false);
+      struct hk_tess_fused_info info = {0};
+      CHECK(hk_nir_tess_fused_lower(vb.shader, cb.shader, tes, &opts, NULL,
+                                    NULL, &info, NULL));
+      CHECK(!info.constant_tess_levels);
+      CHECK(info.max_prims_per_patch == 8192u);
+      ralloc_free(vb.shader);
+      ralloc_free(cb.shader);
+      ralloc_free(tes);
+   }
+
+   /* 4. fsat(ubo) * 6.0f + bcsel clamp -> provable hi <= 6.0f (72 tris/patch). */
+   {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_builder cb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "interval_fsat_tcs");
+      cb.shader->info.io_lowered = true;
+      cb.shader->info.tess.tcs_vertices_out = 1;
+      nir_def *inv = nir_load_invocation_id(&cb);
+      nir_def *pos = nir_load_per_vertex_input(
+         &cb, 4, 32, inv, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &cb, pos, inv, nir_imm_int(&cb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_def *dyn = nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0),
+                                  nir_imm_int(&cb, 0), .align_mul = 4, .range = 16);
+      nir_def *lvl = nir_fmul_imm(&cb, nir_fsat(&cb, dyn), 6.0f);
+      nir_store_output(
+         &cb, nir_vec4(&cb, lvl, lvl, lvl, lvl), nir_imm_int(&cb, 0),
+         .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+      nir_store_output(
+         &cb, nir_vec2(&cb, lvl, lvl), nir_imm_int(&cb, 0), .write_mask = 0x3,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+      nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
+                                       false, false, 1, 0, 0, 0, false, false);
+      struct hk_tess_fused_info info = {0};
+      CHECK(hk_nir_tess_fused_lower(vs, cb.shader, tes, &opts, NULL, NULL,
+                                    &info, NULL));
+      CHECK(!info.constant_tess_levels);
+      CHECK(info.max_prims_per_patch == 72u); /* 2 * 6 * 6 */
+      ralloc_free(vs);
+      ralloc_free(cb.shader);
+      ralloc_free(tes);
+   }
+
+   /* 5. 64-bit u2f32(u64) * 2^-58 must NOT receive 32-bit bounds (x=2^63 -> 32.0). */
+   {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_builder cb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "interval_u64_tcs");
+      cb.shader->info.io_lowered = true;
+      cb.shader->info.tess.tcs_vertices_out = 1;
+      nir_def *inv = nir_load_invocation_id(&cb);
+      nir_def *pos = nir_load_per_vertex_input(
+         &cb, 4, 32, inv, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &cb, pos, inv, nir_imm_int(&cb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_def *u64 = nir_load_ubo(&cb, 1, 64, nir_imm_int(&cb, 0),
+                                  nir_imm_int(&cb, 0), .align_mul = 8, .range = 16);
+      nir_def *lvl = nir_fmul_imm(&cb, nir_u2f32(&cb, u64), ldexpf(1.0f, -58));
+      nir_store_output(
+         &cb, nir_vec4(&cb, lvl, lvl, lvl, lvl), nir_imm_int(&cb, 0),
+         .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+      nir_store_output(
+         &cb, nir_vec2(&cb, lvl, lvl), nir_imm_int(&cb, 0), .write_mask = 0x3,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+      nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
+                                       false, false, 1, 0, 0, 0, false, false);
+      struct hk_tess_fused_info info = {0};
+      CHECK(hk_nir_tess_fused_lower(vs, cb.shader, tes, &opts, NULL, NULL,
+                                    &info, NULL));
+      CHECK(!info.constant_tess_levels);
+      CHECK(info.max_prims_per_patch == 8192u);
+      ralloc_free(vs);
+      ralloc_free(cb.shader);
+      ralloc_free(tes);
+   }
+
+   /* 6. IEEE frsq(-0.0) = -Inf: fmin(-frsq(ftrunc(clamp(x, -0.5, 0.5))), 64.0)
+    *    produces 64.0 at x=-0.25, so analyzer must NOT report 0 prims! */
+   {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_builder cb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "interval_negzero_rsq_tcs");
+      cb.shader->info.io_lowered = true;
+      cb.shader->info.tess.tcs_vertices_out = 1;
+      nir_def *inv = nir_load_invocation_id(&cb);
+      nir_def *pos = nir_load_per_vertex_input(
+         &cb, 4, 32, inv, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &cb, pos, inv, nir_imm_int(&cb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_def *dyn = nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0),
+                                  nir_imm_int(&cb, 0), .align_mul = 4, .range = 16);
+      nir_def *z = nir_ftrunc(
+         &cb, nir_fmin(&cb, nir_fmax(&cb, dyn, nir_imm_float(&cb, -0.5f)),
+                       nir_imm_float(&cb, 0.5f)));
+      nir_def *lvl = nir_fmin(&cb, nir_fneg(&cb, nir_frsq(&cb, z)),
+                              nir_imm_float(&cb, 64.0f));
+      nir_store_output(
+         &cb, nir_vec4(&cb, lvl, lvl, lvl, lvl), nir_imm_int(&cb, 0),
+         .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+      nir_store_output(
+         &cb, nir_vec2(&cb, lvl, lvl), nir_imm_int(&cb, 0), .write_mask = 0x3,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+      nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
+                                       false, false, 1, 0, 0, 0, false, false);
+      struct hk_tess_fused_info info = {0};
+      CHECK(hk_nir_tess_fused_lower(vs, cb.shader, tes, &opts, NULL, NULL,
+                                    &info, NULL));
+      CHECK(!info.constant_tess_levels);
+      CHECK(info.max_prims_per_patch == 8192u);
+      ralloc_free(vs);
+      ralloc_free(cb.shader);
+      ralloc_free(tes);
+   }
+
+   /* 7. fdiv(x in [0, 21], 7.0) lowered as x * rcp(7.0) yields 3.0000002384
+    *    at x=21 -> Equal spacing rounds up to 4 segments (32 tris, NOT 18). */
+   {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_builder cb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "interval_fdiv_rcp_tcs");
+      cb.shader->info.io_lowered = true;
+      cb.shader->info.tess.tcs_vertices_out = 1;
+      nir_def *inv = nir_load_invocation_id(&cb);
+      nir_def *pos = nir_load_per_vertex_input(
+         &cb, 4, 32, inv, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &cb, pos, inv, nir_imm_int(&cb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_def *dyn = nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0),
+                                  nir_imm_int(&cb, 0), .align_mul = 4, .range = 16);
+      nir_def *x = nir_fmin(&cb, nir_fmax(&cb, dyn, nir_imm_float(&cb, 0.0f)),
+                            nir_imm_float(&cb, 21.0f));
+      nir_def *lvl = nir_fdiv(&cb, x, nir_imm_float(&cb, 7.0f));
+      nir_store_output(
+         &cb, nir_vec4(&cb, lvl, lvl, lvl, lvl), nir_imm_int(&cb, 0),
+         .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+      nir_store_output(
+         &cb, nir_vec2(&cb, lvl, lvl), nir_imm_int(&cb, 0), .write_mask = 0x3,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+      nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
+                                       false, false, 1, 0, 0, 0, false, false);
+      struct hk_tess_fused_info info = {0};
+      CHECK(hk_nir_tess_fused_lower(vs, cb.shader, tes, &opts, NULL, NULL,
+                                    &info, NULL));
+      CHECK(!info.constant_tess_levels);
+      CHECK(info.max_prims_per_patch == 32u); /* 2 * 4 * 4 */
+      ralloc_free(vs);
+      ralloc_free(cb.shader);
+      ralloc_free(tes);
+   }
+
+   /* 8. Apple9 lowers fsqrt(x) as x * rsq(x): at x=49, 49 * rsq(49) = 7 +/- 2^-21,
+    *    so neither sqrt(clamp(x, 0, 49)) - 7 nor 7 - sqrt(clamp(x, 49, 64)) may
+    *    be falsely bounded to <= 0 (culled)! */
+   for (unsigned dir = 0; dir < 2; ++dir) {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_builder cb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "interval_sqrt_cancel_tcs");
+      cb.shader->info.io_lowered = true;
+      cb.shader->info.tess.tcs_vertices_out = 1;
+      nir_def *inv = nir_load_invocation_id(&cb);
+      nir_def *pos = nir_load_per_vertex_input(
+         &cb, 4, 32, inv, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &cb, pos, inv, nir_imm_int(&cb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_def *dyn = nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0),
+                                  nir_imm_int(&cb, 0), .align_mul = 4, .range = 16);
+      nir_def *clamped = nir_fmin(
+         &cb, nir_fmax(&cb, dyn, nir_imm_float(&cb, dir == 0 ? 0.0f : 49.0f)),
+         nir_imm_float(&cb, dir == 0 ? 49.0f : 64.0f));
+      nir_def *sq = nir_fsqrt(&cb, clamped);
+      nir_def *lvl = dir == 0 ? nir_fsub(&cb, sq, nir_imm_float(&cb, 7.0f))
+                              : nir_fsub(&cb, nir_imm_float(&cb, 7.0f), sq);
+      nir_store_output(
+         &cb, nir_vec4(&cb, lvl, lvl, lvl, lvl), nir_imm_int(&cb, 0),
+         .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+      nir_store_output(
+         &cb, nir_vec2(&cb, lvl, lvl), nir_imm_int(&cb, 0), .write_mask = 0x3,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+      nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
+                                       false, false, 1, 0, 0, 0, false, false);
+      struct hk_tess_fused_info info = {0};
+      CHECK(hk_nir_tess_fused_lower(vs, cb.shader, tes, &opts, NULL, NULL,
+                                    &info, NULL));
+      CHECK(!info.constant_tess_levels);
+      CHECK(info.max_prims_per_patch == 2u); /* Live positive epsilon -> 1x1 quad = 2 tris */
+      CHECK(info.max_child_wgs_per_patch == 1u);
+      ralloc_free(vs);
+      ralloc_free(cb.shader);
+      ralloc_free(tes);
+   }
+
+   /* 9. Exact boundary precision regressions:
+    *    (a) fsqrt factor*x error propagation at x = 3.5145106315612793:
+    *        1.8747024536132812 - sqrt(clamp(x, 3.5145106315612793, 4.0)) can be
+    *        positive (> 0) for a 1.997-ULP factor -> must NOT report 0 prims.
+    *    (b) frsq power-of-two binade crossing at x = 0.9999999403953552:
+    *        0.9999998807907104 - frsq(clamp(x, 0.5, 0.9999999403953552)) can be
+    *        positive for a 1.75-ULP Vulkan InverseSqrt -> must NOT report 0 prims. */
+   for (unsigned k = 0; k < 2; ++k) {
+      nir_shader *vs = make_fused_vs(0, false);
+      nir_builder cb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "interval_ulp_boundary_tcs");
+      cb.shader->info.io_lowered = true;
+      cb.shader->info.tess.tcs_vertices_out = 1;
+      nir_def *inv = nir_load_invocation_id(&cb);
+      nir_def *pos = nir_load_per_vertex_input(
+         &cb, 4, 32, inv, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &cb, pos, inv, nir_imm_int(&cb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_def *dyn = nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0),
+                                  nir_imm_int(&cb, 0), .align_mul = 4, .range = 16);
+      nir_def *lvl;
+      if (k == 0) {
+         nir_def *x = nir_fmin(&cb, nir_fmax(&cb, dyn, nir_imm_float(&cb, 3.5145106315612793f)),
+                               nir_imm_float(&cb, 4.0f));
+         lvl = nir_fsub(&cb, nir_imm_float(&cb, 1.8747024536132812f), nir_fsqrt(&cb, x));
+      } else {
+         nir_def *x = nir_fmin(&cb, nir_fmax(&cb, dyn, nir_imm_float(&cb, 0.5f)),
+                               nir_imm_float(&cb, 0.9999999403953552f));
+         lvl = nir_fsub(&cb, nir_imm_float(&cb, 0.9999998807907104f), nir_frsq(&cb, x));
+      }
+      nir_store_output(
+         &cb, nir_vec4(&cb, lvl, lvl, lvl, lvl), nir_imm_int(&cb, 0),
+         .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+      nir_store_output(
+         &cb, nir_vec2(&cb, lvl, lvl), nir_imm_int(&cb, 0), .write_mask = 0x3,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+      nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+
+      nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
+                                       false, false, 1, 0, 0, 0, false, false);
+      struct hk_tess_fused_info info = {0};
+      CHECK(hk_nir_tess_fused_lower(vs, cb.shader, tes, &opts, NULL, NULL,
+                                    &info, NULL));
+      CHECK(!info.constant_tess_levels);
+      CHECK(info.max_prims_per_patch == 2u);
+      CHECK(info.max_child_wgs_per_patch == 1u);
+      ralloc_free(vs);
+      ralloc_free(cb.shader);
+      ralloc_free(tes);
+   }
+
+   printf("fused tessellation interval bounds suite: VS+TCS distance + NaN/u64/-0/fdiv/sqrt/rsq soundness + push cap + fallbacks passed\n");
+}
+
 static uint32_t
 ref_stitch_i(uint32_t n_out, uint32_t n_in_seg, uint32_t t)
 {
@@ -2246,6 +2778,7 @@ main(void)
    levels();
    fused_tess_suite();
    fused_tess_vbo_pack_suite();
+   fused_tess_interval_bounds_suite();
    fused_tess_topology_suite();
    /* Consuming entrypoint lowers in place without a second clone and frees on reject. */
    {
