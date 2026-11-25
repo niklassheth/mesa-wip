@@ -3079,16 +3079,16 @@ fused_tess_astra_regression_suite(void)
    }
 
    /* F7 / M3: Dynamic SetMeshOutputsEXT(ubo.v, 1) on T32 V=16 P=1 comps=8
-    * (and V=32 P=32 comps=4, safe across both idx_rows=4 and idx_rows=8)
-    * emits constant safe U0_B (24 and 68) into MESH_CONTROL for every
-    * non-empty WG, eliminating runtime stride holes. */
+    * (u0_b=24, stride=52) and V=32 P=32 comps=4 with constant P=1 (fixed
+    * idx_rows=4 -> u0_b=48, stride=52) emits constant safe U0_B into
+    * MESH_CONTROL for every non-empty WG, eliminating runtime stride holes. */
    {
       const struct {
          unsigned max_v, max_p, extra_vec4;
          uint32_t expected_u0_b;
       } f7_cases[] = {
          {16, 1, 1, 24},
-         {32, 32, 0, 68},
+         {32, 32, 0, 48},
       };
       for (unsigned i = 0; i < ARRAY_SIZE(f7_cases); ++i) {
          nir_builder mb = nir_builder_init_simple_shader(

@@ -195,7 +195,7 @@ hk_hash_apple9_native_mesh_abi(struct mesa_blake3 *ctx)
       1, /* Guarded empty-grid taskless object/mesh for indirect & cond render. */
       1, /* Multiview native mesh layer lowering from root.draw.view_index. */
       1, /* Native-only indirect output-slot lowering without fallback bloat. */
-      1, /* Safe-stride U0_B ring-wrap padding & widened fused tess meshlets. */
+      2, /* Safe-stride U0_B ring-wrap padding, variable idx_rows guard, & widened fused tess meshlets. */
    };
    _mesa_blake3_update(ctx, abi, sizeof(abi));
 }

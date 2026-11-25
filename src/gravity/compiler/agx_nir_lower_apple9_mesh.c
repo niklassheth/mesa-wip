@@ -164,6 +164,10 @@ validate(nir_shader *nir, const struct agx_apple9_mesh_key *key,
    }
 
    bool payload = false, local_output = false;
+   uint64_t max_idx_rows =
+      nir->info.stage == MESA_SHADER_MESH ? agx_apple9_mesh_idx_rows(layout) : 0;
+   bool idx_variable = false;
+   uint16_t idx_bucket = 0;
    uint8_t vertex[VARYING_SLOT_MAX] = {0}, primitive[VARYING_SLOT_MAX] = {0};
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -241,6 +245,24 @@ validate(nir_shader *nir, const struct agx_apple9_mesh_key *key,
                     nir_src_as_uint(intr->src[1]) > layout->max_primitives))
                   return fail(reason,
                               "Apple9 mesh counts exceed the output declaration");
+               if (max_idx_rows > 4u && !idx_variable) {
+                  if (!nir_src_is_const(intr->src[1])) {
+                     idx_variable = true;
+                  } else {
+                     uint64_t p = nir_src_as_uint(intr->src[1]);
+                     if (p > 0) {
+                        uint16_t bucket =
+                           (uint16_t)(DIV_ROUND_UP(
+                                         p * layout->indices_per_primitive,
+                                         64u) *
+                                      4u);
+                        if (!idx_bucket)
+                           idx_bucket = bucket;
+                        else if (idx_bucket != bucket)
+                           idx_variable = true;
+                     }
+                  }
+               }
             }
             if (intr->intrinsic == nir_intrinsic_launch_mesh_workgroups &&
                 (nir->info.stage != MESA_SHADER_TASK ||
@@ -323,6 +345,17 @@ validate(nir_shader *nir, const struct agx_apple9_mesh_key *key,
                   "Apple9 local root aliases the payload pointer argument");
    if (nir->info.stage == MESA_SHADER_TASK)
       return true;
+
+   if (max_idx_rows <= 4u) {
+      layout->variable_idx_rows = false;
+      layout->fixed_idx_rows = 4u;
+   } else if (idx_variable) {
+      layout->variable_idx_rows = true;
+      layout->fixed_idx_rows = 0;
+   } else {
+      layout->variable_idx_rows = false;
+      layout->fixed_idx_rows = idx_bucket ? idx_bucket : (uint16_t)max_idx_rows;
+   }
 
    /* ViewportIndex is linked as a flat varying for fragment reads AND packed
     * into the rasterizer's shared Layer/Viewport word at VARYING_SLOT_LAYER. */

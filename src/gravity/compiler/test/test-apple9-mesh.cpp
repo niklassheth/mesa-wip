@@ -3678,6 +3678,87 @@ TEST(Apple9MeshNativeExpand, SafeU0BUnlocksWgRows32AndGt40)
       ASSERT_TRUE(agx_apple9_mesh_safe_u0_b(&info.layout, &safe_u0_b, &stride));
       EXPECT_EQ(safe_u0_b, 20u);
       EXPECT_EQ(stride, 164u);
+      EXPECT_FALSE(info.layout.variable_idx_rows);
+      EXPECT_EQ(info.layout.fixed_idx_rows, 4u);
+      free(code.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* Dynamic P under max_primitives=42 (>64 index bytes -> multiple index-row
+    * buckets) must set variable_idx_rows=true so ring wrap is disabled, while
+    * constant P=42 keeps fixed_idx_rows=8 and dynamic P under max_primitives=18
+    * keeps fixed_idx_rows=4. */
+   for (unsigned mode = 0; mode < 3; ++mode) {
+      unsigned max_v = mode == 2 ? 16u : 32u;
+      unsigned max_p = mode == 2 ? 18u : 42u;
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_MESH, &agx_nir_options, "idx_bucket_guard");
+      b.shader->info.io_lowered = true;
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.mesh.max_vertices_out = max_v;
+      b.shader->info.mesh.max_primitives_out = max_p;
+      b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      nir_def *gid = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+      nir_def *prim_cnt =
+         mode == 1
+            ? nir_imm_int(&b, 42)
+            : nir_bcsel(&b, nir_ieq_imm(&b, nir_iand_imm(&b, gid, 1), 0),
+                        nir_imm_int(&b, mode == 2 ? 6 : 18),
+                        nir_imm_int(&b, max_p));
+      nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, max_v), prim_cnt,
+                                         nir_imm_int(&b, 0));
+      nir_store_per_vertex_output(
+         &b, nir_imm_vec4(&b, 0.0f, 0.0f, 0.5f, 1.0f), nir_imm_int(&b, 0),
+         nir_imm_int(&b, 0), .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &b, nir_imm_vec4(&b, 1.0f, 0.0f, 0.0f, 1.0f), nir_imm_int(&b, 0),
+         nir_imm_int(&b, 0), .write_mask = 0xf, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+      nir_store_per_primitive_output(
+         &b, nir_imm_ivec3(&b, 0, 1, 2), nir_imm_int(&b, 0),
+         nir_imm_int(&b, 0), .write_mask = 0x7, .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+      nir_pop_if(&b, nullptr);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+
+      agx_apple9_native_mesh_options opts = {};
+      opts.physical_threads = 32;
+      opts.packed_index_publication = true;
+      opts.publication_rounds = true;
+      opts.attributes = true;
+
+      agx_shader_part code = {};
+      agx_apple9_mesh_body_info info = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_native_mesh(b.shader, true, &opts, &code,
+                                                 &info, &reason))
+         << "mode=" << mode << ": " << (reason ?: "");
+      uint32_t safe_u0_b = 0, stride = 0;
+      if (mode == 0) {
+         /* Dynamic P across 4-row / 8-row index buckets -> bounded only. */
+         EXPECT_TRUE(info.layout.variable_idx_rows);
+         EXPECT_EQ(info.layout.fixed_idx_rows, 0u);
+         EXPECT_FALSE(agx_apple9_mesh_safe_u0_b(&info.layout, &safe_u0_b, &stride));
+      } else if (mode == 1) {
+         /* Constant P=42 -> single 8-row bucket, exact stride 72. */
+         EXPECT_FALSE(info.layout.variable_idx_rows);
+         EXPECT_EQ(info.layout.fixed_idx_rows, 8u);
+         ASSERT_TRUE(agx_apple9_mesh_safe_u0_b(&info.layout, &safe_u0_b, &stride));
+         EXPECT_EQ(safe_u0_b, 32u);
+         EXPECT_EQ(stride, 72u);
+      } else {
+         /* Dynamic P under max_primitives=18 -> single 4-row bucket. */
+         EXPECT_FALSE(info.layout.variable_idx_rows);
+         EXPECT_EQ(info.layout.fixed_idx_rows, 4u);
+         ASSERT_TRUE(agx_apple9_mesh_safe_u0_b(&info.layout, &safe_u0_b, &stride));
+      }
       free(code.binary);
       ralloc_free(b.shader);
    }

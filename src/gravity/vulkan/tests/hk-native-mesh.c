@@ -375,6 +375,39 @@ check_mesh_ring_fits(void)
          .max_vertices = 4, .max_primitives = 2, .indices_per_primitive = 3, .vertex_components = 56,
       };
       CHECK(agx_apple9_mesh_safe_u0_b(&v4c56, &u0, &st) && u0 == 12 && st == 172);
+
+      /* Variable index-row buckets (> 4 rows with runtime-variable P) cannot
+       * safely wrap the 4,096-row ring and fall back to bounded admission. */
+      struct agx_apple9_mesh_layout var_idx = {
+         .max_vertices = 32, .max_primitives = 42, .indices_per_primitive = 3,
+         .vertex_components = 8, .variable_idx_rows = true,
+      };
+      CHECK(!agx_apple9_mesh_safe_u0_b(&var_idx, &u0, &st));
+      uint64_t var_max = 0;
+      CHECK(agx_apple9_mesh_ring_max_groups(&var_idx, &var_max));
+      CHECK(var_max == 4096u / (8u * 8u + 8u)); /* 56 non-wrapping groups */
+      CHECK(agx_apple9_mesh_ring_fits(&var_idx, var_max));
+      CHECK(!agx_apple9_mesh_ring_fits(&var_idx, var_max + 1));
+
+      /* Constant P=42 (fixed_idx_rows=8) stays unbounded with exact stride. */
+      struct agx_apple9_mesh_layout fixed_idx = {
+         .max_vertices = 32, .max_primitives = 42, .indices_per_primitive = 3,
+         .vertex_components = 8, .fixed_idx_rows = 8,
+      };
+      CHECK(agx_apple9_mesh_safe_u0_b(&fixed_idx, &u0, &st) && u0 == 32 && st == 72);
+
+      /* Position-only (planes == 4) with variable_idx_rows stays unbounded via
+       * runtime U0_B compensation to a single constant stride. */
+      struct agx_apple9_mesh_layout pos_var_idx = {
+         .max_vertices = 32, .max_primitives = 42, .indices_per_primitive = 3,
+         .vertex_components = 4, .variable_idx_rows = true,
+      };
+      CHECK(agx_apple9_mesh_safe_u0_b(&pos_var_idx, &u0, &st) && u0 == 44 && st == 52);
+      struct agx_apple9_mesh_layout gs4_var_idx = {
+         .max_vertices = 24, .max_primitives = 31, .indices_per_primitive = 3,
+         .vertex_components = 4, .variable_idx_rows = true,
+      };
+      CHECK(agx_apple9_mesh_safe_u0_b(&gs4_var_idx, &u0, &st) && u0 == 24 && st == 32);
    }
 
    /* Huge footprints exceeding the 2048-row safe-stride ceiling remain bounded

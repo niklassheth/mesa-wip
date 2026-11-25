@@ -110,6 +110,13 @@ struct agx_apple9_mesh_layout {
    unsigned vertex_pitch_B, primitive_stride_B, local_size_B;
    unsigned indices_per_primitive;
    bool culling;
+   /* True when runtime SetMeshOutputsEXT primitive counts may span multiple
+    * 64-byte index-row buckets (>4 rows) within one draw, preventing a single
+    * constant wrap-safe ring stride across workgroups. */
+   bool variable_idx_rows;
+   /* Exact nonzero index-row bucket (multiple of 4) when all non-empty
+    * workgroups share one bucket, or 0 to derive from max_primitives. */
+   uint16_t fixed_idx_rows;
 };
 
 static inline unsigned
@@ -174,34 +181,39 @@ agx_apple9_mesh_safe_u0_b(const struct agx_apple9_mesh_layout *layout,
       return false;
    uint64_t quads = ((uint64_t)layout->max_vertices + 3u) / 4u;
    uint64_t planes = (n + 3u) & ~UINT64_C(3);
-   uint64_t max_idx_rows = agx_apple9_mesh_idx_rows(layout);
-   if (max_idx_rows >= AGX_APPLE9_MESH_RING_ROWS)
+   /* Runtime primitive counts spanning multiple 64-byte index-row buckets
+    * produce distinct per-workgroup ring strides whose linear combinations can
+    * wrap mid-vertex-block (verified on T8132 silicon with alternating P=18/42
+    * at comps=8). For position-only layouts (planes == 4), completion can
+    * compensate U0_B at runtime by (max_idx_rows - runtime_idx_rows) vertices
+    * so every non-empty workgroup allocates the exact same constant stride;
+    * wider layouts (planes > 4) cannot absorb a 4-row index delta in multiples
+    * of planes and fall back to bounded non-wrapping admission. */
+   if (layout->variable_idx_rows && planes != 4u)
+      return false;
+   uint64_t idx_rows =
+      (!layout->variable_idx_rows && layout->fixed_idx_rows)
+         ? (uint64_t)layout->fixed_idx_rows
+         : agx_apple9_mesh_idx_rows(layout);
+   if (!idx_rows || (idx_rows & 3u) || idx_rows >= AGX_APPLE9_MESH_RING_ROWS)
       return false;
    uint64_t vtx_rows = quads * planes;
-   if (vtx_rows + max_idx_rows > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
+   if (vtx_rows + idx_rows > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
       return false;
 
    for (uint64_t q = quads; q <= AGX_APPLE9_MESH_SAFE_U0_B_MAX / 4u; ++q) {
-      uint64_t max_stride = q * planes + max_idx_rows;
-      if (max_stride > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
+      if (layout->variable_idx_rows &&
+          q * 4u + (idx_rows - 4u) > AGX_APPLE9_MESH_SAFE_U0_B_MAX)
          break;
-      /* Require the remainder condition for every reachable index-row class
-       * idx in {4, 8, ..., max_idx_rows} so dynamic runtime SetMeshOutputsEXT
-       * primitive counts cannot drop into an unsafe remainder band. */
-      bool all_safe = true;
-      for (uint64_t idx = 4u; idx <= max_idx_rows; idx += 4u) {
-         uint64_t stride = q * planes + idx;
-         uint64_t rem = AGX_APPLE9_MESH_RING_ROWS % stride;
-         if (rem != 0 && rem < vtx_rows) {
-            all_safe = false;
-            break;
-         }
-      }
-      if (all_safe) {
+      uint64_t stride = q * planes + idx_rows;
+      if (stride > AGX_APPLE9_MESH_SAFE_STRIDE_MAX)
+         break;
+      uint64_t rem = AGX_APPLE9_MESH_RING_ROWS % stride;
+      if (rem == 0 || rem >= vtx_rows) {
          if (out_u0_b)
             *out_u0_b = q == quads ? layout->max_vertices : (uint32_t)(q * 4u);
          if (out_stride)
-            *out_stride = (uint32_t)max_stride;
+            *out_stride = (uint32_t)stride;
          return true;
       }
    }

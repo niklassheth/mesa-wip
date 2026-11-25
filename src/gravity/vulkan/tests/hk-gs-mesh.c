@@ -1532,8 +1532,10 @@ record_and_verify_zero_pregfx(struct hk_device *dev,
          &hk_native_producer_main(ng)->info.apple9_native.layout;
       unsigned saved_vc = l->vertex_components;
       unsigned saved_mv = l->max_vertices;
+      bool saved_var_idx = l->variable_idx_rows;
       l->max_vertices = 4;
       l->vertex_components = 128; /* safe-stride U0_B -> unbounded */
+      l->variable_idx_rows = false;
       unsigned pack = MAX2(hk_native_producer_main(ng)->info.apple9_gs_pack, 1u);
       unsigned inv =
          MAX2(hk_native_producer_main(ng)->info.apple9_gs_invocations, 1u);
@@ -1560,6 +1562,7 @@ record_and_verify_zero_pregfx(struct hk_device *dev,
       }
       l->vertex_components = saved_vc;
       l->max_vertices = saved_mv;
+      l->variable_idx_rows = saved_var_idx;
    } else {
       /* Fallback emulated GS records cleanly via PREGFX CDM + non-native VDM. */
       CHECK(cdm_streams >= 1);

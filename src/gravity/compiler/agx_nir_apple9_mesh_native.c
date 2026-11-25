@@ -1287,10 +1287,26 @@ agx_nir_lower_apple9_native_mesh(
     * vertex count. */
    device_fence(&b);
    nir_def *u0_b = vertices;
-   uint32_t safe_u0_b = 0;
-   if (agx_apple9_mesh_safe_u0_b(layout, &safe_u0_b, NULL) && safe_u0_b > 4u) {
-      u0_b = nir_bcsel(&b, nir_ine_imm(&b, vertices, 0),
-                       nir_imm_int(&b, safe_u0_b), nir_imm_int(&b, 0));
+   uint32_t safe_u0_b = 0, safe_stride = 0;
+   if (agx_apple9_mesh_safe_u0_b(layout, &safe_u0_b, &safe_stride)) {
+      if (layout->variable_idx_rows) {
+         /* Position-only (planes == 4) with variable index-row buckets:
+          * compensate U0_B at runtime by (max_idx_rows - runtime_idx_rows)
+          * vertices so every non-empty workgroup allocates exact constant
+          * safe_stride rows across the 4,096-row ring. */
+         nir_def *idx_bytes =
+            nir_imul_imm(&b, primitives, layout->indices_per_primitive);
+         nir_def *runtime_idx_rows =
+            nir_ishl_imm(&b, nir_ushr_imm(&b, nir_iadd_imm(&b, idx_bytes, 63), 6),
+                         2);
+         nir_def *comp_u0_b =
+            nir_isub(&b, nir_imm_int(&b, safe_stride), runtime_idx_rows);
+         u0_b = nir_bcsel(&b, nir_ine_imm(&b, vertices, 0), comp_u0_b,
+                          nir_imm_int(&b, 0));
+      } else if (safe_u0_b > 4u) {
+         u0_b = nir_bcsel(&b, nir_ine_imm(&b, vertices, 0),
+                          nir_imm_int(&b, safe_u0_b), nir_imm_int(&b, 0));
+      }
    }
    nir_mesh_control_apple9_agx(&b, nir_u2u16(&b, primitives),
                                nir_u2u16(&b, u0_b), .base = 1);
