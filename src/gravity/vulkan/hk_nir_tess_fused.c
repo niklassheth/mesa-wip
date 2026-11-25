@@ -138,6 +138,30 @@ choose_meshlet_shape(unsigned vertex_components)
    };
 }
 
+/* Maximum triangles packed into one multi-ring triangle child WG.
+ * Any contiguous slice of P triangles along the concentric-ring stream
+ * touches at most P + 3 unique vertices (P + 2 within a single ring, +1 when
+ * crossing ring boundaries or merging the odd center triangle). */
+static inline unsigned
+tess_tri_chunk_prims(const struct tess_meshlet_shape *shape)
+{
+   unsigned cap = shape->max_v > 3 ? shape->max_v - 3 : 1;
+   return MIN2(shape->max_p, cap);
+}
+
+/* Maximum interior quad cells packed into one row-major quad child WG.
+ * Any contiguous row-major slice of Q cells (2*Q triangles) touches at most
+ * 2*Q + 4 unique vertices (2*Q + 2 on a single row, +2 when wrapping across a
+ * row boundary with Q < qu). For Q = 1 (max_v == 4), a single cell never wraps
+ * and uses 4 vertices. Row-major chunking guarantees identical primitive order
+ * across all meshlet shapes and whole-patch mode (Vulkan invariance rule 1). */
+static inline unsigned
+tess_quad_int_chunk_cells(const struct tess_meshlet_shape *shape)
+{
+   unsigned cap = shape->max_v >= 6 ? (shape->max_v - 4) / 2 : 1;
+   return MIN2(shape->max_p / 2, cap);
+}
+
 static bool
 tes_output_slot_ok(unsigned loc, unsigned comp, unsigned num_comps,
                    unsigned clip_size, unsigned cull_size)
@@ -616,15 +640,12 @@ cpu_patch_counts(enum tess_primitive_mode domain, enum gl_tess_spacing spacing,
          *out_wgs = 1;
          return;
       }
-      unsigned w = 0;
-      for (unsigned e = 0; e < 4; ++e) {
-         unsigned n_is = ((e & 1) ? n_in[0] : n_in[1]) - 2;
-         w += DIV_ROUND_UP(n_out[e] + n_is, shape->p_strip);
-      }
       unsigned qu = n_in[0] - 2, qv = n_in[1] - 2;
-      if (qu && qv)
-         w += DIV_ROUND_UP(qu, shape->tile_w) * DIV_ROUND_UP(qv, shape->tile_h);
-      *out_wgs = w;
+      unsigned t_outer = outer_sum + 2 * (qu + qv);
+      unsigned w = DIV_ROUND_UP(t_outer, shape->p_strip);
+      unsigned w_int =
+         (qu && qv) ? DIV_ROUND_UP(qu * qv, tess_quad_int_chunk_cells(shape)) : 0;
+      *out_wgs = w + w_int;
    } else {
       unsigned outer_sum = n_out[0] + n_out[1] + n_out[2];
       unsigned ni = n_in[0];
@@ -639,15 +660,7 @@ cpu_patch_counts(enum tess_primitive_mode domain, enum gl_tess_spacing spacing,
          *out_wgs = 1;
          return;
       }
-      unsigned w = 0;
-      for (unsigned e = 0; e < 3; ++e)
-         w += DIV_ROUND_UP(n_out[e] + (ni - 2), shape->p_strip);
-      unsigned rings = ni >> 1;
-      for (unsigned r = 1; r < rings; ++r)
-         w += 3 * DIV_ROUND_UP(2 * (ni - 2 * r - 1), shape->p_strip);
-      if (ni & 1)
-         w += 1;
-      *out_wgs = w;
+      *out_wgs = DIV_ROUND_UP(p_patch, tess_tri_chunk_prims(shape));
    }
 }
 
@@ -3067,8 +3080,7 @@ struct patch_tess_calc {
 /* Shared per-patch clamping, 16.16 fixed-point seg-count derivation, whole-patch
  * classification, and multi-WG count calculation (identical across K=1 and K>=2). */
 static void
-emit_patch_tess_calc(nir_builder *b, nir_function_impl *impl,
-                     enum tess_primitive_mode domain,
+emit_patch_tess_calc(nir_builder *b, enum tess_primitive_mode domain,
                      enum gl_tess_spacing spacing,
                      const struct tess_meshlet_shape *shape,
                      nir_def *const raw_out[4], nir_def *const raw_in[2],
@@ -3152,24 +3164,13 @@ emit_patch_tess_calc(nir_builder *b, nir_function_impl *impl,
          v_patch_val = nir_bcsel(b, all_ones, nir_imm_int(b, 4), v_patch);
          p_patch_val = nir_bcsel(b, all_ones, nir_imm_int(b, 2), p_patch);
       }
-      nir_def *w0 =
-         nir_div_round_up_imm(b, nir_iadd(b, n_out[0], qv), shape->p_strip);
-      nir_def *w1 =
-         nir_div_round_up_imm(b, nir_iadd(b, n_out[1], qu), shape->p_strip);
-      nir_def *w2 =
-         nir_div_round_up_imm(b, nir_iadd(b, n_out[2], qv), shape->p_strip);
-      nir_def *w3 =
-         nir_div_round_up_imm(b, nir_iadd(b, n_out[3], qu), shape->p_strip);
-      nir_def *wp0 = w0;
-      nir_def *wp1 = nir_iadd(b, wp0, w1);
-      nir_def *wp2 = nir_iadd(b, wp1, w2);
-      nir_def *wp3 = nir_iadd(b, wp2, w3);
-      w_prefix = nir_ior(
-         b, nir_ior(b, wp0, nir_ishl_imm(b, wp1, 8)),
-         nir_ior(b, nir_ishl_imm(b, wp2, 16), nir_ishl_imm(b, wp3, 24)));
-      nir_def *w_int = nir_imul(b, nir_div_round_up_imm(b, qu, shape->tile_w),
-                                nir_div_round_up_imm(b, qv, shape->tile_h));
-      nir_def *w_multi = nir_iadd(b, wp3, w_int);
+      nir_def *t_outer =
+         nir_iadd(b, outer_sum, nir_ishl_imm(b, nir_iadd(b, qu, qv), 1));
+      nir_def *w_outer = nir_div_round_up_imm(b, t_outer, shape->p_strip);
+      nir_def *w_int = nir_div_round_up_imm(b, nir_imul(b, qu, qv),
+                                            tess_quad_int_chunk_cells(shape));
+      w_prefix = w_outer;
+      nir_def *w_multi = nir_iadd(b, w_outer, w_int);
       child_wgs = nir_bcsel(b, nir_ior(b, all_ones, whole_patch),
                             nir_imm_int(b, 1), w_multi);
    } else {
@@ -3178,6 +3179,10 @@ emit_patch_tess_calc(nir_builder *b, nir_function_impl *impl,
          nir_iadd(b, nir_iadd(b, n_out[0], n_out[1]), n_out[2]);
       nir_def *ni = n_in[0];
       nir_def *nim2 = nir_usub_sat(b, ni, nir_imm_int(b, 2));
+      nir_def *p_int =
+         nir_ushr_imm(b, nir_imul_imm(b, nir_imul(b, nim2, nim2), 3), 1);
+      nir_def *p_patch = nir_iadd(
+         b, nir_iadd(b, outer_sum, nir_imul_imm(b, nim2, 3)), p_int);
       if (shape->allow_whole_patch) {
          nir_def *m =
             nir_ushr_imm(b, nir_usub_sat(b, ni, nir_imm_int(b, 1)), 1);
@@ -3186,10 +3191,6 @@ emit_patch_tess_calc(nir_builder *b, nir_function_impl *impl,
          nir_def *v_int = nir_iadd(
             b, nir_imul_imm(b, nir_imul(b, m, nir_iadd(b, m, even)), 3), even);
          nir_def *v_patch = nir_iadd(b, outer_sum, v_int);
-         nir_def *p_int =
-            nir_ushr_imm(b, nir_imul_imm(b, nir_imul(b, nim2, nim2), 3), 1);
-         nir_def *p_patch = nir_iadd(
-            b, nir_iadd(b, outer_sum, nir_imul_imm(b, nim2, 3)), p_int);
          whole_patch = nir_iand(
             b, nir_inot(b, all_ones),
             nir_iand(b, nir_ule_imm(b, v_patch, shape->max_v),
@@ -3197,48 +3198,11 @@ emit_patch_tess_calc(nir_builder *b, nir_function_impl *impl,
          v_patch_val = nir_bcsel(b, all_ones, nir_imm_int(b, 3), v_patch);
          p_patch_val = nir_bcsel(b, all_ones, nir_imm_int(b, 1), p_patch);
       }
-      nir_def *w0 =
-         nir_div_round_up_imm(b, nir_iadd(b, n_out[0], nim2), shape->p_strip);
-      nir_def *w1 =
-         nir_div_round_up_imm(b, nir_iadd(b, n_out[1], nim2), shape->p_strip);
-      nir_def *w2 =
-         nir_div_round_up_imm(b, nir_iadd(b, n_out[2], nim2), shape->p_strip);
-      nir_def *wp0 = w0;
-      nir_def *wp1 = nir_iadd(b, wp0, w1);
-      nir_def *wp2 = nir_iadd(b, wp1, w2);
-      w_prefix = nir_ior(b, nir_ior(b, wp0, nir_ishl_imm(b, wp1, 8)),
-                         nir_ishl_imm(b, wp2, 16));
-
-      /* Sum interior ring WGs for r = 1 .. (ni >> 1) - 1 (<= 31 iters). */
-      nir_variable *w_acc =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_tri_w_acc");
-      nir_variable *r_var =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_tri_r");
-      nir_store_var(b, w_acc, nir_iadd(b, wp2, nir_iand_imm(b, ni, 1)), 1);
-      nir_store_var(b, r_var, nir_imm_int(b, 1), 1);
-      nir_def *rings = nir_ushr_imm(b, ni, 1);
-      nir_if *need_multi =
-         nir_push_if(b, nir_inot(b, nir_ior(b, all_ones, whole_patch)));
-      {
-         nir_loop *loop = nir_push_loop(b);
-         {
-            nir_def *r = nir_load_var(b, r_var);
-            nir_push_if(b, nir_uge(b, r, rings));
-            nir_jump(b, nir_jump_break);
-            nir_pop_if(b, NULL);
-            nir_def *t_r = nir_ishl_imm(
-               b, nir_isub(b, ni, nir_iadd_imm(b, nir_ishl_imm(b, r, 1), 1)), 1);
-            nir_def *wr = nir_div_round_up_imm(b, t_r, shape->p_strip);
-            nir_store_var(
-               b, w_acc,
-               nir_iadd(b, nir_load_var(b, w_acc), nir_imul_imm(b, wr, 3)), 1);
-            nir_store_var(b, r_var, nir_iadd_imm(b, r, 1), 1);
-         }
-         nir_pop_loop(b, loop);
-      }
-      nir_pop_if(b, need_multi);
+      nir_def *w_multi =
+         nir_div_round_up_imm(b, p_patch, tess_tri_chunk_prims(shape));
+      w_prefix = nir_imm_int(b, 0);
       child_wgs = nir_bcsel(b, nir_ior(b, all_ones, whole_patch),
-                            nir_imm_int(b, 1), nir_load_var(b, w_acc));
+                            nir_imm_int(b, 1), w_multi);
    }
 
    res->packed_n_out = nir_ior(
@@ -3644,7 +3608,7 @@ build_object_shader(nir_shader *vs, nir_shader *tcs,
       alive_if->control = nir_selection_control_dont_flatten;
       {
          struct patch_tess_calc tc = {0};
-         emit_patch_tess_calc(&b, impl, domain, spacing, shape, raw_out, raw_in,
+         emit_patch_tess_calc(&b, domain, spacing, shape, raw_out, raw_in,
                               flip_winding, &tc);
 
          nir_store_task_payload(
@@ -4215,7 +4179,7 @@ build_object_shader_mp(nir_shader *vs, nir_shader *tcs_in,
       {
          struct patch_tess_calc tc = {0};
          /* flip_winding is carried once in MP_HDR.packed_counts; pass NULL here. */
-         emit_patch_tess_calc(&b, impl, domain, spacing, shape, raw_out, raw_in,
+         emit_patch_tess_calc(&b, domain, spacing, shape, raw_out, raw_in,
                               NULL, &tc);
          nir_store_var(&b, is_small_var, tc.is_small, 1);
          nir_store_var(&b, is_large_var, nir_inot(&b, tc.is_small), 1);
@@ -4582,24 +4546,38 @@ nir_quad_outer_uv(nir_builder *b, enum gl_tess_spacing spacing, nir_def *e,
    return nir_vec2(b, u, v);
 }
 
-/* Compute (u, v) on Quad inner border of edge e (0..3) at point k in
- * [0..n_in_axis - 2]. */
+/* Compute (u, v) on Quad inner border perimeter at linear index pos in
+ * [0..max(2*(qu+qv), 1) - 1], traversing edges 0->1->2->3 clockwise with exact
+ * corner sharing (including degenerate qu==0 or qv==0 strips/center). */
 static nir_def *
-nir_quad_inner_edge_uv(nir_builder *b, enum gl_tess_spacing spacing, nir_def *e,
-                       nir_def *k, nir_def *n_in_u, nir_def *n_in_v,
-                       nir_def *f_in_u, nir_def *f_in_v)
+nir_quad_inner_perim_uv(nir_builder *b, enum gl_tess_spacing spacing,
+                        nir_def *pos, nir_def *n_in_u, nir_def *n_in_v,
+                        nir_def *f_in_u, nir_def *f_in_v)
 {
-   nir_def *iu = nir_bcsel(
-      b, nir_ieq_imm(b, e, 0), nir_imm_int(b, 1),
-      nir_bcsel(b, nir_ieq_imm(b, e, 1), nir_iadd_imm(b, k, 1),
-                nir_bcsel(b, nir_ieq_imm(b, e, 2),
-                          nir_iadd_imm(b, n_in_u, -1),
-                          nir_isub(b, nir_iadd_imm(b, n_in_u, -1), k))));
-   nir_def *iv = nir_bcsel(
-      b, nir_ieq_imm(b, e, 0), nir_isub(b, nir_iadd_imm(b, n_in_v, -1), k),
-      nir_bcsel(b, nir_ieq_imm(b, e, 1), nir_imm_int(b, 1),
-                nir_bcsel(b, nir_ieq_imm(b, e, 2), nir_iadd_imm(b, k, 1),
-                          nir_iadd_imm(b, n_in_v, -1))));
+   nir_def *qu = nir_usub_sat(b, n_in_u, nir_imm_int(b, 2));
+   nir_def *qv = nir_usub_sat(b, n_in_v, nir_imm_int(b, 2));
+   nir_def *p1 = qv;
+   nir_def *p2 = nir_iadd(b, p1, qu);
+   nir_def *p3 = nir_iadd(b, p2, qv);
+   nir_def *um1 = nir_iadd_imm(b, n_in_u, -1);
+   nir_def *vm1 = nir_iadd_imm(b, n_in_v, -1);
+   nir_def *is_ctr = nir_iand(b, nir_ieq_imm(b, qu, 0), nir_ieq_imm(b, qv, 0));
+
+   nir_def *in_e0 = nir_ult(b, pos, p1);
+   nir_def *in_e1 = nir_ult(b, pos, p2);
+   nir_def *in_e2 = nir_ult(b, pos, p3);
+   nir_def *iu_p = nir_bcsel(
+      b, in_e0, nir_imm_int(b, 1),
+      nir_bcsel(b, in_e1, nir_iadd_imm(b, nir_isub(b, pos, p1), 1),
+                nir_bcsel(b, in_e2, um1,
+                          nir_usub_sat(b, um1, nir_isub(b, pos, p3)))));
+   nir_def *iv_p = nir_bcsel(
+      b, in_e0, nir_usub_sat(b, vm1, pos),
+      nir_bcsel(b, in_e1, nir_imm_int(b, 1),
+                nir_bcsel(b, in_e2, nir_iadd_imm(b, nir_isub(b, pos, p2), 1),
+                          vm1)));
+   nir_def *iu = nir_bcsel(b, is_ctr, nir_imm_int(b, 1), iu_p);
+   nir_def *iv = nir_bcsel(b, is_ctr, nir_imm_int(b, 1), iv_p);
    return nir_vec2(b, nir_eval_1d(b, spacing, n_in_u, f_in_u, iu),
                    nir_eval_1d(b, spacing, n_in_v, f_in_v, iv));
 }
@@ -4692,6 +4670,42 @@ emit_triangle_prim(nir_builder *b, nir_def *prim_idx, nir_def *i0, nir_def *i1,
       .src_type = nir_type_uint32,
       .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
                        .num_slots = 1});
+}
+
+/* Compute exact (i0, i1, i2) vertex tuple matching src/poly/cl/tessellator.h
+ * StitchTransition (is_r0) and StitchRegular DIAGONALS_MIRRORED (!is_r0),
+ * preserving both winding and provoking vertex bit-for-bit. */
+static void
+nir_stitch_prim_tuple(nir_builder *b, nir_def *is_r0, nir_def *s_o,
+                      nir_def *s_i, nir_def *t_e, nir_def *ov0, nir_def *ov1,
+                      nir_def *iv0, nir_def *iv1, nir_def *step_i,
+                      nir_def **out_a, nir_def **out_b, nir_def **out_c)
+{
+   nir_def *mid_r0 = nir_iadd(
+      b, nir_ushr_imm(b, s_o, 1), nir_ushr_imm(b, nir_iadd_imm(b, s_i, 1), 1));
+   nir_def *rot_out_r0 = nir_iand(
+      b, nir_ine_imm(b, nir_iand_imm(b, s_o, 1), 0), nir_ieq(b, t_e, mid_r0));
+
+   nir_def *mid_end = nir_iand_imm(b, nir_iadd_imm(b, s_i, 1), ~1u);
+   nir_def *rot_in_reg = nir_uge(b, mid_end, t_e);
+   nir_def *last_t = nir_usub_sat(b, nir_iadd(b, s_o, s_i), nir_imm_int(b, 1));
+   nir_def *rot_out_reg =
+      nir_iand(b, nir_ult(b, mid_end, t_e), nir_ult(b, t_e, last_t));
+
+   nir_def *rot_in = nir_bcsel(b, is_r0, nir_imm_false(b), rot_in_reg);
+   nir_def *rot_out = nir_bcsel(b, is_r0, rot_out_r0, rot_out_reg);
+
+   nir_def *in_a = nir_bcsel(b, rot_in, ov0, iv0);
+   nir_def *in_b = nir_bcsel(b, rot_in, iv1, ov0);
+   nir_def *in_c = nir_bcsel(b, rot_in, iv0, iv1);
+
+   nir_def *out_a_v = nir_bcsel(b, rot_out, iv0, ov0);
+   nir_def *out_b_v = nir_bcsel(b, rot_out, ov0, ov1);
+   nir_def *out_c_v = nir_bcsel(b, rot_out, ov1, iv0);
+
+   *out_a = nir_bcsel(b, step_i, in_a, out_a_v);
+   *out_b = nir_bcsel(b, step_i, in_b, out_b_v);
+   *out_c = nir_bcsel(b, step_i, in_c, out_c_v);
 }
 
 /* Triangulate one interior quad cell (gx, gy) in [0..qu-1] x [0..qv-1] with
@@ -4968,10 +4982,12 @@ emit_whole_patch_quad_prim(nir_builder *b, nir_def *p_slot, nir_def *lp,
                                 nir_iadd_imm(b, ih, -1))));
          iv[d] = nir_iadd(b, s3, nir_iadd(b, nir_imul(b, gy, iw), gx));
       }
-      nir_def *i0 = nir_iadd(b, v_off, nir_bcsel(b, step_i, iv[0], ov0));
-      nir_def *i1 = nir_iadd(b, v_off, nir_bcsel(b, step_i, ov0, ov1));
-      nir_def *i2 = nir_iadd(b, v_off, nir_bcsel(b, step_i, iv[1], iv[0]));
-      emit_triangle_prim(b, p_slot, i0, i1, i2, flip_winding);
+      nir_def *a = NULL, *bv = NULL, *cv = NULL;
+      nir_stitch_prim_tuple(b, nir_imm_true(b), n_o, n_is, t, ov0, ov1, iv[0],
+                            iv[1], step_i, &a, &bv, &cv);
+      emit_triangle_prim(b, p_slot, nir_iadd(b, v_off, a),
+                         nir_iadd(b, v_off, bv), nir_iadd(b, v_off, cv),
+                         flip_winding);
    }
    nir_push_else(b, NULL);
    {
@@ -5153,9 +5169,12 @@ emit_whole_patch_tri_prim(nir_builder *b, nir_function_impl *impl,
             nir_bcsel(b, nir_ieq_imm(b, inner_rs, 1), nir_imm_int(b, 0),
                       nir_umod(b, nir_iadd_imm(b, nir_iadd(b, ie_start, ii), 1),
                                inner_rs)));
-         nir_store_var(b, v0_out, nir_bcsel(b, step_i, iv0, ov0), 1);
-         nir_store_var(b, v1_out, nir_bcsel(b, step_i, ov0, ov1), 1);
-         nir_store_var(b, v2_out, nir_bcsel(b, step_i, iv1, iv0), 1);
+         nir_def *a = NULL, *bv = NULL, *cv = NULL;
+         nir_stitch_prim_tuple(b, is_r0, s_o, s_i, t, ov0, ov1, iv0, iv1,
+                               step_i, &a, &bv, &cv);
+         nir_store_var(b, v0_out, a, 1);
+         nir_store_var(b, v1_out, bv, 1);
+         nir_store_var(b, v2_out, cv, 1);
          nir_jump(b, nir_jump_break);
       }
       nir_pop_if(b, NULL);
@@ -5168,6 +5187,614 @@ emit_whole_patch_tri_prim(nir_builder *b, nir_function_impl *impl,
    emit_triangle_prim(b, p_slot, nir_iadd(b, v_off, nir_load_var(b, v0_out)),
                       nir_iadd(b, v_off, nir_load_var(b, v1_out)),
                       nir_iadd(b, v_off, nir_load_var(b, v2_out)), flip_winding);
+}
+
+/* =========================================================================
+ * Shared Multi-WG High-Tessellation Chunkers (Used by K=1 and K>=2 MESH)
+ * ========================================================================= */
+
+static void
+nir_quad_outer_pos_at(nir_builder *b, nir_def *t, nir_def *const n_out[4],
+                      nir_def *qu, nir_def *qv, bool for_prim,
+                      nir_def **out_o_lin, nir_def **out_i_lin,
+                      nir_def **out_step_i, nir_def **out_n_o,
+                      nir_def **out_n_is, nir_def **out_t_e)
+{
+   nir_def *ep0 = nir_iadd(b, n_out[0], qv);
+   nir_def *ep1 = nir_iadd(b, ep0, nir_iadd(b, n_out[1], qu));
+   nir_def *ep2 = nir_iadd(b, ep1, nir_iadd(b, n_out[2], qv));
+   nir_def *in0 = for_prim ? nir_ult(b, t, ep0) : nir_uge(b, ep0, t);
+   nir_def *in1 = for_prim ? nir_ult(b, t, ep1) : nir_uge(b, ep1, t);
+   nir_def *in2 = for_prim ? nir_ult(b, t, ep2) : nir_uge(b, ep2, t);
+   nir_def *e = nir_bcsel(
+      b, in0, nir_imm_int(b, 0),
+      nir_bcsel(b, in1, nir_imm_int(b, 1),
+                nir_bcsel(b, in2, nir_imm_int(b, 2), nir_imm_int(b, 3))));
+   nir_def *ep_prev = nir_bcsel(
+      b, nir_ieq_imm(b, e, 0), nir_imm_int(b, 0),
+      nir_bcsel(b, nir_ieq_imm(b, e, 1), ep0,
+                nir_bcsel(b, nir_ieq_imm(b, e, 2), ep1, ep2)));
+   nir_def *t_e = nir_usub_sat(b, t, ep_prev);
+   nir_def *n_o = nir_bcsel(
+      b, nir_ieq_imm(b, e, 0), n_out[0],
+      nir_bcsel(b, nir_ieq_imm(b, e, 1), n_out[1],
+                nir_bcsel(b, nir_ieq_imm(b, e, 2), n_out[2], n_out[3])));
+   nir_def *n_is =
+      nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, e, 1), 0), qu, qv);
+   nir_def *s0 = n_out[0];
+   nir_def *s1 = nir_iadd(b, s0, n_out[1]);
+   nir_def *s2 = nir_iadd(b, s1, n_out[2]);
+   nir_def *ob = nir_bcsel(
+      b, nir_ieq_imm(b, e, 0), nir_imm_int(b, 0),
+      nir_bcsel(b, nir_ieq_imm(b, e, 1), s0,
+                nir_bcsel(b, nir_ieq_imm(b, e, 2), s1, s2)));
+   nir_def *i1 = qv;
+   nir_def *i2 = nir_iadd(b, qv, qu);
+   nir_def *i3 = nir_iadd(b, i2, qv);
+   nir_def *ib = nir_bcsel(
+      b, nir_ieq_imm(b, e, 0), nir_imm_int(b, 0),
+      nir_bcsel(b, nir_ieq_imm(b, e, 1), i1,
+                nir_bcsel(b, nir_ieq_imm(b, e, 2), i2, i3)));
+   nir_def *ii = nir_stitch_i(b, n_o, n_is, t_e);
+   nir_def *oi = nir_isub(b, t_e, ii);
+   *out_o_lin = nir_iadd(b, ob, oi);
+   *out_i_lin = nir_iadd(b, ib, ii);
+   if (out_step_i) {
+      nir_def *ii_next = nir_stitch_i(b, n_o, n_is, nir_iadd_imm(b, t_e, 1));
+      *out_step_i = nir_ine(b, ii_next, ii);
+   }
+   if (out_n_o)
+      *out_n_o = n_o;
+   if (out_n_is)
+      *out_n_is = n_is;
+   if (out_t_e)
+      *out_t_e = t_e;
+}
+
+static nir_def *
+nir_ring_arc_local_idx(nir_builder *b, nir_def *vbase, nir_def *pos,
+                       nir_def *start, nir_def *ring_sz)
+{
+   nir_def *off = nir_bcsel(b, nir_uge(b, pos, start), nir_isub(b, pos, start),
+                            nir_isub(b, nir_iadd(b, pos, ring_sz), start));
+   return nir_iadd(b, vbase, off);
+}
+
+/* Multi-WG Quad chunker: continuous 4-edge outer border ring (local_wg < w_outer)
+ * plus shape-invariant row-major interior chunking (local_wg >= w_outer).
+ * Emits primitives in identical order across all meshlet shapes and whole-patch
+ * mode (Vulkan tessellation invariance rule 1). */
+static void
+emit_quad_multi_wg(nir_builder *b, enum gl_tess_spacing spacing,
+                   const struct tess_meshlet_shape *shape, nir_def *lane,
+                   nir_def *local_wg, nir_def *const n_out[4],
+                   nir_def *const f_out[4], nir_def *n_in_u, nir_def *n_in_v,
+                   nir_def *const f_in[2], nir_def *w_prefix,
+                   nir_def *flip_winding, nir_variable *v_live_var,
+                   nir_variable *p_live_var, nir_variable *uv_var)
+{
+   const unsigned prim_iters = DIV_ROUND_UP(shape->max_p, 32u);
+   const unsigned q_chunk = tess_quad_int_chunk_cells(shape);
+   nir_def *w_outer = w_prefix;
+   nir_def *qu = nir_usub_sat(b, n_in_u, nir_imm_int(b, 2));
+   nir_def *qv = nir_usub_sat(b, n_in_v, nir_imm_int(b, 2));
+
+   nir_push_if(b, nir_ult(b, local_wg, w_outer));
+   {
+      /* Continuous 4-edge outer border ring chunk. */
+      nir_def *s0 = n_out[0];
+      nir_def *s1 = nir_iadd(b, s0, n_out[1]);
+      nir_def *s2 = nir_iadd(b, s1, n_out[2]);
+      nir_def *outer_sum = nir_iadd(b, s2, n_out[3]);
+      nir_def *inner_perim = nir_ishl_imm(b, nir_iadd(b, qu, qv), 1);
+      nir_def *inner_rs = nir_umax(b, inner_perim, nir_imm_int(b, 1));
+      nir_def *t_total = nir_iadd(b, outer_sum, inner_perim);
+      nir_def *t0 = nir_imul_imm(b, local_wg, shape->p_strip);
+      nir_def *t1 = nir_umin(b, nir_iadd_imm(b, t0, shape->p_strip), t_total);
+      nir_def *cnt = nir_usub_sat(b, t1, t0);
+
+      nir_def *o0 = NULL, *i0 = NULL, *o1 = NULL, *i1 = NULL;
+      nir_quad_outer_pos_at(b, t0, n_out, qu, qv, false, &o0, &i0, NULL, NULL,
+                            NULL, NULL);
+      nir_quad_outer_pos_at(b, t1, n_out, qu, qv, false, &o1, &i1, NULL, NULL,
+                            NULL, NULL);
+      nir_def *no_raw = nir_iadd_imm(b, nir_isub(b, o1, o0), 1);
+      nir_def *no = nir_umin(b, no_raw, outer_sum);
+      nir_def *o_st = nir_bcsel(
+         b, nir_ior(b, nir_ieq(b, no, outer_sum), nir_uge(b, o0, outer_sum)),
+         nir_imm_int(b, 0), o0);
+      nir_def *ni_raw = nir_iadd_imm(b, nir_isub(b, i1, i0), 1);
+      nir_def *ni_v = nir_umin(b, ni_raw, inner_rs);
+      nir_def *i_st = nir_bcsel(
+         b, nir_ior(b, nir_ieq(b, ni_v, inner_rs), nir_uge(b, i0, inner_rs)),
+         nir_imm_int(b, 0), i0);
+      nir_def *vl = nir_bcsel(b, nir_ieq_imm(b, cnt, 0), nir_imm_int(b, 0),
+                              nir_iadd(b, no, ni_v));
+
+      nir_store_var(b, v_live_var, vl, 1);
+      nir_store_var(b, p_live_var, cnt, 1);
+
+      nir_push_if(b, nir_ult(b, lane, vl));
+      {
+         nir_push_if(b, nir_ult(b, lane, no));
+         {
+            nir_def *raw = nir_iadd(b, o_st, lane);
+            nir_def *pos = nir_bcsel(b, nir_uge(b, raw, outer_sum),
+                                     nir_isub(b, raw, outer_sum), raw);
+            nir_def *e = nir_bcsel(
+               b, nir_ult(b, pos, s0), nir_imm_int(b, 0),
+               nir_bcsel(b, nir_ult(b, pos, s1), nir_imm_int(b, 1),
+                         nir_bcsel(b, nir_ult(b, pos, s2), nir_imm_int(b, 2),
+                                   nir_imm_int(b, 3))));
+            nir_def *ebase = nir_bcsel(
+               b, nir_ieq_imm(b, e, 0), nir_imm_int(b, 0),
+               nir_bcsel(b, nir_ieq_imm(b, e, 1), s0,
+                         nir_bcsel(b, nir_ieq_imm(b, e, 2), s1, s2)));
+            nir_def *k = nir_isub(b, pos, ebase);
+            nir_store_var(b, uv_var,
+                          nir_quad_outer_uv(b, spacing, e, k, n_out, f_out), 3);
+         }
+         nir_push_else(b, NULL);
+         {
+            nir_def *raw = nir_iadd(b, i_st, nir_isub(b, lane, no));
+            nir_def *pos = nir_bcsel(b, nir_uge(b, raw, inner_rs),
+                                     nir_isub(b, raw, inner_rs), raw);
+            nir_store_var(b, uv_var,
+                          nir_quad_inner_perim_uv(b, spacing, pos, n_in_u,
+                                                  n_in_v, f_in[0], f_in[1]),
+                          3);
+         }
+         nir_pop_if(b, NULL);
+      }
+      nir_pop_if(b, NULL);
+
+      nir_def *is_ctr = nir_ieq_imm(b, inner_perim, 0);
+      for (unsigned it = 0; it < prim_iters; ++it) {
+         nir_def *p = it ? nir_iadd_imm(b, lane, it * 32u) : lane;
+         nir_if *p_if = nir_push_if(b, nir_ult(b, p, cnt));
+         p_if->control = nir_selection_control_dont_flatten;
+         {
+            nir_def *t = nir_iadd(b, t0, p);
+            nir_def *o_lin = NULL, *i_lin = NULL, *step_i = NULL;
+            nir_def *n_o = NULL, *n_is = NULL, *t_e = NULL;
+            nir_quad_outer_pos_at(b, t, n_out, qu, qv, true, &o_lin, &i_lin,
+                                  &step_i, &n_o, &n_is, &t_e);
+            nir_def *ov0 = nir_bcsel(b, nir_uge(b, o_lin, outer_sum),
+                                     nir_imm_int(b, 0), o_lin);
+            nir_def *o_next = nir_iadd_imm(b, o_lin, 1);
+            nir_def *ov1 = nir_bcsel(b, nir_uge(b, o_next, outer_sum),
+                                     nir_imm_int(b, 0), o_next);
+            nir_def *iv0 =
+               nir_bcsel(b, nir_ior(b, is_ctr, nir_uge(b, i_lin, inner_rs)),
+                         nir_imm_int(b, 0), i_lin);
+            nir_def *i_next = nir_iadd_imm(b, i_lin, 1);
+            nir_def *iv1 =
+               nir_bcsel(b, nir_ior(b, is_ctr, nir_uge(b, i_next, inner_rs)),
+                         nir_imm_int(b, 0), i_next);
+            nir_def *ov0_l =
+               nir_ring_arc_local_idx(b, nir_imm_int(b, 0), ov0, o_st, outer_sum);
+            nir_def *ov1_l =
+               nir_ring_arc_local_idx(b, nir_imm_int(b, 0), ov1, o_st, outer_sum);
+            nir_def *iv0_l = nir_ring_arc_local_idx(b, no, iv0, i_st, inner_rs);
+            nir_def *iv1_l = nir_ring_arc_local_idx(b, no, iv1, i_st, inner_rs);
+            nir_def *a = NULL, *bv = NULL, *cv = NULL;
+            nir_stitch_prim_tuple(b, nir_imm_true(b), n_o, n_is, t_e, ov0_l,
+                                  ov1_l, iv0_l, iv1_l, step_i, &a, &bv, &cv);
+            emit_triangle_prim(b, p, a, bv, cv, flip_winding);
+         }
+         nir_pop_if(b, p_if);
+      }
+   }
+   nir_push_else(b, NULL);
+   {
+      /* Shape-invariant row-major quad interior chunk [q0, q1).
+       * On the (qu+1) x (qv+1) interior grid (row stride iw = qu + 1), the
+       * touched vertices form [g_first .. g_top_end] U [g_first+iw .. g_top_end+iw]
+       * with gap = usub_sat(iw, L) where L = g_top_end - g_first + 1. */
+      nir_def *int_id = nir_isub(b, local_wg, w_outer);
+      nir_def *tot_q = nir_imul(b, qu, qv);
+      nir_def *q0 = nir_imul_imm(b, int_id, q_chunk);
+      nir_def *q1 = nir_umin(b, nir_iadd_imm(b, q0, q_chunk), tot_q);
+      nir_def *q_cnt = nir_usub_sat(b, q1, q0);
+      nir_def *q1_last = nir_usub_sat(b, q1, nir_imm_int(b, 1));
+      nir_def *qu_safe = nir_umax(b, qu, nir_imm_int(b, 1));
+      nir_def *iw = nir_iadd_imm(b, qu, 1);
+
+      nir_def *x0 = nir_umod(b, q0, qu_safe);
+      nir_def *y0 = nir_udiv(b, q0, qu_safe);
+      nir_def *x1 = nir_umod(b, q1_last, qu_safe);
+      nir_def *y1 = nir_udiv(b, q1_last, qu_safe);
+      nir_def *g_first = nir_iadd(b, nir_imul(b, y0, iw), x0);
+      nir_def *g_top_end =
+         nir_iadd_imm(b, nir_iadd(b, nir_imul(b, y1, iw), x1), 1);
+      nir_def *g_bot_start = nir_iadd(b, g_first, iw);
+      nir_def *len = nir_iadd_imm(b, nir_usub_sat(b, g_top_end, g_first), 1);
+      nir_def *gap = nir_usub_sat(b, iw, len);
+      nir_def *vl = nir_bcsel(b, nir_ieq_imm(b, q_cnt, 0), nir_imm_int(b, 0),
+                              nir_iadd(b, len, nir_umin(b, len, iw)));
+      nir_def *pl_c = nir_ishl_imm(b, q_cnt, 1);
+
+      nir_store_var(b, v_live_var, vl, 1);
+      nir_store_var(b, p_live_var, pl_c, 1);
+
+      nir_push_if(b, nir_ult(b, lane, vl));
+      {
+         nir_def *g = nir_iadd(
+            b, nir_iadd(b, g_first, lane),
+            nir_bcsel(b, nir_uge(b, lane, len), gap, nir_imm_int(b, 0)));
+         nir_def *vx = nir_umod(b, g, iw);
+         nir_def *vy = nir_udiv(b, g, iw);
+         nir_def *u =
+            nir_eval_1d(b, spacing, n_in_u, f_in[0], nir_iadd_imm(b, vx, 1));
+         nir_def *v =
+            nir_eval_1d(b, spacing, n_in_v, f_in[1], nir_iadd_imm(b, vy, 1));
+         nir_store_var(b, uv_var, nir_vec2(b, u, v), 3);
+      }
+      nir_pop_if(b, NULL);
+
+      for (unsigned it = 0; it < prim_iters; ++it) {
+         nir_def *p = it ? nir_iadd_imm(b, lane, it * 32u) : lane;
+         nir_if *p_if = nir_push_if(b, nir_ult(b, p, pl_c));
+         p_if->control = nir_selection_control_dont_flatten;
+         {
+            nir_def *q = nir_iadd(b, q0, nir_ushr_imm(b, p, 1));
+            nir_def *tri = nir_iand_imm(b, p, 1);
+            nir_def *gx = nir_umod(b, q, qu_safe);
+            nir_def *gy = nir_udiv(b, q, qu_safe);
+            nir_def *g00 = nir_iadd(b, nir_imul(b, gy, iw), gx);
+            nir_def *g10 = nir_iadd_imm(b, g00, 1);
+            nir_def *g01 = nir_iadd(b, g00, iw);
+            nir_def *g11 = nir_iadd_imm(b, g01, 1);
+            nir_def *v00 = nir_isub(
+               b, nir_isub(b, g00, g_first),
+               nir_bcsel(b, nir_uge(b, g00, g_bot_start), gap, nir_imm_int(b, 0)));
+            nir_def *v10 = nir_isub(
+               b, nir_isub(b, g10, g_first),
+               nir_bcsel(b, nir_uge(b, g10, g_bot_start), gap, nir_imm_int(b, 0)));
+            nir_def *v01 = nir_isub(
+               b, nir_isub(b, g01, g_first),
+               nir_bcsel(b, nir_uge(b, g01, g_bot_start), gap, nir_imm_int(b, 0)));
+            nir_def *v11 = nir_isub(
+               b, nir_isub(b, g11, g_first),
+               nir_bcsel(b, nir_uge(b, g11, g_bot_start), gap, nir_imm_int(b, 0)));
+            emit_quad_cell_tri(b, p, v00, v10, v01, v11, tri, gx, gy, qu, qv,
+                               flip_winding);
+         }
+         nir_pop_if(b, p_if);
+      }
+   }
+   nir_pop_if(b, NULL);
+}
+
+static nir_def *
+nir_tri_ring_rs(nir_builder *b, nir_def *r, nir_def *outer_sum, nir_def *ni)
+{
+   nir_def *s_r = nir_usub_sat(b, ni, nir_ishl_imm(b, r, 1));
+   nir_def *inner_rs =
+      nir_bcsel(b, nir_ieq_imm(b, s_r, 0), nir_imm_int(b, 1),
+                nir_imul_imm(b, s_r, 3));
+   return nir_bcsel(b, nir_ieq_imm(b, r, 0), outer_sum, inner_rs);
+}
+
+static nir_def *
+nir_tri_ring_pbase(nir_builder *b, nir_def *r, nir_def *t0_ring, nir_def *ni,
+                   nir_def *rings, nir_def *p_total)
+{
+   nir_def *rm1 = nir_usub_sat(b, r, nir_imm_int(b, 1));
+   nir_def *ni_sub = nir_usub_sat(b, ni, nir_iadd_imm(b, r, 1));
+   nir_def *int_base =
+      nir_iadd(b, t0_ring, nir_imul_imm(b, nir_imul(b, rm1, ni_sub), 6));
+   return nir_bcsel(b, nir_ieq_imm(b, r, 0), nir_imm_int(b, 0),
+                    nir_bcsel(b, nir_uge(b, rings, r), int_base, p_total));
+}
+
+/* Loop-free 5-step binary search mapping global triangle index gp in
+ * [0..p_total-1] to (ring r in [0..rings], offset t_in_ring). */
+static void
+nir_tri_locate_prim_ring(nir_builder *b, nir_def *gp, nir_def *t0_ring,
+                         nir_def *ni, nir_def *rings, nir_def **out_r,
+                         nir_def **out_t)
+{
+   nir_def *is_r0 = nir_ult(b, gp, t0_ring);
+   nir_def *rem = nir_usub_sat(b, gp, t0_ring);
+   nir_def *r = nir_imm_int(b, 1);
+   const unsigned steps[5] = {16, 8, 4, 2, 1};
+   for (unsigned s = 0; s < 5; ++s) {
+      nir_def *cand = nir_iadd_imm(b, r, steps[s]);
+      nir_def *in_range = nir_uge(b, rings, cand);
+      nir_def *cum = nir_imul_imm(
+         b,
+         nir_imul(b, nir_iadd_imm(b, cand, -1),
+                  nir_usub_sat(b, ni, nir_iadd_imm(b, cand, 1))),
+         6);
+      r = nir_bcsel(b, nir_iand(b, in_range, nir_uge(b, rem, cum)), cand, r);
+   }
+   nir_def *base = nir_imul_imm(
+      b,
+      nir_imul(b, nir_usub_sat(b, r, nir_imm_int(b, 1)),
+               nir_usub_sat(b, ni, nir_iadd_imm(b, r, 1))),
+      6);
+   nir_def *t_int = nir_usub_sat(b, rem, base);
+   *out_r = nir_bcsel(b, is_r0, nir_imm_int(b, 0), r);
+   *out_t = nir_bcsel(b, is_r0, gp, t_int);
+}
+
+static void
+nir_tri_ring_pos_at(nir_builder *b, nir_def *r, nir_def *t_in_ring,
+                    nir_def *const n_out[3], nir_def *ni, bool for_prim,
+                    nir_def **out_o_lin, nir_def **out_i_lin,
+                    nir_def **out_step_i, nir_def **out_s_o,
+                    nir_def **out_s_i, nir_def **out_t_e)
+{
+   nir_def *is_r0 = nir_ieq_imm(b, r, 0);
+   nir_def *nim2 = nir_usub_sat(b, ni, nir_imm_int(b, 2));
+   nir_def *e0_r0 = nir_iadd(b, n_out[0], nim2);
+   nir_def *e1_r0 = nir_iadd(b, e0_r0, nir_iadd(b, n_out[1], nim2));
+   nir_def *in0 = for_prim ? nir_ult(b, t_in_ring, e0_r0)
+                           : nir_uge(b, e0_r0, t_in_ring);
+   nir_def *in1 = for_prim ? nir_ult(b, t_in_ring, e1_r0)
+                           : nir_uge(b, e1_r0, t_in_ring);
+   nir_def *e_r0 = nir_bcsel(
+      b, in0, nir_imm_int(b, 0),
+      nir_bcsel(b, in1, nir_imm_int(b, 1), nir_imm_int(b, 2)));
+   nir_def *t_r0 = nir_bcsel(
+      b, nir_ieq_imm(b, e_r0, 0), t_in_ring,
+      nir_bcsel(b, nir_ieq_imm(b, e_r0, 1), nir_usub_sat(b, t_in_ring, e0_r0),
+                nir_usub_sat(b, t_in_ring, e1_r0)));
+   nir_def *so_r0 = nir_bcsel(
+      b, nir_ieq_imm(b, e_r0, 0), n_out[0],
+      nir_bcsel(b, nir_ieq_imm(b, e_r0, 1), n_out[1], n_out[2]));
+   nir_def *ob_r0 = nir_bcsel(
+      b, nir_ieq_imm(b, e_r0, 0), nir_imm_int(b, 0),
+      nir_bcsel(b, nir_ieq_imm(b, e_r0, 1), n_out[0],
+                nir_iadd(b, n_out[0], n_out[1])));
+   nir_def *ib_r0 = nir_imul(b, e_r0, nim2);
+
+   nir_def *so_in = nir_usub_sat(b, ni, nir_ishl_imm(b, r, 1));
+   nir_def *si_in = nir_usub_sat(b, so_in, nir_imm_int(b, 2));
+   nir_def *t_edge = nir_umax(b, nir_iadd(b, so_in, si_in), nir_imm_int(b, 1));
+   nir_def *e_in = nir_umin(b, nir_udiv(b, t_in_ring, t_edge), nir_imm_int(b, 2));
+   nir_def *t_in = nir_usub_sat(b, t_in_ring, nir_imul(b, e_in, t_edge));
+   nir_def *ob_in = nir_imul(b, e_in, so_in);
+   nir_def *ib_in = nir_imul(b, e_in, si_in);
+
+   nir_def *s_o = nir_bcsel(b, is_r0, so_r0, so_in);
+   nir_def *s_i = nir_bcsel(b, is_r0, nim2, si_in);
+   nir_def *t_e = nir_bcsel(b, is_r0, t_r0, t_in);
+   nir_def *ob = nir_bcsel(b, is_r0, ob_r0, ob_in);
+   nir_def *ib = nir_bcsel(b, is_r0, ib_r0, ib_in);
+
+   nir_def *ii = nir_stitch_i(b, s_o, s_i, t_e);
+   nir_def *oi = nir_isub(b, t_e, ii);
+   *out_o_lin = nir_iadd(b, ob, oi);
+   *out_i_lin = nir_iadd(b, ib, ii);
+   if (out_step_i) {
+      nir_def *ii_next = nir_stitch_i(b, s_o, s_i, nir_iadd_imm(b, t_e, 1));
+      *out_step_i = nir_ine(b, ii_next, ii);
+   }
+   if (out_s_o)
+      *out_s_o = s_o;
+   if (out_s_i)
+      *out_s_i = s_i;
+   if (out_t_e)
+      *out_t_e = t_e;
+}
+
+/* Multi-WG Triangle contiguous multi-ring chunker: packs up to p_chunk
+ * consecutive triangles in exact tessellator.h order across edges, concentric
+ * rings, and the odd center triangle with exact per-ring vertex deduplication
+ * (V <= P + 3 <= max_v, touching at most 4 concentric rings). */
+static void
+emit_tri_multi_wg(nir_builder *b, enum gl_tess_spacing spacing,
+                  const struct tess_meshlet_shape *shape, nir_def *lane,
+                  nir_def *local_wg, nir_def *const n_out[3],
+                  nir_def *const f_out[3], nir_def *ni, nir_def *fi,
+                  nir_def *flip_winding, nir_variable *v_live_var,
+                  nir_variable *p_live_var, nir_variable *uv_var)
+{
+   const unsigned p_chunk = tess_tri_chunk_prims(shape);
+   const unsigned prim_iters = DIV_ROUND_UP(shape->max_p, 32u);
+   nir_def *s01 = nir_iadd(b, n_out[0], n_out[1]);
+   nir_def *outer_sum = nir_iadd(b, s01, n_out[2]);
+   nir_def *nim2 = nir_usub_sat(b, ni, nir_imm_int(b, 2));
+   nir_def *t0_ring = nir_iadd(b, outer_sum, nir_imul_imm(b, nim2, 3));
+   nir_def *p_int =
+      nir_ushr_imm(b, nir_imul_imm(b, nir_imul(b, nim2, nim2), 3), 1);
+   nir_def *p_total = nir_iadd(b, t0_ring, p_int);
+   nir_def *rings = nir_ushr_imm(b, ni, 1);
+
+   nir_def *p0 = nir_imul_imm(b, local_wg, p_chunk);
+   nir_def *p1 = nir_umin(b, nir_iadd_imm(b, p0, p_chunk), p_total);
+   nir_def *p_live = nir_usub_sat(b, p1, p0);
+   nir_def *p1_last = nir_usub_sat(b, p1, nir_imm_int(b, 1));
+
+   nir_def *r0 = NULL, *t0 = NULL, *r1 = NULL, *t1_last = NULL;
+   nir_tri_locate_prim_ring(b, p0, t0_ring, ni, rings, &r0, &t0);
+   nir_tri_locate_prim_ring(b, p1_last, t0_ring, ni, rings, &r1, &t1_last);
+   nir_def *t1_end = nir_iadd_imm(b, t1_last, 1);
+
+   nir_def *o_start = NULL, *i_start = NULL, *o_end = NULL, *i_end = NULL;
+   nir_tri_ring_pos_at(b, r0, t0, n_out, ni, false, &o_start, &i_start, NULL,
+                       NULL, NULL, NULL);
+   nir_tri_ring_pos_at(b, r1, t1_end, n_out, ni, false, &o_end, &i_end, NULL,
+                       NULL, NULL, NULL);
+
+   nir_def *rs[4];
+   for (unsigned k = 0; k < 4; ++k)
+      rs[k] = nir_tri_ring_rs(b, k ? nir_iadd_imm(b, r0, k) : r0, outer_sum, ni);
+
+   nir_def *r0_is_ctr = nir_ieq(b, r0, rings);
+   nir_def *r1_is_ctr = nir_ieq(b, r1, rings);
+   nir_def *same_ring = nir_ieq(b, r0, r1);
+   nir_def *r_last_v = nir_bcsel(b, r1_is_ctr, r1, nir_iadd_imm(b, r1, 1));
+
+   /* Ring k = 0 (r0). */
+   nir_def *c0_raw = nir_bcsel(
+      b, same_ring, nir_iadd_imm(b, nir_isub(b, o_end, o_start), 1),
+      nir_iadd_imm(b, nir_usub_sat(b, rs[0], o_start), 1));
+   nir_def *full0 = nir_uge(b, c0_raw, rs[0]);
+   nir_def *arc_cnt0 =
+      nir_bcsel(b, r0_is_ctr, nir_imm_int(b, 3),
+                nir_bcsel(b, full0, rs[0], c0_raw));
+   nir_def *arc_st0 = nir_bcsel(
+      b, nir_ior(b, r0_is_ctr, nir_ior(b, full0, nir_uge(b, o_start, rs[0]))),
+      nir_imm_int(b, 0), o_start);
+
+   /* Ring k = 1 (r0 + 1). */
+   nir_def *c1_same = nir_iadd_imm(b, nir_isub(b, i_end, i_start), 1);
+   nir_def *c1_adj =
+      nir_iadd_imm(b, nir_iadd(b, nir_usub_sat(b, rs[1], i_start), o_end), 1);
+   nir_def *c1_raw = nir_bcsel(b, same_ring, c1_same, c1_adj);
+   nir_def *r1_gt1_or_ctr =
+      nir_ior(b, nir_ult(b, nir_iadd_imm(b, r0, 1), r1), r1_is_ctr);
+   nir_def *full1 = nir_ior(b, r1_gt1_or_ctr, nir_uge(b, c1_raw, rs[1]));
+   nir_def *arc_cnt1 =
+      nir_bcsel(b, r0_is_ctr, nir_imm_int(b, 0),
+                nir_bcsel(b, full1, rs[1], c1_raw));
+   nir_def *arc_st1 = nir_bcsel(
+      b, nir_ior(b, r0_is_ctr, nir_ior(b, full1, nir_uge(b, i_start, rs[1]))),
+      nir_imm_int(b, 0), i_start);
+
+   /* Rings k = 2 and k = 3 (always start at ring index 0). */
+   nir_def *r2 = nir_iadd_imm(b, r0, 2);
+   nir_def *ie_p1 = nir_iadd_imm(b, i_end, 1);
+   nir_def *full2 = nir_ior(b, nir_uge(b, r1, r2), nir_uge(b, ie_p1, rs[2]));
+   nir_def *arc_cnt2 = nir_bcsel(b, nir_uge(b, r_last_v, r2),
+                                 nir_bcsel(b, full2, rs[2], ie_p1),
+                                 nir_imm_int(b, 0));
+   nir_def *r3 = nir_iadd_imm(b, r0, 3);
+   nir_def *full3 = nir_ior(b, nir_uge(b, r1, r3), nir_uge(b, ie_p1, rs[3]));
+   nir_def *arc_cnt3 = nir_bcsel(b, nir_uge(b, r_last_v, r3),
+                                 nir_bcsel(b, full3, rs[3], ie_p1),
+                                 nir_imm_int(b, 0));
+
+   nir_def *vb0 = nir_imm_int(b, 0);
+   nir_def *vb1 = arc_cnt0;
+   nir_def *vb2 = nir_iadd(b, vb1, arc_cnt1);
+   nir_def *vb3 = nir_iadd(b, vb2, arc_cnt2);
+   nir_def *v_live = nir_bcsel(b, nir_ieq_imm(b, p_live, 0), nir_imm_int(b, 0),
+                               nir_iadd(b, vb3, arc_cnt3));
+
+   nir_store_var(b, v_live_var, v_live, 1);
+   nir_store_var(b, p_live_var, p_live, 1);
+
+   /* Compute deduplicated vertex (u, v) for lane < v_live. */
+   nir_push_if(b, nir_ult(b, lane, v_live));
+   {
+      nir_def *in0 = nir_ult(b, lane, vb1);
+      nir_def *in1 = nir_ult(b, lane, vb2);
+      nir_def *in2 = nir_ult(b, lane, vb3);
+      nir_def *k = nir_bcsel(
+         b, in0, nir_imm_int(b, 0),
+         nir_bcsel(b, in1, nir_imm_int(b, 1),
+                   nir_bcsel(b, in2, nir_imm_int(b, 2), nir_imm_int(b, 3))));
+      nir_def *r = nir_iadd(b, r0, k);
+      nir_def *vb_v = nir_bcsel(
+         b, in0, vb0, nir_bcsel(b, in1, vb1, nir_bcsel(b, in2, vb2, vb3)));
+      nir_def *st_v =
+         nir_bcsel(b, in0, arc_st0,
+                   nir_bcsel(b, in1, arc_st1, nir_imm_int(b, 0)));
+      nir_def *rs_v = nir_bcsel(
+         b, in0, rs[0],
+         nir_bcsel(b, in1, rs[1], nir_bcsel(b, in2, rs[2], rs[3])));
+      nir_def *raw = nir_iadd(b, st_v, nir_isub(b, lane, vb_v));
+      nir_def *pos = nir_bcsel(b, nir_uge(b, raw, rs_v),
+                               nir_isub(b, raw, rs_v), raw);
+
+      nir_def *e_r0 = nir_bcsel(
+         b, nir_ult(b, pos, n_out[0]), nir_imm_int(b, 0),
+         nir_bcsel(b, nir_ult(b, pos, s01), nir_imm_int(b, 1),
+                   nir_imm_int(b, 2)));
+      nir_def *k_r0 = nir_bcsel(
+         b, nir_ieq_imm(b, e_r0, 0), pos,
+         nir_bcsel(b, nir_ieq_imm(b, e_r0, 1), nir_isub(b, pos, n_out[0]),
+                   nir_isub(b, pos, s01)));
+      nir_def *s_r =
+         nir_umax(b, nir_usub_sat(b, ni, nir_ishl_imm(b, r, 1)), nir_imm_int(b, 1));
+      nir_def *e_in = nir_udiv(b, pos, s_r);
+      nir_def *k_in = nir_umod(b, pos, s_r);
+      nir_def *is_r0 = nir_ieq_imm(b, r, 0);
+      nir_def *e = nir_bcsel(b, is_r0, e_r0, e_in);
+      nir_def *ke = nir_bcsel(b, is_r0, k_r0, k_in);
+      nir_store_var(b, uv_var,
+                    nir_tri_ring_uv(b, spacing, r, e, ke, n_out, f_out, ni, fi),
+                    3);
+   }
+   nir_pop_if(b, NULL);
+
+   /* Emit primitives for p < p_live across up to 3 rings (r0, r0+1, r0+2). */
+   nir_def *pb0 = nir_tri_ring_pbase(b, r0, t0_ring, ni, rings, p_total);
+   nir_def *pb1 =
+      nir_tri_ring_pbase(b, nir_iadd_imm(b, r0, 1), t0_ring, ni, rings, p_total);
+   nir_def *pb2 =
+      nir_tri_ring_pbase(b, nir_iadd_imm(b, r0, 2), t0_ring, ni, rings, p_total);
+
+   for (unsigned it = 0; it < prim_iters; ++it) {
+      nir_def *p = it ? nir_iadd_imm(b, lane, it * 32u) : lane;
+      nir_if *p_if = nir_push_if(b, nir_ult(b, p, p_live));
+      p_if->control = nir_selection_control_dont_flatten;
+      {
+         nir_def *gp = nir_iadd(b, p0, p);
+         nir_def *in0 = nir_ult(b, gp, pb1);
+         nir_def *in1 = nir_ult(b, gp, pb2);
+         nir_def *k = nir_bcsel(
+            b, in0, nir_imm_int(b, 0),
+            nir_bcsel(b, in1, nir_imm_int(b, 1), nir_imm_int(b, 2)));
+         nir_def *r = nir_iadd(b, r0, k);
+         nir_def *vb_o = nir_bcsel(b, in0, vb0, nir_bcsel(b, in1, vb1, vb2));
+
+         nir_push_if(b, nir_ieq(b, r, rings));
+         {
+            emit_triangle_prim(b, p, vb_o, nir_iadd_imm(b, vb_o, 1),
+                               nir_iadd_imm(b, vb_o, 2), flip_winding);
+         }
+         nir_push_else(b, NULL);
+         {
+            nir_def *pbase = nir_bcsel(b, in0, pb0, nir_bcsel(b, in1, pb1, pb2));
+            nir_def *t_in_ring = nir_isub(b, gp, pbase);
+            nir_def *o_lin = NULL, *i_lin = NULL, *step_i = NULL;
+            nir_def *s_o = NULL, *s_i = NULL, *t_e = NULL;
+            nir_tri_ring_pos_at(b, r, t_in_ring, n_out, ni, true, &o_lin,
+                                &i_lin, &step_i, &s_o, &s_i, &t_e);
+            nir_def *o_rs =
+               nir_bcsel(b, in0, rs[0], nir_bcsel(b, in1, rs[1], rs[2]));
+            nir_def *i_rs =
+               nir_bcsel(b, in0, rs[1], nir_bcsel(b, in1, rs[2], rs[3]));
+            nir_def *st_o =
+               nir_bcsel(b, in0, arc_st0,
+                         nir_bcsel(b, in1, arc_st1, nir_imm_int(b, 0)));
+            nir_def *st_i = nir_bcsel(b, in0, arc_st1, nir_imm_int(b, 0));
+            nir_def *vb_i =
+               nir_bcsel(b, in0, vb1, nir_bcsel(b, in1, vb2, vb3));
+
+            nir_def *ov0 =
+               nir_bcsel(b, nir_uge(b, o_lin, o_rs), nir_imm_int(b, 0), o_lin);
+            nir_def *o_next = nir_iadd_imm(b, o_lin, 1);
+            nir_def *ov1 =
+               nir_bcsel(b, nir_uge(b, o_next, o_rs), nir_imm_int(b, 0), o_next);
+            nir_def *is_ctr_in = nir_ieq_imm(b, i_rs, 1);
+            nir_def *iv0 =
+               nir_bcsel(b, nir_ior(b, is_ctr_in, nir_uge(b, i_lin, i_rs)),
+                         nir_imm_int(b, 0), i_lin);
+            nir_def *i_next = nir_iadd_imm(b, i_lin, 1);
+            nir_def *iv1 =
+               nir_bcsel(b, nir_ior(b, is_ctr_in, nir_uge(b, i_next, i_rs)),
+                         nir_imm_int(b, 0), i_next);
+
+            nir_def *ov0_l = nir_ring_arc_local_idx(b, vb_o, ov0, st_o, o_rs);
+            nir_def *ov1_l = nir_ring_arc_local_idx(b, vb_o, ov1, st_o, o_rs);
+            nir_def *iv0_l = nir_ring_arc_local_idx(b, vb_i, iv0, st_i, i_rs);
+            nir_def *iv1_l = nir_ring_arc_local_idx(b, vb_i, iv1, st_i, i_rs);
+            nir_def *a = NULL, *bv = NULL, *cv = NULL;
+            nir_stitch_prim_tuple(b, nir_ieq_imm(b, r, 0), s_o, s_i, t_e,
+                                  ov0_l, ov1_l, iv0_l, iv1_l, step_i, &a, &bv,
+                                  &cv);
+            emit_triangle_prim(b, p, a, bv, cv, flip_winding);
+         }
+         nir_pop_if(b, NULL);
+      }
+      nir_pop_if(b, p_if);
+   }
 }
 
 static nir_shader *
@@ -5226,53 +5853,27 @@ build_mesh_shader(nir_shader *tes, enum tess_primitive_mode domain,
          ? nir_ine_imm(&b, nir_iand_imm(&b, flags, HK_TESS_FLAG_WHOLE_PATCH), 0)
          : nir_imm_false(&b);
 
-   nir_def *wp0 = nir_iand_imm(&b, w_prefix, 0xff);
-   nir_def *wp1 = nir_iand_imm(&b, nir_ushr_imm(&b, w_prefix, 8), 0xff);
-   nir_def *wp2 = nir_iand_imm(&b, nir_ushr_imm(&b, w_prefix, 16), 0xff);
-   nir_def *wp3 = nir_iand_imm(&b, nir_ushr_imm(&b, w_prefix, 24), 0xff);
-
-   /* Shared state computed before the single TES body & reused for prims. */
+   /* Shared state computed before the single TES body. */
    nir_variable *v_live_var =
       nir_local_variable_create(impl, glsl_uint_type(), "ft_v_live");
    nir_variable *p_live_var =
       nir_local_variable_create(impl, glsl_uint_type(), "ft_p_live");
    nir_variable *uv_var =
       nir_local_variable_create(impl, glsl_vec2_type(), "ft_uv");
-   /* Strip / tile routing locals shared between vertex and primitive phases. */
-   nir_variable *mode_var =
-      nir_local_variable_create(impl, glsl_uint_type(), "ft_mode");
-   nir_variable *edge_var =
-      nir_local_variable_create(impl, glsl_uint_type(), "ft_edge");
-   nir_variable *s_out_var =
-      nir_local_variable_create(impl, glsl_uint_type(), "ft_s_out");
-   nir_variable *s_in_var =
-      nir_local_variable_create(impl, glsl_uint_type(), "ft_s_in");
-   nir_variable *t0_var =
-      nir_local_variable_create(impl, glsl_uint_type(), "ft_t0");
-   nir_variable *o0_var =
-      nir_local_variable_create(impl, glsl_uint_type(), "ft_o0");
-   nir_variable *i0_var =
-      nir_local_variable_create(impl, glsl_uint_type(), "ft_i0");
-   nir_variable *no_var =
-      nir_local_variable_create(impl, glsl_uint_type(), "ft_no");
-   nir_variable *cw_var =
-      nir_local_variable_create(impl, glsl_uint_type(), "ft_cw");
-   nir_variable *ox_var =
-      nir_local_variable_create(impl, glsl_uint_type(), "ft_ox");
-   nir_variable *oy_var =
-      nir_local_variable_create(impl, glsl_uint_type(), "ft_oy");
 
    nir_store_var(&b, v_live_var, nir_imm_int(&b, 0), 1);
    nir_store_var(&b, p_live_var, nir_imm_int(&b, 0), 1);
    nir_store_var(&b, uv_var, nir_imm_vec2(&b, 0.0f, 0.0f), 3);
-   nir_store_var(&b, mode_var, nir_imm_int(&b, 0), 1);
 
-   /* ---- Compute (V_live, P_live, uv) for this workgroup & lane ---- */
+   const unsigned prim_iters = DIV_ROUND_UP(shape->max_p, 32u);
+
+   /* ---- Compute (V_live, P_live, uv) and Emit Primitives BEFORE TES ----
+    * Doing topology emission before TES lets every tess-factor and strip/tile
+    * register die before the user TES body runs, cutting live register pressure
+    * across heavy TES shaders (e.g. Elden Ring's 40-64-comp textured TES). */
    if (domain == TESS_PRIMITIVE_QUADS) {
-      /* mode: 0 = all_ones, 1 = whole_patch, 2 = outer_strip, 3 = interior_tile */
       nir_push_if(&b, is_all_ones);
       {
-         nir_store_var(&b, mode_var, nir_imm_int(&b, 0), 1);
          nir_store_var(&b, v_live_var, nir_imm_int(&b, 4), 1);
          nir_store_var(&b, p_live_var, nir_imm_int(&b, 2), 1);
          nir_def *u = nir_bcsel(
@@ -5281,17 +5882,25 @@ build_mesh_shader(nir_shader *tes, enum tess_primitive_mode domain,
          nir_def *v = nir_bcsel(&b, nir_uge_imm(&b, lane, 2),
                                 nir_imm_float(&b, 1.0f), nir_imm_float(&b, 0.0f));
          nir_store_var(&b, uv_var, nir_vec2(&b, u, v), 3);
+         nir_if *p_if = nir_push_if(&b, nir_ult_imm(&b, lane, 2));
+         p_if->control = nir_selection_control_dont_flatten;
+         {
+            nir_def *is_p1 = nir_ine_imm(&b, lane, 0);
+            emit_triangle_prim(
+               &b, lane,
+               nir_bcsel(&b, is_p1, nir_imm_int(&b, 1), nir_imm_int(&b, 0)),
+               nir_bcsel(&b, is_p1, nir_imm_int(&b, 2), nir_imm_int(&b, 1)),
+               nir_imm_int(&b, 3), flip_winding);
+         }
+         nir_pop_if(&b, p_if);
       }
       nir_push_else(&b, NULL);
       {
          if (shape->allow_whole_patch) {
             nir_push_if(&b, is_whole_patch);
             {
-               nir_store_var(&b, mode_var, nir_imm_int(&b, 1), 1);
-               nir_def *s0 = n_out[0];
-               nir_def *s1 = nir_iadd(&b, s0, n_out[1]);
-               nir_def *s2 = nir_iadd(&b, s1, n_out[2]);
-               nir_def *s3 = nir_iadd(&b, s2, n_out[3]);
+               nir_def *s3 = nir_iadd(&b, nir_iadd(&b, n_out[0], n_out[1]),
+                                      nir_iadd(&b, n_out[2], n_out[3]));
                nir_def *iw = nir_usub_sat(&b, n_in_u, nir_imm_int(&b, 1));
                nir_def *ih = nir_usub_sat(&b, n_in_v, nir_imm_int(&b, 1));
                nir_def *qu = nir_usub_sat(&b, n_in_u, nir_imm_int(&b, 2));
@@ -5305,161 +5914,41 @@ build_mesh_shader(nir_shader *tes, enum tess_primitive_mode domain,
                nir_store_var(&b, p_live_var, pl_c, 1);
                nir_push_if(&b, nir_ult(&b, lane, vl));
                {
-                  nir_push_if(&b, nir_ult(&b, lane, s3));
-                  {
-                     nir_def *e = nir_bcsel(
-                        &b, nir_ult(&b, lane, s0), nir_imm_int(&b, 0),
-                        nir_bcsel(&b, nir_ult(&b, lane, s1), nir_imm_int(&b, 1),
-                                  nir_bcsel(&b, nir_ult(&b, lane, s2),
-                                            nir_imm_int(&b, 2),
-                                            nir_imm_int(&b, 3))));
-                     nir_def *base = nir_bcsel(
-                        &b, nir_ieq_imm(&b, e, 0), nir_imm_int(&b, 0),
-                        nir_bcsel(&b, nir_ieq_imm(&b, e, 1), s0,
-                                  nir_bcsel(&b, nir_ieq_imm(&b, e, 2), s1, s2)));
-                     nir_def *k = nir_isub(&b, lane, base);
-                     nir_store_var(&b, uv_var,
-                                   nir_quad_outer_uv(&b, spacing, e, k, n_out, f_out),
-                                   3);
-                  }
-                  nir_push_else(&b, NULL);
-                  {
-                     nir_def *idx = nir_isub(&b, lane, s3);
-                     nir_def *gx = nir_umod(&b, idx, iw);
-                     nir_def *gy = nir_udiv(&b, idx, iw);
-                     nir_def *u = nir_eval_1d(&b, spacing, n_in_u, f_in[0],
-                                              nir_iadd_imm(&b, gx, 1));
-                     nir_def *v = nir_eval_1d(&b, spacing, n_in_v, f_in[1],
-                                              nir_iadd_imm(&b, gy, 1));
-                     nir_store_var(&b, uv_var, nir_vec2(&b, u, v), 3);
-                  }
-                  nir_pop_if(&b, NULL);
+                  nir_store_var(&b, uv_var,
+                                emit_whole_patch_quad_uv(&b, spacing, lane,
+                                                         n_out, f_out, n_in_u,
+                                                         n_in_v, f_in),
+                                3);
                }
                nir_pop_if(&b, NULL);
+               for (unsigned it = 0; it < prim_iters; ++it) {
+                  nir_def *p = it ? nir_iadd_imm(&b, lane, it * 32u) : lane;
+                  nir_if *p_if = nir_push_if(&b, nir_ult(&b, p, pl_c));
+                  p_if->control = nir_selection_control_dont_flatten;
+                  {
+                     emit_whole_patch_quad_prim(&b, p, p, nir_imm_int(&b, 0),
+                                                n_out, n_in_u, n_in_v,
+                                                flip_winding);
+                  }
+                  nir_pop_if(&b, p_if);
+               }
             }
             nir_push_else(&b, NULL);
          }
 
-         /* Multi-WG Quad: outer strip (wg_id < wp3) vs interior tile. */
-         nir_push_if(&b, nir_ult(&b, wg_id, wp3));
-         {
-            nir_store_var(&b, mode_var, nir_imm_int(&b, 2), 1);
-            nir_def *e = nir_bcsel(
-               &b, nir_ult(&b, wg_id, wp0), nir_imm_int(&b, 0),
-               nir_bcsel(&b, nir_ult(&b, wg_id, wp1), nir_imm_int(&b, 1),
-                         nir_bcsel(&b, nir_ult(&b, wg_id, wp2),
-                                   nir_imm_int(&b, 2), nir_imm_int(&b, 3))));
-            nir_def *prev_wp = nir_bcsel(
-               &b, nir_ieq_imm(&b, e, 0), nir_imm_int(&b, 0),
-               nir_bcsel(&b, nir_ieq_imm(&b, e, 1), wp0,
-                         nir_bcsel(&b, nir_ieq_imm(&b, e, 2), wp1, wp2)));
-            nir_def *chunk = nir_isub(&b, wg_id, prev_wp);
-            nir_def *n_o = nir_bcsel(
-               &b, nir_ieq_imm(&b, e, 0), n_out[0],
-               nir_bcsel(&b, nir_ieq_imm(&b, e, 1), n_out[1],
-                         nir_bcsel(&b, nir_ieq_imm(&b, e, 2), n_out[2], n_out[3])));
-            nir_def *n_is = nir_usub_sat(
-               &b,
-               nir_bcsel(&b, nir_ine_imm(&b, nir_iand_imm(&b, e, 1), 0), n_in_u,
-                         n_in_v),
-               nir_imm_int(&b, 2));
-            nir_def *t_total = nir_iadd(&b, n_o, n_is);
-            nir_def *t0 = nir_imul_imm(&b, chunk, shape->p_strip);
-            nir_def *t1 = nir_umin(&b, nir_iadd_imm(&b, t0, shape->p_strip), t_total);
-            nir_def *cnt = nir_usub_sat(&b, t1, t0);
-            nir_def *i0 = nir_stitch_i(&b, n_o, n_is, t0);
-            nir_def *o0 = nir_isub(&b, t0, i0);
-            nir_def *i1 = nir_stitch_i(&b, n_o, n_is, t1);
-            nir_def *o1 = nir_isub(&b, t1, i1);
-            nir_def *no = nir_iadd_imm(&b, nir_isub(&b, o1, o0), 1);
-            nir_def *ni = nir_iadd_imm(&b, nir_isub(&b, i1, i0), 1);
-            nir_def *vl = nir_iadd(&b, no, ni);
-
-            nir_store_var(&b, edge_var, e, 1);
-            nir_store_var(&b, s_out_var, n_o, 1);
-            nir_store_var(&b, s_in_var, n_is, 1);
-            nir_store_var(&b, t0_var, t0, 1);
-            nir_store_var(&b, o0_var, o0, 1);
-            nir_store_var(&b, i0_var, i0, 1);
-            nir_store_var(&b, no_var, no, 1);
-            nir_store_var(&b, v_live_var, vl, 1);
-            nir_store_var(&b, p_live_var, cnt, 1);
-
-            nir_push_if(&b, nir_ult(&b, lane, vl));
-            {
-               nir_push_if(&b, nir_ult(&b, lane, no));
-               {
-                  nir_def *k = nir_iadd(&b, o0, lane);
-                  nir_store_var(&b, uv_var,
-                                nir_quad_outer_uv(&b, spacing, e, k, n_out, f_out),
-                                3);
-               }
-               nir_push_else(&b, NULL);
-               {
-                  nir_def *k = nir_iadd(&b, i0, nir_isub(&b, lane, no));
-                  nir_store_var(
-                     &b, uv_var,
-                     nir_quad_inner_edge_uv(&b, spacing, e, k, n_in_u, n_in_v,
-                                            f_in[0], f_in[1]),
-                     3);
-               }
-               nir_pop_if(&b, NULL);
-            }
-            nir_pop_if(&b, NULL);
-         }
-         nir_push_else(&b, NULL);
-         {
-            /* Quad interior tile. */
-            nir_store_var(&b, mode_var, nir_imm_int(&b, 3), 1);
-            nir_def *int_id = nir_isub(&b, wg_id, wp3);
-            nir_def *qu = nir_usub_sat(&b, n_in_u, nir_imm_int(&b, 2));
-            nir_def *qv = nir_usub_sat(&b, n_in_v, nir_imm_int(&b, 2));
-            nir_def *tiles_u =
-               nir_umax(&b, nir_div_round_up_imm(&b, qu, shape->tile_w),
-                        nir_imm_int(&b, 1));
-            nir_def *tx = nir_umod(&b, int_id, tiles_u);
-            nir_def *ty = nir_udiv(&b, int_id, tiles_u);
-            nir_def *ox = nir_imul_imm(&b, tx, shape->tile_w);
-            nir_def *oy = nir_imul_imm(&b, ty, shape->tile_h);
-            nir_def *cw =
-               nir_umin(&b, nir_imm_int(&b, shape->tile_w), nir_usub_sat(&b, qu, ox));
-            nir_def *ch =
-               nir_umin(&b, nir_imm_int(&b, shape->tile_h), nir_usub_sat(&b, qv, oy));
-            nir_def *vw = nir_iadd_imm(&b, cw, 1);
-            nir_def *vh = nir_iadd_imm(&b, ch, 1);
-            nir_def *vl = nir_imul(&b, vw, vh);
-            nir_def *pl_c = nir_ishl_imm(&b, nir_imul(&b, cw, ch), 1);
-            nir_store_var(&b, cw_var, cw, 1);
-            nir_store_var(&b, ox_var, ox, 1);
-            nir_store_var(&b, oy_var, oy, 1);
-            nir_store_var(&b, v_live_var, vl, 1);
-            nir_store_var(&b, p_live_var, pl_c, 1);
-            nir_push_if(&b, nir_ult(&b, lane, vl));
-            {
-               nir_def *vx = nir_umod(&b, lane, vw);
-               nir_def *vy = nir_udiv(&b, lane, vw);
-               nir_def *u = nir_eval_1d(&b, spacing, n_in_u, f_in[0],
-                                        nir_iadd(&b, nir_iadd_imm(&b, ox, 1), vx));
-               nir_def *v = nir_eval_1d(&b, spacing, n_in_v, f_in[1],
-                                        nir_iadd(&b, nir_iadd_imm(&b, oy, 1), vy));
-               nir_store_var(&b, uv_var, nir_vec2(&b, u, v), 3);
-            }
-            nir_pop_if(&b, NULL);
-         }
-         nir_pop_if(&b, NULL);
+         emit_quad_multi_wg(&b, spacing, shape, lane, wg_id, n_out, f_out,
+                            n_in_u, n_in_v, f_in, w_prefix, flip_winding,
+                            v_live_var, p_live_var, uv_var);
 
          if (shape->allow_whole_patch)
             nir_pop_if(&b, NULL);
       }
       nir_pop_if(&b, NULL);
    } else {
-      /* TRIANGLES domain.
-       * mode: 0 = all_ones, 1 = whole_patch, 2 = ring_strip, 3 = center_tri */
       nir_def *ni = n_in_u;
       nir_def *fi = f_in[0];
       nir_push_if(&b, is_all_ones);
       {
-         nir_store_var(&b, mode_var, nir_imm_int(&b, 0), 1);
          nir_store_var(&b, v_live_var, nir_imm_int(&b, 3), 1);
          nir_store_var(&b, p_live_var, nir_imm_int(&b, 1), 1);
          nir_def *u = nir_bcsel(&b, nir_ieq_imm(&b, lane, 2),
@@ -5467,13 +5956,19 @@ build_mesh_shader(nir_shader *tes, enum tess_primitive_mode domain,
          nir_def *v = nir_bcsel(&b, nir_ieq_imm(&b, lane, 0),
                                 nir_imm_float(&b, 1.0f), nir_imm_float(&b, 0.0f));
          nir_store_var(&b, uv_var, nir_vec2(&b, u, v), 3);
+         nir_if *p_if = nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
+         p_if->control = nir_selection_control_dont_flatten;
+         {
+            emit_triangle_prim(&b, lane, nir_imm_int(&b, 0), nir_imm_int(&b, 1),
+                               nir_imm_int(&b, 2), flip_winding);
+         }
+         nir_pop_if(&b, p_if);
       }
       nir_push_else(&b, NULL);
       {
          if (shape->allow_whole_patch) {
             nir_push_if(&b, is_whole_patch);
             {
-               nir_store_var(&b, mode_var, nir_imm_int(&b, 1), 1);
                nir_def *outer_sum =
                   nir_iadd(&b, nir_iadd(&b, n_out[0], n_out[1]), n_out[2]);
                nir_def *nim2 = nir_usub_sat(&b, ni, nir_imm_int(&b, 2));
@@ -5491,210 +5986,30 @@ build_mesh_shader(nir_shader *tes, enum tess_primitive_mode domain,
                   &b, nir_iadd(&b, outer_sum, nir_imul_imm(&b, nim2, 3)), p_int);
                nir_store_var(&b, v_live_var, vl, 1);
                nir_store_var(&b, p_live_var, pl_c, 1);
-
                nir_push_if(&b, nir_ult(&b, lane, vl));
                {
-                  /* Locate ring r, edge e, offset k for vertex `lane` (R <= 2). */
-                  nir_variable *rem = nir_local_variable_create(
-                     impl, glsl_uint_type(), "ft_wp_vrem");
-                  nir_variable *rv = nir_local_variable_create(
-                     impl, glsl_uint_type(), "ft_wp_vr");
-                  nir_variable *ev = nir_local_variable_create(
-                     impl, glsl_uint_type(), "ft_wp_ve");
-                  nir_variable *kv = nir_local_variable_create(
-                     impl, glsl_uint_type(), "ft_wp_vk");
-                  nir_store_var(&b, rem, lane, 1);
-                  nir_store_var(&b, rv, nir_imm_int(&b, 0), 1);
-                  nir_store_var(&b, ev, nir_imm_int(&b, 0), 1);
-                  nir_store_var(&b, kv, nir_imm_int(&b, 0), 1);
-                  nir_loop *loop = nir_push_loop(&b);
-                  {
-                     nir_def *r = nir_load_var(&b, rv);
-                     nir_def *rem_v = nir_load_var(&b, rem);
-                     nir_def *is_r0 = nir_ieq_imm(&b, r, 0);
-                     nir_def *s_r = nir_usub_sat(&b, ni, nir_ishl_imm(&b, r, 1));
-                     nir_def *is_ctr = nir_iand(&b, nir_inot(&b, is_r0),
-                                                nir_ieq_imm(&b, s_r, 0));
-                     nir_def *rs = nir_bcsel(
-                        &b, is_r0, outer_sum,
-                        nir_bcsel(&b, is_ctr, nir_imm_int(&b, 1),
-                                  nir_imul_imm(&b, s_r, 3)));
-                     nir_push_if(&b, nir_ult(&b, rem_v, rs));
-                     {
-                        nir_push_if(&b, is_r0);
-                        {
-                           nir_def *s01 = nir_iadd(&b, n_out[0], n_out[1]);
-                           nir_def *e = nir_bcsel(
-                              &b, nir_ult(&b, rem_v, n_out[0]), nir_imm_int(&b, 0),
-                              nir_bcsel(&b, nir_ult(&b, rem_v, s01),
-                                        nir_imm_int(&b, 1), nir_imm_int(&b, 2)));
-                           nir_def *k = nir_bcsel(
-                              &b, nir_ieq_imm(&b, e, 0), rem_v,
-                              nir_bcsel(&b, nir_ieq_imm(&b, e, 1),
-                                        nir_isub(&b, rem_v, n_out[0]),
-                                        nir_isub(&b, rem_v, s01)));
-                           nir_store_var(&b, ev, e, 1);
-                           nir_store_var(&b, kv, k, 1);
-                        }
-                        nir_push_else(&b, NULL);
-                        {
-                           nir_def *s_safe = nir_umax(&b, s_r, nir_imm_int(&b, 1));
-                           nir_store_var(&b, ev, nir_udiv(&b, rem_v, s_safe), 1);
-                           nir_store_var(&b, kv, nir_umod(&b, rem_v, s_safe), 1);
-                        }
-                        nir_pop_if(&b, NULL);
-                        nir_jump(&b, nir_jump_break);
-                     }
-                     nir_pop_if(&b, NULL);
-                     nir_store_var(&b, rem, nir_isub(&b, rem_v, rs), 1);
-                     nir_store_var(&b, rv, nir_iadd_imm(&b, r, 1), 1);
-                  }
-                  nir_pop_loop(&b, loop);
-                  nir_store_var(
-                     &b, uv_var,
-                     nir_tri_ring_uv(&b, spacing, nir_load_var(&b, rv),
-                                     nir_load_var(&b, ev), nir_load_var(&b, kv),
-                                     n_out, f_out, ni, fi),
-                     3);
+                  nir_store_var(&b, uv_var,
+                                emit_whole_patch_tri_uv(&b, impl, spacing, lane,
+                                                        n_out, f_out, ni, fi),
+                                3);
                }
                nir_pop_if(&b, NULL);
+               for (unsigned it = 0; it < prim_iters; ++it) {
+                  nir_def *p = it ? nir_iadd_imm(&b, lane, it * 32u) : lane;
+                  nir_if *p_if = nir_push_if(&b, nir_ult(&b, p, pl_c));
+                  p_if->control = nir_selection_control_dont_flatten;
+                  {
+                     emit_whole_patch_tri_prim(&b, impl, p, p, nir_imm_int(&b, 0),
+                                               n_out, ni, flip_winding);
+                  }
+                  nir_pop_if(&b, p_if);
+               }
             }
             nir_push_else(&b, NULL);
          }
 
-         /* Multi-WG Triangles: map wg_id -> (r, e, chunk) or odd center tri. */
-         nir_variable *r_sel =
-            nir_local_variable_create(impl, glsl_uint_type(), "ft_tr_r");
-         nir_variable *c_sel =
-            nir_local_variable_create(impl, glsl_uint_type(), "ft_tr_c");
-         nir_variable *is_ctr_wg =
-            nir_local_variable_create(impl, glsl_bool_type(), "ft_tr_ctr");
-         nir_store_var(&b, r_sel, nir_imm_int(&b, 0), 1);
-         nir_store_var(&b, edge_var, nir_imm_int(&b, 0), 1);
-         nir_store_var(&b, c_sel, nir_imm_int(&b, 0), 1);
-         nir_store_var(&b, is_ctr_wg, nir_imm_false(&b), 1);
-
-         nir_push_if(&b, nir_ult(&b, wg_id, wp2));
-         {
-            nir_def *e = nir_bcsel(
-               &b, nir_ult(&b, wg_id, wp0), nir_imm_int(&b, 0),
-               nir_bcsel(&b, nir_ult(&b, wg_id, wp1), nir_imm_int(&b, 1),
-                         nir_imm_int(&b, 2)));
-            nir_def *prev = nir_bcsel(
-               &b, nir_ieq_imm(&b, e, 0), nir_imm_int(&b, 0),
-               nir_bcsel(&b, nir_ieq_imm(&b, e, 1), wp0, wp1));
-            nir_store_var(&b, edge_var, e, 1);
-            nir_store_var(&b, c_sel, nir_isub(&b, wg_id, prev), 1);
-            nir_def *n_o = nir_bcsel(
-               &b, nir_ieq_imm(&b, e, 0), n_out[0],
-               nir_bcsel(&b, nir_ieq_imm(&b, e, 1), n_out[1], n_out[2]));
-            nir_store_var(&b, s_out_var, n_o, 1);
-            nir_store_var(&b, s_in_var, nir_usub_sat(&b, ni, nir_imm_int(&b, 2)), 1);
-         }
-         nir_push_else(&b, NULL);
-         {
-            nir_variable *rem =
-               nir_local_variable_create(impl, glsl_uint_type(), "ft_tr_rem");
-            nir_store_var(&b, rem, nir_isub(&b, wg_id, wp2), 1);
-            nir_store_var(&b, r_sel, nir_imm_int(&b, 1), 1);
-            nir_store_var(&b, is_ctr_wg, nir_imm_true(&b), 1);
-            nir_def *rings = nir_ushr_imm(&b, ni, 1);
-            nir_loop *loop = nir_push_loop(&b);
-            {
-               nir_def *r = nir_load_var(&b, r_sel);
-               nir_push_if(&b, nir_uge(&b, r, rings));
-               nir_jump(&b, nir_jump_break);
-               nir_pop_if(&b, NULL);
-               nir_def *s_o = nir_isub(&b, ni, nir_ishl_imm(&b, r, 1));
-               nir_def *s_i = nir_usub_sat(&b, s_o, nir_imm_int(&b, 2));
-               nir_def *t_r = nir_iadd(&b, s_o, s_i);
-               nir_def *wr = nir_div_round_up_imm(&b, t_r, shape->p_strip);
-               nir_def *w3 = nir_imul_imm(&b, wr, 3);
-               nir_def *rem_v = nir_load_var(&b, rem);
-               nir_push_if(&b, nir_ult(&b, rem_v, w3));
-               {
-                  nir_store_var(&b, edge_var, nir_udiv(&b, rem_v, wr), 1);
-                  nir_store_var(&b, c_sel, nir_umod(&b, rem_v, wr), 1);
-                  nir_store_var(&b, s_out_var, s_o, 1);
-                  nir_store_var(&b, s_in_var, s_i, 1);
-                  nir_store_var(&b, is_ctr_wg, nir_imm_false(&b), 1);
-                  nir_jump(&b, nir_jump_break);
-               }
-               nir_pop_if(&b, NULL);
-               nir_store_var(&b, rem, nir_isub(&b, rem_v, w3), 1);
-               nir_store_var(&b, r_sel, nir_iadd_imm(&b, r, 1), 1);
-            }
-            nir_pop_loop(&b, loop);
-         }
-         nir_pop_if(&b, NULL);
-
-         nir_push_if(&b, nir_load_var(&b, is_ctr_wg));
-         {
-            /* Center triangle of odd n_in (ring R = n_in >> 1). */
-            nir_store_var(&b, mode_var, nir_imm_int(&b, 3), 1);
-            nir_store_var(&b, v_live_var, nir_imm_int(&b, 3), 1);
-            nir_store_var(&b, p_live_var, nir_imm_int(&b, 1), 1);
-            nir_push_if(&b, nir_ult_imm(&b, lane, 3));
-            {
-               nir_store_var(
-                  &b, uv_var,
-                  nir_tri_ring_uv(&b, spacing, nir_ushr_imm(&b, ni, 1), lane,
-                                  nir_imm_int(&b, 0), n_out, f_out, ni, fi),
-                  3);
-            }
-            nir_pop_if(&b, NULL);
-         }
-         nir_push_else(&b, NULL);
-         {
-            nir_store_var(&b, mode_var, nir_imm_int(&b, 2), 1);
-            nir_def *r = nir_load_var(&b, r_sel);
-            nir_def *e = nir_load_var(&b, edge_var);
-            nir_def *chunk = nir_load_var(&b, c_sel);
-            nir_def *s_o = nir_load_var(&b, s_out_var);
-            nir_def *s_i = nir_load_var(&b, s_in_var);
-            nir_def *t_total = nir_iadd(&b, s_o, s_i);
-            nir_def *t0 = nir_imul_imm(&b, chunk, shape->p_strip);
-            nir_def *t1 = nir_umin(&b, nir_iadd_imm(&b, t0, shape->p_strip), t_total);
-            nir_def *cnt = nir_usub_sat(&b, t1, t0);
-            nir_def *i0 = nir_stitch_i(&b, s_o, s_i, t0);
-            nir_def *o0 = nir_isub(&b, t0, i0);
-            nir_def *i1 = nir_stitch_i(&b, s_o, s_i, t1);
-            nir_def *o1 = nir_isub(&b, t1, i1);
-            nir_def *no = nir_iadd_imm(&b, nir_isub(&b, o1, o0), 1);
-            nir_def *ni_v = nir_iadd_imm(&b, nir_isub(&b, i1, i0), 1);
-            nir_def *vl = nir_iadd(&b, no, ni_v);
-
-            nir_store_var(&b, t0_var, t0, 1);
-            nir_store_var(&b, o0_var, o0, 1);
-            nir_store_var(&b, i0_var, i0, 1);
-            nir_store_var(&b, no_var, no, 1);
-            nir_store_var(&b, v_live_var, vl, 1);
-            nir_store_var(&b, p_live_var, cnt, 1);
-
-            nir_push_if(&b, nir_ult(&b, lane, vl));
-            {
-               nir_push_if(&b, nir_ult(&b, lane, no));
-               {
-                  nir_def *k = nir_iadd(&b, o0, lane);
-                  nir_store_var(
-                     &b, uv_var,
-                     nir_tri_ring_uv(&b, spacing, r, e, k, n_out, f_out, ni, fi),
-                     3);
-               }
-               nir_push_else(&b, NULL);
-               {
-                  nir_def *k = nir_iadd(&b, i0, nir_isub(&b, lane, no));
-                  nir_store_var(
-                     &b, uv_var,
-                     nir_tri_ring_uv(&b, spacing, nir_iadd_imm(&b, r, 1), e, k,
-                                     n_out, f_out, ni, fi),
-                     3);
-               }
-               nir_pop_if(&b, NULL);
-            }
-            nir_pop_if(&b, NULL);
-         }
-         nir_pop_if(&b, NULL);
+         emit_tri_multi_wg(&b, spacing, shape, lane, wg_id, n_out, f_out, ni, fi,
+                           flip_winding, v_live_var, p_live_var, uv_var);
 
          if (shape->allow_whole_patch)
             nir_pop_if(&b, NULL);
@@ -5702,10 +6017,6 @@ build_mesh_shader(nir_shader *tes, enum tess_primitive_mode domain,
       nir_pop_if(&b, NULL);
    }
 
-   /* ---- Emit Counts and Primitive Indices BEFORE the TES Body ----
-    * Doing topology emission before TES lets every tess-factor and strip/tile
-    * register die before the user TES body runs, cutting live register pressure
-    * across heavy TES shaders (e.g. Elden Ring's 40-64-comp textured TES). */
    nir_def *v_live = nir_load_var(&b, v_live_var);
    nir_def *p_live = nir_load_var(&b, p_live_var);
    nir_def *uv_val = nir_load_var(&b, uv_var);
@@ -5713,333 +6024,6 @@ build_mesh_shader(nir_shader *tes, enum tess_primitive_mode domain,
    nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
    nir_set_vertex_and_primitive_count(&b, v_live, p_live, nir_imm_int(&b, 0));
    nir_pop_if(&b, NULL);
-
-   nir_def *mode = nir_load_var(&b, mode_var);
-   unsigned prim_iters = DIV_ROUND_UP(shape->max_p, 32u);
-   for (unsigned it = 0; it < prim_iters; ++it) {
-      nir_def *p = it ? nir_iadd_imm(&b, lane, it * 32) : lane;
-      nir_if *p_if = nir_push_if(&b, nir_ult(&b, p, p_live));
-      p_if->control = nir_selection_control_dont_flatten;
-      {
-         if (domain == TESS_PRIMITIVE_QUADS) {
-            nir_push_if(&b, nir_ieq_imm(&b, mode, 0));
-            {
-               /* All-1s Quad: (0, 1, 3), (1, 2, 3). */
-               nir_def *is_p1 = nir_ine_imm(&b, p, 0);
-               emit_triangle_prim(
-                  &b, p,
-                  nir_bcsel(&b, is_p1, nir_imm_int(&b, 1), nir_imm_int(&b, 0)),
-                  nir_bcsel(&b, is_p1, nir_imm_int(&b, 2), nir_imm_int(&b, 1)),
-                  nir_imm_int(&b, 3), flip_winding);
-            }
-            nir_push_else(&b, NULL);
-            {
-               if (shape->allow_whole_patch) {
-                  nir_push_if(&b, nir_ieq_imm(&b, mode, 1));
-                  {
-                     /* Whole-Patch Quad primitive p. */
-                     nir_def *s0 = n_out[0];
-                     nir_def *s1 = nir_iadd(&b, s0, n_out[1]);
-                     nir_def *s2 = nir_iadd(&b, s1, n_out[2]);
-                     nir_def *s3 = nir_iadd(&b, s2, n_out[3]);
-                     nir_def *iw = nir_usub_sat(&b, n_in_u, nir_imm_int(&b, 1));
-                     nir_def *ih = nir_usub_sat(&b, n_in_v, nir_imm_int(&b, 1));
-                     nir_def *qu = nir_usub_sat(&b, n_in_u, nir_imm_int(&b, 2));
-                     nir_def *qv = nir_usub_sat(&b, n_in_v, nir_imm_int(&b, 2));
-                     nir_def *ep1 = nir_iadd(&b, n_out[0], qv);
-                     nir_def *ep2 = nir_iadd(&b, ep1, nir_iadd(&b, n_out[1], qu));
-                     nir_def *ep3 = nir_iadd(&b, ep2, nir_iadd(&b, n_out[2], qv));
-                     nir_def *ep4 = nir_iadd(&b, ep3, nir_iadd(&b, n_out[3], qu));
-                     nir_push_if(&b, nir_ult(&b, p, ep4));
-                     {
-                        nir_def *e = nir_bcsel(
-                           &b, nir_ult(&b, p, ep1), nir_imm_int(&b, 0),
-                           nir_bcsel(&b, nir_ult(&b, p, ep2), nir_imm_int(&b, 1),
-                                     nir_bcsel(&b, nir_ult(&b, p, ep3),
-                                               nir_imm_int(&b, 2),
-                                               nir_imm_int(&b, 3))));
-                        nir_def *ep_prev = nir_bcsel(
-                           &b, nir_ieq_imm(&b, e, 0), nir_imm_int(&b, 0),
-                           nir_bcsel(&b, nir_ieq_imm(&b, e, 1), ep1,
-                                     nir_bcsel(&b, nir_ieq_imm(&b, e, 2), ep2, ep3)));
-                        nir_def *t = nir_isub(&b, p, ep_prev);
-                        nir_def *n_o = nir_bcsel(
-                           &b, nir_ieq_imm(&b, e, 0), n_out[0],
-                           nir_bcsel(&b, nir_ieq_imm(&b, e, 1), n_out[1],
-                                     nir_bcsel(&b, nir_ieq_imm(&b, e, 2), n_out[2],
-                                               n_out[3])));
-                        nir_def *n_is = nir_bcsel(
-                           &b, nir_ine_imm(&b, nir_iand_imm(&b, e, 1), 0), qu, qv);
-                        nir_def *ii = nir_stitch_i(&b, n_o, n_is, t);
-                        nir_def *oi = nir_isub(&b, t, ii);
-                        nir_def *ii_next =
-                           nir_stitch_i(&b, n_o, n_is, nir_iadd_imm(&b, t, 1));
-                        nir_def *step_i = nir_ine(&b, ii_next, ii);
-                        nir_def *ebase = nir_bcsel(
-                           &b, nir_ieq_imm(&b, e, 0), nir_imm_int(&b, 0),
-                           nir_bcsel(&b, nir_ieq_imm(&b, e, 1), s0,
-                                     nir_bcsel(&b, nir_ieq_imm(&b, e, 2), s1, s2)));
-                        nir_def *ov0 = nir_umod(&b, nir_iadd(&b, ebase, oi), s3);
-                        nir_def *ov1 = nir_umod(
-                           &b, nir_iadd_imm(&b, nir_iadd(&b, ebase, oi), 1), s3);
-                        /* Inner vertex index on interior grid (s3 + gy * iw + gx). */
-                        nir_def *iv[2];
-                        for (unsigned d = 0; d < 2; ++d) {
-                           nir_def *k = d ? nir_iadd_imm(&b, ii, 1) : ii;
-                           nir_def *gx = nir_bcsel(
-                              &b, nir_ieq_imm(&b, e, 0), nir_imm_int(&b, 0),
-                              nir_bcsel(&b, nir_ieq_imm(&b, e, 1), k,
-                                        nir_bcsel(&b, nir_ieq_imm(&b, e, 2),
-                                                  nir_iadd_imm(&b, iw, -1),
-                                                  nir_isub(&b, nir_iadd_imm(&b, iw, -1), k))));
-                           nir_def *gy = nir_bcsel(
-                              &b, nir_ieq_imm(&b, e, 0),
-                              nir_isub(&b, nir_iadd_imm(&b, ih, -1), k),
-                              nir_bcsel(&b, nir_ieq_imm(&b, e, 1), nir_imm_int(&b, 0),
-                                        nir_bcsel(&b, nir_ieq_imm(&b, e, 2), k,
-                                                  nir_iadd_imm(&b, ih, -1))));
-                           iv[d] = nir_iadd(&b, s3, nir_iadd(&b, nir_imul(&b, gy, iw), gx));
-                        }
-                        nir_def *i0 = nir_bcsel(&b, step_i, iv[0], ov0);
-                        nir_def *i1 = nir_bcsel(&b, step_i, ov0, ov1);
-                        nir_def *i2 = nir_bcsel(&b, step_i, iv[1], iv[0]);
-                        emit_triangle_prim(&b, p, i0, i1, i2, flip_winding);
-                     }
-                     nir_push_else(&b, NULL);
-                     {
-                        nir_def *ip = nir_isub(&b, p, ep4);
-                        nir_def *q = nir_ushr_imm(&b, ip, 1);
-                        nir_def *tri = nir_iand_imm(&b, ip, 1);
-                        nir_def *qu_safe = nir_umax(&b, qu, nir_imm_int(&b, 1));
-                        nir_def *qx = nir_umod(&b, q, qu_safe);
-                        nir_def *qy = nir_udiv(&b, q, qu_safe);
-                        nir_def *v00 =
-                           nir_iadd(&b, s3, nir_iadd(&b, nir_imul(&b, qy, iw), qx));
-                        nir_def *v10 = nir_iadd_imm(&b, v00, 1);
-                        nir_def *v01 = nir_iadd(&b, v00, iw);
-                        nir_def *v11 = nir_iadd_imm(&b, v01, 1);
-                        emit_quad_cell_tri(&b, p, v00, v10, v01, v11, tri, qx,
-                                           qy, qu, qv, flip_winding);
-                     }
-                     nir_pop_if(&b, NULL);
-                  }
-                  nir_push_else(&b, NULL);
-               }
-
-               nir_push_if(&b, nir_ieq_imm(&b, mode, 2));
-               {
-                  /* Multi-WG Quad outer strip primitive p. */
-                  nir_def *n_o = nir_load_var(&b, s_out_var);
-                  nir_def *n_is = nir_load_var(&b, s_in_var);
-                  nir_def *t = nir_iadd(&b, nir_load_var(&b, t0_var), p);
-                  nir_def *o0 = nir_load_var(&b, o0_var);
-                  nir_def *i0_b = nir_load_var(&b, i0_var);
-                  nir_def *no = nir_load_var(&b, no_var);
-                  nir_def *ii_abs = nir_stitch_i(&b, n_o, n_is, t);
-                  nir_def *oi = nir_isub(&b, nir_isub(&b, t, ii_abs), o0);
-                  nir_def *ii = nir_isub(&b, ii_abs, i0_b);
-                  nir_def *step_i = nir_ine(
-                     &b, nir_stitch_i(&b, n_o, n_is, nir_iadd_imm(&b, t, 1)),
-                     ii_abs);
-                  nir_def *iv0 = nir_iadd(&b, no, ii);
-                  nir_def *i0 = nir_bcsel(&b, step_i, iv0, oi);
-                  nir_def *i1 = nir_bcsel(&b, step_i, oi, nir_iadd_imm(&b, oi, 1));
-                  nir_def *i2 = nir_bcsel(&b, step_i, nir_iadd_imm(&b, iv0, 1), iv0);
-                  emit_triangle_prim(&b, p, i0, i1, i2, flip_winding);
-               }
-               nir_push_else(&b, NULL);
-               {
-                  /* Multi-WG Quad interior tile primitive p. */
-                  nir_def *cw = nir_umax(&b, nir_load_var(&b, cw_var), nir_imm_int(&b, 1));
-                  nir_def *vw = nir_iadd_imm(&b, cw, 1);
-                  nir_def *q = nir_ushr_imm(&b, p, 1);
-                  nir_def *tri = nir_iand_imm(&b, p, 1);
-                  nir_def *qx = nir_umod(&b, q, cw);
-                  nir_def *qy = nir_udiv(&b, q, cw);
-                  nir_def *v00 = nir_iadd(&b, nir_imul(&b, qy, vw), qx);
-                  nir_def *v10 = nir_iadd_imm(&b, v00, 1);
-                  nir_def *v01 = nir_iadd(&b, v00, vw);
-                  nir_def *v11 = nir_iadd_imm(&b, v01, 1);
-                  nir_def *qu = nir_usub_sat(&b, n_in_u, nir_imm_int(&b, 2));
-                  nir_def *qv = nir_usub_sat(&b, n_in_v, nir_imm_int(&b, 2));
-                  nir_def *gx = nir_iadd(&b, nir_load_var(&b, ox_var), qx);
-                  nir_def *gy = nir_iadd(&b, nir_load_var(&b, oy_var), qy);
-                  emit_quad_cell_tri(&b, p, v00, v10, v01, v11, tri, gx, gy, qu,
-                                     qv, flip_winding);
-               }
-               nir_pop_if(&b, NULL);
-
-               if (shape->allow_whole_patch)
-                  nir_pop_if(&b, NULL);
-            }
-            nir_pop_if(&b, NULL);
-         } else {
-            /* TRIANGLES primitive emission. */
-            nir_push_if(&b, nir_ior(&b, nir_ieq_imm(&b, mode, 0),
-                                    nir_ieq_imm(&b, mode, 3)));
-            {
-               /* All-1s or odd center triangle: (0, 1, 2). */
-               emit_triangle_prim(&b, p, nir_imm_int(&b, 0), nir_imm_int(&b, 1),
-                                  nir_imm_int(&b, 2), flip_winding);
-            }
-            nir_push_else(&b, NULL);
-            {
-               if (shape->allow_whole_patch) {
-                  nir_push_if(&b, nir_ieq_imm(&b, mode, 1));
-                  {
-                     /* Whole-Patch Triangle primitive p. */
-                     nir_def *ni = n_in_u;
-                     nir_def *outer_sum =
-                        nir_iadd(&b, nir_iadd(&b, n_out[0], n_out[1]), n_out[2]);
-                     nir_def *rings = nir_ushr_imm(&b, ni, 1);
-                     nir_variable *rem = nir_local_variable_create(
-                        impl, glsl_uint_type(), "ft_wp_prem");
-                     nir_variable *rv = nir_local_variable_create(
-                        impl, glsl_uint_type(), "ft_wp_pr");
-                     nir_variable *ob = nir_local_variable_create(
-                        impl, glsl_uint_type(), "ft_wp_ob");
-                     nir_variable *v0_out = nir_local_variable_create(
-                        impl, glsl_uint_type(), "ft_wp_i0");
-                     nir_variable *v1_out = nir_local_variable_create(
-                        impl, glsl_uint_type(), "ft_wp_i1");
-                     nir_variable *v2_out = nir_local_variable_create(
-                        impl, glsl_uint_type(), "ft_wp_i2");
-                     nir_store_var(&b, rem, p, 1);
-                     nir_store_var(&b, rv, nir_imm_int(&b, 0), 1);
-                     nir_store_var(&b, ob, nir_imm_int(&b, 0), 1);
-                     nir_store_var(&b, v0_out, nir_imm_int(&b, 0), 1);
-                     nir_store_var(&b, v1_out, nir_imm_int(&b, 1), 1);
-                     nir_store_var(&b, v2_out, nir_imm_int(&b, 2), 1);
-
-                     nir_loop *loop = nir_push_loop(&b);
-                     {
-                        nir_def *r = nir_load_var(&b, rv);
-                        nir_def *ob_v = nir_load_var(&b, ob);
-                        nir_push_if(&b, nir_uge(&b, r, rings));
-                        {
-                           /* Odd center triangle at ob_v .. ob_v + 2. */
-                           nir_store_var(&b, v0_out, ob_v, 1);
-                           nir_store_var(&b, v1_out, nir_iadd_imm(&b, ob_v, 1), 1);
-                           nir_store_var(&b, v2_out, nir_iadd_imm(&b, ob_v, 2), 1);
-                           nir_jump(&b, nir_jump_break);
-                        }
-                        nir_pop_if(&b, NULL);
-
-                        nir_def *is_r0 = nir_ieq_imm(&b, r, 0);
-                        nir_def *s_o_ring = nir_isub(&b, ni, nir_ishl_imm(&b, r, 1));
-                        nir_def *s_i = nir_usub_sat(&b, s_o_ring, nir_imm_int(&b, 2));
-                        nir_def *outer_rs =
-                           nir_bcsel(&b, is_r0, outer_sum, nir_imul_imm(&b, s_o_ring, 3));
-                        nir_def *inner_rs = nir_bcsel(
-                           &b, nir_ieq_imm(&b, s_i, 0), nir_imm_int(&b, 1),
-                           nir_imul_imm(&b, s_i, 3));
-                        nir_def *t0_e =
-                           nir_iadd(&b, nir_bcsel(&b, is_r0, n_out[0], s_o_ring), s_i);
-                        nir_def *t1_e =
-                           nir_iadd(&b, nir_bcsel(&b, is_r0, n_out[1], s_o_ring), s_i);
-                        nir_def *t2_e =
-                           nir_iadd(&b, nir_bcsel(&b, is_r0, n_out[2], s_o_ring), s_i);
-                        nir_def *tp1 = t0_e;
-                        nir_def *tp2 = nir_iadd(&b, tp1, t1_e);
-                        nir_def *band_tris = nir_iadd(&b, tp2, t2_e);
-                        nir_def *rem_v = nir_load_var(&b, rem);
-
-                        nir_push_if(&b, nir_ult(&b, rem_v, band_tris));
-                        {
-                           nir_def *e = nir_bcsel(
-                              &b, nir_ult(&b, rem_v, tp1), nir_imm_int(&b, 0),
-                              nir_bcsel(&b, nir_ult(&b, rem_v, tp2),
-                                        nir_imm_int(&b, 1), nir_imm_int(&b, 2)));
-                           nir_def *t = nir_bcsel(
-                              &b, nir_ieq_imm(&b, e, 0), rem_v,
-                              nir_bcsel(&b, nir_ieq_imm(&b, e, 1),
-                                        nir_isub(&b, rem_v, tp1),
-                                        nir_isub(&b, rem_v, tp2)));
-                           nir_def *s_o = nir_bcsel(
-                              &b, is_r0,
-                              nir_bcsel(&b, nir_ieq_imm(&b, e, 0), n_out[0],
-                                        nir_bcsel(&b, nir_ieq_imm(&b, e, 1),
-                                                  n_out[1], n_out[2])),
-                              s_o_ring);
-                           nir_def *ii = nir_stitch_i(&b, s_o, s_i, t);
-                           nir_def *oi = nir_isub(&b, t, ii);
-                           nir_def *step_i = nir_ine(
-                              &b, nir_stitch_i(&b, s_o, s_i, nir_iadd_imm(&b, t, 1)),
-                              ii);
-                           nir_def *oe_start = nir_bcsel(
-                              &b, is_r0,
-                              nir_bcsel(&b, nir_ieq_imm(&b, e, 0), nir_imm_int(&b, 0),
-                                        nir_bcsel(&b, nir_ieq_imm(&b, e, 1),
-                                                  n_out[0],
-                                                  nir_iadd(&b, n_out[0], n_out[1]))),
-                              nir_imul(&b, e, s_o_ring));
-                           nir_def *ie_start = nir_imul(&b, e, s_i);
-                           nir_def *ib = nir_iadd(&b, ob_v, outer_rs);
-                           nir_def *ov0 = nir_iadd(
-                              &b, ob_v, nir_umod(&b, nir_iadd(&b, oe_start, oi), outer_rs));
-                           nir_def *ov1 = nir_iadd(
-                              &b, ob_v,
-                              nir_umod(&b, nir_iadd_imm(&b, nir_iadd(&b, oe_start, oi), 1),
-                                       outer_rs));
-                           nir_def *iv0 = nir_iadd(
-                              &b, ib,
-                              nir_bcsel(&b, nir_ieq_imm(&b, inner_rs, 1),
-                                        nir_imm_int(&b, 0),
-                                        nir_umod(&b, nir_iadd(&b, ie_start, ii),
-                                                 inner_rs)));
-                           nir_def *iv1 = nir_iadd(
-                              &b, ib,
-                              nir_bcsel(&b, nir_ieq_imm(&b, inner_rs, 1),
-                                        nir_imm_int(&b, 0),
-                                        nir_umod(&b,
-                                                 nir_iadd_imm(&b, nir_iadd(&b, ie_start, ii), 1),
-                                                 inner_rs)));
-                           nir_store_var(&b, v0_out, nir_bcsel(&b, step_i, iv0, ov0), 1);
-                           nir_store_var(&b, v1_out, nir_bcsel(&b, step_i, ov0, ov1), 1);
-                           nir_store_var(&b, v2_out, nir_bcsel(&b, step_i, iv1, iv0), 1);
-                           nir_jump(&b, nir_jump_break);
-                        }
-                        nir_pop_if(&b, NULL);
-                        nir_store_var(&b, rem, nir_isub(&b, rem_v, band_tris), 1);
-                        nir_store_var(&b, ob, nir_iadd(&b, ob_v, outer_rs), 1);
-                        nir_store_var(&b, rv, nir_iadd_imm(&b, r, 1), 1);
-                     }
-                     nir_pop_loop(&b, loop);
-
-                     emit_triangle_prim(&b, p, nir_load_var(&b, v0_out),
-                                        nir_load_var(&b, v1_out),
-                                        nir_load_var(&b, v2_out), flip_winding);
-                  }
-                  nir_push_else(&b, NULL);
-               }
-
-               /* Multi-WG Triangle ring-edge strip primitive p. */
-               nir_def *s_o = nir_load_var(&b, s_out_var);
-               nir_def *s_i = nir_load_var(&b, s_in_var);
-               nir_def *t = nir_iadd(&b, nir_load_var(&b, t0_var), p);
-               nir_def *o0 = nir_load_var(&b, o0_var);
-               nir_def *i0_b = nir_load_var(&b, i0_var);
-               nir_def *no = nir_load_var(&b, no_var);
-               nir_def *ii_abs = nir_stitch_i(&b, s_o, s_i, t);
-               nir_def *oi = nir_isub(&b, nir_isub(&b, t, ii_abs), o0);
-               nir_def *ii = nir_isub(&b, ii_abs, i0_b);
-               nir_def *step_i = nir_ine(
-                  &b, nir_stitch_i(&b, s_o, s_i, nir_iadd_imm(&b, t, 1)),
-                  ii_abs);
-               nir_def *iv0 = nir_iadd(&b, no, ii);
-               nir_def *i0 = nir_bcsel(&b, step_i, iv0, oi);
-               nir_def *i1 = nir_bcsel(&b, step_i, oi, nir_iadd_imm(&b, oi, 1));
-               nir_def *i2 = nir_bcsel(&b, step_i, nir_iadd_imm(&b, iv0, 1), iv0);
-               emit_triangle_prim(&b, p, i0, i1, i2, flip_winding);
-
-               if (shape->allow_whole_patch)
-                  nir_pop_if(&b, NULL);
-            }
-            nir_pop_if(&b, NULL);
-         }
-      }
-      nir_pop_if(&b, p_if);
-   }
 
    /* ---- Single Shared TES Body Execution (Parallel Across V_live Lanes) ---- */
    nir_if *tes_active = nir_push_if(&b, nir_ult(&b, lane, v_live));
@@ -6534,367 +6518,15 @@ build_mesh_shader_mp(nir_shader *tes, nir_shader *vs_tes,
          n_out[e] = nir_iand_imm(&b, nir_ushr_imm(&b, pk_nout, 8 * e), 0xff);
       nir_def *n_in_u = nir_iand_imm(&b, pk_nin, 0xff);
       nir_def *n_in_v = nir_iand_imm(&b, nir_ushr_imm(&b, pk_nin, 8), 0xff);
-      nir_def *wp0 = nir_iand_imm(&b, w_prefix, 0xff);
-      nir_def *wp1 = nir_iand_imm(&b, nir_ushr_imm(&b, w_prefix, 8), 0xff);
-      nir_def *wp2 = nir_iand_imm(&b, nir_ushr_imm(&b, w_prefix, 16), 0xff);
-      nir_def *wp3 = nir_iand_imm(&b, nir_ushr_imm(&b, w_prefix, 24), 0xff);
-
-      /* Multi-WG strip/tile/ring/center UV + primitive emission (identical to K=1). */
-      nir_variable *mode_var =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_mode");
-      nir_variable *edge_var =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_edge");
-      nir_variable *s_out_var =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_sout");
-      nir_variable *s_in_var =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_sin");
-      nir_variable *t0_var =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_t0");
-      nir_variable *o0_var =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_o0");
-      nir_variable *i0_var =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_i0");
-      nir_variable *no_var =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_no");
-      nir_variable *cw_var =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_cw");
-      nir_variable *ox_var =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_ox");
-      nir_variable *oy_var =
-         nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_oy");
-      nir_store_var(&b, mode_var, nir_imm_int(&b, 2), 1);
-
+      /* Multi-WG Quad/Triangle UV + primitive emission (shared with K=1). */
       if (domain == TESS_PRIMITIVE_QUADS) {
-         nir_push_if(&b, nir_ult(&b, local_wg, wp3));
-         {
-            nir_store_var(&b, mode_var, nir_imm_int(&b, 2), 1);
-            nir_def *e = nir_bcsel(
-               &b, nir_ult(&b, local_wg, wp0), nir_imm_int(&b, 0),
-               nir_bcsel(&b, nir_ult(&b, local_wg, wp1), nir_imm_int(&b, 1),
-                         nir_bcsel(&b, nir_ult(&b, local_wg, wp2),
-                                   nir_imm_int(&b, 2), nir_imm_int(&b, 3))));
-            nir_def *prev_wp = nir_bcsel(
-               &b, nir_ieq_imm(&b, e, 0), nir_imm_int(&b, 0),
-               nir_bcsel(&b, nir_ieq_imm(&b, e, 1), wp0,
-                         nir_bcsel(&b, nir_ieq_imm(&b, e, 2), wp1, wp2)));
-            nir_def *chunk = nir_isub(&b, local_wg, prev_wp);
-            nir_def *n_o = nir_bcsel(
-               &b, nir_ieq_imm(&b, e, 0), n_out[0],
-               nir_bcsel(&b, nir_ieq_imm(&b, e, 1), n_out[1],
-                         nir_bcsel(&b, nir_ieq_imm(&b, e, 2), n_out[2], n_out[3])));
-            nir_def *n_is = nir_usub_sat(
-               &b,
-               nir_bcsel(&b, nir_ine_imm(&b, nir_iand_imm(&b, e, 1), 0), n_in_u,
-                         n_in_v),
-               nir_imm_int(&b, 2));
-            nir_def *t_total = nir_iadd(&b, n_o, n_is);
-            nir_def *t0 = nir_imul_imm(&b, chunk, shape->p_strip);
-            nir_def *t1 = nir_umin(&b, nir_iadd_imm(&b, t0, shape->p_strip), t_total);
-            nir_def *cnt = nir_usub_sat(&b, t1, t0);
-            nir_def *i0 = nir_stitch_i(&b, n_o, n_is, t0);
-            nir_def *o0 = nir_isub(&b, t0, i0);
-            nir_def *i1 = nir_stitch_i(&b, n_o, n_is, t1);
-            nir_def *o1 = nir_isub(&b, t1, i1);
-            nir_def *no = nir_iadd_imm(&b, nir_isub(&b, o1, o0), 1);
-            nir_def *ni = nir_iadd_imm(&b, nir_isub(&b, i1, i0), 1);
-            nir_def *vl = nir_iadd(&b, no, ni);
-
-            nir_store_var(&b, edge_var, e, 1);
-            nir_store_var(&b, s_out_var, n_o, 1);
-            nir_store_var(&b, s_in_var, n_is, 1);
-            nir_store_var(&b, t0_var, t0, 1);
-            nir_store_var(&b, o0_var, o0, 1);
-            nir_store_var(&b, i0_var, i0, 1);
-            nir_store_var(&b, no_var, no, 1);
-            nir_store_var(&b, v_live_var, vl, 1);
-            nir_store_var(&b, p_live_var, cnt, 1);
-
-            nir_push_if(&b, nir_ult(&b, lane, vl));
-            {
-               nir_push_if(&b, nir_ult(&b, lane, no));
-               {
-                  nir_def *k = nir_iadd(&b, o0, lane);
-                  nir_store_var(&b, uv_var,
-                                nir_quad_outer_uv(&b, spacing, e, k, n_out, f_out),
-                                3);
-               }
-               nir_push_else(&b, NULL);
-               {
-                  nir_def *k = nir_iadd(&b, i0, nir_isub(&b, lane, no));
-                  nir_store_var(
-                     &b, uv_var,
-                     nir_quad_inner_edge_uv(&b, spacing, e, k, n_in_u, n_in_v,
-                                            f_in[0], f_in[1]),
-                     3);
-               }
-               nir_pop_if(&b, NULL);
-            }
-            nir_pop_if(&b, NULL);
-         }
-         nir_push_else(&b, NULL);
-         {
-            nir_store_var(&b, mode_var, nir_imm_int(&b, 3), 1);
-            nir_def *int_id = nir_isub(&b, local_wg, wp3);
-            nir_def *qu = nir_usub_sat(&b, n_in_u, nir_imm_int(&b, 2));
-            nir_def *qv = nir_usub_sat(&b, n_in_v, nir_imm_int(&b, 2));
-            nir_def *tiles_u =
-               nir_umax(&b, nir_div_round_up_imm(&b, qu, shape->tile_w),
-                        nir_imm_int(&b, 1));
-            nir_def *tx = nir_umod(&b, int_id, tiles_u);
-            nir_def *ty = nir_udiv(&b, int_id, tiles_u);
-            nir_def *ox = nir_imul_imm(&b, tx, shape->tile_w);
-            nir_def *oy = nir_imul_imm(&b, ty, shape->tile_h);
-            nir_def *cw =
-               nir_umin(&b, nir_imm_int(&b, shape->tile_w), nir_usub_sat(&b, qu, ox));
-            nir_def *ch =
-               nir_umin(&b, nir_imm_int(&b, shape->tile_h), nir_usub_sat(&b, qv, oy));
-            nir_def *vw = nir_iadd_imm(&b, cw, 1);
-            nir_def *vh = nir_iadd_imm(&b, ch, 1);
-            nir_def *vl = nir_imul(&b, vw, vh);
-            nir_def *pl_c = nir_ishl_imm(&b, nir_imul(&b, cw, ch), 1);
-            nir_store_var(&b, cw_var, cw, 1);
-            nir_store_var(&b, ox_var, ox, 1);
-            nir_store_var(&b, oy_var, oy, 1);
-            nir_store_var(&b, v_live_var, vl, 1);
-            nir_store_var(&b, p_live_var, pl_c, 1);
-            nir_push_if(&b, nir_ult(&b, lane, vl));
-            {
-               nir_def *vx = nir_umod(&b, lane, vw);
-               nir_def *vy = nir_udiv(&b, lane, vw);
-               nir_def *u = nir_eval_1d(&b, spacing, n_in_u, f_in[0],
-                                        nir_iadd(&b, nir_iadd_imm(&b, ox, 1), vx));
-               nir_def *v = nir_eval_1d(&b, spacing, n_in_v, f_in[1],
-                                        nir_iadd(&b, nir_iadd_imm(&b, oy, 1), vy));
-               nir_store_var(&b, uv_var, nir_vec2(&b, u, v), 3);
-            }
-            nir_pop_if(&b, NULL);
-         }
-         nir_pop_if(&b, NULL);
-
-         /* Emit Branch 2 Quad primitives. */
-         nir_def *p_live_b2 = nir_load_var(&b, p_live_var);
-         nir_def *mode_b2 = nir_load_var(&b, mode_var);
-         for (unsigned it = 0; it < prim_iters; ++it) {
-            nir_def *p = it ? nir_iadd_imm(&b, lane, it * 32u) : lane;
-            nir_if *p_if = nir_push_if(&b, nir_ult(&b, p, p_live_b2));
-            p_if->control = nir_selection_control_dont_flatten;
-            {
-               nir_push_if(&b, nir_ieq_imm(&b, mode_b2, 2));
-               {
-                  nir_def *n_o = nir_load_var(&b, s_out_var);
-                  nir_def *n_is = nir_load_var(&b, s_in_var);
-                  nir_def *t = nir_iadd(&b, nir_load_var(&b, t0_var), p);
-                  nir_def *o0 = nir_load_var(&b, o0_var);
-                  nir_def *i0_b = nir_load_var(&b, i0_var);
-                  nir_def *no = nir_load_var(&b, no_var);
-                  nir_def *ii_abs = nir_stitch_i(&b, n_o, n_is, t);
-                  nir_def *oi = nir_isub(&b, nir_isub(&b, t, ii_abs), o0);
-                  nir_def *ii = nir_isub(&b, ii_abs, i0_b);
-                  nir_def *step_i = nir_ine(
-                     &b, nir_stitch_i(&b, n_o, n_is, nir_iadd_imm(&b, t, 1)),
-                     ii_abs);
-                  nir_def *iv0 = nir_iadd(&b, no, ii);
-                  nir_def *i0 = nir_bcsel(&b, step_i, iv0, oi);
-                  nir_def *i1 = nir_bcsel(&b, step_i, oi, nir_iadd_imm(&b, oi, 1));
-                  nir_def *i2 = nir_bcsel(&b, step_i, nir_iadd_imm(&b, iv0, 1), iv0);
-                  emit_triangle_prim(&b, p, i0, i1, i2, flip_winding);
-               }
-               nir_push_else(&b, NULL);
-               {
-                  nir_def *cw = nir_umax(&b, nir_load_var(&b, cw_var), nir_imm_int(&b, 1));
-                  nir_def *vw = nir_iadd_imm(&b, cw, 1);
-                  nir_def *q = nir_ushr_imm(&b, p, 1);
-                  nir_def *tri = nir_iand_imm(&b, p, 1);
-                  nir_def *qx = nir_umod(&b, q, cw);
-                  nir_def *qy = nir_udiv(&b, q, cw);
-                  nir_def *v00 = nir_iadd(&b, nir_imul(&b, qy, vw), qx);
-                  nir_def *v10 = nir_iadd_imm(&b, v00, 1);
-                  nir_def *v01 = nir_iadd(&b, v00, vw);
-                  nir_def *v11 = nir_iadd_imm(&b, v01, 1);
-                  nir_def *qu = nir_usub_sat(&b, n_in_u, nir_imm_int(&b, 2));
-                  nir_def *qv = nir_usub_sat(&b, n_in_v, nir_imm_int(&b, 2));
-                  nir_def *gx = nir_iadd(&b, nir_load_var(&b, ox_var), qx);
-                  nir_def *gy = nir_iadd(&b, nir_load_var(&b, oy_var), qy);
-                  emit_quad_cell_tri(&b, p, v00, v10, v01, v11, tri, gx, gy, qu,
-                                     qv, flip_winding);
-               }
-               nir_pop_if(&b, NULL);
-            }
-            nir_pop_if(&b, p_if);
-         }
+         emit_quad_multi_wg(&b, spacing, shape, lane, local_wg, n_out, f_out,
+                            n_in_u, n_in_v, f_in, w_prefix, flip_winding,
+                            v_live_var, p_live_var, uv_var);
       } else {
-         /* TRIANGLES multi-WG Branch 2. */
-         nir_def *ni = n_in_u;
-         nir_def *fi = f_in[0];
-         nir_variable *r_sel =
-            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_tr_r");
-         nir_variable *c_sel =
-            nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_tr_c");
-         nir_variable *is_ctr_wg =
-            nir_local_variable_create(impl, glsl_bool_type(), "ft_mp_tr_ctr");
-         nir_store_var(&b, r_sel, nir_imm_int(&b, 0), 1);
-         nir_store_var(&b, edge_var, nir_imm_int(&b, 0), 1);
-         nir_store_var(&b, c_sel, nir_imm_int(&b, 0), 1);
-         nir_store_var(&b, is_ctr_wg, nir_imm_false(&b), 1);
-
-         nir_push_if(&b, nir_ult(&b, local_wg, wp2));
-         {
-            nir_def *e = nir_bcsel(
-               &b, nir_ult(&b, local_wg, wp0), nir_imm_int(&b, 0),
-               nir_bcsel(&b, nir_ult(&b, local_wg, wp1), nir_imm_int(&b, 1),
-                         nir_imm_int(&b, 2)));
-            nir_def *prev = nir_bcsel(
-               &b, nir_ieq_imm(&b, e, 0), nir_imm_int(&b, 0),
-               nir_bcsel(&b, nir_ieq_imm(&b, e, 1), wp0, wp1));
-            nir_store_var(&b, edge_var, e, 1);
-            nir_store_var(&b, c_sel, nir_isub(&b, local_wg, prev), 1);
-            nir_def *n_o = nir_bcsel(
-               &b, nir_ieq_imm(&b, e, 0), n_out[0],
-               nir_bcsel(&b, nir_ieq_imm(&b, e, 1), n_out[1], n_out[2]));
-            nir_store_var(&b, s_out_var, n_o, 1);
-            nir_store_var(&b, s_in_var, nir_usub_sat(&b, ni, nir_imm_int(&b, 2)), 1);
-         }
-         nir_push_else(&b, NULL);
-         {
-            nir_variable *rem =
-               nir_local_variable_create(impl, glsl_uint_type(), "ft_mp_tr_rem");
-            nir_store_var(&b, rem, nir_isub(&b, local_wg, wp2), 1);
-            nir_store_var(&b, r_sel, nir_imm_int(&b, 1), 1);
-            nir_store_var(&b, is_ctr_wg, nir_imm_true(&b), 1);
-            nir_def *rings = nir_ushr_imm(&b, ni, 1);
-            nir_loop *loop = nir_push_loop(&b);
-            {
-               nir_def *r = nir_load_var(&b, r_sel);
-               nir_push_if(&b, nir_uge(&b, r, rings));
-               nir_jump(&b, nir_jump_break);
-               nir_pop_if(&b, NULL);
-               nir_def *s_o = nir_isub(&b, ni, nir_ishl_imm(&b, r, 1));
-               nir_def *s_i = nir_usub_sat(&b, s_o, nir_imm_int(&b, 2));
-               nir_def *t_r = nir_iadd(&b, s_o, s_i);
-               nir_def *wr = nir_div_round_up_imm(&b, t_r, shape->p_strip);
-               nir_def *w3 = nir_imul_imm(&b, wr, 3);
-               nir_def *rem_v = nir_load_var(&b, rem);
-               nir_push_if(&b, nir_ult(&b, rem_v, w3));
-               {
-                  nir_store_var(&b, edge_var, nir_udiv(&b, rem_v, wr), 1);
-                  nir_store_var(&b, c_sel, nir_umod(&b, rem_v, wr), 1);
-                  nir_store_var(&b, s_out_var, s_o, 1);
-                  nir_store_var(&b, s_in_var, s_i, 1);
-                  nir_store_var(&b, is_ctr_wg, nir_imm_false(&b), 1);
-                  nir_jump(&b, nir_jump_break);
-               }
-               nir_pop_if(&b, NULL);
-               nir_store_var(&b, rem, nir_isub(&b, rem_v, w3), 1);
-               nir_store_var(&b, r_sel, nir_iadd_imm(&b, r, 1), 1);
-            }
-            nir_pop_loop(&b, loop);
-         }
-         nir_pop_if(&b, NULL);
-
-         nir_push_if(&b, nir_load_var(&b, is_ctr_wg));
-         {
-            nir_store_var(&b, mode_var, nir_imm_int(&b, 3), 1);
-            nir_store_var(&b, v_live_var, nir_imm_int(&b, 3), 1);
-            nir_store_var(&b, p_live_var, nir_imm_int(&b, 1), 1);
-            nir_push_if(&b, nir_ult_imm(&b, lane, 3));
-            {
-               nir_store_var(
-                  &b, uv_var,
-                  nir_tri_ring_uv(&b, spacing, nir_ushr_imm(&b, ni, 1), lane,
-                                  nir_imm_int(&b, 0), n_out, f_out, ni, fi),
-                  3);
-            }
-            nir_pop_if(&b, NULL);
-         }
-         nir_push_else(&b, NULL);
-         {
-            nir_store_var(&b, mode_var, nir_imm_int(&b, 2), 1);
-            nir_def *r = nir_load_var(&b, r_sel);
-            nir_def *e = nir_load_var(&b, edge_var);
-            nir_def *chunk = nir_load_var(&b, c_sel);
-            nir_def *s_o = nir_load_var(&b, s_out_var);
-            nir_def *s_i = nir_load_var(&b, s_in_var);
-            nir_def *t_total = nir_iadd(&b, s_o, s_i);
-            nir_def *t0 = nir_imul_imm(&b, chunk, shape->p_strip);
-            nir_def *t1 = nir_umin(&b, nir_iadd_imm(&b, t0, shape->p_strip), t_total);
-            nir_def *cnt = nir_usub_sat(&b, t1, t0);
-            nir_def *i0 = nir_stitch_i(&b, s_o, s_i, t0);
-            nir_def *o0 = nir_isub(&b, t0, i0);
-            nir_def *i1 = nir_stitch_i(&b, s_o, s_i, t1);
-            nir_def *o1 = nir_isub(&b, t1, i1);
-            nir_def *no = nir_iadd_imm(&b, nir_isub(&b, o1, o0), 1);
-            nir_def *ni_v = nir_iadd_imm(&b, nir_isub(&b, i1, i0), 1);
-            nir_def *vl = nir_iadd(&b, no, ni_v);
-
-            nir_store_var(&b, t0_var, t0, 1);
-            nir_store_var(&b, o0_var, o0, 1);
-            nir_store_var(&b, i0_var, i0, 1);
-            nir_store_var(&b, no_var, no, 1);
-            nir_store_var(&b, v_live_var, vl, 1);
-            nir_store_var(&b, p_live_var, cnt, 1);
-
-            nir_push_if(&b, nir_ult(&b, lane, vl));
-            {
-               nir_push_if(&b, nir_ult(&b, lane, no));
-               {
-                  nir_def *k = nir_iadd(&b, o0, lane);
-                  nir_store_var(
-                     &b, uv_var,
-                     nir_tri_ring_uv(&b, spacing, r, e, k, n_out, f_out, ni, fi),
-                     3);
-               }
-               nir_push_else(&b, NULL);
-               {
-                  nir_def *k = nir_iadd(&b, i0, nir_isub(&b, lane, no));
-                  nir_store_var(
-                     &b, uv_var,
-                     nir_tri_ring_uv(&b, spacing, nir_iadd_imm(&b, r, 1), e, k,
-                                     n_out, f_out, ni, fi),
-                     3);
-               }
-               nir_pop_if(&b, NULL);
-            }
-            nir_pop_if(&b, NULL);
-         }
-         nir_pop_if(&b, NULL);
-
-         /* Emit Branch 2 Triangle primitives. */
-         nir_def *p_live_b2 = nir_load_var(&b, p_live_var);
-         nir_def *mode_b2 = nir_load_var(&b, mode_var);
-         for (unsigned it = 0; it < prim_iters; ++it) {
-            nir_def *p = it ? nir_iadd_imm(&b, lane, it * 32u) : lane;
-            nir_if *p_if = nir_push_if(&b, nir_ult(&b, p, p_live_b2));
-            p_if->control = nir_selection_control_dont_flatten;
-            {
-               nir_push_if(&b, nir_ieq_imm(&b, mode_b2, 3));
-               {
-                  emit_triangle_prim(&b, p, nir_imm_int(&b, 0), nir_imm_int(&b, 1),
-                                     nir_imm_int(&b, 2), flip_winding);
-               }
-               nir_push_else(&b, NULL);
-               {
-                  nir_def *s_o = nir_load_var(&b, s_out_var);
-                  nir_def *s_i = nir_load_var(&b, s_in_var);
-                  nir_def *t = nir_iadd(&b, nir_load_var(&b, t0_var), p);
-                  nir_def *o0 = nir_load_var(&b, o0_var);
-                  nir_def *i0_b = nir_load_var(&b, i0_var);
-                  nir_def *no = nir_load_var(&b, no_var);
-                  nir_def *ii_abs = nir_stitch_i(&b, s_o, s_i, t);
-                  nir_def *oi = nir_isub(&b, nir_isub(&b, t, ii_abs), o0);
-                  nir_def *ii = nir_isub(&b, ii_abs, i0_b);
-                  nir_def *step_i = nir_ine(
-                     &b, nir_stitch_i(&b, s_o, s_i, nir_iadd_imm(&b, t, 1)),
-                     ii_abs);
-                  nir_def *iv0 = nir_iadd(&b, no, ii);
-                  nir_def *i0 = nir_bcsel(&b, step_i, iv0, oi);
-                  nir_def *i1 = nir_bcsel(&b, step_i, oi, nir_iadd_imm(&b, oi, 1));
-                  nir_def *i2 = nir_bcsel(&b, step_i, nir_iadd_imm(&b, iv0, 1), iv0);
-                  emit_triangle_prim(&b, p, i0, i1, i2, flip_winding);
-               }
-               nir_pop_if(&b, NULL);
-            }
-            nir_pop_if(&b, p_if);
-         }
+         emit_tri_multi_wg(&b, spacing, shape, lane, local_wg, n_out, f_out,
+                           n_in_u, f_in[0], flip_winding, v_live_var,
+                           p_live_var, uv_var);
       }
    }
    nir_pop_if(&b, br_packed);

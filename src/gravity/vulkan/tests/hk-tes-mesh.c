@@ -854,7 +854,8 @@ fused_tess_suite(void)
                   CHECK(info.max_child_wgs_per_patch == 1);
                   CHECK(info.max_prims_per_patch == 37);
                } else {
-                  CHECK(info.max_child_wgs_per_patch == 5);
+                  /* Continuous outer ring: ceil(32/30) = 2 WGs + 1 interior tile = 3 WGs. */
+                  CHECK(info.max_child_wgs_per_patch == 3);
                   CHECK(info.max_prims_per_patch == 50);
                }
             } else {
@@ -1878,7 +1879,8 @@ fused_tess_interval_bounds_suite(void)
       CHECK(!info.constant_tess_levels);
       if (safe_nan) {
          CHECK(info.max_prims_per_patch == 181u);
-         CHECK(info.max_child_wgs_per_patch == 16u);
+         /* Multi-ring triangle chunker (V=24/P=20 -> p_chunk=20): ceil(181/20) = 10 WGs. */
+         CHECK(info.max_child_wgs_per_patch == 10u);
       } else {
          CHECK(info.max_prims_per_patch == 5953u);
       }
@@ -3384,13 +3386,11 @@ sim_multipatch_object_wg(enum tess_primitive_mode domain,
          } else {
             uint32_t iw = ni[0] >= 2 ? ni[0] - 2 : 0;
             uint32_t ih = ni[1] >= 2 ? ni[1] - 2 : 0;
-            uint32_t tiles = (iw && ih) ? ((iw + tile_w - 1) / tile_w) *
-                                             ((ih + tile_h - 1) / tile_h)
-                                        : 0;
-            uint32_t s_wgs = 0;
-            uint32_t in_s[4] = {ih, iw, ih, iw};
-            for (unsigned e = 0; e < 4; ++e)
-               s_wgs += (no[e] + in_s[e] + p_strip - 1) / p_strip;
+            uint32_t t_outer = no[0] + no[1] + no[2] + no[3] + 2u * (iw + ih);
+            uint32_t s_wgs = (t_outer + p_strip - 1) / p_strip;
+            uint32_t q_cap = max_v >= 6 ? (max_v - 4) / 2 : 1;
+            uint32_t q_chunk = MIN2(max_p / 2, q_cap);
+            uint32_t tiles = (iw && ih) ? (iw * ih + q_chunk - 1) / q_chunk : 0;
             wgs = tiles + s_wgs;
          }
       } else {
@@ -3434,17 +3434,8 @@ sim_multipatch_object_wg(enum tess_primitive_mode domain,
          if (n_v <= max_v && n_p <= max_p) {
             wgs = 1;
          } else {
-            uint32_t s_wgs = 0;
-            for (unsigned e = 0; e < 3; ++e)
-               s_wgs += (no[e] + (ni >= 2 ? ni - 2 : 0) + p_strip - 1) / p_strip;
-            uint32_t rings = ni / 2;
-            for (uint32_t r = 1; r < rings; ++r) {
-               uint32_t sr = ni - 2 * r;
-               s_wgs += 3u * ((sr + (sr - 2) + p_strip - 1) / p_strip);
-            }
-            if (ni & 1)
-               s_wgs += 1;
-            wgs = s_wgs;
+            uint32_t p_chunk = MIN2(max_p, max_v > 3 ? max_v - 3 : 1);
+            wgs = (n_p + p_chunk - 1) / p_chunk;
          }
       }
 
@@ -4765,6 +4756,8 @@ fused_tess_multipatch_suite(void)
                   uint32_t i0 = mex.out_indices[pr][0];
                   uint32_t i1 = mex.out_indices[pr][1];
                   uint32_t i2 = mex.out_indices[pr][2];
+                  CHECK(mex.out_pid[i0] == p_i && mex.out_pid[i1] == p_i &&
+                        mex.out_pid[i2] == p_i);
                   k1_pids[k1_prims] = mex.out_pid[i0];
                   k1_vpos[k1_prims][0][0] = mex.out_pos[i0][0];
                   k1_vpos[k1_prims][0][1] = mex.out_pos[i0][1];
@@ -5150,6 +5143,790 @@ fused_tess_multipatch_suite(void)
    printf("fused tessellation multi-patch suite: Tier 2 K=16, Tier 1 K=2..8, 8 negative guards, order-preserving mixed-LOD, Astra P0/P1/P2 regressions passed\n");
 }
 
+/* Direct transcription of src/poly/cl/tessellator.h::StitchTransition and
+ * StitchRegular(bTrapezoid=true, DIAGONALS_MIRRORED) returning exact (a, b, c)
+ * vertex tuples (outer in 0..s_o, inner in 1000..1000+s_i) so tests verify
+ * both connectivity and provoking vertex against the actual reference algorithm. */
+static uint32_t
+ref_final_point_pos(uint32_t x)
+{
+   if (x == 0)
+      return 0;
+   if (x == 1)
+      return 0x20;
+   uint32_t shift = ((x & 1) == 0) ? 1 : ((x & 3) == 3) ? 2 :
+                    ((x & 7) == 5) ? 3 : (x != 17) ? 4 : 5;
+   uint32_t shifted = (x | (0x20u << 16)) >> shift;
+   return MIN2(0xfu, shifted >> 16) + (shifted & 0xffffu);
+}
+
+static uint32_t
+ref_loop_start(uint32_t n)
+{
+   return n < 2 ? 1 : n == 2 ? 17 : n < 5 ? 9 : n < 9 ? 5 : n < 17 ? 3 : 2;
+}
+
+static uint32_t
+ref_loop_end(uint32_t n)
+{
+   return n < 2 ? 0 : n < 4 ? 17 : n < 8 ? 25 : n < 16 ? 29 : n < 32 ? 31 : 32;
+}
+
+static uint32_t
+ref_tess_h_stitch_transition(uint32_t s_o, uint32_t s_i, uint32_t out_tris[][3])
+{
+   bool in_odd = (s_i & 1u) != 0;
+   bool out_odd = (s_o & 1u) != 0;
+   uint32_t in_h = (s_i >> 1) + 1u;
+   uint32_t out_h = s_o >> 1;
+   uint32_t op = 0, ip = 1000, n = 0;
+   uint32_t i_start = MIN2(ref_loop_start(in_h), ref_loop_start(out_h));
+   uint32_t i_end = ref_loop_end(MAX2(in_h, out_h));
+   if (out_h > 0) {
+      out_tris[n][0] = op; out_tris[n][1] = op + 1; out_tris[n][2] = ip;
+      n++; op++;
+   }
+   for (uint32_t i = i_start; i <= i_end; ++i) {
+      uint32_t b = ref_final_point_pos(i);
+      if (b < in_h) {
+         out_tris[n][0] = ip; out_tris[n][1] = op; out_tris[n][2] = ip + 1;
+         n++; ip++;
+      }
+      if (b < out_h) {
+         out_tris[n][0] = op; out_tris[n][1] = op + 1; out_tris[n][2] = ip;
+         n++; op++;
+      }
+   }
+   if ((in_odd != out_odd) || in_odd) {
+      if (in_odd == out_odd) {
+         out_tris[n][0] = ip; out_tris[n][1] = op; out_tris[n][2] = ip + 1; n++;
+         out_tris[n][0] = ip + 1; out_tris[n][1] = op; out_tris[n][2] = op + 1; n++;
+         ip++; op++;
+      } else if (!in_odd) {
+         out_tris[n][0] = ip; out_tris[n][1] = op; out_tris[n][2] = op + 1;
+         n++; op++;
+      } else {
+         out_tris[n][0] = ip; out_tris[n][1] = op; out_tris[n][2] = ip + 1;
+         n++; ip++;
+      }
+   }
+   for (int i = (int)i_end; i >= (int)i_start; --i) {
+      uint32_t b = ref_final_point_pos((uint32_t)i);
+      if (b < out_h) {
+         out_tris[n][0] = op; out_tris[n][1] = op + 1; out_tris[n][2] = ip;
+         n++; op++;
+      }
+      if (b < in_h) {
+         out_tris[n][0] = ip; out_tris[n][1] = op; out_tris[n][2] = ip + 1;
+         n++; ip++;
+      }
+   }
+   if (out_h > 0) {
+      out_tris[n][0] = op; out_tris[n][1] = op + 1; out_tris[n][2] = ip;
+      n++; op++;
+   }
+   return n;
+}
+
+static uint32_t
+ref_tess_h_stitch_regular(uint32_t s_i, uint32_t out_tris[][3])
+{
+   uint32_t n_in_pts = s_i + 1u;
+   uint32_t op = 0, ip = 1000, n = 0;
+   out_tris[n][0] = op; out_tris[n][1] = op + 1; out_tris[n][2] = ip;
+   n++; op++;
+   uint32_t p = 0;
+   for (; p < n_in_pts / 2; ++p) {
+      out_tris[n][0] = op; out_tris[n][1] = ip + 1; out_tris[n][2] = ip; n++;
+      out_tris[n][0] = op; out_tris[n][1] = op + 1; out_tris[n][2] = ip + 1; n++;
+      ip++; op++;
+   }
+   for (; p < n_in_pts - 1; ++p) {
+      out_tris[n][0] = ip; out_tris[n][1] = op; out_tris[n][2] = op + 1; n++;
+      out_tris[n][0] = ip; out_tris[n][1] = op + 1; out_tris[n][2] = ip + 1; n++;
+      ip++; op++;
+   }
+   out_tris[n][0] = op; out_tris[n][1] = op + 1; out_tris[n][2] = ip;
+   n++;
+   return n;
+}
+
+static void
+ref_gen_tri_prims(enum gl_tess_spacing sp, bool ccw, const float raw_out[3],
+                  float raw_in, float (*out_tris)[3][2], uint32_t *out_count)
+{
+   float lo = sp == TESS_SPACING_FRACTIONAL_EVEN ? 2.0f : 1.0f;
+   float hi = sp == TESS_SPACING_FRACTIONAL_ODD ? 63.0f : 64.0f;
+   float f_out[3], maxf = 0.0f;
+   for (unsigned e = 0; e < 3; ++e) {
+      float f = raw_out[e];
+      f = !(f >= lo) ? lo : (f > hi ? hi : f);
+      if (sp == TESS_SPACING_EQUAL)
+         f = ceilf(f);
+      f_out[e] = f;
+      if (f > maxf)
+         maxf = f;
+   }
+   if (raw_in > maxf)
+      maxf = raw_in;
+   float in_lo = (sp == TESS_SPACING_FRACTIONAL_ODD &&
+                  maxf > 1.0f + 0.5f / 65536.0f)
+                    ? 1.0f + 1.0f / 65536.0f
+                    : lo;
+   float f_in = !(raw_in >= in_lo) ? in_lo : (raw_in > hi ? hi : raw_in);
+   if (sp == TESS_SPACING_EQUAL)
+      f_in = ceilf(f_in);
+
+   uint32_t n_out[3];
+   bool all_ones = sp != TESS_SPACING_FRACTIONAL_EVEN;
+   for (unsigned e = 0; e < 3; ++e) {
+      n_out[e] = ref_seg_count(sp, f_out[e]);
+      if (n_out[e] != 1)
+         all_ones = false;
+   }
+   uint32_t ni = ref_seg_count(sp, f_in);
+   if (ni != 1)
+      all_ones = false;
+
+   uint32_t cnt = 0;
+   if (all_ones) {
+      float p0[2] = {0.0f, 1.0f}, p1[2] = {0.0f, 0.0f}, p2[2] = {1.0f, 0.0f};
+      memcpy(out_tris[0][0], p0, 8);
+      memcpy(out_tris[0][1], ccw ? p2 : p1, 8);
+      memcpy(out_tris[0][2], ccw ? p1 : p2, 8);
+      *out_count = 1;
+      return;
+   }
+
+   uint32_t min_in = sp == TESS_SPACING_FRACTIONAL_ODD ? 3 : 2;
+   if (ni < min_in) {
+      ni = min_in;
+      if (sp == TESS_SPACING_EQUAL)
+         f_in = (float)ni;
+   }
+   uint32_t rings = ni >> 1;
+   uint32_t edge_tris[128][3];
+   for (uint32_t r = 0; r < rings; ++r) {
+      uint32_t s_o_ring = ni - 2u * r;
+      uint32_t s_i = s_o_ring > 2 ? s_o_ring - 2 : 0;
+      for (uint32_t e = 0; e < 3; ++e) {
+         uint32_t s_o = r == 0 ? n_out[e] : s_o_ring;
+         uint32_t n_e = r == 0 ? ref_tess_h_stitch_transition(s_o, s_i, edge_tris)
+                               : ref_tess_h_stitch_regular(s_i, edge_tris);
+         CHECK(n_e == s_o + s_i);
+         for (uint32_t t = 0; t < n_e; ++t) {
+            float pts[3][2];
+            for (unsigned m = 0; m < 3; ++m) {
+               uint32_t id = edge_tris[t][m];
+               if (id >= 1000)
+                  ref_tri_ring_uv(sp, r + 1, e, id - 1000, n_out, f_out, ni, f_in, pts[m]);
+               else
+                  ref_tri_ring_uv(sp, r, e, id, n_out, f_out, ni, f_in, pts[m]);
+            }
+            memcpy(out_tris[cnt][0], pts[0], 8);
+            memcpy(out_tris[cnt][1], ccw ? pts[2] : pts[1], 8);
+            memcpy(out_tris[cnt][2], ccw ? pts[1] : pts[2], 8);
+            cnt++;
+         }
+      }
+   }
+   if (ni & 1) {
+      float c0[2], c1[2], c2[2];
+      ref_tri_ring_uv(sp, rings, 0, 0, n_out, f_out, ni, f_in, c0);
+      ref_tri_ring_uv(sp, rings, 1, 0, n_out, f_out, ni, f_in, c1);
+      ref_tri_ring_uv(sp, rings, 2, 0, n_out, f_out, ni, f_in, c2);
+      memcpy(out_tris[cnt][0], c0, 8);
+      memcpy(out_tris[cnt][1], ccw ? c2 : c1, 8);
+      memcpy(out_tris[cnt][2], ccw ? c1 : c2, 8);
+      cnt++;
+   }
+   *out_count = cnt;
+}
+
+static void
+ref_gen_quad_prims(enum gl_tess_spacing sp, bool ccw,
+                   const float raw_out[4], const float raw_in[2],
+                   float (*out_tris)[3][2], uint32_t *out_total_cnt)
+{
+   float lo = sp == TESS_SPACING_FRACTIONAL_EVEN ? 2.0f : 1.0f;
+   float hi = sp == TESS_SPACING_FRACTIONAL_ODD ? 63.0f : 64.0f;
+   float f_out[4], f_in[2], maxf = 0.0f;
+   for (unsigned e = 0; e < 4; ++e) {
+      float f = raw_out[e];
+      f = !(f >= lo) ? lo : (f > hi ? hi : f);
+      if (sp == TESS_SPACING_EQUAL)
+         f = ceilf(f);
+      f_out[e] = f;
+      if (f > maxf)
+         maxf = f;
+   }
+   for (unsigned a = 0; a < 2; ++a)
+      if (raw_in[a] > maxf)
+         maxf = raw_in[a];
+   float in_lo = (sp == TESS_SPACING_FRACTIONAL_ODD &&
+                  maxf > 1.0f + 0.5f / 65536.0f)
+                    ? 1.0f + 1.0f / 65536.0f
+                    : lo;
+   for (unsigned a = 0; a < 2; ++a) {
+      float f = raw_in[a];
+      f = !(f >= in_lo) ? in_lo : (f > hi ? hi : f);
+      if (sp == TESS_SPACING_EQUAL)
+         f = ceilf(f);
+      f_in[a] = f;
+   }
+   uint32_t n_out[4], n_in[2];
+   bool all_ones = sp != TESS_SPACING_FRACTIONAL_EVEN;
+   for (unsigned e = 0; e < 4; ++e) {
+      n_out[e] = ref_seg_count(sp, f_out[e]);
+      if (n_out[e] != 1)
+         all_ones = false;
+   }
+   for (unsigned a = 0; a < 2; ++a) {
+      n_in[a] = ref_seg_count(sp, f_in[a]);
+      if (n_in[a] != 1)
+         all_ones = false;
+   }
+   if (all_ones) {
+      float p0[2] = {0.0f, 0.0f}, p1[2] = {1.0f, 0.0f},
+            p2[2] = {1.0f, 1.0f}, p3[2] = {0.0f, 1.0f};
+      memcpy(out_tris[0][0], p0, 8);
+      memcpy(out_tris[0][1], ccw ? p3 : p1, 8);
+      memcpy(out_tris[0][2], ccw ? p1 : p3, 8);
+      memcpy(out_tris[1][0], p1, 8);
+      memcpy(out_tris[1][1], ccw ? p3 : p2, 8);
+      memcpy(out_tris[1][2], ccw ? p2 : p3, 8);
+      *out_total_cnt = 2;
+      return;
+   }
+   uint32_t min_in = sp == TESS_SPACING_FRACTIONAL_ODD ? 3 : 2;
+   for (unsigned a = 0; a < 2; ++a) {
+      if (n_in[a] < min_in) {
+         n_in[a] = min_in;
+         if (sp == TESS_SPACING_EQUAL)
+            f_in[a] = (float)n_in[a];
+      }
+   }
+   uint32_t qu = n_in[0] - 2, qv = n_in[1] - 2;
+   uint32_t cnt = 0;
+   uint32_t edge_tris[128][3];
+   for (uint32_t e = 0; e < 4; ++e) {
+      uint32_t n_is = (e & 1) ? qu : qv;
+      uint32_t n_e = ref_tess_h_stitch_transition(n_out[e], n_is, edge_tris);
+      CHECK(n_e == n_out[e] + n_is);
+      for (uint32_t t = 0; t < n_e; ++t) {
+         float pts[3][2];
+         for (unsigned m = 0; m < 3; ++m) {
+            uint32_t id = edge_tris[t][m];
+            if (id >= 1000)
+               ref_quad_inner_uv(sp, e, id - 1000, n_in[0], n_in[1], f_in[0], f_in[1], pts[m]);
+            else
+               ref_quad_outer_uv(sp, e, id, n_out, f_out, pts[m]);
+         }
+         memcpy(out_tris[cnt][0], pts[0], 8);
+         memcpy(out_tris[cnt][1], ccw ? pts[2] : pts[1], 8);
+         memcpy(out_tris[cnt][2], ccw ? pts[1] : pts[2], 8);
+         cnt++;
+      }
+   }
+   /* Canonical row-major interior matching emit_whole_patch_quad_prim and
+    * emit_quad_multi_wg identically across all meshlet shapes (Rule 1). */
+   for (uint32_t gy = 0; gy < qv; ++gy) {
+      for (uint32_t gx = 0; gx < qu; ++gx) {
+         float v00[2] = {ref_eval_1d(sp, n_in[0], f_in[0], gx + 1),
+                         ref_eval_1d(sp, n_in[1], f_in[1], gy + 1)};
+         float v10[2] = {ref_eval_1d(sp, n_in[0], f_in[0], gx + 2),
+                         ref_eval_1d(sp, n_in[1], f_in[1], gy + 1)};
+         float v01[2] = {ref_eval_1d(sp, n_in[0], f_in[0], gx + 1),
+                         ref_eval_1d(sp, n_in[1], f_in[1], gy + 2)};
+         float v11[2] = {ref_eval_1d(sp, n_in[0], f_in[0], gx + 2),
+                         ref_eval_1d(sp, n_in[1], f_in[1], gy + 2)};
+         uint32_t gx2p1 = 2u * gx + 1u, gy2p1 = 2u * gy + 1u;
+         bool diag = (gx2p1 < qu && gy2p1 < qv) || (qu < gx2p1 && qv < gy2p1) ||
+                     (gx2p1 == qu && gy2p1 != qv);
+         for (unsigned tri = 0; tri < 2; ++tri) {
+            const float *a = diag ? v00 : v01;
+            const float *bv = tri ? (diag ? v11 : v10) : (diag ? v10 : v00);
+            const float *cv = tri ? (diag ? v01 : v11) : (diag ? v11 : v10);
+            memcpy(out_tris[cnt][0], a, 8);
+            memcpy(out_tris[cnt][1], ccw ? cv : bv, 8);
+            memcpy(out_tris[cnt][2], ccw ? bv : cv, 8);
+            cnt++;
+         }
+      }
+   }
+   *out_total_cnt = cnt;
+}
+
+static void
+fused_tess_hightess_chunker_suite(void)
+{
+   struct hk_tess_fused_options base_opts = {
+      .max_payload_bytes = 1024,
+   };
+   base_opts.vertex.buffer_descriptor_ubo = HK_APPLE9_VERTEX_BUFFERS_BINDING;
+   base_opts.vertex.draw_params_ubo = HK_APPLE9_DRAW_PARAMS_BINDING;
+   base_opts.vertex.dynamic_stride = true;
+   base_opts.vertex.format[0] = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   base_opts.vertex.stride[0] = 16;
+
+   /* 1. Exact child WG dispatch counts for tess = 4, 6, 8, 16, 32, 64
+    *    (Triangles & Quads) across V=24/P=20 (extra_vars=3) and V=16/P=18
+    *    (extra_vars=10). */
+   {
+      struct wg_expect {
+         float tess;
+         uint32_t tri_v24, tri_v16, quad_v24, quad_v16;
+      };
+      static const struct wg_expect expects[] = {
+         {4.0f,  2,   2,   3,   3},
+         {6.0f,  3,   5,   4,   6},
+         {8.0f,  5,   8,   7,   10},
+         {16.0f, 20,  30,  26,  42},
+         {32.0f, 77,  119, 103, 168},
+         {64.0f, 308, 473, 411, 677},
+      };
+      for (unsigned i = 0; i < ARRAY_SIZE(expects); ++i) {
+         for (unsigned shape_i = 0; shape_i < 2; ++shape_i) {
+            unsigned ev = shape_i == 0 ? 3 : 10;
+            unsigned exp_v = shape_i == 0 ? 24 : 16;
+            unsigned exp_p = shape_i == 0 ? 20 : 18;
+            for (unsigned d = 0; d < 2; ++d) {
+               enum tess_primitive_mode dom =
+                  d == 0 ? TESS_PRIMITIVE_TRIANGLES : TESS_PRIMITIVE_QUADS;
+               unsigned cp = d == 0 ? 3 : 4;
+               nir_shader *vs = make_fused_vs(0, false);
+               nir_shader *tcs = make_fused_tcs(
+                  cp, 0, expects[i].tess, expects[i].tess, false, false, false,
+                  TESS_SPACING_EQUAL, false, false);
+               nir_shader *tes = make_fused_tes(
+                  dom, TESS_SPACING_EQUAL, false, false, cp, ev, 0, 0, false,
+                  false);
+               struct hk_tess_fused_info info = {0};
+               nir_shader *obj = NULL, *mesh = NULL;
+               CHECK(hk_nir_tess_fused_lower(vs, tcs, tes, &base_opts, &obj,
+                                             &mesh, &info, NULL));
+               CHECK(info.mesh_max_vertices == exp_v &&
+                     info.mesh_max_primitives == exp_p);
+               uint32_t want_wgs =
+                  d == 0 ? (shape_i == 0 ? expects[i].tri_v24 : expects[i].tri_v16)
+                         : (shape_i == 0 ? expects[i].quad_v24 : expects[i].quad_v16);
+               CHECK(info.max_child_wgs_per_patch == want_wgs);
+               /* Also verify real OBJECT NIR launch_grid[0] matches! */
+               uint8_t pay[1024] = {0};
+               struct hk_apple9_fused_tess_params params = {
+                  .input_patch_size = cp,
+                  .patches_per_instance = 1,
+                  .groups_x = 1,
+               };
+               struct nir_wg_exec oex = {
+                  .payload = pay, .payload_size = sizeof(pay), .params = &params,
+               };
+               run_nir_wg(obj, &oex);
+               CHECK(oex.launch_grid[0] == want_wgs);
+               ralloc_free(obj);
+               ralloc_free(mesh);
+               ralloc_free(vs);
+               ralloc_free(tcs);
+               ralloc_free(tes);
+            }
+         }
+      }
+   }
+
+   /* 2. End-to-end host NIR execution of REAL generated OBJECT + MESH shaders
+    *    verifying 100% bit-exact vertex/triangle/winding/order parity vs
+    *    tessellator.h across Equal / FracOdd / FracEven, CW / CCW, asymmetric
+    *    inner/outer mismatches, and all 4 meshlet shapes! */
+   {
+      nir_builder vb = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "ht_vs");
+      vb.shader->info.io_lowered = true;
+      nir_store_output(&vb, nir_imm_vec4(&vb, 0, 0, 0, 1), nir_imm_int(&vb, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_shader_gather_info(vb.shader, nir_shader_get_entrypoint(vb.shader));
+
+      /* TCS reading 6 floats [o0,o1,o2,o3,i0,i1] from UBO 0 for patch 0. */
+      nir_builder cb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "ht_ubo_tcs");
+      cb.shader->info.io_lowered = true;
+      cb.shader->info.tess.tcs_vertices_out = 3;
+      nir_def *inv = nir_load_invocation_id(&cb);
+      nir_def *p = nir_load_per_vertex_input(
+         &cb, 4, 32, inv, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &cb, p, inv, nir_imm_int(&cb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_push_if(&cb, nir_ieq_imm(&cb, inv, 0));
+      nir_def *o0 = nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0), nir_imm_int(&cb, 0), .align_mul = 4, .range = 32);
+      nir_def *o1 = nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0), nir_imm_int(&cb, 4), .align_mul = 4, .range = 32);
+      nir_def *o2 = nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0), nir_imm_int(&cb, 8), .align_mul = 4, .range = 32);
+      nir_def *o3 = nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0), nir_imm_int(&cb, 12), .align_mul = 4, .range = 32);
+      nir_def *i0 = nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0), nir_imm_int(&cb, 16), .align_mul = 4, .range = 32);
+      nir_def *i1 = nir_load_ubo(&cb, 1, 32, nir_imm_int(&cb, 0), nir_imm_int(&cb, 20), .align_mul = 4, .range = 32);
+      nir_store_output(&cb, nir_vec4(&cb, o0, o1, o2, o3), nir_imm_int(&cb, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+      nir_store_output(&cb, nir_vec2(&cb, i0, i1), nir_imm_int(&cb, 0),
+                       .write_mask = 0x3, .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+      nir_pop_if(&cb, NULL);
+      nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+
+      const enum gl_tess_spacing sps[3] = {
+         TESS_SPACING_EQUAL, TESS_SPACING_FRACTIONAL_ODD,
+         TESS_SPACING_FRACTIONAL_EVEN,
+      };
+      static const float tri_cases[][6] = {
+         {4, 4, 4, 4, 4, 4},
+         {5, 5, 5, 5, 5, 5},
+         {8, 8, 8, 8, 8, 8},
+         {9, 9, 9, 9, 9, 9},
+         {16, 16, 16, 16, 16, 16},
+         {17, 17, 17, 17, 17, 17},
+         {31, 1, 1, 1, 2, 2}, /* exact StitchTransition provoking-vertex check */
+         {1, 1, 64, 1, 4, 4},
+         {64, 1, 1, 1, 3, 3},
+         {2.25f, 3.75f, 5.1f, 1.0f, 6.9f, 6.9f},
+         {32, 32, 32, 32, 32, 32},
+      };
+      static const float quad_cases[][6] = {
+         {1, 1, 1, 1, 1, 1}, /* all-ones ordered diagonal & provoking-vertex check */
+         {4, 4, 4, 4, 4, 4},
+         {4, 4, 4, 4, 7, 4}, /* 5x2 interior: cross-shape Rule 1 invariance check */
+         {6, 6, 6, 6, 6, 6},
+         {8, 8, 8, 8, 8, 8},
+         {10, 10, 10, 10, 12, 3},
+         {10, 10, 10, 10, 3, 12},
+         {64, 1, 3, 17, 2, 2},
+         {20, 1, 20, 1, 2, 10},
+         {1, 20, 1, 20, 10, 2},
+         {2.25f, 3.75f, 5.1f, 6.9f, 3.3f, 5.8f},
+         {16, 16, 16, 16, 16, 16},
+      };
+      const unsigned extra_vars_shapes[4] = {0, 3, 10, 18}; /* V32/P42, V24/P20, V16/P18, V8/P6 */
+
+      float (*ref_tris)[3][2] = calloc(8192, sizeof(*ref_tris));
+      CHECK(ref_tris != NULL);
+      unsigned checked_tri_cases = 0, checked_quad_cases = 0;
+
+      for (unsigned si = 0; si < 3; ++si) {
+         for (unsigned ccw = 0; ccw < 2; ++ccw) {
+            for (unsigned shi = 0; shi < 4; ++shi) {
+               /* Run all 4 shapes for equal/CW, and V24/P20 + V16/P18 for all spacing/winding combos. */
+               if ((si != 0 || ccw != 0) && (shi != 1 && shi != 2))
+                  continue;
+               /* Triangles bit-exact parity vs tessellator.h */
+               nir_shader *tes_tri = make_fused_tes(
+                  TESS_PRIMITIVE_TRIANGLES, sps[si], ccw, false, 3,
+                  extra_vars_shapes[shi], 0, 0, false, false);
+               nir_shader *obj = NULL, *mesh = NULL;
+               struct hk_tess_fused_info info = {0};
+               CHECK(hk_nir_tess_fused_lower(vb.shader, cb.shader, tes_tri,
+                                             &base_opts, &obj, &mesh, &info, NULL));
+               for (unsigned ci = 0; ci < ARRAY_SIZE(tri_cases); ++ci) {
+                  /* Skip 32x32 on V8/P6 (308 WGs) to keep host interpreter fast; test up to 17x17 there. */
+                  if (shi == 3 && tri_cases[ci][0] >= 32.0f)
+                     continue;
+                  uint32_t ubo[6];
+                  for (unsigned k = 0; k < 6; ++k)
+                     ubo[k] = f32_to_u32(tri_cases[ci][k]);
+                  uint32_t ref_cnt = 0;
+                  ref_gen_tri_prims(sps[si], ccw, tri_cases[ci], tri_cases[ci][4],
+                                    ref_tris, &ref_cnt);
+                  struct hk_apple9_fused_tess_params params = {
+                     .input_patch_size = 3, .patches_per_instance = 1,
+                     .groups_x = 1, .flip_winding = ccw,
+                  };
+                  uint8_t pay[1024] = {0};
+                  struct nir_wg_exec oex = {
+                     .payload = pay, .payload_size = sizeof(pay),
+                     .params = &params, .ubo0 = ubo, .ubo0_words = 6,
+                  };
+                  run_nir_wg(obj, &oex);
+                  CHECK(oex.launch_grid[0] > 0);
+                  uint32_t got_cnt = 0;
+                  for (uint32_t cwg = 0; cwg < oex.launch_grid[0]; ++cwg) {
+                     struct nir_wg_exec mex = {
+                        .payload = pay, .payload_size = sizeof(pay),
+                        .params = &params, .ubo0 = ubo, .ubo0_words = 6,
+                        .wg_id = {cwg, 0, 0},
+                     };
+                     run_nir_wg(mesh, &mex);
+                     CHECK(mex.out_v_cnt > 0 && mex.out_v_cnt <= info.mesh_max_vertices);
+                     CHECK(mex.out_p_cnt > 0 && mex.out_p_cnt <= info.mesh_max_primitives);
+                     uint32_t used_mask = 0;
+                     for (uint32_t pr = 0; pr < mex.out_p_cnt; ++pr) {
+                        uint32_t i0 = mex.out_indices[pr][0];
+                        uint32_t i1 = mex.out_indices[pr][1];
+                        uint32_t i2 = mex.out_indices[pr][2];
+                        CHECK(i0 < mex.out_v_cnt && i1 < mex.out_v_cnt && i2 < mex.out_v_cnt);
+                        CHECK(!(i0 == 0 && i1 == 0 && i2 == 0));
+                        used_mask |= (1u << i0) | (1u << i1) | (1u << i2);
+                        CHECK(got_cnt < ref_cnt);
+                        float got[3][2] = {
+                           {mex.out_pos[i0][0], mex.out_pos[i0][1]},
+                           {mex.out_pos[i1][0], mex.out_pos[i1][1]},
+                           {mex.out_pos[i2][0], mex.out_pos[i2][1]},
+                        };
+                        CHECK(memcmp(got, ref_tris[got_cnt], sizeof(got)) == 0);
+                        got_cnt++;
+                     }
+                     CHECK(used_mask == ((1ull << mex.out_v_cnt) - 1ull));
+                  }
+                  CHECK(got_cnt == ref_cnt);
+                  checked_tri_cases++;
+               }
+               ralloc_free(obj);
+               ralloc_free(mesh);
+               ralloc_free(tes_tri);
+
+               /* Quads outer-ring exact order + full area/winding + zero-unused-vertex check */
+               nir_shader *tes_q = make_fused_tes(
+                  TESS_PRIMITIVE_QUADS, sps[si], ccw, false, 3,
+                  extra_vars_shapes[shi], 0, 0, false, false);
+               obj = NULL;
+               mesh = NULL;
+               memset(&info, 0, sizeof(info));
+               CHECK(hk_nir_tess_fused_lower(vb.shader, cb.shader, tes_q,
+                                             &base_opts, &obj, &mesh, &info, NULL));
+               for (unsigned ci = 0; ci < ARRAY_SIZE(quad_cases); ++ci) {
+                  if (shi == 3 && quad_cases[ci][0] >= 16.0f)
+                     continue;
+                  uint32_t ubo[6];
+                  for (unsigned k = 0; k < 6; ++k)
+                     ubo[k] = f32_to_u32(quad_cases[ci][k]);
+                  uint32_t ref_tot = 0;
+                  ref_gen_quad_prims(sps[si], ccw, quad_cases[ci],
+                                     &quad_cases[ci][4], ref_tris, &ref_tot);
+                  struct hk_apple9_fused_tess_params params = {
+                     .input_patch_size = 3, .patches_per_instance = 1,
+                     .groups_x = 1, .flip_winding = ccw,
+                  };
+                  uint8_t pay[1024] = {0};
+                  struct nir_wg_exec oex = {
+                     .payload = pay, .payload_size = sizeof(pay),
+                     .params = &params, .ubo0 = ubo, .ubo0_words = 6,
+                  };
+                  run_nir_wg(obj, &oex);
+                  CHECK(oex.launch_grid[0] > 0);
+                  uint32_t got_cnt = 0;
+                  double area = 0.0;
+                  for (uint32_t cwg = 0; cwg < oex.launch_grid[0]; ++cwg) {
+                     struct nir_wg_exec mex = {
+                        .payload = pay, .payload_size = sizeof(pay),
+                        .params = &params, .ubo0 = ubo, .ubo0_words = 6,
+                        .wg_id = {cwg, 0, 0},
+                     };
+                     run_nir_wg(mesh, &mex);
+                     CHECK(mex.out_v_cnt > 0 && mex.out_v_cnt <= info.mesh_max_vertices);
+                     CHECK(mex.out_p_cnt > 0 && mex.out_p_cnt <= info.mesh_max_primitives);
+                     uint32_t used_mask = 0;
+                     for (uint32_t pr = 0; pr < mex.out_p_cnt; ++pr) {
+                        uint32_t i0 = mex.out_indices[pr][0];
+                        uint32_t i1 = mex.out_indices[pr][1];
+                        uint32_t i2 = mex.out_indices[pr][2];
+                        CHECK(i0 < mex.out_v_cnt && i1 < mex.out_v_cnt && i2 < mex.out_v_cnt);
+                        CHECK(!(i0 == 0 && i1 == 0 && i2 == 0));
+                        used_mask |= (1u << i0) | (1u << i1) | (1u << i2);
+                        CHECK(got_cnt < ref_tot);
+                        float got[3][2] = {
+                           {mex.out_pos[i0][0], mex.out_pos[i0][1]},
+                           {mex.out_pos[i1][0], mex.out_pos[i1][1]},
+                           {mex.out_pos[i2][0], mex.out_pos[i2][1]},
+                        };
+                        /* Full ordered bit-exact check across outer AND interior
+                         * primitives (proves cross-shape Vulkan Rule 1 invariance!). */
+                        CHECK(memcmp(got, ref_tris[got_cnt], sizeof(got)) == 0);
+                        double cr =
+                           ((double)got[1][0] - got[0][0]) *
+                              ((double)got[2][1] - got[0][1]) -
+                           ((double)got[1][1] - got[0][1]) *
+                              ((double)got[2][0] - got[0][0]);
+                        double signed_cr = ccw ? -cr : cr;
+                        CHECK(signed_cr >= -1e-6);
+                        area += 0.5 * signed_cr;
+                        got_cnt++;
+                     }
+                     CHECK(used_mask == ((1ull << mex.out_v_cnt) - 1ull));
+                  }
+                  CHECK(got_cnt == ref_tot);
+                  CHECK(fabs(area - 1.0) < 1e-4);
+                  checked_quad_cases++;
+               }
+               ralloc_free(obj);
+               ralloc_free(mesh);
+               ralloc_free(tes_q);
+            }
+         }
+      }
+
+      /* 3. 16-patch mixed_lod (culled + tess=1,2,4,8,16 in ONE K=16 OBJECT WG)
+       *    K=16 vs K=1 bit-exact PrimitiveID + vertex + order parity (Tri & Quad). */
+      static const float mix_lvls[16] = {
+         0.0f, 1.0f, 2.0f, 4.0f, 0.0f, 8.0f, 1.0f, 1.0f,
+         2.0f, 0.0f, 16.0f, 4.0f, 2.0f, 0.0f, 1.0f, 8.0f,
+      };
+      uint32_t ubo_mix[16];
+      for (unsigned k = 0; k < 16; ++k)
+         ubo_mix[k] = f32_to_u32(mix_lvls[k]);
+
+      nir_builder mcb = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "ht_mix16_tcs");
+      mcb.shader->info.io_lowered = true;
+      mcb.shader->info.tess.tcs_vertices_out = 3;
+      nir_def *minv = nir_load_invocation_id(&mcb);
+      nir_def *mp = nir_load_per_vertex_input(
+         &mcb, 4, 32, minv, nir_imm_int(&mcb, 0), .dest_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &mcb, mp, minv, nir_imm_int(&mcb, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_push_if(&mcb, nir_ieq_imm(&mcb, minv, 0));
+      nir_def *mpid = nir_load_primitive_id(&mcb);
+      nir_def *mlvl = nir_load_ubo(&mcb, 1, 32, nir_imm_int(&mcb, 0),
+                                   nir_ishl_imm(&mcb, mpid, 2), .align_mul = 4, .range = 64);
+      nir_store_output(&mcb, nir_vec4(&mcb, mlvl, mlvl, mlvl, mlvl), nir_imm_int(&mcb, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+      nir_store_output(&mcb, nir_vec2(&mcb, mlvl, mlvl), nir_imm_int(&mcb, 0),
+                       .write_mask = 0x3, .src_type = nir_type_float32,
+                       .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+      nir_pop_if(&mcb, NULL);
+      nir_shader_gather_info(mcb.shader, nir_shader_get_entrypoint(mcb.shader));
+
+      uint32_t *mp_pids = calloc(2048, sizeof(uint32_t));
+      uint32_t *k1_pids = calloc(2048, sizeof(uint32_t));
+      float (*mp_vpos)[3][2] = calloc(2048, sizeof(*mp_vpos));
+      float (*k1_vpos)[3][2] = calloc(2048, sizeof(*k1_vpos));
+      CHECK(mp_pids && k1_pids && mp_vpos && k1_vpos);
+
+      for (unsigned d = 0; d < 2; ++d) {
+         enum tess_primitive_mode dom =
+            d == 0 ? TESS_PRIMITIVE_TRIANGLES : TESS_PRIMITIVE_QUADS;
+         nir_shader *tes = make_fused_tes(dom, TESS_SPACING_EQUAL, false, false,
+                                          3, 3, 0, 0, false, false);
+         struct hk_tess_fused_options opts_mp = base_opts;
+         opts_mp.fs_reads_primitive_id = true;
+         struct hk_tess_fused_options opts_k1 = opts_mp;
+         opts_k1.disable_multipatch = true;
+
+         nir_shader *obj_mp = NULL, *mesh_mp = NULL, *obj_k1 = NULL, *mesh_k1 = NULL;
+         struct hk_tess_fused_info info_mp = {0}, info_k1 = {0};
+         CHECK(hk_nir_tess_fused_lower(vb.shader, mcb.shader, tes, &opts_mp,
+                                       &obj_mp, &mesh_mp, &info_mp, NULL));
+         CHECK(hk_nir_tess_fused_lower(vb.shader, mcb.shader, tes, &opts_k1,
+                                       &obj_k1, &mesh_k1, &info_k1, NULL));
+         CHECK(info_mp.multipatch_tier == 2 && info_mp.patches_per_group == 16);
+
+         struct hk_apple9_fused_tess_params params = {
+            .input_patch_size = 3, .patches_per_instance = 16, .groups_x = 16,
+         };
+         uint8_t pay_mp[1024] = {0};
+         struct nir_wg_exec oex_mp = {
+            .payload = pay_mp, .payload_size = sizeof(pay_mp),
+            .params = &params, .ubo0 = ubo_mix, .ubo0_words = 16,
+         };
+         run_nir_wg(obj_mp, &oex_mp);
+         uint32_t mp_prims = 0;
+         for (uint32_t cwg = 0; cwg < oex_mp.launch_grid[0]; ++cwg) {
+            struct nir_wg_exec mex = {
+               .payload = pay_mp, .payload_size = sizeof(pay_mp),
+               .params = &params, .ubo0 = ubo_mix, .ubo0_words = 16,
+               .wg_id = {cwg, 0, 0},
+            };
+            run_nir_wg(mesh_mp, &mex);
+            for (uint32_t pr = 0; pr < mex.out_p_cnt; ++pr) {
+               CHECK(mp_prims < 2048);
+               uint32_t i0 = mex.out_indices[pr][0];
+               uint32_t i1 = mex.out_indices[pr][1];
+               uint32_t i2 = mex.out_indices[pr][2];
+               CHECK(i0 < mex.out_v_cnt && i1 < mex.out_v_cnt && i2 < mex.out_v_cnt);
+               CHECK(mex.out_pid[i0] == mex.out_pid[i1] &&
+                     mex.out_pid[i0] == mex.out_pid[i2]);
+               mp_pids[mp_prims] = mex.out_pid[i0];
+               mp_vpos[mp_prims][0][0] = mex.out_pos[i0][0];
+               mp_vpos[mp_prims][0][1] = mex.out_pos[i0][1];
+               mp_vpos[mp_prims][1][0] = mex.out_pos[i1][0];
+               mp_vpos[mp_prims][1][1] = mex.out_pos[i1][1];
+               mp_vpos[mp_prims][2][0] = mex.out_pos[i2][0];
+               mp_vpos[mp_prims][2][1] = mex.out_pos[i2][1];
+               mp_prims++;
+            }
+         }
+
+         static const uint32_t exp_patch_prims[2][16] = {
+            /* Tri: 0, 1, 6, 24, 0, 96, 1, 1, 6, 0, 384, 24, 6, 0, 1, 96 => 646 */
+            {0, 1, 6, 24, 0, 96, 1, 1, 6, 0, 384, 24, 6, 0, 1, 96},
+            /* Quad: 0, 2, 8, 32, 0, 128, 2, 2, 8, 0, 512, 32, 8, 0, 2, 128 => 864 */
+            {0, 2, 8, 32, 0, 128, 2, 2, 8, 0, 512, 32, 8, 0, 2, 128},
+         };
+         uint32_t k1_prims = 0;
+         for (uint32_t p_i = 0; p_i < 16; ++p_i) {
+            uint8_t pay_k1[1024] = {0};
+            struct nir_wg_exec oex_k1 = {
+               .payload = pay_k1, .payload_size = sizeof(pay_k1),
+               .params = &params, .ubo0 = ubo_mix, .ubo0_words = 16,
+               .wg_id = {p_i, 0, 0},
+            };
+            run_nir_wg(obj_k1, &oex_k1);
+            uint32_t patch_prims = 0;
+            for (uint32_t cwg = 0; cwg < oex_k1.launch_grid[0]; ++cwg) {
+               struct nir_wg_exec mex = {
+                  .payload = pay_k1, .payload_size = sizeof(pay_k1),
+                  .params = &params, .ubo0 = ubo_mix, .ubo0_words = 16,
+                  .wg_id = {cwg, 0, 0},
+               };
+               run_nir_wg(mesh_k1, &mex);
+               for (uint32_t pr = 0; pr < mex.out_p_cnt; ++pr) {
+                  CHECK(k1_prims < 2048);
+                  uint32_t i0 = mex.out_indices[pr][0];
+                  uint32_t i1 = mex.out_indices[pr][1];
+                  uint32_t i2 = mex.out_indices[pr][2];
+                  CHECK(i0 < mex.out_v_cnt && i1 < mex.out_v_cnt && i2 < mex.out_v_cnt);
+                  CHECK(mex.out_pid[i0] == p_i && mex.out_pid[i1] == p_i &&
+                        mex.out_pid[i2] == p_i);
+                  k1_pids[k1_prims] = mex.out_pid[i0];
+                  k1_vpos[k1_prims][0][0] = mex.out_pos[i0][0];
+                  k1_vpos[k1_prims][0][1] = mex.out_pos[i0][1];
+                  k1_vpos[k1_prims][1][0] = mex.out_pos[i1][0];
+                  k1_vpos[k1_prims][1][1] = mex.out_pos[i1][1];
+                  k1_vpos[k1_prims][2][0] = mex.out_pos[i2][0];
+                  k1_vpos[k1_prims][2][1] = mex.out_pos[i2][1];
+                  k1_prims++;
+                  patch_prims++;
+               }
+            }
+            CHECK(patch_prims == exp_patch_prims[d][p_i]);
+         }
+         CHECK(mp_prims == k1_prims && mp_prims == (d == 0 ? 646u : 864u));
+         for (uint32_t pr = 0; pr < mp_prims; ++pr) {
+            CHECK(mp_pids[pr] == k1_pids[pr]);
+            CHECK(memcmp(mp_vpos[pr], k1_vpos[pr], sizeof(mp_vpos[pr])) == 0);
+         }
+         ralloc_free(obj_mp);
+         ralloc_free(mesh_mp);
+         ralloc_free(obj_k1);
+         ralloc_free(mesh_k1);
+         ralloc_free(tes);
+      }
+
+      free(mp_pids);
+      free(k1_pids);
+      free(mp_vpos);
+      free(k1_vpos);
+      free(ref_tris);
+      ralloc_free(mcb.shader);
+      ralloc_free(cb.shader);
+      ralloc_free(vb.shader);
+      printf("fused tessellation high-tess chunker suite: WG reductions (tess 4..64) + %u Tri / %u Quad bit-exact NIR exec cases + 16-patch mixed_lod K=16 vs K=1 passed\n",
+             checked_tri_cases, checked_quad_cases);
+   }
+}
+
 int
 main(void)
 {
@@ -5209,6 +5986,7 @@ main(void)
    fused_tess_topology_suite();
    fused_tess_astra_regression_suite();
    fused_tess_multipatch_suite();
+   fused_tess_hightess_chunker_suite();
    /* Consuming entrypoint lowers in place without a second clone and frees on reject. */
    {
       nir_shader *owned = source(false, false, false);
