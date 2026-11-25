@@ -120,7 +120,12 @@ struct hk_apple9_fused_tess_params {
    uint32_t first_instance_offset;
    /* Non-zero if emitted triangle winding must be flipped (ccw ^ lower_left). */
    uint32_t flip_winding;
-   uint32_t _pad;
+   /* Bitmask of active mesh pipeline stats (bit0=TES, bit1=CLIP_INV, bit2=CLIP_PRIM). */
+   uint32_t stat_mask;
+   /* Active pipeline statistics counter addresses (loaded only when stat_mask != 0). */
+   uint64_t stat_tes_invocations;
+   uint64_t stat_clip_invocations;
+   uint64_t stat_clip_primitives;
 };
 
 /* Explicit research selection, e.g. T16V3P2,T32V32P42, after qualification.

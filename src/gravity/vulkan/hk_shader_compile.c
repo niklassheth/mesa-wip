@@ -1981,6 +1981,7 @@ hk_apple9_native_tess_fused_check(struct hk_device *dev,
       .fs_reads_clip_distance = key->fs_reads_clip_distance,
       .fs_reads_primitive_id = key->fs_reads_primitive_id || !has_fs_mask,
       .has_fs_inputs_mask = has_fs_mask,
+      .enable_pipeline_stats = dev->vk.enabled_features.pipelineStatisticsQuery,
    };
    struct hk_apple9_graphics_key stage_key = *key;
    if (has_fs_mask && fs_source && !key->vertex.use_prolog && !key->is_library) {
@@ -3197,6 +3198,8 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                      .fs_reads_primitive_id =
                         key.fs_reads_primitive_id || !has_fs_var_read_mask,
                      .has_fs_inputs_mask = has_fs_var_read_mask,
+                     .enable_pipeline_stats =
+                        dev->vk.enabled_features.pipelineStatisticsQuery,
                   };
                   if (has_fs_var_read_mask)
                      memcpy(tess_opts.fs_var_read_mask, fs_var_read_mask,
@@ -3255,6 +3258,8 @@ hk_apple9_compile_graphics_path(struct hk_device *dev, uint32_t count,
                   main->info.apple9_tess_fused = true;
                   main->info.apple9_tess_const_levels =
                      fused_info.constant_tess_levels;
+                  main->info.apple9_tess_pipeline_stats =
+                     tess_opts.enable_pipeline_stats;
                   main->info.apple9_tess_patches_per_group =
                      fused_info.patches_per_group;
                   main->info.apple9_tess_max_input_pcp =

@@ -1676,7 +1676,8 @@ hk_apple9_native_gs_state_eligible(struct hk_cmd_buffer *cmd,
 
 static bool
 hk_apple9_native_tess_common_state_eligible(struct hk_cmd_buffer *cmd,
-                                            struct agx_draw draw)
+                                            struct agx_draw draw,
+                                            bool allow_pipeline_stats)
 {
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
    const struct vk_dynamic_graphics_state *dyn =
@@ -1698,7 +1699,8 @@ hk_apple9_native_tess_common_state_eligible(struct hk_cmd_buffer *cmd,
        !hk_apple9_native_layers_samples_eligible(
           gfx, dyn, hk_apple9_native_tess_enabled()) ||
        hk_cond_render_applies(cmd) ||
-       gfx->descriptors.root.draw.pipeline_stats_flags ||
+       (!allow_pipeline_stats &&
+        gfx->descriptors.root.draw.pipeline_stats_flags) ||
        gfx->occlusion.active_count || gfx->mesh_pg_query || gfx->xfb_enabled ||
        dyn->rs.rasterization_stream || dyn->rs.rasterizer_discard_enable ||
        dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL ||
@@ -1721,7 +1723,7 @@ hk_apple9_native_tess_state_eligible(struct hk_cmd_buffer *cmd,
 {
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
-   return hk_apple9_native_tess_common_state_eligible(cmd, draw) &&
+   return hk_apple9_native_tess_common_state_eligible(cmd, draw, false) &&
           !draw.indexed && !draw.start && !draw.start_instance &&
           draw.b.count[0] == dyn->ts.patch_control_points &&
           draw.b.count[1] == 1;
@@ -1872,7 +1874,8 @@ hk_apple9_use_native_tess(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    if (main->info.apple9_tess_fused) {
       if (!hk_apple9_native_tess_enabled() ||
           !hk_apple9_native_object_available_device(dev) ||
-          !hk_apple9_native_tess_common_state_eligible(cmd, draw) ||
+          !hk_apple9_native_tess_common_state_eligible(
+             cmd, draw, main->info.apple9_tess_pipeline_stats) ||
           main->info.apple9_tess_payload_B >
              AGX_NATIVE_OBJECT_MP_PAYLOAD_BYTES ||
           object->b.info.workgroup_size[0] >
@@ -2011,6 +2014,51 @@ hk_apple9_launch_native_tess_fused(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    const uint64_t est_patch_prims = max_patch_prims;
    const uint64_t est_child_wgs = max_child_wgs;
 
+   uint32_t stat_mask = 0;
+   uint64_t stat_tes_inv = 0, stat_clip_inv = 0, stat_clip_prims = 0;
+   if (desc->root.draw.pipeline_stats_flags) {
+      uint64_t ia_verts = hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT);
+      uint64_t ia_prims = hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT);
+      uint64_t vs_inv = hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT);
+      if (hk_stat_enabled(ia_verts) || hk_stat_enabled(ia_prims) ||
+          hk_stat_enabled(vs_inv)) {
+         hk_ia_update(cmd, draw, ia_verts, ia_prims, vs_inv, 0, 0);
+      }
+      uint64_t tcs_patches = hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_TESSELLATION_CONTROL_SHADER_PATCHES_BIT);
+      if (hk_stat_enabled(tcs_patches)) {
+         /* Matches hk_ia_update / libagx_add_u32s 32-bit query counter width. */
+         uint32_t total_patches = patches * instances;
+         if (total_patches) {
+            struct libagx_imm_write add = {.address = tcs_patches,
+                                           .value = total_patches};
+            util_dynarray_append(&cmd->query_adds, add);
+         }
+      }
+      uint64_t a_tes = hk_pipeline_stat_addr(
+         cmd,
+         VK_QUERY_PIPELINE_STATISTIC_TESSELLATION_EVALUATION_SHADER_INVOCATIONS_BIT);
+      uint64_t a_cinv = hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT);
+      uint64_t a_cprim = hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT);
+      if (hk_stat_enabled(a_tes)) {
+         stat_tes_inv = a_tes;
+         stat_mask |= 1u;
+      }
+      if (hk_stat_enabled(a_cinv)) {
+         stat_clip_inv = a_cinv;
+         stat_mask |= 2u;
+      }
+      if (hk_stat_enabled(a_cprim)) {
+         stat_clip_prims = a_cprim;
+         stat_mask |= 4u;
+      }
+   }
+
    for (uint64_t first_inst = 0; first_inst < instances;) {
       const uint32_t chunk_insts =
          (uint32_t)MIN2((uint64_t)plan.inst_chunk_cap, instances - first_inst);
@@ -2053,6 +2101,10 @@ hk_apple9_launch_native_tess_fused(struct hk_cmd_buffer *cmd, uint32_t draw_id,
             .groups_x = obj_groups[0],
             .first_instance_offset = (uint32_t)first_inst,
             .flip_winding = flip_winding,
+            .stat_mask = stat_mask,
+            .stat_tes_invocations = stat_tes_inv,
+            .stat_clip_invocations = stat_clip_inv,
+            .stat_clip_primitives = stat_clip_prims,
          };
          uint64_t tp_gpu = hk_pool_upload(cmd, &tp, sizeof(tp), 8);
          if (!tp_gpu)
@@ -2567,12 +2619,20 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
                                    ? MESA_SHADER_GEOMETRY
                                    : MESA_SHADER_TESS_EVAL;
    const struct hk_api_shader *source = gfx->shaders[producer];
+   struct hk_api_shader *tes_native =
+      producer == MESA_SHADER_TESS_EVAL
+         ? hk_api_shader_native(gfx->shaders[MESA_SHADER_TESS_EVAL])
+         : NULL;
+   const bool tess_allow_stats =
+      tes_native &&
+      hk_native_producer_main(tes_native)->info.apple9_tess_pipeline_stats;
    bool prefer_native =
       source && !source->is_passthrough &&
       p_atomic_read(&source->apple9_native_candidate) &&
       (producer == MESA_SHADER_GEOMETRY
           ? hk_apple9_native_gs_common_state_eligible(cmd, draw_)
-          : hk_apple9_native_tess_common_state_eligible(cmd, draw_));
+          : hk_apple9_native_tess_common_state_eligible(
+               cmd, draw_, tess_allow_stats));
    if (producer == MESA_SHADER_GEOMETRY && source &&
        debug_get_option_gs_route_log()) {
       fprintf(stderr, "HK_GS_SELECT candidate=%u prefer=%u state=%u leaf=%u vs_leaf=%u vs_writes=%u\n",

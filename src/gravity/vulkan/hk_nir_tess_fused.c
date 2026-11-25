@@ -5797,12 +5797,46 @@ emit_tri_multi_wg(nir_builder *b, enum gl_tess_spacing spacing,
    }
 }
 
+static void
+emit_mesh_pipeline_stats(nir_builder *b, nir_def *v_live, nir_def *p_live)
+{
+   nir_def *tp = nir_load_tess_param_buffer_poly(b);
+   nir_def *mask = hk_nir_fused_param_u32(
+      b, tp, offsetof(struct hk_apple9_fused_tess_params, stat_mask));
+   nir_if *if_any = nir_push_if(b, nir_ine_imm(b, mask, 0));
+   if_any->control = nir_selection_control_dont_flatten;
+   {
+      nir_if *if_tes = nir_push_if(
+         b, nir_iand(b, nir_test_mask(b, mask, 1u), nir_ine_imm(b, v_live, 0)));
+      nir_def *a_tes = hk_nir_fused_param_u64(
+         b, tp, offsetof(struct hk_apple9_fused_tess_params, stat_tes_invocations));
+      nir_global_atomic(b, 32, a_tes, v_live, .atomic_op = nir_atomic_op_iadd);
+      nir_pop_if(b, if_tes);
+
+      nir_if *if_cinv = nir_push_if(
+         b, nir_iand(b, nir_test_mask(b, mask, 2u), nir_ine_imm(b, p_live, 0)));
+      nir_def *a_cinv = hk_nir_fused_param_u64(
+         b, tp, offsetof(struct hk_apple9_fused_tess_params, stat_clip_invocations));
+      nir_global_atomic(b, 32, a_cinv, p_live, .atomic_op = nir_atomic_op_iadd);
+      nir_pop_if(b, if_cinv);
+
+      nir_if *if_cprim = nir_push_if(
+         b, nir_iand(b, nir_test_mask(b, mask, 4u), nir_ine_imm(b, p_live, 0)));
+      nir_def *a_cprim = hk_nir_fused_param_u64(
+         b, tp, offsetof(struct hk_apple9_fused_tess_params, stat_clip_primitives));
+      nir_global_atomic(b, 32, a_cprim, p_live, .atomic_op = nir_atomic_op_iadd);
+      nir_pop_if(b, if_cprim);
+   }
+   nir_pop_if(b, if_any);
+}
+
 static nir_shader *
 build_mesh_shader(nir_shader *tes, enum tess_primitive_mode domain,
                   enum gl_tess_spacing spacing,
                   const struct tess_payload_layout *pl,
                   const struct tess_meshlet_shape *shape, unsigned clip_size,
-                  unsigned cull_size, bool export_primitive_id)
+                  unsigned cull_size, bool export_primitive_id,
+                  bool enable_pipeline_stats)
 {
    NIR_PASS(_, tes, nir_lower_returns);
    NIR_PASS(_, tes, nir_lower_tess_coord_z, domain == TESS_PRIMITIVE_TRIANGLES);
@@ -6023,6 +6057,8 @@ build_mesh_shader(nir_shader *tes, enum tess_primitive_mode domain,
 
    nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
    nir_set_vertex_and_primitive_count(&b, v_live, p_live, nir_imm_int(&b, 0));
+   if (enable_pipeline_stats)
+      emit_mesh_pipeline_stats(&b, v_live, p_live);
    nir_pop_if(&b, NULL);
 
    /* ---- Single Shared TES Body Execution (Parallel Across V_live Lanes) ---- */
@@ -6111,7 +6147,7 @@ build_mesh_shader_mp(nir_shader *tes, nir_shader *vs_tes,
                      const struct tess_meshlet_shape *shape,
                      const struct tcs_passthrough_info *pt,
                      unsigned clip_size, unsigned cull_size,
-                     bool export_primitive_id)
+                     bool export_primitive_id, bool enable_pipeline_stats)
 {
    const bool tier2 = pl->mp_tier == 2;
    const bool tier2_has_vs = tier2 && pl->pv_stride_B > 0 && vs_tes && pt;
@@ -6536,6 +6572,8 @@ build_mesh_shader_mp(nir_shader *tes, nir_shader *vs_tes,
    nir_def *p_live = nir_load_var(&b, p_live_var);
    nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
    nir_set_vertex_and_primitive_count(&b, v_live, p_live, nir_imm_int(&b, 0));
+   if (enable_pipeline_stats)
+      emit_mesh_pipeline_stats(&b, v_live, p_live);
    nir_pop_if(&b, NULL);
 
    /* ---- Tier 2 ONLY: Cooperative Parallel VS Evaluation into MESH SHM ---- */
@@ -7425,9 +7463,11 @@ hk_nir_tess_fused_lower(const nir_shader *vs_source,
       selected_k >= 2
          ? build_mesh_shader_mp(tes, vs_tes, domain, spacing, &pl, &shape,
                                 selected_tier == 2 ? &pt_info : NULL,
-                                clip_size, cull_size, export_primitive_id)
+                                clip_size, cull_size, export_primitive_id,
+                                options->enable_pipeline_stats)
          : build_mesh_shader(tes, domain, spacing, &pl, &shape, clip_size,
-                             cull_size, export_primitive_id);
+                             cull_size, export_primitive_id,
+                             options->enable_pipeline_stats);
    ralloc_free(vs_tes);
    if (!mesh) {
       ralloc_free(obj);

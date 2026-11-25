@@ -3266,6 +3266,11 @@ hk_apple9_draw_impl(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       effects |= native_grid && mesh && mesh->writes_memory;
       effects |= native_object_groups && gfx->shaders[MESA_SHADER_TASK] &&
                  gfx->shaders[MESA_SHADER_TASK]->writes_memory;
+      effects |= native_object_groups && gfx->shaders[MESA_SHADER_TESS_EVAL] &&
+                 (gfx->descriptors.root.draw.pipeline_stats_flags &
+                  (VK_QUERY_PIPELINE_STATISTIC_TESSELLATION_EVALUATION_SHADER_INVOCATIONS_BIT |
+                   VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
+                   VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT));
       if (!effects)
          goto cleanup;
       bbox[0] = bbox[1] = bbox[2] = bbox[3] = 0;

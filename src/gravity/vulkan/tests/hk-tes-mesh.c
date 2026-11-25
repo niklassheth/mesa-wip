@@ -3824,6 +3824,20 @@ wg_exec_block(struct nir_wg_exec *ex, nir_block *blk, uint32_t active)
                if (active & (1u << l))
                   ex->ssa[l][intr->def.index].u[0] = (uintptr_t)ex->params;
             break;
+         case nir_intrinsic_global_atomic:
+            CHECK(nir_intrinsic_atomic_op(intr) == nir_atomic_op_iadd);
+            for (unsigned l = 0; l < 32; ++l) {
+               if (!(active & (1u << l)))
+                  continue;
+               uint64_t addr = wg_src_u(ex, l, intr->src[0], 0);
+               uint32_t add = (uint32_t)wg_src_u(ex, l, intr->src[1], 0);
+               uint32_t old = 0;
+               memcpy(&old, (const void *)(uintptr_t)addr, 4);
+               uint32_t next = old + add;
+               memcpy((void *)(uintptr_t)addr, &next, 4);
+               ex->ssa[l][intr->def.index].u[0] = old;
+            }
+            break;
          case nir_intrinsic_load_global:
          case nir_intrinsic_load_global_constant:
             for (unsigned l = 0; l < 32; ++l) {
@@ -5811,8 +5825,26 @@ fused_tess_hightess_chunker_suite(void)
                                           3, 3, 0, 0, false, false);
          struct hk_tess_fused_options opts_mp = base_opts;
          opts_mp.fs_reads_primitive_id = true;
+         opts_mp.enable_pipeline_stats = true;
          struct hk_tess_fused_options opts_k1 = opts_mp;
          opts_k1.disable_multipatch = true;
+
+         /* Verify unqueried devices omit pipeline statistics atomics entirely. */
+         {
+            nir_shader *o0 = NULL, *m0 = NULL;
+            struct hk_tess_fused_info i0 = {0};
+            CHECK(hk_nir_tess_fused_lower(vb.shader, mcb.shader, tes, &base_opts,
+                                          &o0, &m0, &i0, NULL));
+            nir_foreach_block(blk, nir_shader_get_entrypoint(m0)) {
+               nir_foreach_instr(ins, blk) {
+                  if (ins->type == nir_instr_type_intrinsic)
+                     CHECK(nir_instr_as_intrinsic(ins)->intrinsic !=
+                           nir_intrinsic_global_atomic);
+               }
+            }
+            ralloc_free(o0);
+            ralloc_free(m0);
+         }
 
          nir_shader *obj_mp = NULL, *mesh_mp = NULL, *obj_k1 = NULL, *mesh_k1 = NULL;
          struct hk_tess_fused_info info_mp = {0}, info_k1 = {0};
@@ -5822,8 +5854,14 @@ fused_tess_hightess_chunker_suite(void)
                                        &obj_k1, &mesh_k1, &info_k1, NULL));
          CHECK(info_mp.multipatch_tier == 2 && info_mp.patches_per_group == 16);
 
+         uint32_t mp_stat_tes = 0, mp_stat_cinv = 0, mp_stat_cprim = 0;
+         uint32_t k1_stat_tes = 0, k1_stat_cinv = 0, k1_stat_cprim = 0;
          struct hk_apple9_fused_tess_params params = {
             .input_patch_size = 3, .patches_per_instance = 16, .groups_x = 16,
+            .stat_mask = 7u,
+            .stat_tes_invocations = (uintptr_t)&mp_stat_tes,
+            .stat_clip_invocations = (uintptr_t)&mp_stat_cinv,
+            .stat_clip_primitives = (uintptr_t)&mp_stat_cprim,
          };
          uint8_t pay_mp[1024] = {0};
          struct nir_wg_exec oex_mp = {
@@ -5831,7 +5869,7 @@ fused_tess_hightess_chunker_suite(void)
             .params = &params, .ubo0 = ubo_mix, .ubo0_words = 16,
          };
          run_nir_wg(obj_mp, &oex_mp);
-         uint32_t mp_prims = 0;
+         uint32_t mp_prims = 0, mp_verts_sum = 0;
          for (uint32_t cwg = 0; cwg < oex_mp.launch_grid[0]; ++cwg) {
             struct nir_wg_exec mex = {
                .payload = pay_mp, .payload_size = sizeof(pay_mp),
@@ -5839,6 +5877,7 @@ fused_tess_hightess_chunker_suite(void)
                .wg_id = {cwg, 0, 0},
             };
             run_nir_wg(mesh_mp, &mex);
+            mp_verts_sum += mex.out_v_cnt;
             for (uint32_t pr = 0; pr < mex.out_p_cnt; ++pr) {
                CHECK(mp_prims < 2048);
                uint32_t i0 = mex.out_indices[pr][0];
@@ -5857,6 +5896,8 @@ fused_tess_hightess_chunker_suite(void)
                mp_prims++;
             }
          }
+         CHECK(mp_stat_tes == mp_verts_sum);
+         CHECK(mp_stat_cinv == mp_prims && mp_stat_cprim == mp_prims);
 
          static const uint32_t exp_patch_prims[2][16] = {
             /* Tri: 0, 1, 6, 24, 0, 96, 1, 1, 6, 0, 384, 24, 6, 0, 1, 96 => 646 */
@@ -5864,12 +5905,16 @@ fused_tess_hightess_chunker_suite(void)
             /* Quad: 0, 2, 8, 32, 0, 128, 2, 2, 8, 0, 512, 32, 8, 0, 2, 128 => 864 */
             {0, 2, 8, 32, 0, 128, 2, 2, 8, 0, 512, 32, 8, 0, 2, 128},
          };
-         uint32_t k1_prims = 0;
+         struct hk_apple9_fused_tess_params k1_params = params;
+         k1_params.stat_tes_invocations = (uintptr_t)&k1_stat_tes;
+         k1_params.stat_clip_invocations = (uintptr_t)&k1_stat_cinv;
+         k1_params.stat_clip_primitives = (uintptr_t)&k1_stat_cprim;
+         uint32_t k1_prims = 0, k1_verts_sum = 0;
          for (uint32_t p_i = 0; p_i < 16; ++p_i) {
             uint8_t pay_k1[1024] = {0};
             struct nir_wg_exec oex_k1 = {
                .payload = pay_k1, .payload_size = sizeof(pay_k1),
-               .params = &params, .ubo0 = ubo_mix, .ubo0_words = 16,
+               .params = &k1_params, .ubo0 = ubo_mix, .ubo0_words = 16,
                .wg_id = {p_i, 0, 0},
             };
             run_nir_wg(obj_k1, &oex_k1);
@@ -5877,10 +5922,11 @@ fused_tess_hightess_chunker_suite(void)
             for (uint32_t cwg = 0; cwg < oex_k1.launch_grid[0]; ++cwg) {
                struct nir_wg_exec mex = {
                   .payload = pay_k1, .payload_size = sizeof(pay_k1),
-                  .params = &params, .ubo0 = ubo_mix, .ubo0_words = 16,
+                  .params = &k1_params, .ubo0 = ubo_mix, .ubo0_words = 16,
                   .wg_id = {cwg, 0, 0},
                };
                run_nir_wg(mesh_k1, &mex);
+               k1_verts_sum += mex.out_v_cnt;
                for (uint32_t pr = 0; pr < mex.out_p_cnt; ++pr) {
                   CHECK(k1_prims < 2048);
                   uint32_t i0 = mex.out_indices[pr][0];
@@ -5902,6 +5948,8 @@ fused_tess_hightess_chunker_suite(void)
             }
             CHECK(patch_prims == exp_patch_prims[d][p_i]);
          }
+         CHECK(k1_stat_tes == k1_verts_sum);
+         CHECK(k1_stat_cinv == k1_prims && k1_stat_cprim == k1_prims);
          CHECK(mp_prims == k1_prims && mp_prims == (d == 0 ? 646u : 864u));
          for (uint32_t pr = 0; pr < mp_prims; ++pr) {
             CHECK(mp_pids[pr] == k1_pids[pr]);
