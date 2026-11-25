@@ -2820,8 +2820,11 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
          }
       }
 
-      /* Rewrite source references through active split mapping. */
-      if (util_dynarray_num_elements(&rctx->active_splits, uint32_t) > 0) {
+      /* Rewrite source references through active split mapping.
+       * VIR_SPLIT resolves each lane (orig_base + c) explicitly below so an
+       * eviction of lane 0 or any non-base lane never aliases a stale GPR. */
+      if (ins->op != AGX_APPLE9_VIR_SPLIT &&
+          util_dynarray_num_elements(&rctx->active_splits, uint32_t) > 0) {
          unsigned ns = agx_apple9_vir_nr_srcs(ins);
          for (unsigned s = 0; s < ns; ++s) {
             uint32_t sv = agx_apple9_vir_src(ins, s);
@@ -2839,11 +2842,25 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
       /* Handle VIR_SPLIT (zero-copy coalescing when source tuple dies). */
       if (ins->op == AGX_APPLE9_VIR_SPLIT) {
          unsigned comps = ins->dest_components;
-         uint32_t s0 = ins->src[0];
-         if (agx_apple9_vir_src_killed(ins, 0)) {
+         assert(comps <= 8u && comps <= AGX_APPLE9_MAX_VIR_SRCS);
+         uint32_t orig_s0 = ins->src[0];
+         uint32_t lane_ssa[8];
+         bool any_evicted = false;
+         for (unsigned c = 0; c < comps; ++c) {
+            lane_ssa[c] = a9_resolve_cur(rctx, orig_s0 + c);
+            if (lane_ssa[c] != orig_s0 + c)
+               any_evicted = true;
+         }
+         if (any_evicted) {
+            for (unsigned c = 0; c < comps; ++c)
+               ins->src[c] = lane_ssa[c];
+            ins->nr_srcs = comps;
+         }
+         if (agx_apple9_vir_src_killed(ins, 0) && !(ins->retain_mask & 1u)) {
             for (unsigned c = 0; c < comps; ++c) {
-               unsigned sr = rctx->phys[s0 + c];
-               if (rctx->reg_to_ssa[sr] == s0 + c) {
+               uint32_t sv = lane_ssa[c];
+               unsigned sr = rctx->phys[sv];
+               if (rctx->reg_to_ssa[sr] == sv) {
                   gpr_clear(rctx->used_gprs, sr);
                   rctx->reg_to_ssa[sr] = AGX_APPLE9_VREG_INVALID;
                }
@@ -2854,9 +2871,17 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                }
             }
          } else {
+            uint64_t saved_pinned[2] = {rctx->pinned[0], rctx->pinned[1]};
+            for (unsigned c = 0; c < comps; ++c) {
+               if (ins->dead_dest_mask & (1u << c))
+                  continue;
+               unsigned sr = rctx->phys[lane_ssa[c]];
+               if (sr < AGX_APPLE9_GPR_COUNT)
+                  gpr_set(rctx->pinned, sr);
+            }
             for (unsigned c = 0; c < comps; ++c) {
                if (ins->dead_dest_mask & (1u << c)) {
-                  a9_assign_gpr_val(rctx, ins->dest + c, rctx->phys[s0 + c]);
+                  a9_assign_gpr_val(rctx, ins->dest + c, rctx->phys[lane_ssa[c]]);
                   continue;
                }
                unsigned moves = 0;
@@ -2864,16 +2889,24 @@ a9_assign_block(struct a9_ra_ctx *rctx, struct agx_apple9_block *block)
                   rctx, ins->dest + c, 1, rctx->reserved, rctx->bound - 1u, 1,
                   UINT_MAX, &moves);
                if (chosen == UINT_MAX) {
+                  rctx->pinned[0] = saved_pinned[0];
+                  rctx->pinned[1] = saved_pinned[1];
                   rctx->needs_spill_headroom = true;
                   rctx->error = "no free GPR for live VIR_SPLIT lane";
                   return false;
                }
-               if (moves > 0 && !a9_vacate_window(rctx, chosen, 1, ins))
+               if (moves > 0 && !a9_vacate_window(rctx, chosen, 1, ins)) {
+                  rctx->pinned[0] = saved_pinned[0];
+                  rctx->pinned[1] = saved_pinned[1];
                   return false;
+               }
                gpr_set(rctx->used_gprs, chosen);
+               gpr_set(rctx->pinned, chosen);
                rctx->reg_to_ssa[chosen] = ins->dest + c;
                a9_assign_gpr_val(rctx, ins->dest + c, chosen);
             }
+            rctx->pinned[0] = saved_pinned[0];
+            rctx->pinned[1] = saved_pinned[1];
          }
          continue;
       }
@@ -3687,9 +3720,12 @@ a9_lower_to_physical_vir(struct agx_apple9_vir_program *program,
             for (unsigned c = 0; c < w; ++c) {
                if (ins->dead_dest_mask & (1u << c))
                   continue;
+               unsigned sr = (ins->nr_srcs == w)
+                                ? program->phys[ins->src[c]]
+                                : (sbase + c);
                copies[nc++] = (struct apple9_ra_copy){
                   .dst = apple9_ra_loc_gpr(program->phys[ins->dest + c]),
-                  .src = apple9_ra_loc_gpr(sbase + c),
+                  .src = apple9_ra_loc_gpr(sr),
                   .count = 1,
                };
             }

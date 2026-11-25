@@ -6458,13 +6458,14 @@ TEST(Apple9Compiler, VertexVaryStoresBatchWaitsAndFuseDirectAluExports)
 TEST(Apple9Compiler, DirectLoopBreakDeferredExitWithLiveValuesValidates)
 {
    /* Single-exit dynamic loop with many live values across the loop and
-    * divergent exit. Exercises deferred break_block placement so RA exit
-    * coupling runs only after LOOP_MASK_POP restores all exiting lanes. */
+    * genuinely divergent per-lane trip counts (0..7, including zero-trip lane
+    * 0) plus an exit-edge value that forces RA coupling after exit. Exercises
+    * deferred break_block placement so RA exit coupling runs only after
+    * LOOP_MASK_POP restores all exiting lanes. */
    nir_builder b = apple9_compute_builder("loop_deferred_exit_live");
    b.shader->info.num_ubos = 1;
    nir_def *gid = apple9_global_id_x(&b);
-   nir_def *limit = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0),
-                                 nir_imm_int(&b, 0), .align_mul = 4, .range = 4);
+   nir_def *limit = nir_iand_imm(&b, gid, 7);
 
    nir_def *live[16];
    for (unsigned i = 0; i < 16; ++i) {
@@ -6502,9 +6503,13 @@ TEST(Apple9Compiler, DirectLoopBreakDeferredExitWithLiveValuesValidates)
    ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, nullptr, &reason))
       << (reason ?: "");
    const uint8_t loop_update_keep_true[] = {0x8f, 0x04, 0x54, 0x02};
+   const uint8_t loop_mask_pop[] = {0x0f, 0x06, 0x04, 0x02, 0x00, 0x00};
    const uint8_t unwind[] = {0x8f, 0x05, 0x54};
    EXPECT_EQ(apple9_binary_count_sequence(&compiled, loop_update_keep_true,
                                           sizeof(loop_update_keep_true)),
+             1u);
+   EXPECT_GE(apple9_binary_count_sequence(&compiled, loop_mask_pop,
+                                          sizeof(loop_mask_pop)),
              1u);
    EXPECT_EQ(apple9_binary_count_sequence(&compiled, unwind, sizeof(unwind)), 0u);
    free(compiled.binary);
@@ -21208,13 +21213,14 @@ TEST(Apple9IsaTable, CheckedTextureModeTableRejectsUnmeasuredForms)
    EXPECT_EQ(agx_apple9_texture_mode(false, false, false, 7, false, false), 0xffffu);
 }
 
-TEST(Apple9Compiler, ScaledLoadElidesShiftMaskOnlyWhenInBoundsAmul)
+TEST(Apple9Compiler, ScaledLoadElidesShiftMaskOnlyWhenNuwOrProvenRange)
 {
    /* Pointer-chasing / runtime-indexed scaled DEVICE_LOADs should elide the
-    * 32-bit wraparound BFE mask (idx & (UINT32_MAX >> shift)) when the offset
-    * is an ACCESS_IN_BOUNDS nir_op_amul, while strictly preserving the BFE
-    * mask when NOT ACCESS_IN_BOUNDS (robustness) or when scaled by a wrapping
-    * non-amul nir_op_ishl or nir_op_imul. */
+    * 32-bit wraparound BFE mask (idx & (UINT32_MAX >> shift)) when the scaling
+    * ALU carries no_unsigned_wrap (nuw) — e.g., non-robust SSBO/UBO array
+    * derefs — while strictly preserving the BFE mask when !nuw (even if
+    * ACCESS_IN_BOUNDS is set on the load, since intermediate 32-bit ops may
+    * still wrap). */
    auto count_shift_mask_bfe = [](const struct agx_shader_part *compiled) {
       const uint8_t *bin = static_cast<const uint8_t *>(compiled->binary);
       unsigned count = 0;
@@ -21230,35 +21236,37 @@ TEST(Apple9Compiler, ScaledLoadElidesShiftMaskOnlyWhenInBoundsAmul)
 
    for (unsigned shift : {1u, 2u, 3u, 4u}) {
       SCOPED_TRACE(shift);
-      unsigned sizes[4] = {};
-      unsigned bfes[4] = {};
+      unsigned sizes[5] = {};
+      unsigned bfes[5] = {};
       unsigned elem_bits = shift == 1u ? 16u : 32u;
       unsigned elem_align = elem_bits / 8u;
 
-      /* mode 0: amul + ACCESS_IN_BOUNDS -> BFE elided
-       * mode 1: amul without ACCESS_IN_BOUNDS (robust) -> BFE preserved
-       * mode 2: ishl + ACCESS_IN_BOUNDS -> BFE preserved (ishl can wrap)
-       * mode 3: imul + ACCESS_IN_BOUNDS -> BFE preserved (imul can wrap) */
-      for (unsigned mode = 0; mode < 4; ++mode) {
+      /* mode 0: amul + nuw + ACCESS_IN_BOUNDS -> BFE elided
+       * mode 1: amul (no nuw) + ACCESS_IN_BOUNDS -> BFE preserved
+       * mode 2: ishl + nuw + ACCESS_IN_BOUNDS -> BFE elided
+       * mode 3: ishl (no nuw) + ACCESS_IN_BOUNDS -> BFE preserved
+       * mode 4: imul (no nuw) + ACCESS_IN_BOUNDS -> BFE preserved */
+      for (unsigned mode = 0; mode < 5; ++mode) {
          SCOPED_TRACE(mode);
-         nir_builder b = apple9_compute_builder("scaled_load_in_bounds");
+         nir_builder b = apple9_compute_builder("scaled_load_nuw");
          b.shader->info.num_ssbos = 2;
 
          /* Load an unbounded runtime index from SSBO 0 at constant offset 0. */
          nir_def *idx = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0),
                                       nir_imm_int(&b, 0), .align_mul = 4);
          nir_def *offset = nullptr;
-         if (mode == 2)
+         if (mode == 2 || mode == 3)
             offset = nir_ishl_imm(&b, idx, shift);
-         else if (mode == 3)
+         else if (mode == 4)
             offset = nir_imul(&b, idx, nir_imm_int(&b, 1u << shift));
          else
             offset = nir_amul(&b, idx, nir_imm_int(&b, 1u << shift));
 
-         enum gl_access_qualifier access =
-            mode == 1 ? (enum gl_access_qualifier)0 : ACCESS_IN_BOUNDS;
+         if (mode == 0 || mode == 2)
+            nir_def_as_alu(offset)->no_unsigned_wrap = true;
+
          nir_def *val = nir_load_ssbo(&b, 1, elem_bits, nir_imm_int(&b, 0),
-                                      offset, .access = access,
+                                      offset, .access = ACCESS_IN_BOUNDS,
                                       .align_mul = elem_align);
          nir_def *out = elem_bits == 16u ? nir_u2u32(&b, val) : val;
          nir_store_ssbo(&b, out, nir_imm_int(&b, 1), nir_imm_int(&b, 0),
@@ -21283,12 +21291,90 @@ TEST(Apple9Compiler, ScaledLoadElidesShiftMaskOnlyWhenInBoundsAmul)
          ralloc_free(b.shader);
       }
 
-      EXPECT_EQ(bfes[0], 0u) << "ACCESS_IN_BOUNDS amul must elide BFE mask";
-      EXPECT_EQ(bfes[1], 1u) << "robust (non-IN_BOUNDS) amul must keep BFE mask";
-      EXPECT_EQ(bfes[2], 1u) << "non-amul ishl must keep BFE mask";
-      EXPECT_EQ(bfes[3], 1u) << "non-amul imul must keep BFE mask";
+      EXPECT_EQ(bfes[0], 0u) << "nuw amul must elide BFE mask";
+      EXPECT_EQ(bfes[1], 1u) << "non-nuw amul must keep BFE mask even with ACCESS_IN_BOUNDS";
+      EXPECT_EQ(bfes[2], 0u) << "nuw ishl must elide BFE mask";
+      EXPECT_EQ(bfes[3], 1u) << "non-nuw ishl must keep BFE mask";
+      EXPECT_EQ(bfes[4], 1u) << "non-nuw imul must keep BFE mask";
       EXPECT_EQ(sizes[0] + 12u, sizes[1]);
-      EXPECT_EQ(sizes[1], sizes[2]);
+      EXPECT_EQ(sizes[0], sizes[2]);
       EXPECT_EQ(sizes[1], sizes[3]);
+      EXPECT_EQ(sizes[1], sizes[4]);
+   }
+}
+
+TEST(Apple9Compiler, ScaledLoadPreservesWrapping32BitOffsetsAcrossU2U64)
+{
+   /* Verify strict 32-bit -> 64-bit u2u64 algebraic boundary:
+    * - Wrapping 32-bit offset `4 + amul(i, 4)` (e.g. signed ptr_as_array at
+    *   i = 0xffffffffu -> offset 0) must NOT hoist +4 into a 64-bit hardware
+    *   displacement unless iadd carries no_unsigned_wrap.
+    * - Nested `amul(4 + amul(i, 4), 2)` must NOT hoist +4 or combine scales
+    *   across the wrapping inner iadd, even when ACCESS_IN_BOUNDS is set or
+    *   only the outer amul is nuw.
+    * - Proven non-wrapping `iadd_nuw(amul_nuw(i, 16), 4)` folds cleanly to
+    *   shift=4, displacement=4 with zero extra BFE/ISHL instructions. */
+   for (unsigned mode = 0; mode < 4; ++mode) {
+      SCOPED_TRACE(mode);
+      nir_builder b = apple9_compute_builder("u2u64_wrap_boundary");
+      b.shader->info.num_ssbos = 2;
+
+      nir_def *idx = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0),
+                                   nir_imm_int(&b, 0), .align_mul = 4);
+      nir_def *offset = nullptr;
+      if (mode == 0) {
+         /* 4 + amul(i, 4) without nuw: at i = -1, 32-bit offset = 0. */
+         offset = nir_iadd_imm(&b, nir_amul(&b, idx, nir_imm_int(&b, 4)), 4);
+      } else if (mode == 1) {
+         /* amul(4 + amul(i, 4), 2) without nuw: at i = -1, 32-bit offset = 0. */
+         nir_def *inner = nir_iadd_imm(&b, nir_amul(&b, idx, nir_imm_int(&b, 4)), 4);
+         offset = nir_amul(&b, inner, nir_imm_int(&b, 2));
+      } else if (mode == 2) {
+         /* amul_nuw(4 + amul(i, 4), 2): outer scale is nuw (shift 1), inner
+          * wrapping iadd must stay in 32-bit (displacement must stay 0!). */
+         nir_def *inner = nir_iadd_imm(&b, nir_amul(&b, idx, nir_imm_int(&b, 4)), 4);
+         offset = nir_amul(&b, inner, nir_imm_int(&b, 2));
+         nir_def_as_alu(offset)->no_unsigned_wrap = true;
+      } else {
+         /* iadd_nuw(amul_nuw(i, 16), 4): folds to shift=4, disp=4, zero BFE. */
+         nir_def *scaled = nir_amul(&b, idx, nir_imm_int(&b, 16));
+         nir_def_as_alu(scaled)->no_unsigned_wrap = true;
+         offset = nir_iadd_imm_nuw(&b, scaled, 4);
+      }
+
+      nir_def *val = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0), offset,
+                                   .access = ACCESS_IN_BOUNDS, .align_mul = 4);
+      nir_store_ssbo(&b, val, nir_imm_int(&b, 1), nir_imm_int(&b, 0),
+                     .write_mask = 1, .align_mul = 4);
+
+      agx_shader_part compiled = {};
+      agx_apple9_compute_profile profile = {};
+      const char *reason = nullptr;
+      ASSERT_TRUE(agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason))
+         << (reason ?: "");
+
+      unsigned loads[4];
+      ASSERT_EQ(apple9_binary_device_load_offsets(&compiled, loads, 4), 2u);
+      const uint8_t *load1 = static_cast<const uint8_t *>(compiled.binary) + loads[1];
+      int16_t disp = (int16_t)apple9_test_bits(load1, 77, 16);
+      unsigned encoded = apple9_test_bits(load1, 97, 3);
+      unsigned shift = encoded ? encoded - 1 : 4;
+
+      if (mode == 0) {
+         EXPECT_EQ(disp, 0) << "wrapping 4 + amul(i, 4) must not hoist +4 across u2u64";
+         EXPECT_EQ(shift, 0u);
+      } else if (mode == 1) {
+         EXPECT_EQ(disp, 0) << "wrapping amul(4 + amul(i, 4), 2) must not hoist +4";
+         EXPECT_EQ(shift, 1u) << "must not merge inner amul across wrapping iadd";
+      } else if (mode == 2) {
+         EXPECT_EQ(disp, 0) << "inner wrapping iadd must not hoist +4 even with outer nuw";
+         EXPECT_EQ(shift, 1u) << "outer nuw peels shift=1 and stops at wrapping iadd";
+      } else {
+         EXPECT_EQ(disp, 4) << "nuw iadd must fold +4 into hardware displacement";
+         EXPECT_EQ(shift, 4u) << "nuw amul must fold *16 into hardware shift=4";
+      }
+
+      free(compiled.binary);
+      ralloc_free(b.shader);
    }
 }

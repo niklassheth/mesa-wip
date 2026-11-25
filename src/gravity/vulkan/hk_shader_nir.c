@@ -1738,10 +1738,7 @@ lower_load_global_constant_offset_instr(nir_builder *b,
    unsigned align_offset = nir_intrinsic_align_offset(intrin);
 
    /* Without robustness an access outside the buffer is undefined, so the
-    * load itself is in bounds. The Apple9 backend relies on this to fold
-    * constant offsets past an amul: the hardware adds the displacement in
-    * 64 bits, which differs from the 32-bit offset only outside the buffer.
-    */
+    * load itself is in bounds. */
    enum gl_access_qualifier access = nir_intrinsic_access(intrin);
    if (intrin->intrinsic == nir_intrinsic_load_global_constant_offset)
       access |= ACCESS_IN_BOUNDS;
@@ -3383,6 +3380,172 @@ hk_apple9_lower_tex_2d_as_array(nir_builder *b, nir_tex_instr *tex, void *data)
 
 static void hk_apple9_cap_loop_unroll_l1i(nir_shader *nir);
 
+static bool
+hk_deref_chain_is_nonneg_root(nir_deref_instr *d, nir_variable_mode mode)
+{
+   while (d) {
+      if (!nir_deref_mode_is(d, mode))
+         return false;
+      switch (d->deref_type) {
+      case nir_deref_type_var:
+         return true;
+      case nir_deref_type_cast: {
+         if (nir_src_as_deref(d->parent) != NULL || d->cast.ptr_stride != 0)
+            return false;
+         if (d->parent.ssa->num_components != 4 || d->parent.ssa->bit_size != 32)
+            return false;
+         nir_scalar w = nir_scalar_resolved(d->parent.ssa, 3);
+         return nir_scalar_is_const(w) && nir_scalar_as_uint(w) == 0;
+      }
+      case nir_deref_type_struct: {
+         nir_deref_instr *parent = nir_deref_instr_parent(d);
+         if (!parent || glsl_get_struct_field_offset(parent->type, d->strct.index) < 0)
+            return false;
+         d = parent;
+         break;
+      }
+      case nir_deref_type_array: {
+         nir_deref_instr *parent = nir_deref_instr_parent(d);
+         if (!parent || nir_deref_instr_array_stride(d) == 0 ||
+             d->arr.index.ssa->bit_size > 32)
+            return false;
+         if (nir_src_is_const(d->arr.index) && nir_src_as_int(d->arr.index) < 0)
+            return false;
+         d = parent;
+         break;
+      }
+      default:
+         return false;
+      }
+   }
+   return false;
+}
+
+static bool
+hk_instr_may_exit_block_early(const nir_instr *instr)
+{
+   if (instr->type == nir_instr_type_call || instr->type == nir_instr_type_jump)
+      return true;
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+   case nir_intrinsic_demote:
+   case nir_intrinsic_demote_if:
+   case nir_intrinsic_terminate:
+   case nir_intrinsic_terminate_if:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Lower explicit I/O for non-robust SSBO/UBO buffers and tag the newly-created
+ * 32-bit offset arithmetic with no_unsigned_wrap when every deref in the block
+ * belongs to a strictly non-negative struct/array chain rooted at offset 0 and
+ * consumed in the same exit-free block segment. Signed ptr_as_array chains,
+ * robust accesses, and shader-authored index ALU are never tagged. */
+static bool
+hk_lower_explicit_io_nuw(nir_shader *nir, nir_variable_mode mode,
+                         nir_address_format addr_format)
+{
+   if (addr_format != nir_address_format_64bit_global_32bit_offset)
+      return nir_lower_explicit_io(nir, mode, addr_format);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_metadata_require(impl, nir_metadata_block_index);
+
+   bool *block_safe = calloc(impl->num_blocks, sizeof(*block_safe));
+   uint32_t *deref_seg = calloc(impl->ssa_alloc, sizeof(*deref_seg));
+   if (!block_safe || !deref_seg) {
+      free(block_safe);
+      free(deref_seg);
+      return nir_lower_explicit_io(nir, mode, addr_format);
+   }
+
+   uint32_t seg = 0;
+   nir_foreach_block(block, impl) {
+      seg++;
+      bool safe = true;
+      nir_foreach_instr(instr, block) {
+         /* Bit 0 marks pre-existing instructions so post-lowering only tags
+          * newly created deref offset ALU. Bit 1 marks derefs guaranteed to
+          * reach an unconditional memory access in the same block segment. */
+         instr->pass_flags = 0x1;
+         if (hk_instr_may_exit_block_early(instr)) {
+            seg++;
+            continue;
+         }
+         if (instr->type == nir_instr_type_deref) {
+            nir_deref_instr *d = nir_instr_as_deref(instr);
+            if (nir_deref_mode_may_be(d, mode))
+               deref_seg[d->def.index] = seg;
+         } else if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_deref ||
+                intr->intrinsic == nir_intrinsic_store_deref ||
+                intr->intrinsic == nir_intrinsic_deref_atomic ||
+                intr->intrinsic == nir_intrinsic_deref_atomic_swap) {
+               nir_deref_instr *d = nir_src_as_deref(intr->src[0]);
+               if (!d) {
+                  safe = false;
+               } else if (nir_deref_mode_may_be(d, mode)) {
+                  if (!hk_deref_chain_is_nonneg_root(d, mode)) {
+                     safe = false;
+                  } else if (!(nir_intrinsic_access(intr) & ACCESS_CAN_SPECULATE)) {
+                     while (d && nir_deref_mode_is(d, mode) &&
+                            d->instr.block == block &&
+                            deref_seg[d->def.index] == seg) {
+                        d->instr.pass_flags |= 0x2;
+                        d = nir_deref_instr_parent(d);
+                     }
+                  }
+               }
+            }
+         }
+      }
+      nir_foreach_instr(instr, block) {
+         if (!safe || instr->type != nir_instr_type_deref)
+            continue;
+         nir_deref_instr *d = nir_instr_as_deref(instr);
+         if (!nir_deref_mode_may_be(d, mode))
+            continue;
+         if (d->deref_type == nir_deref_type_var ||
+             d->deref_type == nir_deref_type_cast) {
+            if (!hk_deref_chain_is_nonneg_root(d, mode)) {
+               safe = false;
+               break;
+            }
+            continue;
+         }
+         if (!(instr->pass_flags & 0x2) ||
+             !hk_deref_chain_is_nonneg_root(d, mode)) {
+            safe = false;
+            break;
+         }
+      }
+      block_safe[block->index] = safe;
+   }
+   free(deref_seg);
+
+   bool progress = nir_lower_explicit_io(nir, mode, addr_format);
+   if (progress) {
+      nir_foreach_block(block, impl) {
+         if (block->index >= impl->num_blocks || !block_safe[block->index])
+            continue;
+         nir_foreach_instr(instr, block) {
+            if ((instr->pass_flags & 0x1) || instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->def.bit_size == 32 &&
+                (alu->op == nir_op_amul || alu->op == nir_op_iadd))
+               alu->no_unsigned_wrap = true;
+         }
+      }
+   }
+   free(block_safe);
+   return progress;
+}
+
 void
 hk_lower_nir(struct hk_device *dev, nir_shader *nir,
              const struct vk_pipeline_robustness_state *rs, bool is_multiview,
@@ -3461,9 +3624,9 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             set_layouts, true);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
+   NIR_PASS(_, nir, hk_lower_explicit_io_nuw, nir_var_mem_ssbo,
             hk_buffer_addr_format(rs->storage_buffers));
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
+   NIR_PASS(_, nir, hk_lower_explicit_io_nuw, nir_var_mem_ubo,
             hk_buffer_addr_format(rs->uniform_buffers));
 
    /* Before inserting bounds checks, we want to do a fair bit of optimization.

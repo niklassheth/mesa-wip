@@ -1403,16 +1403,34 @@ static bool
 fold_alu_exports(struct agx_apple9_vir_program *p, const bool *constant,
                  const uint32_t *values)
 {
+   bool has_export = false;
+   for (unsigned i = 0; i < p->instruction_count; ++i) {
+      struct agx_apple9_vir_instr *I = p->instructions[i];
+      if (I->dest < p->value_count &&
+          (I->encoding == AGX_APPLE9_ENC_LOGIC_EXPORT ||
+           I->encoding == AGX_APPLE9_ENC_FLOAT2_EXPORT) &&
+          I->nr_srcs == 2 && !I->alu_src_uniform_mask &&
+          !I->alu_src_immediate_mask) {
+         has_export = true;
+         break;
+      }
+   }
+   if (!has_export)
+      return true;
+
    unsigned *instr_uses = calloc(p->value_count, sizeof(*instr_uses));
+   uint32_t *last_use_instr = malloc(p->value_count * sizeof(*last_use_instr));
    struct agx_apple9_vir_instr **def_instr =
       calloc(p->value_count, sizeof(*def_instr));
    unsigned *def_pos = calloc(p->value_count, sizeof(*def_pos));
-   if (!instr_uses || !def_instr || !def_pos) {
+   if (!instr_uses || !last_use_instr || !def_instr || !def_pos) {
       free(instr_uses);
+      free(last_use_instr);
       free(def_instr);
       free(def_pos);
       return false;
    }
+   memset(last_use_instr, 0xff, p->value_count * sizeof(*last_use_instr));
 
    for (unsigned i = 0; i < p->instruction_count; ++i) {
       struct agx_apple9_vir_instr *I = p->instructions[i];
@@ -1426,17 +1444,13 @@ fold_alu_exports(struct agx_apple9_vir_program *p, const bool *constant,
          uint32_t v = *agx_apple9_vir_src_ptr(I, s);
          if (v >= p->value_count)
             continue;
-         bool dup = false;
-         for (unsigned k = 0; k < s; ++k) {
-            if (*agx_apple9_vir_src_ptr(I, k) == v) {
-               dup = true;
-               break;
-            }
-         }
-         if (!dup)
+         if (last_use_instr[v] != i) {
+            last_use_instr[v] = i;
             instr_uses[v]++;
+         }
       }
    }
+   free(last_use_instr);
    for (unsigned i = 0; i < p->live_out_count; ++i) {
       if (p->live_out[i] < p->value_count)
          instr_uses[p->live_out[i]]++;

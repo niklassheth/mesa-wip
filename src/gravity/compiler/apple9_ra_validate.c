@@ -953,6 +953,13 @@ validate_encoding_constraints(const struct agx_apple9_vir_program *program,
 
 /* Compute exact backward CFG SSA liveness (live_in / live_out per active block)
  * so post-RA validation can verify kill_mask, clobber, and reuse_killed. */
+static inline uint32_t
+vir_split_src_lane(const struct agx_apple9_vir_instr *ins, unsigned c)
+{
+   return ins->nr_srcs == vir_dest_components(ins) ? ins->src[c]
+                                                   : (ins->src[0] + c);
+}
+
 static bool
 compute_liveness(const struct agx_apple9_vir_program *program,
                  struct agx_apple9_block *const *blocks, unsigned num_blocks,
@@ -1025,13 +1032,13 @@ compute_liveness(const struct agx_apple9_vir_program *program,
             }
 
             if (ins->op == AGX_APPLE9_VIR_SPLIT) {
-               uint32_t s0 = ins->src[0];
                for (unsigned c = 0; c < comps; ++c) {
                   if (ins->dead_dest_mask & (1u << c))
                      continue;
-                  if (s0 + c < program->value_count &&
-                      !is_publication_val(program, s0 + c))
-                     BITSET_SET(tmp, s0 + c);
+                  uint32_t sv = vir_split_src_lane(ins, c);
+                  if (sv < program->value_count &&
+                      !is_publication_val(program, sv))
+                     BITSET_SET(tmp, sv);
                }
                continue;
             }
@@ -1161,13 +1168,13 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
          }
 
          if (ins->op == AGX_APPLE9_VIR_SPLIT) {
-            uint32_t s0 = ins->src[0];
             for (unsigned c = 0; c < comps; ++c) {
                if (ins->dead_dest_mask & (1u << c))
                   continue;
-               if (s0 + c < program->value_count &&
-                   !is_publication_val(program, s0 + c))
-                  BITSET_SET(live_scratch, s0 + c);
+               uint32_t sv = vir_split_src_lane(ins, c);
+               if (sv < program->value_count &&
+                   !is_publication_val(program, sv))
+                  BITSET_SET(live_scratch, sv);
             }
             continue;
          }
@@ -1305,17 +1312,17 @@ step_block_regfile(const struct agx_apple9_vir_program *program,
       if (check_errors) {
          if (ins->op == AGX_APPLE9_VIR_SPLIT) {
             unsigned comps = vir_dest_components(ins);
-            uint32_t s0 = ins->src[0];
             for (unsigned c = 0; c < comps; ++c) {
                if (ins->dead_dest_mask & (1u << c))
                   continue;
-               uint32_t sv = s0 + c;
+               uint32_t sv = vir_split_src_lane(ins, c);
                if (is_publication_val(program, sv))
                   continue;
                struct apple9_ra_loc sloc;
                if (!get_val_loc(program, assign, mem_slots, sv, &sloc)) {
                   set_err(err, b->index, pos,
-                          "VIR_SPLIT src v%u+%u has invalid assignment", s0, c);
+                          "VIR_SPLIT src lane %u (v%u) has invalid assignment",
+                          c, sv);
                   goto out;
                }
                struct reg_slot actual = *file_slot(cur, sloc);

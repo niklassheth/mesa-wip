@@ -58,7 +58,14 @@ for name in ('HK_APPLE9_DUMP_FRAGMENT_DIR',
     for value in ('0', '1', '/tmp/trace-a', '/tmp/trace-b'):
         assert read(**{name: value}) == (base, 0), (name, value)
 # Code-generation controls continue to separate cache entries.
-for name in ('AGX_MESA_DEBUG', 'HK_APPLE9_NATIVE_MESH',
+# AGX_MESA_DEBUG hashes only active codegen bits (e.g. spill), so non-codegen
+# or compiled-out flags like novalidate do not split the cache.
+assert read(AGX_MESA_DEBUG='')[0] == base
+assert read(AGX_MESA_DEBUG='novalidate')[0] == base
+spill_key = read(AGX_MESA_DEBUG='spill')[0]
+assert spill_key != base
+assert read(AGX_MESA_DEBUG='novalidate,spill')[0] == spill_key
+for name in ('HK_APPLE9_NATIVE_MESH',
              'HK_APPLE9_TESS_NATIVE', 'HK_APPLE9_NATIVE_INDEX'):
     zero = read(**{name: '0'})[0]
     one = read(**{name: '1'})[0]

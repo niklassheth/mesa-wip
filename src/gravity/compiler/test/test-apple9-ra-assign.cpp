@@ -2332,3 +2332,251 @@ TEST_F(Apple9RaAssignTest, CollectBypassVetoedWhenLaterSplitKillsSourceTuple)
 
    EXPECT_GT(verify_binary_emission(&p), 0u);
 }
+
+TEST_F(Apple9RaAssignTest, VirSplitReadsEvictedLaneBeforeSplit)
+{
+   /* Regression test for pre-split independent eviction of a tuple lane:
+    * build a 2-word tuple tup=(r0, r1), force an independent fixed-reg
+    * eviction of lane 1 (or lane 0) BEFORE VIR_SPLIT(tup), then verify BOTH
+    * output words of VIR_SPLIT in both killed and non-killed modes. */
+   for (unsigned mode = 0; mode < 3; ++mode) {
+      SCOPED_TRACE(mode);
+      agx_apple9_vir_finish(&p);
+      agx_apple9_vir_init(&p);
+      auto *b0 = agx_apple9_block_create(&p);
+      agx_apple9_block_begin(&p, b0);
+
+      uint32_t a = agx_apple9_vir_emit_entry_reg(&p, 0);
+      uint32_t b = agx_apple9_vir_emit_entry_reg(&p, 1);
+      uint32_t c = agx_apple9_vir_emit_entry_reg(&p, 2);
+
+      uint32_t t_srcs[2] = {a, b};
+      uint32_t tup = agx_apple9_vir_emit_collect(&p, t_srcs, 2);
+      ASSERT_NE(tup, AGX_APPLE9_VREG_INVALID);
+
+      /* Force a fixed-register write BEFORE VIR_SPLIT that evicts a tuple lane:
+       * mode 0: evict non-base lane tup+1 (r1), killed VIR_SPLIT
+       * mode 1: evict non-base lane tup+1 (r1), non-killed VIR_SPLIT
+       * mode 2: evict base lane tup+0 (r0), killed VIR_SPLIT */
+      uint32_t clob = emit_imm(777u);
+      ASSERT_NE(clob, AGX_APPLE9_VREG_INVALID);
+      p.fixed_phys[clob] = (mode == 2) ? 0u : 1u;
+
+      uint32_t sp = agx_apple9_vir_emit_split(&p, tup, 2);
+      ASSERT_NE(sp, AGX_APPLE9_VREG_INVALID);
+
+      uint32_t out0 = emit_iadd(sp, c);
+      uint32_t out1 = emit_iadd(sp + 1, clob);
+      if (mode == 1) {
+         /* Keep tup+0 and tup+1 live past VIR_SPLIT so it takes the non-killed path. */
+         uint32_t keep_sum = emit_iadd(tup, tup + 1);
+         out0 = emit_iadd(out0, keep_sum);
+      }
+
+      ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, out0, 8));
+      ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, out1, 9));
+      ASSERT_TRUE(agx_apple9_vir_emit_abi_return(&p));
+      cfg_init(&p, {b0});
+
+      auto opts = validated_opts();
+      opts.skip_schedule = true;
+      apple9_ra_assign_result res = {};
+      ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+         << (res.error ? res.error : "");
+      EXPECT_FALSE(res.has_spills);
+
+      PhysVirSim sim;
+      sim.gpr[0] = 100u; /* a (tup+0) */
+      sim.gpr[1] = 200u; /* b (tup+1) */
+      sim.gpr[2] = 5u;   /* c */
+      sim.exec_block(p.blocks);
+      EXPECT_EQ(sim.gpr[8], mode == 1 ? (105u + 300u) : 105u);
+      EXPECT_EQ(sim.gpr[9], 200u + 777u);
+
+      EXPECT_GT(verify_binary_emission(&p), 0u);
+   }
+}
+
+TEST_F(Apple9RaAssignTest, DeferredLoopBreakExitEdgeRestoresDivergentLanes)
+{
+   /* Verify that a divergent-lane loop with LOOP_MASK_UPDATE, LOOP_MASK_POP,
+    * and a deferred break block containing an exit-edge phi/copy computes the
+    * exact per-lane result for 8 divergent lanes (trip counts 0..7, including
+    * zero-trip lane 0), where masked-off lanes ignore writes until
+    * LOOP_MASK_POP restores the execution mask. */
+   auto *b_entry = agx_apple9_block_create(&p);
+   auto *b_header = agx_apple9_block_create(&p);
+   auto *b_body = agx_apple9_block_create(&p);
+   auto *b_pop = agx_apple9_block_create(&p);
+   auto *b_break = agx_apple9_block_create(&p);
+
+   /* Entry: r0 = lane_limit (0..7), r1 = base_val (1000 + lane*10). */
+   agx_apple9_block_begin(&p, b_entry);
+   uint32_t limit = agx_apple9_vir_emit_entry_reg(&p, 0);
+   uint32_t base_val = agx_apple9_vir_emit_entry_reg(&p, 1);
+   uint32_t zero = emit_imm(0u);
+   uint32_t one = emit_imm(1u);
+
+   /* Header: phi idx, phi acc; exit if idx == limit via LOOP_MASK_UPDATE. */
+   agx_apple9_block_begin(&p, b_header);
+   uint32_t idx_phi = agx_apple9_vir_emit_phi(&p, b_header);
+   uint32_t acc_phi = agx_apple9_vir_emit_phi(&p, b_header);
+   uint32_t rem = emit_isub(limit, idx_phi);
+   /* LOOP_MASK_UPDATE keeps lanes with rem != 0 (exits lanes with idx == limit). */
+   uint32_t lmu_srcs[1] = {rem};
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_LOOP_MASK_UPDATE, AGX_APPLE9_ENC_LOOP_MASK_UPDATE,
+      lmu_srcs, 1, 0));
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_JMP_EXEC_NONE, AGX_APPLE9_ENC_JMP_EXEC_NONE,
+      nullptr, 0, 0));
+   agx_apple9_block_last_instr(b_header)->branch_target = b_pop;
+
+   /* Body: acc_next = acc_phi + base_val + idx_phi; idx_next = idx_phi + 1. */
+   agx_apple9_block_begin(&p, b_body);
+   uint32_t acc_next = emit_iadd(emit_iadd(acc_phi, base_val), idx_phi);
+   uint32_t idx_next = emit_iadd(idx_phi, one);
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_JMP_EXEC_ANY, AGX_APPLE9_ENC_JMP_EXEC_ANY,
+      nullptr, 0, 0));
+   agx_apple9_block_last_instr(b_body)->branch_target = b_header;
+
+   /* Pop block: LOOP_MASK_POP restores all exiting lanes before b_break runs. */
+   agx_apple9_block_begin(&p, b_pop);
+   ASSERT_TRUE(agx_apple9_vir_emit_side_effect(
+      &p, AGX_APPLE9_VIR_LOOP_MASK_POP, AGX_APPLE9_ENC_LOOP_MASK_POP,
+      nullptr, 0, 0));
+
+   /* Deferred break block: exit-edge copy of acc_phi + base_val and idx_phi
+    * into fixed ABI outputs (plus forced spill/reload under tight budget). */
+   agx_apple9_block_begin(&p, b_break);
+   uint32_t final_out = emit_iadd(acc_phi, base_val);
+   ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, final_out, 8));
+   ASSERT_TRUE(agx_apple9_vir_add_abi_output(&p, idx_phi, 9));
+   ASSERT_TRUE(agx_apple9_vir_emit_abi_return(&p));
+
+   cfg_init(&p, {b_entry, b_header, b_body, b_pop, b_break});
+   cfg_edge(b_entry, b_header);
+   cfg_edge(b_header, b_body);
+   cfg_edge(b_header, b_pop);
+   cfg_edge(b_body, b_header);
+   cfg_edge(b_pop, b_break);
+
+   /* Wire phi sources matching predecessor order (b_entry, b_body). */
+   agx_apple9_vir_instr *p_idx = agx_apple9_block_first_instr(b_header);
+   agx_apple9_vir_instr *p_acc = agx_apple9_instr_next(p_idx);
+   p_idx->nr_srcs = 2;
+   p_idx->src[0] = zero;
+   p_idx->src[1] = idx_next;
+   p_acc->nr_srcs = 2;
+   p_acc->src[0] = base_val;
+   p_acc->src[1] = acc_next;
+
+   auto opts = validated_opts();
+   opts.skip_schedule = true;
+   apple9_ra_assign_result res = {};
+   ASSERT_TRUE(apple9_ra_allocate_native(&p, &opts, &res))
+      << (res.error ? res.error : "");
+
+   /* Locate physical blocks in lowered program order. */
+   auto *pb_entry = p.blocks;
+   auto *pb_hdr = pb_entry->next;
+   auto *pb_body = pb_hdr->next;
+   auto *pb_pop = pb_body->next;
+   auto *pb_break = pb_pop->next;
+   ASSERT_NE(pb_break, nullptr);
+
+   /* Verify LOOP_MASK_POP is in pb_pop and all exit copies/uses occur after it. */
+   bool saw_pop = false;
+   for (const agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(pb_pop);
+        ins; ins = agx_apple9_instr_next(ins)) {
+      if (ins->op == AGX_APPLE9_VIR_LOOP_MASK_POP)
+         saw_pop = true;
+   }
+   EXPECT_TRUE(saw_pop);
+
+   /* Simulate an 8-lane divergent warp across the physical CFG. */
+   constexpr unsigned LANES = 8;
+   std::array<std::array<uint32_t, AGX_APPLE9_GPR_COUNT>, LANES> gpr = {};
+   uint32_t active_mask = (1u << LANES) - 1u;
+   uint32_t saved_mask = 0u;
+   for (unsigned l = 0; l < LANES; ++l) {
+      gpr[l][0] = l;               /* trip count 0..7 (lane 0 is zero-trip!) */
+      gpr[l][1] = 1000u + l * 10u; /* base_val */
+   }
+
+   const agx_apple9_block *cur = pb_entry;
+   unsigned steps = 0;
+   while (cur && steps++ < 256) {
+      const agx_apple9_block *next = cur->next;
+      bool returned = false;
+      for (const agx_apple9_vir_instr *ins = agx_apple9_block_first_instr(cur);
+           ins; ins = agx_apple9_instr_next(ins)) {
+         if (ins->op == AGX_APPLE9_VIR_LOOP_MASK_UPDATE) {
+            uint32_t keep = 0u;
+            for (unsigned l = 0; l < LANES; ++l) {
+               if (((active_mask >> l) & 1u) && gpr[l][ins->src[0]] != 0u)
+                  keep |= (1u << l);
+            }
+            saved_mask |= active_mask & ~keep;
+            active_mask = keep;
+            continue;
+         } else if (ins->op == AGX_APPLE9_VIR_JMP_EXEC_NONE) {
+            if (active_mask == 0u) {
+               next = ins->branch_target;
+               break;
+            }
+            continue;
+         } else if (ins->op == AGX_APPLE9_VIR_JMP_EXEC_ANY) {
+            if (active_mask != 0u) {
+               next = ins->branch_target;
+               break;
+            }
+            continue;
+         } else if (ins->op == AGX_APPLE9_VIR_LOOP_MASK_POP) {
+            active_mask |= saved_mask;
+            saved_mask = 0u;
+            continue;
+         } else if (ins->op == AGX_APPLE9_VIR_ABI_RETURN) {
+            returned = true;
+            break;
+         }
+         /* All ALU/copy instructions write ONLY active lanes! */
+         for (unsigned l = 0; l < LANES; ++l) {
+            if (!((active_mask >> l) & 1u))
+               continue;
+            switch (ins->op) {
+            case AGX_APPLE9_VIR_IMM:
+               gpr[l][ins->dest] = ins->immediate;
+               break;
+            case AGX_APPLE9_VIR_IADD:
+               gpr[l][ins->dest] = gpr[l][ins->src[0]] + gpr[l][ins->src[1]];
+               break;
+            case AGX_APPLE9_VIR_ISUB:
+               gpr[l][ins->dest] = gpr[l][ins->src[0]] - gpr[l][ins->src[1]];
+               break;
+            case AGX_APPLE9_VIR_IOR:
+               gpr[l][ins->dest] = gpr[l][ins->src[0]] | gpr[l][ins->src[1]];
+               break;
+            case AGX_APPLE9_VIR_IXOR:
+               gpr[l][ins->dest] = gpr[l][ins->src[0]] ^ gpr[l][ins->src[1]];
+               break;
+            default:
+               FAIL() << "Unexpected op in divergent loop sim: " << ins->op;
+            }
+         }
+      }
+      if (returned)
+         break;
+      cur = next;
+   }
+   EXPECT_EQ(active_mask, (1u << LANES) - 1u);
+   for (unsigned l = 0; l < LANES; ++l) {
+      uint32_t base = 1000u + l * 10u;
+      uint32_t expected_acc = base;
+      for (unsigned it = 0; it < l; ++it)
+         expected_acc += base + it;
+      EXPECT_EQ(gpr[l][8], expected_acc + base) << "lane " << l;
+      EXPECT_EQ(gpr[l][9], l) << "lane " << l;
+   }
+}

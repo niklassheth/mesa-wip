@@ -624,17 +624,9 @@ apple9_memory_address(nir_shader *nir, nir_intrinsic_instr *intr, nir_def *offse
             if (total < INT16_MIN || total > max_offset)
                break;
             bool safe = add >= 0 &&
-               !nir_addition_might_overflow(nir, bounds, other, constant);
+               (nir_def_as_alu(value.def)->no_unsigned_wrap ||
+                !nir_addition_might_overflow(nir, bounds, other, constant));
             if (add < 0 && apple9_address_lower_bound(other) >= -add)
-               safe = true;
-            /* An amul cannot overflow the variable it indexes, so for an
-             * in-bounds access the 32-bit sum equals the hardware's 64-bit
-             * index + displacement. Robust accesses still load out of
-             * bounds before their result is discarded, so keep the proof. */
-            if (nir_intrinsic_has_access(intr) &&
-                (nir_intrinsic_access(intr) & ACCESS_IN_BOUNDS) &&
-                nir_scalar_is_alu(other) &&
-                nir_scalar_alu_op(other) == nir_op_amul)
                safe = true;
             if (safe) {
                *displacement = total;
@@ -655,16 +647,11 @@ apple9_memory_address(nir_shader *nir, nir_intrinsic_instr *intr, nir_def *offse
                break;
             uint32_t maximum = UINT32_MAX >> amount;
             *shift += amount;
-            /* An amul cannot overflow the variable it indexes, so for an
-             * in-bounds access the scaled 32-bit offset cannot wrap and the
-             * hardware's 64-bit (u2u64(index) << shift) matches it directly.
-             * Robust accesses still load out of bounds before their result is
-             * discarded, so keep the mask unless ACCESS_IN_BOUNDS holds. */
-            bool in_bounds_amul =
-               op == nir_op_amul &&
-               nir_intrinsic_has_access(intr) &&
-               (nir_intrinsic_access(intr) & ACCESS_IN_BOUNDS);
-            if (!in_bounds_amul &&
+            /* Hardware widens the 32-bit index to 64 bits before shifting, so
+             * elide the wrap mask only when the 32-bit operation itself is
+             * proven not to wrap (explicit no_unsigned_wrap or range bound). */
+            bool nuw = nir_def_as_alu(value.def)->no_unsigned_wrap;
+            if (!nuw &&
                 apple9_address_upper_bound(nir, bounds, other) > maximum) {
                nir_def *base = nir_channel(&b, other.def, other.comp);
                value = nir_get_scalar(nir_iand_imm(&b, base, maximum), 0);

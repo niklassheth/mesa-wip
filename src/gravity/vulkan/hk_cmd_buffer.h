@@ -552,7 +552,8 @@ struct hk_cs {
    uint64_t apple9_native_ring_rows;
    bool apple9_native_ring_limited;
    /* PPP state of the stream's last native block, for blocks that update
-    * only what changed (on by default; HK_APPLE9_NATIVE_PPP_DELTA=0 turns it off). Any other draw clears it. */
+    * only what changed (enabled by default in native streams; any non-native
+    * draw clears it). */
    bool apple9_ppp_valid;
    uint16_t apple9_ppp_size;
    /* Its viewport block's offset and words: records of the same size can

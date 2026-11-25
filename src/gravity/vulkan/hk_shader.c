@@ -94,9 +94,10 @@ static once_flag hk_compiler_env_hash_once = ONCE_FLAG_INIT;
  * HK_APPLE9_* variable (traces, dumps, statistics, runtime switches, or a
  * codegen knob missing here) keys the caches by name only, so output paths
  * never split them while an unlisted knob still does, conservatively.
+ * AGX_MESA_DEBUG is keyed by its active codegen bits rather than raw text so
+ * non-codegen or compiled-out flags never split the cache.
  */
 static const char *const hk_codegen_env[] = {
-   "AGX_MESA_DEBUG",
    "HK_APPLE9_NATIVE_MESH",
    "HK_APPLE9_NATIVE_MESH_ATTRIBUTES",
    "HK_APPLE9_NATIVE_MESH_PRIMITIVE_LOWERING",
@@ -128,7 +129,7 @@ hk_env_named(const char *var, const char *const *names, unsigned count)
 {
    const size_t len = strcspn(var, "=");
    for (unsigned i = 0; i < count; ++i) {
-      if (strlen(names[i]) == len && !strncmp(var, names[i], len))
+      if (names[i] && strlen(names[i]) == len && !strncmp(var, names[i], len))
          return true;
    }
    return false;
@@ -143,6 +144,9 @@ hk_env_key_kind(const char *var)
       return 0;
    if (agx_apple9_is_debug_env(var) ||
        hk_env_named(var, hk_ignored_env, ARRAY_SIZE(hk_ignored_env)))
+      return 0;
+   /* AGX_MESA_DEBUG is hashed via active parsed codegen bits below. */
+   if (!strncmp(var, "AGX_MESA_DEBUG=", 15) || !strcmp(var, "AGX_MESA_DEBUG"))
       return 0;
    return hk_env_named(var, hk_codegen_env, ARRAY_SIZE(hk_codegen_env)) ? 2 : 1;
 }
@@ -199,14 +203,15 @@ static void
 hk_compiler_env_hash_init(void)
 {
    extern char **environ;
+   const uint64_t dbg_codegen = agx_get_compiler_debug() & AGX_DBG_SPILL;
    unsigned count = 0;
    for (char **e = environ; e && *e; ++e)
       count += hk_env_key_kind(*e) != 0;
-   if (!count)
+   if (!count && !dbg_codegen && !hk_apple9_native_mesh_enabled())
       return;
 
-   const char **vars = malloc(count * sizeof(*vars));
-   if (!vars) {
+   const char **vars = count ? malloc(count * sizeof(*vars)) : NULL;
+   if (count && !vars) {
       hk_compiler_env_hash_value = ~0ull;
       return;
    }
@@ -215,7 +220,8 @@ hk_compiler_env_hash_init(void)
       if (hk_env_key_kind(*e))
          vars[n++] = *e;
    }
-   qsort(vars, n, sizeof(*vars), hk_compare_env);
+   if (n > 1)
+      qsort(vars, n, sizeof(*vars), hk_compare_env);
 
    struct mesa_blake3 ctx;
    _mesa_blake3_init(&ctx);
@@ -226,7 +232,11 @@ hk_compiler_env_hash_init(void)
       _mesa_blake3_update(&ctx, vars[i], len);
       _mesa_blake3_update(&ctx, "", 1);
    }
-   if (debug_get_bool_option("HK_APPLE9_NATIVE_MESH", false))
+   if (dbg_codegen) {
+      _mesa_blake3_update(&ctx, "AGX_MESA_DEBUG", sizeof("AGX_MESA_DEBUG"));
+      _mesa_blake3_update(&ctx, &dbg_codegen, sizeof(dbg_codegen));
+   }
+   if (hk_apple9_native_mesh_enabled())
       hk_hash_apple9_native_mesh_abi(&ctx);
    blake3_hash hash;
    _mesa_blake3_final(&ctx, hash);
