@@ -142,7 +142,8 @@ hk_apple9_native_stream_classify(const struct hk_apple9_stream_summary *s,
    const bool wraps_ring =
       d->ring_rows > HK_APPLE9_NATIVE_RING_ROWS ||
       s->ring_rows > HK_APPLE9_NATIVE_RING_ROWS - d->ring_rows;
-   if (s->ring_limited || d->ring_limited) {
+   const bool draw_ring_limited = d->ring_rows > 0 && d->ring_limited;
+   if (s->ring_limited || draw_ring_limited) {
       if (wraps_ring)
          return HK_APPLE9_NATIVE_ADMIT_SPLIT;
    } else if (s->native && s->ring_rows > 0 && d->ring_rows > 0 && wraps_ring) {

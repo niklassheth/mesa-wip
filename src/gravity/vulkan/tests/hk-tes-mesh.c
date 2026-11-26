@@ -912,9 +912,16 @@ fused_tess_suite(void)
       nir_shader *tes16 = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
                                          false, false, 1, 3, 0, 0, false, false);
       compile_fused_tess_pair(vs, tcs, tes16, &base_opts, &info);
-      CHECK(info.mesh_max_vertices == 24 && info.mesh_max_primitives == 42);
+      CHECK(info.mesh_max_vertices == 32 && info.mesh_max_primitives == 42);
       CHECK(info.max_child_wgs_per_patch == 1 && info.max_prims_per_patch == 2);
       ralloc_free(tes16);
+
+      nir_shader *tes32 = make_fused_tes(TESS_PRIMITIVE_QUADS, TESS_SPACING_EQUAL,
+                                         false, false, 1, 7, 0, 0, false, false);
+      compile_fused_tess_pair(vs, tcs, tes32, &base_opts, &info);
+      CHECK(info.mesh_max_vertices == 24 && info.mesh_max_primitives == 42);
+      CHECK(info.max_child_wgs_per_patch == 1 && info.max_prims_per_patch == 2);
+      ralloc_free(tes32);
 
       struct hk_tess_fused_options depth_opts = base_opts;
       depth_opts.has_fs_inputs_mask = true; /* FS reads 0 generic vars */
@@ -1882,9 +1889,9 @@ fused_tess_interval_bounds_suite(void)
       CHECK(!info.constant_tess_levels);
       if (safe_nan) {
          CHECK(info.max_prims_per_patch == 181u);
-         /* Multi-ring triangle chunker (20 comps -> V=24/P=42 -> p_chunk=21):
-          * ceil(181/21) = 9 WGs. */
-         CHECK(info.max_child_wgs_per_patch == 9u);
+         /* Multi-ring triangle chunker (20 comps -> V=32/P=42 -> p_chunk=29):
+          * ceil(181/29) = 7 WGs. */
+         CHECK(info.max_child_wgs_per_patch == 7u);
       } else {
          CHECK(info.max_prims_per_patch == 5953u);
       }
@@ -4087,7 +4094,7 @@ fused_tess_multipatch_suite(void)
    base_opts.vertex.format[0] = PIPE_FORMAT_R32G32B32A32_FLOAT;
 
    /* 1. Tier 2 Passthrough-TCS K=16 across all 4 meshlet shapes:
-    *    planes 4/8/12/24/28 -> V32/P42, 16/20/32/36 -> V24/P42,
+    *    planes 4..28 -> V32/P42, 32/36 -> V24/P42,
     *    40..68 -> V16/P18, 72..128 -> V8/P6, plus full OBJECT + MESH AGX
     *    backend compilation. */
    {
@@ -4098,8 +4105,8 @@ fused_tess_multipatch_suite(void)
          {0, 32, 42},  /* 4 planes -> V32/P42 (G=64) */
          {1, 32, 42},  /* 8 planes -> V32/P42 (padded 12, G=128) */
          {2, 32, 42},  /* 12 planes -> V32/P42 (G=128) */
-         {3, 24, 42},  /* 16 planes -> V24/P42 (padded 20, G=128) */
-         {4, 24, 42},  /* 20 planes -> V24/P42 (G=128) */
+         {3, 32, 42},  /* 16 planes -> V32/P42 (padded 20, G=256, strides 1024/768) */
+         {4, 32, 42},  /* 20 planes -> V32/P42 (G=256, strides 1024/768) */
          {5, 32, 42},  /* 24 planes -> V32/P42 (padded 28, G=256) */
          {6, 32, 42},  /* 28 planes -> V32/P42 (G=256) */
          {7, 24, 42},  /* 32 planes -> V24/P42 (padded 36, G=256) */
@@ -4217,6 +4224,78 @@ fused_tess_multipatch_suite(void)
          CHECK(info.multipatch_tier == 1);
          CHECK(info.patches_per_group >= 4 && info.patches_per_group <= 10);
          CHECK(info.payload_B <= 1024);
+         ralloc_free(vs);
+         ralloc_free(cb.shader);
+         ralloc_free(tes);
+      }
+
+      /* 3a2: Multi-KiB Tier 1 payload (3 vec4 varyings + pos = 192 B/patch ->
+       * K=10 packs cleanly into >1 KiB and <=4 KiB when 16 KiB HW payload is
+       * enabled, while staying <=1 KiB under the 1024 B budget). */
+      {
+         nir_shader *vs = make_fused_vs(3, false);
+         nir_builder cb = nir_builder_init_simple_shader(
+            MESA_SHADER_TESS_CTRL, &agx_nir_options, "t1_wide_k10");
+         cb.shader->info.io_lowered = true;
+         cb.shader->info.tess.tcs_vertices_out = 3;
+         nir_def *inv = nir_load_invocation_id(&cb);
+         for (unsigned s = 0; s < 4; ++s) {
+            unsigned loc = s == 0 ? VARYING_SLOT_POS : VARYING_SLOT_VAR0 + s - 1;
+            nir_def *v = nir_load_per_vertex_input(
+               &cb, 4, 32, inv, nir_imm_int(&cb, 0), .dest_type = nir_type_float32,
+               .io_semantics = {.location = loc, .num_slots = 1});
+            if (s == 0)
+               v = nir_fmul_imm(&cb, v, 1.5);
+            nir_store_per_vertex_output(
+               &cb, v, inv, nir_imm_int(&cb, 0), .write_mask = 0xf,
+               .src_type = nir_type_float32,
+               .io_semantics = {.location = loc, .num_slots = 1});
+         }
+         nir_push_if(&cb, nir_ieq_imm(&cb, inv, 0));
+         nir_store_output(&cb, nir_imm_vec4(&cb, 4, 4, 4, 4), nir_imm_int(&cb, 0),
+                          .write_mask = 0xf, .src_type = nir_type_float32,
+                          .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_OUTER, .num_slots = 1});
+         nir_store_output(&cb, nir_imm_vec2(&cb, 4, 4), nir_imm_int(&cb, 0),
+                          .write_mask = 0x3, .src_type = nir_type_float32,
+                          .io_semantics = {.location = VARYING_SLOT_TESS_LEVEL_INNER, .num_slots = 1});
+         nir_pop_if(&cb, NULL);
+         nir_shader_gather_info(cb.shader, nir_shader_get_entrypoint(cb.shader));
+         nir_shader *tes = make_fused_tes(TESS_PRIMITIVE_TRIANGLES,
+                                          TESS_SPACING_EQUAL, false, false, 3,
+                                          3, 0, 0, false, false);
+         /* Make TES consume VAR0..VAR2 per-CP so all 4 vec4s (192 B/patch) are live. */
+         {
+            nir_builder tb = nir_builder_at(
+               nir_before_impl(nir_shader_get_entrypoint(tes)));
+            nir_def *sum = nir_imm_vec4(&tb, 0, 0, 0, 0);
+            for (unsigned s = 0; s < 3; ++s) {
+               for (unsigned c = 0; c < 3; ++c) {
+                  sum = nir_fadd(&tb, sum,
+                     nir_load_per_vertex_input(&tb, 4, 32, nir_imm_int(&tb, c),
+                        nir_imm_int(&tb, 0), .dest_type = nir_type_float32,
+                        .io_semantics = {.location = VARYING_SLOT_VAR0 + s,
+                                         .num_slots = 1}));
+               }
+            }
+            nir_store_output(&tb, sum, nir_imm_int(&tb, 0), .write_mask = 0xf,
+                             .src_type = nir_type_float32,
+                             .io_semantics = {.location = VARYING_SLOT_VAR2,
+                                              .num_slots = 1});
+            nir_shader_gather_info(tes, nir_shader_get_entrypoint(tes));
+         }
+         struct hk_tess_fused_info info1k = {0};
+         compile_fused_tess_pair(vs, cb.shader, tes, &base_opts, &info1k);
+         CHECK(info1k.multipatch_tier == 1 && info1k.patches_per_group >= 2 &&
+               info1k.patches_per_group < 10 && info1k.payload_B <= 1024);
+
+         struct hk_tess_fused_options wide_opts = base_opts;
+         wide_opts.max_payload_bytes = 16384;
+         struct hk_tess_fused_info wide_info = {0};
+         compile_fused_tess_pair(vs, cb.shader, tes, &wide_opts, &wide_info);
+         CHECK(wide_info.multipatch_tier == 1);
+         CHECK(wide_info.patches_per_group == 10);
+         CHECK(wide_info.payload_B > 1024 && wide_info.payload_B <= 4096);
+         CHECK(wide_info.mesh_max_vertices == 32 && wide_info.mesh_max_primitives == 42);
          ralloc_free(vs);
          ralloc_free(cb.shader);
          ralloc_free(tes);
@@ -4547,7 +4626,7 @@ fused_tess_multipatch_suite(void)
                struct hk_tess_fused_info info = {0};
                compile_fused_tess_pair(vs, tcs, tes, &opts, &info);
                CHECK(info.multipatch_tier == 2 && info.patches_per_group == 16);
-               CHECK(info.mesh_max_vertices == 24 && info.mesh_max_primitives == 42);
+               CHECK(info.mesh_max_vertices == 32 && info.mesh_max_primitives == 42);
                ralloc_free(vs);
                ralloc_free(tcs);
                ralloc_free(tes);
@@ -5508,7 +5587,7 @@ fused_tess_hightess_chunker_suite(void)
          {32.0f, {53,  74,  119}, {74,  103, 168}},
          {64.0f, {212, 293, 473}, {292, 411, 677}},
       };
-      const unsigned evs[3] = {5, 3, 10};
+      const unsigned evs[3] = {5, 7, 10};
       const unsigned exp_vs[3] = {32, 24, 16};
       const unsigned exp_ps[3] = {42, 42, 18};
       for (unsigned i = 0; i < ARRAY_SIZE(expects); ++i) {

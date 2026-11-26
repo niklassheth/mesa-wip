@@ -421,7 +421,7 @@ static void
 check_vdm_recording(struct hk_device *dev, struct hk_api_shader *task,
                     struct hk_api_shader *mesh, struct hk_api_shader *fs,
                     const uint32_t groups[3], uint64_t payload_gpu,
-                    unsigned expect_local)
+                    unsigned expect_local, uint32_t expect_word9)
 {
    struct hk_cmd_buffer *cmd = calloc(1, sizeof(*cmd));
    CHECK(cmd);
@@ -474,6 +474,7 @@ check_vdm_recording(struct hk_device *dev, struct hk_api_shader *task,
    CHECK(cs.apple9_native_mesh);
    CHECK(!(cs.pre_raster_reads & HK_READS_INTERNAL));
    CHECK(command[0] == 0x40000d2c);
+   CHECK(command[9] == expect_word9);
    CHECK(command[33] == groups[0] * expect_local);
    CHECK(command[34] == groups[1]);
    CHECK(command[35] == groups[2]);
@@ -941,7 +942,7 @@ main(int argc, char **argv)
       CHECK(hk_apple9_select_native_mesh_route(cmd, g1, 0) ==
             HK_APPLE9_MESH_ROUTE_EMULATED);
       cmd->state.cond_render.active = false;
-      check_vdm_recording(dev, t_rt, m_rt, f_rt, g1024, 0, 32);
+      check_vdm_recording(dev, t_rt, m_rt, f_rt, g1024, 0, 32, 1);
 
       destroy_pair(dev, t_rt, m_rt, f_rt);
       destroy_pair(dev, t, m, f);
@@ -964,14 +965,22 @@ main(int argc, char **argv)
             HK_APPLE9_MESH_ROUTE_NATIVE);
       destroy_pair(dev, t, m, f);
 
-      compile_pair(dev, 32, 1024, 0, 4, false, true, &t, &m, &f);
-      CHECK(hk_api_shader_native(t)->variants[0].info.apple9_native.key.hw_payload);
-      cmd->state.gfx.shaders[MESA_SHADER_TASK] = t;
-      cmd->state.gfx.shaders[MESA_SHADER_MESH] = m;
-      cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = f;
-      CHECK(hk_apple9_select_native_mesh_route(cmd, g1024, 0) ==
-            HK_APPLE9_MESH_ROUTE_NATIVE);
-      destroy_pair(dev, t, m, f);
+      for (unsigned pbytes = 1024; pbytes <= 16368; pbytes = pbytes == 1024 ? 16368 : 16369) {
+         compile_pair(dev, 32, pbytes, 0, 4, false, true, &t, &m, &f);
+         CHECK(hk_api_shader_native(t)->variants[0].info.apple9_native.key.hw_payload);
+         struct hk_api_shader *t2 = roundtrip_shader(dev, t);
+         struct hk_api_shader *m2 = roundtrip_shader(dev, m);
+         struct hk_api_shader *f2 = roundtrip_shader(dev, f);
+         cmd->state.gfx.shaders[MESA_SHADER_TASK] = t2;
+         cmd->state.gfx.shaders[MESA_SHADER_MESH] = m2;
+         cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = f2;
+         CHECK(hk_apple9_select_native_mesh_route(cmd, g1024, 0) ==
+               HK_APPLE9_MESH_ROUTE_NATIVE);
+         check_vdm_recording(dev, t2, m2, f2, g1024, 0, 32,
+                             pbytes == 1024 ? 2u : 16u);
+         destroy_pair(dev, t2, m2, f2);
+         destroy_pair(dev, t, m, f);
+      }
 
       for (unsigned pbytes = 2048; pbytes <= 16384; pbytes *= 8) {
          compile_pair(dev, 32, pbytes, 0, 4, false, false, &t, &m, &f);
@@ -981,7 +990,7 @@ main(int argc, char **argv)
          cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = f;
          CHECK(hk_apple9_select_native_mesh_route(cmd, g1024, 0) ==
                HK_APPLE9_MESH_ROUTE_NATIVE);
-         check_vdm_recording(dev, t, m, f, g1024, 0, 32);
+         check_vdm_recording(dev, t, m, f, g1024, 0, 32, pbytes / 1024u);
          destroy_pair(dev, t, m, f);
       }
 
@@ -1005,7 +1014,7 @@ main(int argc, char **argv)
                HK_APPLE9_MESH_ROUTE_TASK_BRIDGE);
          CHECK(hk_apple9_select_native_mesh_route(cmd, NULL, 0) ==
                HK_APPLE9_MESH_ROUTE_EMULATED);
-         check_vdm_recording(dev, t2, m2, f2, g1, 0x1600000000ull, 32);
+         check_vdm_recording(dev, t2, m2, f2, g1, 0x1600000000ull, 32, 1u);
          check_bridge_prepare_and_record(dev, t2, m2, f2);
          struct blob m2_blob;
          blob_init(&m2_blob);
@@ -1042,7 +1051,7 @@ main(int argc, char **argv)
       const uint32_t g_multi[3] = {4, 3, 2};
       CHECK(hk_apple9_select_native_mesh_route(cmd, g_multi, 0) ==
             HK_APPLE9_MESH_ROUTE_NATIVE);
-      check_vdm_recording(dev, t, m, f, g_multi, 0, 32);
+      check_vdm_recording(dev, t, m, f, g_multi, 0, 32, 1u);
       destroy_pair(dev, t, m, f);
 
       /* Fallback cases on Phase 2 kernel: payload > 16 KiB, invocations > 128,

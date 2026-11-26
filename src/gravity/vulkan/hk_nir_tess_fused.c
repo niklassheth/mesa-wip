@@ -70,10 +70,13 @@ choose_meshlet_shape(unsigned vertex_components)
    unsigned planes_odd = (planes & 7u) == 0u ? planes + 4u : planes;
 
    /* Prefer widened multi-bucket shapes (V=32/P=42 first, then V=24/P=42)
-    * whenever GCD power-of-2 multi-bucket U0_B(b) keeps max_stride <= 512
-    * (>= 8 concurrent WGs in the 64 KiB output ring, zero degenerate tris,
-    * whole-patch tess=4 in 1 WG, and power-of-2 stride GCD for zero-split
-    * mixed-stride render-pass batching). */
+    * whenever GCD power-of-2 multi-bucket U0_B(b) keeps ring stride compact
+    * (zero degenerate tris, whole-patch tess=4 in 1 WG, and power-of-2 stride
+    * GCD for zero-split mixed-stride render-pass batching). Allowing
+    * plan32.max_stride <= 1024 unlocks V=32/P=42 (p_chunk=29, 1.38x fewer
+    * MESH WGs than V=24/P=42) for 16..20-component G-buffer shaders
+    * (padded planes=20, G=256, strides=[1024, 768]) while 32..36-component
+    * shaders use V=24/P=42 (G=256, strides=[256, 512]). */
    if (planes_odd <= 4u + AGX_APPLE9_MAX_VARYING_COMPONENTS) {
       const struct agx_apple9_mesh_layout l32 = {
          .max_vertices = 32,
@@ -84,7 +87,7 @@ choose_meshlet_shape(unsigned vertex_components)
       };
       struct agx_apple9_mesh_ring_plan plan32;
       if (agx_apple9_mesh_ring_plan_solve(&l32, &plan32) &&
-          plan32.max_stride <= 512u) {
+          plan32.max_stride <= 1024u) {
          return (struct tess_meshlet_shape){
             .max_v = 32,
             .max_p = 42,

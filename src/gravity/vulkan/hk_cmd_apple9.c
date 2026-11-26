@@ -2091,8 +2091,8 @@ hk_apple9_add_native_ring_rows(struct hk_cs *cs, uint64_t rows, bool limited,
       rows > UINT64_MAX - cs->apple9_native_ring_rows
          ? UINT64_MAX
          : cs->apple9_native_ring_rows + rows;
-   cs->apple9_native_ring_limited |= limited;
    if (rows > 0) {
+      cs->apple9_native_ring_limited |= limited;
       const uint32_t eff = (!limited && stride_gcd) ? stride_gcd : 0;
       if (first_nonempty) {
          cs->apple9_native_ring_stride_gcd = eff;

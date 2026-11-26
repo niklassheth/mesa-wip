@@ -296,10 +296,14 @@ main(void)
    CHECK(hk_apple9_native_stream_admits(&unb_stream, &(struct hk_apple9_draw_summary){
       .native = false, .primitives = UINT64_MAX}, &enabled_capped));
    /* Appending a ring-limited draw onto that unbounded stream still enforces
-    * the 64 KiB (4096-row) ring budget and splits cleanly. */
+    * the 64 KiB (4096-row) ring budget and splits cleanly, whereas a zero-row
+    * draw touches no ring rows and never forces a ring-limit split. */
    CHECK(!hk_apple9_native_stream_admits(&unb_stream, &(struct hk_apple9_draw_summary){
       .native = true, .primitives = 100, .ring_rows = 48, .ring_limited = true},
       &enabled_capped));
+   CHECK(hk_apple9_native_stream_classify(&pow2_256, &(struct hk_apple9_draw_summary){
+      .native = true, .unbounded_prims = true, .ring_rows = 0, .ring_limited = true},
+      &enabled_capped) == HK_APPLE9_NATIVE_ADMIT_APPEND);
 
    /* Both native ordering directions between capped and exempt draws MUST split
     * when combined primitives exceed max_render_primitives:
